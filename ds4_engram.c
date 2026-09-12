@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
@@ -274,4 +275,91 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
     free(request);
     errno = saved;
     return ok;
+}
+
+static uint64_t engram_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static void engram_fetch_rows(ds4_engram_fetch *f, size_t begin, size_t end) {
+    for (size_t i = begin; i < end; i++) {
+        if (!ds4_engram_read(f->table, &f->ids[i], 1,
+                             f->out + i * DS4_ENGRAM_DIM))
+            f->error[i] = errno ? errno : EIO;
+    }
+}
+
+#ifdef __APPLE__
+/* Same fixed-width partition as the prefill batch reader: each worker owns
+ * disjoint output rows, so no row is written twice and none is shared. */
+static void engram_fetch_part(void *context, size_t part) {
+    ds4_engram_fetch *f = context;
+    engram_fetch_rows(f, DS4_ENGRAM_COLS * part / ENGRAM_READERS,
+                         DS4_ENGRAM_COLS * (part + 1) / ENGRAM_READERS);
+}
+
+static void engram_fetch_run(void *context) {
+    ds4_engram_fetch *f = context;
+    dispatch_apply_f(ENGRAM_READERS,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), f, engram_fetch_part);
+    f->done_ns = engram_now_ns();
+}
+#endif
+
+bool ds4_engram_fetch_begin(ds4_engram_fetch *f, const ds4_engram_table *t,
+                            const uint32_t *rows, float *out) {
+    if (!f || !t || t->fd < 0 || !rows || !out) {
+        errno = EINVAL;
+        return false;
+    }
+    (void)ds4_engram_fetch_wait(f);
+    f->table = t;
+    f->out = out;
+    memcpy(f->ids, rows, sizeof(f->ids));
+    memset(f->error, 0, sizeof(f->error));
+    f->issue_ns = engram_now_ns();
+    f->done_ns = 0;
+#ifdef __APPLE__
+    if (!f->group) f->group = dispatch_group_create();
+    if (f->group) {
+        dispatch_group_async_f((dispatch_group_t)f->group,
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), f, engram_fetch_run);
+        f->inflight = true;
+        return true;
+    }
+#endif
+    engram_fetch_rows(f, 0, DS4_ENGRAM_COLS);
+    f->done_ns = engram_now_ns();
+    return true;
+}
+
+bool ds4_engram_fetch_wait(ds4_engram_fetch *f) {
+    if (!f) {
+        errno = EINVAL;
+        return false;
+    }
+#ifdef __APPLE__
+    if (f->inflight) {
+        dispatch_group_wait((dispatch_group_t)f->group, DISPATCH_TIME_FOREVER);
+        f->inflight = false;
+    }
+#endif
+    for (size_t i = 0; i < DS4_ENGRAM_COLS; i++) {
+        if (f->error[i]) {
+            errno = f->error[i];
+            return false;
+        }
+    }
+    return true;
+}
+
+void ds4_engram_fetch_release(ds4_engram_fetch *f) {
+    if (!f) return;
+    (void)ds4_engram_fetch_wait(f);
+#ifdef __APPLE__
+    if (f->group) dispatch_release((dispatch_group_t)f->group);
+#endif
+    memset(f, 0, sizeof(*f));
 }

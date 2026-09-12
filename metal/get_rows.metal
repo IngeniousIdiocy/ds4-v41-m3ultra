@@ -79,6 +79,11 @@ typedef decltype(kernel_get_rows_f<float, float>) get_rows_f_t;
 template [[host_name("kernel_get_rows_f32")]] kernel get_rows_f_t kernel_get_rows_f<float, float>;
 template [[host_name("kernel_get_rows_f16")]] kernel get_rows_f_t kernel_get_rows_f<half, float>;
 template [[host_name("kernel_get_rows_i32")]] kernel get_rows_f_t kernel_get_rows_f<int32_t, int32_t>;
+/* R3a: the same gather writing F16.  The decode attention stages its gathered
+ * compressed KV rows into an F16 buffer; producing them as F16 here is the
+ * identical float -> half conversion the staging copy applied, one pass
+ * earlier, and lets the contiguous staging kernel take the rows verbatim. */
+template [[host_name("kernel_get_rows_f32_f16")]] kernel get_rows_f_t kernel_get_rows_f<float, half>;
 
 kernel void kernel_get_rows_q8_0_f32(
         constant ds4_metal_args_get_rows_q8_0 & args,

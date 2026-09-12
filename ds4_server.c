@@ -5420,6 +5420,266 @@ bad:
     return false;
 }
 
+
+static void json_escape_fragment_n(buf *b, const char *s, size_t n);
+
+/* ---------------------------------------------------------------------------
+ * /debug/bench - resident A/B fixture for the V4.1 decode campaign.
+ *
+ * One tokenized prompt file, one session, one post-prefill snapshot per
+ * (path, ctx_start).  A lever A/B then costs one snapshot restore plus one
+ * decode instead of a 294 GiB weight load plus an 8,192-token prefill.  The
+ * decode loop is a transcription of ds4_bench.c's, so the generated text and
+ * the steady-state tokens/s are the same quantities the campaign's gate
+ * references were produced with.
+ *
+ * Reachable only with --debug-levers.  Serialised on its own mutex; the
+ * harness is the only client and the server is single-slot while it runs.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    char                *path;
+    int                  ctx_start;
+    int                  ctx_alloc;
+    ds4_tokens           prompt;
+    ds4_session         *session;
+    ds4_session_snapshot snap;
+    bool                 have_snap;
+    double               prefill_sec;
+    int                  prefill_tokens;
+    bool                 from_disk;
+} bench_fixture;
+
+#define BENCH_FIXTURES 4
+static bench_fixture   g_bench_fix[BENCH_FIXTURES];
+static pthread_mutex_t g_bench_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Where the post-prefill session payloads live, so a server restart onto a
+ * different binary restores the prefix from disk instead of re-prefilling.
+ * Set from --kv-disk-dir at startup; NULL disables persistence. */
+static const char     *g_bench_snap_dir;
+
+static double bench_now_sec_srv(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void bench_fixture_reset(bench_fixture *f) {
+    if (!f) return;
+    if (f->have_snap) { ds4_session_snapshot_free(&f->snap); f->have_snap = false; }
+    if (f->session) { ds4_session_free(f->session); f->session = NULL; }
+    ds4_tokens_free(&f->prompt);
+    free(f->path);
+    memset(f, 0, sizeof(*f));
+}
+
+static char *bench_read_file(const char *path, size_t *len_out) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long n = ftell(fp);
+    if (n < 0) { fclose(fp); return NULL; }
+    rewind(fp);
+    char *b = malloc((size_t)n + 1);
+    if (!b) { fclose(fp); return NULL; }
+    if (fread(b, 1, (size_t)n, fp) != (size_t)n) { free(b); fclose(fp); return NULL; }
+    fclose(fp);
+    b[n] = 0;
+    if (len_out) *len_out = (size_t)n;
+    return b;
+}
+
+static bench_fixture *bench_fixture_get(ds4_engine *e, const char *path,
+                                        int ctx_start, int ctx_alloc, bool fresh,
+                                        bool *created, char *err, size_t errlen) {
+    if (created) *created = false;
+    bench_fixture *free_slot = NULL;
+    for (int i = 0; i < BENCH_FIXTURES; i++) {
+        bench_fixture *f = &g_bench_fix[i];
+        if (f->path && !strcmp(f->path, path) && f->ctx_start == ctx_start) {
+            if (!fresh) return f;
+            bench_fixture_reset(f);
+            free_slot = f;
+            break;
+        }
+        if (!f->path && !free_slot) free_slot = f;
+    }
+    if (!free_slot) { snprintf(err, errlen, "no free bench fixture slot"); return NULL; }
+    if (created) *created = true;
+
+    size_t text_len = 0;
+    char *text = bench_read_file(path, &text_len);
+    if (!text) { snprintf(err, errlen, "cannot read %s", path); return NULL; }
+    bench_fixture *f = free_slot;
+    memset(f, 0, sizeof(*f));
+    ds4_tokenize_text(e, text, &f->prompt);
+    free(text);
+    if (f->prompt.len < ctx_start) {
+        snprintf(err, errlen, "prompt has %d tokens, need %d", f->prompt.len, ctx_start);
+        ds4_tokens_free(&f->prompt);
+        return NULL;
+    }
+    f->path = xstrdup(path);
+    f->ctx_start = ctx_start;
+    f->ctx_alloc = ctx_alloc;
+    if (ds4_session_create(&f->session, e, ctx_alloc) != 0) {
+        snprintf(err, errlen, "session create failed");
+        bench_fixture_reset(f);
+        return NULL;
+    }
+    char serr[256];
+
+    /* Try the persisted post-prefill payload first: it is the same
+     * ds4_session_save_payload format the server's KV disk cache uses, so a
+     * restart onto a different binary costs a weight load and nothing else. */
+    char snap_path[1024];
+    snap_path[0] = 0;
+    if (g_bench_snap_dir && !fresh) {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        snprintf(snap_path, sizeof(snap_path), "%s/ds41-fixture-%s-%d.snap",
+                 g_bench_snap_dir, base, ctx_start);
+        FILE *fp = fopen(snap_path, "rb");
+        if (fp) {
+            long n = 0;
+            if (fseek(fp, 0, SEEK_END) == 0 && (n = ftell(fp)) > 0 &&
+                fseek(fp, 0, SEEK_SET) == 0) {
+                uint8_t *p = malloc((size_t)n + 1);
+                if (p && fread(p, 1, (size_t)n, fp) == (size_t)n) {
+                    ds4_session_snapshot disk = { .ptr = p, .len = (uint64_t)n,
+                                                  .cap = (uint64_t)n + 1 };
+                    const double r0 = bench_now_sec_srv();
+                    if (ds4_session_load_snapshot(f->session, &disk, serr, sizeof(serr)) == 0) {
+                        f->snap = disk;                 /* fixture owns it now */
+                        f->have_snap = true;
+                        f->from_disk = true;
+                        f->prefill_sec = bench_now_sec_srv() - r0;
+                        f->prefill_tokens = ctx_start;
+                        p = NULL;
+                    } else {
+                        fprintf(stderr,
+                                "ds4-server: bench fixture payload %s unusable (%s); re-prefilling\n",
+                                snap_path, serr);
+                    }
+                }
+                free(p);
+            }
+            fclose(fp);
+        }
+    }
+
+    if (!f->have_snap) {
+        ds4_tokens prefix = { .v = f->prompt.v, .len = ctx_start, .cap = ctx_start };
+        const double t0 = bench_now_sec_srv();
+        if (ds4_session_sync(f->session, &prefix, serr, sizeof(serr)) != 0) {
+            snprintf(err, errlen, "prefill failed: %s", serr);
+            bench_fixture_reset(f);
+            return NULL;
+        }
+        f->prefill_sec = bench_now_sec_srv() - t0;
+        f->prefill_tokens = ctx_start;
+        if (ds4_session_save_snapshot(f->session, &f->snap, serr, sizeof(serr)) != 0) {
+            snprintf(err, errlen, "snapshot failed: %s", serr);
+            bench_fixture_reset(f);
+            return NULL;
+        }
+        f->have_snap = true;
+        if (snap_path[0]) {
+            FILE *fp = fopen(snap_path, "wb");
+            if (fp) {
+                if (fwrite(f->snap.ptr, 1, (size_t)f->snap.len, fp) != (size_t)f->snap.len)
+                    fprintf(stderr, "ds4-server: bench fixture payload write to %s failed\n", snap_path);
+                fclose(fp);
+            }
+        }
+    }
+    return f;
+}
+
+/* Returns a malloc'd JSON body, or NULL with err set. */
+static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
+                       int ctx_alloc, int gen_tokens, bool fresh,
+                       char *err, size_t errlen) {
+    pthread_mutex_lock(&g_bench_mu);
+    char *out = NULL;
+    bool created = false;
+    bench_fixture *f = bench_fixture_get(e, path, ctx_start, ctx_alloc, fresh,
+                                         &created, err, errlen);
+    if (!f) goto out;
+
+    char serr[256];
+    /* Restore on every call, including the one that built the fixture, so the
+     * first arm of an A/B and every later arm execute exactly the same path. */
+    double restore_sec = 0.0;
+    if (f->have_snap) {
+        const double r0 = bench_now_sec_srv();
+        if (ds4_session_load_snapshot(f->session, &f->snap, serr, sizeof(serr)) != 0) {
+            snprintf(err, errlen, "snapshot restore failed: %s", serr);
+            goto out;
+        }
+        restore_sec = bench_now_sec_srv() - r0;
+    }
+
+    const int eos = ds4_token_eos(e);
+    int *toks = calloc((size_t)(gen_tokens > 0 ? gen_tokens : 1), sizeof(int));
+    if (!toks) { snprintf(err, errlen, "oom"); goto out; }
+    double first_sec = 0.0, steady_sec = 0.0;
+    int done = 0;
+    const double gen_t0 = bench_now_sec_srv();
+    while (done < gen_tokens) {
+        const int token = ds4_session_argmax_excluding(f->session, eos);
+        if (token < 0) { snprintf(err, errlen, "argmax failed"); free(toks); goto out; }
+        const double t0 = bench_now_sec_srv();
+        if (ds4_session_eval(f->session, token, serr, sizeof(serr)) != 0) {
+            snprintf(err, errlen, "decode failed: %s", serr);
+            free(toks);
+            goto out;
+        }
+        const double t1 = bench_now_sec_srv();
+        toks[done++] = token;
+        if (done == 1) first_sec = t1 - t0; else steady_sec += t1 - t0;
+    }
+    const double gen_sec = bench_now_sec_srv() - gen_t0;
+
+    buf b = {0};
+    buf_printf(&b, "{\"prompt_tokens\":%d,\"gen_tokens\":%d", ctx_start, done);
+    buf_printf(&b, ",\"prefilled_now\":%s", (created && !f->from_disk) ? "true" : "false");
+    buf_printf(&b, ",\"prefix_from_disk\":%s", f->from_disk ? "true" : "false");
+    buf_printf(&b, ",\"fixture_created\":%s", created ? "true" : "false");
+    /* prefill_ms is the one-off cost of getting the prefix in place: a real
+     * prefill, or the disk load of a persisted payload.  prefill_tps is only
+     * meaningful for the former. */
+    buf_printf(&b, ",\"prefill_ms\":%.3f,\"prefill_tps\":%.4f",
+               f->prefill_sec * 1e3,
+               (!f->from_disk && f->prefill_sec > 0.0)
+                   ? (double)f->prefill_tokens / f->prefill_sec : 0.0);
+    buf_printf(&b, ",\"restore_ms\":%.3f", restore_sec * 1e3);
+    buf_printf(&b, ",\"gen_ms\":%.3f,\"gen_tps\":%.4f",
+               gen_sec * 1e3, gen_sec > 0.0 ? (double)done / gen_sec : 0.0);
+    buf_printf(&b, ",\"gen_first_ms\":%.3f", first_sec * 1e3);
+    buf_printf(&b, ",\"gen_steady_tokens\":%d,\"gen_steady_tps\":%.4f",
+               done > 1 ? done - 1 : 0,
+               steady_sec > 0.0 ? (double)(done - 1) / steady_sec : 0.0);
+    buf_printf(&b, ",\"levers\":{");
+    for (size_t i = 0; i < ds41_levers_count(); i++) {
+        int v = 0;
+        ds41_levers_get(ds41_levers_name(i), &v);
+        buf_printf(&b, "%s\"%s\":%d", i ? "," : "", ds41_levers_name(i), v);
+    }
+    buf_puts(&b, "},\"text\":\"");
+    for (int i = 0; i < done; i++) {
+        size_t tlen = 0;
+        char *txt = ds4_token_text(e, toks[i], &tlen);
+        if (txt) { json_escape_fragment_n(&b, txt, tlen); free(txt); }
+    }
+    buf_puts(&b, "\"}");
+    free(toks);
+    out = buf_take(&b);
+    buf_free(&b);
+out:
+    pthread_mutex_unlock(&g_bench_mu);
+    return out;
+}
+
 static long long wall_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -9594,6 +9854,7 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     server_image_cache image_cache; /* Protected by inference_mu. */
+    bool debug_levers;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -14357,6 +14618,141 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/bench")) {
+        if (!s->debug_levers) {
+            http_error(fd, s->enable_cors, 404, "unknown endpoint");
+            http_request_free(&hr);
+            goto done;
+        }
+        char *bpath = NULL;
+        int ctx_start = 8192, ctx_alloc = 0, gen = 512;
+        bool fresh = false;
+        if (hr.body) {
+            const char *p = hr.body;
+            json_ws(&p);
+            if (*p == '{') {
+                p++;
+                json_ws(&p);
+                while (*p && *p != '}') {
+                    char *key = NULL;
+                    if (!json_string(&p, &key)) break;
+                    json_ws(&p);
+                    if (*p != ':') { free(key); break; }
+                    p++;
+                    json_ws(&p);
+                    if (!strcmp(key, "path")) {
+                        if (!json_string(&p, &bpath)) { free(key); break; }
+                    } else if (!strcmp(key, "ctx_start")) {
+                        if (!json_int(&p, &ctx_start)) { free(key); break; }
+                    } else if (!strcmp(key, "ctx_alloc")) {
+                        if (!json_int(&p, &ctx_alloc)) { free(key); break; }
+                    } else if (!strcmp(key, "gen_tokens")) {
+                        if (!json_int(&p, &gen)) { free(key); break; }
+                    } else if (!strcmp(key, "fresh")) {
+                        if (!json_bool(&p, &fresh)) { free(key); break; }
+                    } else if (!strcmp(key, "levers")) {
+                        json_ws(&p);
+                        if (*p == '{') {
+                            p++;
+                            json_ws(&p);
+                            while (*p && *p != '}') {
+                                char *lk = NULL;
+                                if (!json_string(&p, &lk)) break;
+                                json_ws(&p);
+                                if (*p != ':') { free(lk); break; }
+                                p++;
+                                json_ws(&p);
+                                int lv = 0;
+                                bool lb = false;
+                                if (json_int(&p, &lv)) { /* numeric */ }
+                                else if (json_bool(&p, &lb)) { lv = lb ? 1 : 0; }
+                                else { free(lk); break; }
+                                ds41_levers_set(lk, lv);
+                                free(lk);
+                                json_ws(&p);
+                                if (*p == ',') { p++; json_ws(&p); }
+                            }
+                            if (*p == '}') p++;
+                        } else if (!json_skip_value(&p)) { free(key); break; }
+                    } else if (!json_skip_value(&p)) { free(key); break; }
+                    free(key);
+                    json_ws(&p);
+                    if (*p == ',') { p++; json_ws(&p); }
+                }
+            }
+        }
+        if (!bpath) {
+            http_error(fd, s->enable_cors, 400, "missing \"path\"");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (ctx_alloc <= 0) ctx_alloc = s->ctx_size;
+        char berr[256] = {0};
+        char *body = bench_run(s->engine, bpath, ctx_start, ctx_alloc, gen, fresh,
+                               berr, sizeof(berr));
+        free(bpath);
+        if (!body) {
+            http_error(fd, s->enable_cors, 500, berr[0] ? berr : "bench failed");
+        } else {
+            http_response(fd, s->enable_cors, 200, "application/json", body);
+            free(body);
+        }
+        http_request_free(&hr);
+        goto done;
+    }
+
+    /* Campaign A/B harness: read and flip the V4.1 decode levers between
+     * requests so a lever comparison costs one decode instead of a weight
+     * load plus a prefill.  Only reachable with --debug-levers. */
+    if (!strcmp(hr.path, "/debug/levers") &&
+        (!strcmp(hr.method, "GET") || !strcmp(hr.method, "POST"))) {
+        if (!s->debug_levers) {
+            http_error(fd, s->enable_cors, 404, "unknown endpoint");
+            http_request_free(&hr);
+            goto done;
+        }
+        int applied = 0, unknown = 0;
+        if (!strcmp(hr.method, "POST") && hr.body) {
+            const char *p = hr.body;
+            json_ws(&p);
+            if (*p == '{') {
+                p++;
+                json_ws(&p);
+                while (*p && *p != '}') {
+                    char *key = NULL;
+                    if (!json_string(&p, &key)) break;
+                    json_ws(&p);
+                    if (*p != ':') { free(key); break; }
+                    p++;
+                    json_ws(&p);
+                    int v = 0;
+                    bool b = false;
+                    if (json_int(&p, &v)) {
+                        /* numeric */
+                    } else if (json_bool(&p, &b)) {
+                        v = b ? 1 : 0;
+                    } else { free(key); break; }
+                    if (ds41_levers_set(key, v)) applied++; else unknown++;
+                    free(key);
+                    json_ws(&p);
+                    if (*p == ',') { p++; json_ws(&p); }
+                }
+            }
+        }
+        buf b = {0};
+        buf_printf(&b, "{\"applied\":%d,\"unknown\":%d,\"levers\":{", applied, unknown);
+        for (size_t i2 = 0; i2 < ds41_levers_count(); i2++) {
+            int v = 0;
+            ds41_levers_get(ds41_levers_name(i2), &v);
+            buf_printf(&b, "%s\"%s\":%d", i2 ? "," : "", ds41_levers_name(i2), v);
+        }
+        buf_puts(&b, "}}");
+        http_response(fd, s->enable_cors, 200, "application/json", b.ptr ? b.ptr : "{}");
+        buf_free(&b);
+        http_request_free(&hr);
+        goto done;
+    }
+
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
         http_request_free(&hr);
@@ -14495,6 +14891,7 @@ typedef struct {
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
+    bool debug_levers;            /* --debug-levers / DS4_DEBUG_LEVERS=1 */
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
@@ -14728,6 +15125,8 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--debug-levers")) {
+            c.debug_levers = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -15005,6 +15404,9 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    g_bench_snap_dir = cfg.kv_disk_dir;
+    s.debug_levers = cfg.debug_levers ||
+        (getenv("DS4_DEBUG_LEVERS") && getenv("DS4_DEBUG_LEVERS")[0] == '1');
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {

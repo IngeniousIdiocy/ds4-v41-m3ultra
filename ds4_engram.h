@@ -60,4 +60,31 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
 bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out);
 
+/* One decode step's DS4_ENGRAM_COLS rows, fetched off the caller's thread on a
+ * bounded worker pool. Row order, the e4m3 -> BF16-rounded F32 conversion and
+ * the EDOM/EINVAL validation are ds4_engram_read's, unchanged; only the thread
+ * and the moment of the pread move. `out` holds COLS * DIM floats and is owned
+ * by the caller, which must not touch it between begin and wait. Zero the
+ * struct once before first use. */
+typedef struct {
+    const ds4_engram_table *table;
+    float *out;
+    uint32_t ids[DS4_ENGRAM_COLS];
+    int error[DS4_ENGRAM_COLS];
+    void *group;            /* dispatch_group_t where available, else NULL */
+    bool inflight;
+    uint64_t issue_ns, done_ns;
+} ds4_engram_fetch;
+
+/* Issues the fetch and returns immediately. Joins a previous fetch on the same
+ * struct first. Falls back to a synchronous ds4_engram_read when no worker can
+ * be created; read failures are reported by ds4_engram_fetch_wait. */
+bool ds4_engram_fetch_begin(ds4_engram_fetch *fetch, const ds4_engram_table *table,
+                            const uint32_t *rows, float *out);
+/* Blocks until every row is in place. False with errno set from the
+ * lowest-indexed failing row, matching the serial read's first failure. */
+bool ds4_engram_fetch_wait(ds4_engram_fetch *fetch);
+/* Joins and releases the worker group. Safe on a zeroed struct. */
+void ds4_engram_fetch_release(ds4_engram_fetch *fetch);
+
 #endif

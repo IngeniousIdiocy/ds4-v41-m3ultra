@@ -1401,7 +1401,10 @@ constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_A
 /* Shared and deliberately noinline so the split-K reduction is compiled once and
  * every caller gets identical codegen. The RoPE-fused sibling in dsv4_rope.metal
  * calls this same body, which is what keeps the fusion bit-exact. */
-static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
+static inline float dsv41_bf16(float x);
+
+template<bool ROUND>
+static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row_impl(
         constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
         device  const char * htmp,
         device        char * dst,
@@ -1434,9 +1437,25 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
         const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
 
         if (iwg == 0) {
-            dst4[i] = v*S;
+            const float4 o = v*S;
+            dst4[i] = ROUND ? float4(dsv41_bf16(o.x), dsv41_bf16(o.y),
+                                     dsv41_bf16(o.z), dsv41_bf16(o.w)) : o;
         }
     }
+}
+
+/* The production reduce: ROUND = false is the body this file has always had. */
+static inline void ds4_flash_attn_vec_reduce_row(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        uint   tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        short  NWG_,
+        short  DV_) {
+    ds4_flash_attn_vec_reduce_row_impl<false>(args, htmp, dst, tgpig, tiisg,
+                                              sgitg, NWG_, DV_);
 }
 
 kernel void kernel_flash_attn_ext_vec_reduce(
@@ -1449,6 +1468,23 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
                                   (short)FC_flash_attn_ext_vec_reduce_NWG,
                                   (short)FC_flash_attn_ext_vec_reduce_DV);
+}
+
+/* R8': the decode reduce with V4.1's BF16 re-round of the attention heads on
+ * the store.  The V4.1 graph followed every decode attention with a
+ * kernel_dsv41_bf16_linear pass over exactly the words this kernel writes;
+ * dsv41_bf16 is a pure function of the stored value, so rounding here writes
+ * the same word and removes the pass. */
+kernel void kernel_flash_attn_ext_vec_reduce_bf16(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_flash_attn_vec_reduce_row_impl<true>(args, htmp, dst, tgpig, tiisg, sgitg,
+                                             (short)FC_flash_attn_ext_vec_reduce_NWG,
+                                             (short)FC_flash_attn_ext_vec_reduce_DV);
 }
 
 // M5 decode specialization: time-slice all 32 split-K workgroups through eight

@@ -176,6 +176,78 @@ typedef struct {
     ds4_tp_options tp;
 } ds4_engine_options;
 
+/* ---------------------------------------------------------------------------
+ * DeepSeek V4.1 decode campaign levers.
+ *
+ * One struct holding every kill switch the campaign toggles, so that a resident
+ * server can flip them between requests instead of an A/B costing a full weight
+ * load and prefill.  Every field is 1 for the production default.  Historical
+ * environment variables still work and still mean exactly what they meant:
+ *
+ *   queue_layers         DS4_DS41_QUEUE_LAYERS=0 disables          (L1)
+ *   engram_async         DS4_DS41_ENGRAM_ASYNC=0 disables          (L2)
+ *   round_fuse_norm      DS4_METAL_DISABLE_V41_ROUND_FUSE_NORM=1 disables     (L3/D1)
+ *   round_fuse_hcsum     DS4_METAL_DISABLE_V41_ROUND_FUSE_HCSUM=1 disables    (L3/D1)
+ *   round_fuse_hcexpand  DS4_METAL_DISABLE_V41_ROUND_FUSE_HCEXPAND=1 disables (L3/D1)
+ *
+ * Opt-in levers (default 0, the environment variable enables):
+ *
+ *   q4_grouped   DS4_METAL_ENABLE_Q4_GROUPED_EXPERTS        (L3/W1)
+ *   q4_group8    DS4_METAL_ENABLE_Q4_GROUP8_EXPERT_TABLE    (L3/W1)
+ *   q4_group24   DS4_METAL_ENABLE_Q4_GROUP24_EXPERT_TABLE   (L3/W1)
+ *
+ * and one default-on:
+ *
+ *   q4_group6    DS4_METAL_DISABLE_Q4_GROUP6_EXPERT_TABLE=1 disables (L3/W1)
+ *   q4_wide      DS4_DS41_Q4_WIDE=0 disables                          (L3/W2a)
+ *   q4_gu_nr1    DS4_DS41_Q4_GU_NR1 enables (default off)             (L3/W2b)
+ *   router_fused DS4_DS41_ROUTER_FUSED=0 disables                     (L3/W2/D2)
+ *   router_fused_w DS4_DS41_ROUTER_FUSED_W=0 keeps the 5-dispatch tail (L3/W2/D2)
+ *   shared_swiglu DS4_DS41_SHARED_SWIGLU=0 disables                   (L3/R9)
+ *   hc_norm_mix  DS4_DS41_HC_NORM_MIX=0 disables                     (L3/R1a)
+ *   hc_tail      DS4_DS41_HC_TAIL=0 disables                          (L3/R1a)
+ *   hc_expand_fold DS4_DS41_HC_EXPAND_FOLD=0 disables                 (L3/R1b)
+ *   mv_round     DS4_DS41_MV_ROUND=0 disables                         (L3/R2)
+ *   producer_round DS4_DS41_PRODUCER_ROUND=0 disables                  (L3/R8')
+ *   ffn_add_fold DS4_DS41_FFN_ADD_FOLD=0 disables                      (L3/R8')
+ *   kv_stage_f16 DS4_DS41_KV_STAGE_F16=0 disables                      (L3/R3a)
+ *
+ * The graph reads g_ds41_levers with plain global loads.  ds41_levers_set() is
+ * only ever called between requests, by ds4-server's --debug-levers endpoint.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    int queue_layers;
+    int engram_async;
+    int round_fuse_norm;
+    int round_fuse_hcsum;
+    int round_fuse_hcexpand;
+    int q4_grouped;
+    int q4_group6;
+    int q4_group8;
+    int q4_group24;
+    int q4_wide;
+    int q4_gu_nr1;
+    int router_fused;
+    int router_fused_w;
+    int shared_swiglu;
+    int hc_norm_mix;
+    int hc_tail;
+    int hc_expand_fold;
+    int mv_round;
+    int producer_round;
+    int ffn_add_fold;
+    int kv_stage_f16;
+} ds41_levers;
+
+extern ds41_levers g_ds41_levers;
+
+void        ds41_levers_init_from_env(void);
+size_t      ds41_levers_count(void);
+const char *ds41_levers_name(size_t i);
+const char *ds41_levers_env_name(size_t i);
+int         ds41_levers_get(const char *name, int *out);
+int         ds41_levers_set(const char *name, int value);
+
 typedef struct {
     float *data;
     uint32_t token_count;

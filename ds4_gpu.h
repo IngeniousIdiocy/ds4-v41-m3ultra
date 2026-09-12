@@ -175,7 +175,7 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
 /* Gather 512-wide F32 KV rows; IDs must come from top-k over source_rows. */
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
-                           uint32_t selected_rows);
+                           uint32_t selected_rows, int f16_out);
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(
@@ -880,6 +880,59 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         const ds4_gpu_tensor *x,
         float                   clamp);
 
+int ds4_gpu_dsv41_matmul_round_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        int                   q8_weights,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_dsv41_hc_round_expand4_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const ds4_gpu_tensor *block_in,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc);
+
+int ds4_gpu_dsv41_hc_tail_available(uint32_t n_embd);
+
+int ds4_gpu_dsv41_hc_tail_tensor(
+        ds4_gpu_tensor       *split,
+        ds4_gpu_tensor       *collapsed,
+        ds4_gpu_tensor       *norm_out,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *pre,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              scale_offset,
+        uint64_t              base_offset,
+        uint64_t              norm_weight_offset,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        uint32_t              mix_dim,
+        uint32_t              sinkhorn_iters,
+        float                 hc_eps,
+        float                 norm_eps);
+
+int ds4_gpu_dsv41_shared_mid_swiglu_q8_0_tensor(
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp,
+        float                 alpha);
+
 int ds4_gpu_router_shared_gate_up_q8_0_tensor(
         ds4_gpu_tensor       *router_logits,
         ds4_gpu_tensor       *gate,
@@ -1174,6 +1227,29 @@ int ds4_gpu_rms_norm_weight_tensor(
         uint64_t                weight_offset,
         uint32_t                n,
         float                   eps);
+
+/* L3/D1: same kernel with DeepSeek V4.1 BF16 re-rounding folded into the store.
+ * round == 0 encodes the production pipeline, bit-for-bit. */
+int ds4_gpu_rms_norm_weight_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n,
+        float                 eps,
+        int                   round);
+
+int ds4_gpu_rms_norm_weight_rows_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n,
+        uint32_t              rows,
+        float                 eps,
+        int                   round);
 
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
@@ -2132,6 +2208,13 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         uint32_t                head_dim,
         uint32_t                pos0);
 
+/* R8': arm (on = 1) or disarm the BF16 re-round of the decode attention heads
+ * on the split-K reduce store, and ask afterwards whether the encoder that ran
+ * actually applied it.  The caller keeps its standalone rounding pass for any
+ * attention path that does not consume the arm. */
+void ds4_gpu_set_decode_attn_round_fuse(int on);
+int  ds4_gpu_decode_attn_round_fuse_used(void);
+
 int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -2455,7 +2538,8 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                group_dim,
         uint64_t                rank,
         uint32_t                n_groups,
-        const ds4_gpu_tensor *heads);
+        const ds4_gpu_tensor *heads,
+        int                     round);
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -2921,6 +3005,24 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* L3/D1: same kernels with the V4.1 BF16 re-rounding folded into the store.
+ * round == 0 encodes the production pipeline, bit-for-bit. */
+int ds4_gpu_hc_weighted_sum_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        int                   round);
+
+int ds4_gpu_hc_weighted_sum_split_round_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        int                   round);
+
 /* Release decode fused HC pre-sublayer operation: split the HC mixer and
  * immediately reduce four HC streams into the active 4096-wide sublayer row. */
 int ds4_gpu_hc_split_weighted_sum_tensor(
@@ -3074,6 +3176,17 @@ int ds4_gpu_hc_expand_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* L3/D1: same kernel with the V4.1 BF16 re-rounding folded into the store.
+ * Requires n_hc == 4; round == 0 encodes the production pipeline. */
+int ds4_gpu_hc_expand_split_round_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc,
+        int                   round);
 
 int ds4_gpu_hc_expand_split_half_tensor(
         ds4_gpu_tensor       *out_hc,

@@ -1,3 +1,8 @@
+/* Defined in metal/dsv41.metal, which ds4_gpu_full_source() concatenates
+ * after this file; declared here so the L3/D1 BF16-store variants below
+ * use the one definition of DeepSeek V4.1's rounding. */
+static inline float dsv41_bf16(float x);
+
 struct ds4_metal_args_dsv4_hc_split_sinkhorn {
     int32_t  n_hc;
     int32_t  sinkhorn_iters;
@@ -692,6 +697,52 @@ kernel void kernel_dsv4_hc_expand4(
     }
 }
 
+/* L3/D1: identical to kernel_dsv4_hc_expand4, with the V4.1 BF16 re-rounding on
+ * the store instead of in a following kernel_dsv41_bf16_linear pass over the
+ * same words.  Per-stream accumulation order is unchanged. */
+kernel void kernel_dsv4_hc_expand4_bf16(
+        constant ds4_metal_args_dsv4_hc_expand & args,
+        device  const char * block_out,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device  const char * block_add,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) {
+        return;
+    }
+
+    const int64_t n_elem = args.n_embd * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = ((int64_t) gid) % args.n_embd;
+    const int64_t t = ((int64_t) gid) / args.n_embd;
+
+    float block_v = *((device const float *) (block_out + d*args.nb_block0 + t*args.nb_block1));
+    if (args.has_add) {
+        block_v += *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
+    }
+
+    const float r0 = *((device const float *) (residual + d*args.nb_res0 + 0*args.nb_res1 + t*args.nb_res2));
+    const float r1 = *((device const float *) (residual + d*args.nb_res0 + 1*args.nb_res1 + t*args.nb_res2));
+    const float r2 = *((device const float *) (residual + d*args.nb_res0 + 2*args.nb_res1 + t*args.nb_res2));
+    const float r3 = *((device const float *) (residual + d*args.nb_res0 + 3*args.nb_res1 + t*args.nb_res2));
+
+    for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+        float acc = block_v * *((device const float *) (post + dst_hc*args.nb_post0 + t*args.nb_post1));
+
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 0*args.nb_comb1 + t*args.nb_comb2)) * r0;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 1*args.nb_comb1 + t*args.nb_comb2)) * r1;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
+        acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
+
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = dsv41_bf16(acc);
+    }
+}
+
 // Decode-time FFN tail fusion:
 //
 //     shared_out = shared_mid @ Wshared_down
@@ -1068,6 +1119,34 @@ kernel void kernel_dsv4_hc_weighted_sum(
     }
 
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+}
+
+/* L3/D1: identical reduction, DeepSeek V4.1's BF16 re-rounding applied on the
+ * store.  The accumulation order is unchanged, so the float written before
+ * rounding is the same word the unfused kernel wrote and dsv41_bf16() then
+ * maps it exactly as kernel_dsv41_bf16_linear would have. */
+kernel void kernel_dsv4_hc_weighted_sum_bf16(
+        constant ds4_metal_args_dsv4_hc_weighted_sum & args,
+        device  const char * x,
+        device  const char * weights,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t n_elem = args.n_embd * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = ((int64_t) gid) % args.n_embd;
+    const int64_t t = ((int64_t) gid) / args.n_embd;
+
+    float acc = 0.0f;
+    for (int64_t h = 0; h < args.n_hc; ++h) {
+        const float xv = *((device const float *) (x       + d*args.nb_x0 + h*args.nb_x1 + t*args.nb_x2));
+        const float wv = *((device const float *) (weights + h*args.nb_w0 + t*args.nb_w1));
+        acc += xv * wv;
+    }
+
+    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = dsv41_bf16(acc);
 }
 
 // The one-row HC=4 output head historically materializes four device-F32

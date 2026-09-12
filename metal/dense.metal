@@ -3,6 +3,40 @@
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 
+/*
+ * W2/routed-Q4_K wide quant loads.  Optional: pipelines that do not define it
+ * keep the production narrow loads, so every existing pipeline still builds.
+ * 1 = read a Q4_K row's eight quant uint16s as two ushort4 (8 B) loads instead
+ * of eight scalar loads -- the same bytes, in the same lanes, in the same
+ * order, so the arithmetic tree is textually unchanged.  Ported from GLM's
+ * glm_q4_K_pair_swiglu_simd_f32_wide_impl LOADW 1 (metal/moe.metal:1490 in
+ * ~/src/ds4-glm-eval).
+ */
+constant short FC_q4k_wide_in  [[function_constant(FC_MUL_MV + 8)]];
+constant bool  FC_q4k_wide_set = is_function_constant_defined(FC_q4k_wide_in);
+constant short FC_q4k_wide     = FC_q4k_wide_set ? FC_q4k_wide_in : (short)0;
+
+/*
+ * W2b: one Q4_K output row per simdgroup instead of two, i.e. GLM's routed
+ * gate/up row map (GU: NSG 2, NR0 1, 2 rows per threadgroup).  Rows are
+ * independent, so each row's K reduction is bit-for-bit the one it had; only
+ * the row-to-threadgroup assignment and the grid width change.
+ */
+constant short FC_q4k_nr1_in   [[function_constant(FC_MUL_MV + 9)]];
+constant bool  FC_q4k_nr1_set  = is_function_constant_defined(FC_q4k_nr1_in);
+constant short FC_q4k_nr1      = FC_q4k_nr1_set ? FC_q4k_nr1_in : (short)0;
+
+/*
+ * R2: BF16 re-round folded into the matvec store.  A ROUND template parameter,
+ * not a function constant: kernels that never round (and the ones the host
+ * builds without constant values, such as kernel_dsv4_hc_rms_norm_mix_f16)
+ * must keep compiling with no constants at all.  Rounding the reduced value on
+ * the store writes exactly the word the separate kernel_dsv41_bf16_linear pass
+ * would then have written, because dsv41_bf16 is a pure function of the stored
+ * value.  Defined in metal/dsv41.metal, forward-declared here.
+ */
+static inline float dsv41_bf16(float x);
+
 struct ds4_metal_args_mul_mv {
     int ne00;
     int ne01;
@@ -70,7 +104,7 @@ struct ds4_metal_args_mul_mv_ext {
     int16_t r3;
 };
 
-template<short NR0>
+template<short NR0, bool ROUND = false>
 static inline void helper_mv_reduce_and_write(
         device float * dst_f32,
         float sumf[NR0],
@@ -107,12 +141,12 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = tot;
+            dst_f32[r0 + row] = ROUND ? dsv41_bf16(tot) : tot;
         }
     }
 }
 
-template<short NR0, typename args_t>
+template<short NR0, typename args_t, bool ROUND = false>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
         device const char * src0,
@@ -179,7 +213,7 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
@@ -195,6 +229,20 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+/* R2: kernel_mul_mv_q8_0_f32 with V4.1's BF16 re-round on the store. */
+[[host_name("kernel_mul_mv_q8_0_f32_bf16")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
@@ -1244,7 +1292,7 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 template [[host_name("kernel_mul_mv_f32_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 
-template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
+template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t, bool ROUND = false>
 void kernel_mul_mv_t_t_4_impl(
         args_t args,
         device const char * src0,
@@ -1322,10 +1370,10 @@ void kernel_mul_mv_t_t_4_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
-template<typename T0, typename T04, typename T1, typename T14, typename args_t>
+template<typename T0, typename T04, typename T1, typename T14, typename args_t, bool ROUND = false>
 void kernel_mul_mv_t_t_4_disp(
         args_t args,
         device const char * src0,
@@ -1336,8 +1384,8 @@ void kernel_mul_mv_t_t_4_disp(
         ushort tiisg,
         ushort sgitg) {
     switch (args.nr0) {
-        case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
-        case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
+        case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
     };
 }
 
@@ -1361,6 +1409,25 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 // Host-visible vectorized dense matvec variants for F32 and F16 weights.
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
+
+// R2: the same vectorized dense matvec with V4.1's BF16 re-round on the store.
+template<typename T0, typename T04, typename T1, typename T14>
+kernel void kernel_mul_mv_t_t_4_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_t_t_4_disp<T0, T04, T1, T14, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_t_t_4_bf16<half, half4, half, half4>) mul_mv_t_t_4_bf16;
+
+template [[host_name("kernel_mul_mv_f32_f32_4_bf16")]] kernel mul_mv_t_t_4_bf16 kernel_mul_mv_t_t_4_bf16<float, float4, float, float4>;
+template [[host_name("kernel_mul_mv_f16_f32_4_bf16")]] kernel mul_mv_t_t_4_bf16 kernel_mul_mv_t_t_4_bf16<half,  half4,  float, float4>;
 
 // DS4 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling

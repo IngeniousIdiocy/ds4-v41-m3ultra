@@ -1550,14 +1550,14 @@ static int check_partitions(const char *path) {
         }
         REQUIRE(partition_close("query row split", il, expected, actual, 32768));
         REQUIRE(ds4_gpu_attention_output_low_q8_tensor(g.low, model.map, model.size,
-            l->attn_output_a->abs_offset, 4096, 1024, 8, g.heads));
+            l->attn_output_a->abs_offset, 4096, 1024, 8, g.heads, 0));
         REQUIRE(ds4_gpu_tensor_read(g.low, 0, expected, 8192u * sizeof(float)));
         for (uint32_t rank = 0; rank < 2; rank++) {
             ds4_gpu_tensor *half = ds4_gpu_tensor_view(g.heads, rank * head_bytes / 2, head_bytes / 2);
             uint64_t row;
             REQUIRE(half && tensor_nbytes(l->attn_output_a->type, 4096, &row));
             const bool ok = ds4_gpu_attention_output_low_q8_tensor(g.low, model.map, model.size,
-                l->attn_output_a->abs_offset + rank * 4096u * row, 4096, 1024, 4, half);
+                l->attn_output_a->abs_offset + rank * 4096u * row, 4096, 1024, 4, half, 0);
             ds4_gpu_tensor_free(half);
             REQUIRE(ok && ds4_gpu_tensor_read(g.low, 0, actual + rank * 4096u, 4096u * sizeof(float)));
         }

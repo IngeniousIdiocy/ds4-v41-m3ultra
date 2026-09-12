@@ -2863,15 +2863,30 @@ void kernel_mul_mv_q4_K_f32_impl(
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+            if (FC_q4k_wide) {
+                const ushort4 v1 = *(device const ushort4 *)q1;
+                const ushort4 v2 = *(device const ushort4 *)q2;
+                FOR_UNROLL (short i = 0; i < 4; ++i) {
+                    acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                    acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                    acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                    acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                    acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                    acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                    acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                    acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                }
+            } else {
             FOR_UNROLL (short i = 0; i < 4; ++i) {
-                acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                    acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                    acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                    acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                    acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                    acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                    acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                    acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                    acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                }
             }
 
             sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
@@ -3389,16 +3404,18 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
 // The generic GGML-style id matvec supports arbitrary routed expert ids.  Here
 // the id is always equal to the group number, so this wrapper keeps the exact
 // Q8_0 dot kernel but removes the id-buffer load and the CPU-side id table.
-kernel void kernel_dsv4_attn_out_low_q8_0_f32(
+/* R8': the shared body, so the plain projection and the one that folds V4.1's
+ * BF16 re-round onto the store are the same code with the same reduction. */
+template<bool ROUND>
+static inline void ds4_attn_out_low_q8_0_body(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const int iid1 = tgpig.z/args.nei0;
     const int idx  = tgpig.z%args.nei0;
 
@@ -3433,7 +3450,7 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         /*.r3   =*/ 1,
     };
 
-    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, ROUND>(
         args0,
         src0_cur,
         src1_cur,
@@ -3442,6 +3459,38 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         tgpig,
         tiisg,
         sgitg);
+}
+
+kernel void kernel_dsv4_attn_out_low_q8_0_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+    ds4_attn_out_low_q8_0_body<false>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+/* R8': the same projection with V4.1's BF16 re-round on the store.  The graph
+ * followed every decode out_a low projection with a kernel_dsv41_bf16_linear
+ * pass over exactly these 1,024 words; dsv41_bf16 is a pure function of the
+ * stored value, so applying it here writes the same word. */
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_bf16(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+    ds4_attn_out_low_q8_0_body<true>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
@@ -5439,27 +5488,21 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
         args.ne0, 1, args.nr0, 1, 1,
     };
 
-    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
-        args0,
-        src0_gate_cur,
-        src1_cur,
-        dst_gate_cur,
-        shmem,
-        tgpig,
-        tiisg,
-        sgitg);
-    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
-        args0,
-        src0_up_cur,
-        src1_cur,
-        dst_up_cur,
-        shmem,
-        tgpig,
-        tiisg,
-        sgitg);
+    if (FC_q4k_nr1) {
+        kernel_mul_mv_q4_K_f32_impl<1>(
+            args0, src0_gate_cur, src1_cur, dst_gate_cur, shmem, tgpig, tiisg, sgitg);
+        kernel_mul_mv_q4_K_f32_impl<1>(
+            args0, src0_up_cur, src1_cur, dst_up_cur, shmem, tgpig, tiisg, sgitg);
+    } else {
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+            args0, src0_gate_cur, src1_cur, dst_gate_cur, shmem, tgpig, tiisg, sgitg);
+        kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+            args0, src0_up_cur, src1_cur, dst_up_cur, shmem, tgpig, tiisg, sgitg);
+    }
 
     const short NSG = FC_mul_mv_nsg;
-    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
+    const short NR0 = FC_q4k_nr1 ? (short)1 : (short)N_R0_Q4_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
     device float *gate_f32 = (device float *)dst_gate_cur;
     device float *up_f32 = (device float *)dst_up_cur;
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
@@ -5469,7 +5512,7 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
     const float route_weight = route_w[0];
 
     if (tiisg == 0) {
-        for (int row = 0; row < N_R0_Q4_K && first_row + row < args.ne0; ++row) {
+        for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
             const uint out_row = first_row + row;
             float g = gate_f32[out_row];
             float u = up_f32[out_row];
@@ -6813,15 +6856,30 @@ kernel void kernel_mul_mv_id_q4_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+                    if (FC_q4k_wide) {
+                        const ushort4 v1 = *(device const ushort4 *)q1;
+                        const ushort4 v2 = *(device const ushort4 *)q2;
+                        FOR_UNROLL (short i = 0; i < 4; ++i) {
+                            acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                        }
+                    } else {
                     FOR_UNROLL (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                            acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                        }
                     }
 
                     sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
@@ -6936,15 +6994,30 @@ kernel void kernel_mul_mv_group_q4_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+                    if (FC_q4k_wide) {
+                        const ushort4 v1 = *(device const ushort4 *)q1;
+                        const ushort4 v2 = *(device const ushort4 *)q2;
+                        FOR_UNROLL (short i = 0; i < 4; ++i) {
+                            acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                        }
+                    } else {
                     FOR_UNROLL (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                            acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                        }
                     }
 
                     sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
@@ -7051,15 +7124,30 @@ kernel void kernel_mul_mv_table_q4_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+                    if (FC_q4k_wide) {
+                        const ushort4 v1 = *(device const ushort4 *)q1;
+                        const ushort4 v2 = *(device const ushort4 *)q2;
+                        FOR_UNROLL (short i = 0; i < 4; ++i) {
+                            acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                        }
+                    } else {
                     FOR_UNROLL (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                            acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                        }
                     }
 
                     sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
@@ -7162,15 +7250,30 @@ kernel void kernel_mul_mv_addr_q4_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+                    if (FC_q4k_wide) {
+                        const ushort4 v1 = *(device const ushort4 *)q1;
+                        const ushort4 v2 = *(device const ushort4 *)q2;
+                        FOR_UNROLL (short i = 0; i < 4; ++i) {
+                            acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                        }
+                    } else {
                     FOR_UNROLL (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                            acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                        }
                     }
 
                     sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
@@ -7279,15 +7382,30 @@ kernel void kernel_mul_mv_slots6_q4_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+                    if (FC_q4k_wide) {
+                        const ushort4 v1 = *(device const ushort4 *)q1;
+                        const ushort4 v2 = *(device const ushort4 *)q2;
+                        FOR_UNROLL (short i = 0; i < 4; ++i) {
+                            acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                        }
+                    } else {
                     FOR_UNROLL (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                            acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                        }
                     }
 
                     sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
@@ -7411,15 +7529,30 @@ kernel void kernel_mul_mv_group6_q4_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+                    if (FC_q4k_wide) {
+                        const ushort4 v1 = *(device const ushort4 *)q1;
+                        const ushort4 v2 = *(device const ushort4 *)q2;
+                        FOR_UNROLL (short i = 0; i < 4; ++i) {
+                            acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                        }
+                    } else {
                     FOR_UNROLL (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                            acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                        }
                     }
 
                     sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
@@ -7547,15 +7680,30 @@ kernel void kernel_mul_mv_group8_q4_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+                    if (FC_q4k_wide) {
+                        const ushort4 v1 = *(device const ushort4 *)q1;
+                        const ushort4 v2 = *(device const ushort4 *)q2;
+                        FOR_UNROLL (short i = 0; i < 4; ++i) {
+                            acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                        }
+                    } else {
                     FOR_UNROLL (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                            acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                        }
                     }
 
                     sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
@@ -7694,15 +7842,30 @@ kernel void kernel_mul_mv_group24_q4_K_sum6_f32(
                     float4 acc1 = {0.f, 0.f, 0.f, 0.f};
                     float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
+                    if (FC_q4k_wide) {
+                        const ushort4 v1 = *(device const ushort4 *)q1;
+                        const ushort4 v2 = *(device const ushort4 *)q2;
+                        FOR_UNROLL (short i = 0; i < 4; ++i) {
+                            acc1[0] += yl[2 * i + 0] * (v1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (v1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (v1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (v1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (v2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (v2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (v2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (v2[i] & 0xF000);
+                        }
+                    } else {
                     FOR_UNROLL (short i = 0; i < 4; ++i) {
-                        acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
-                        acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
-                        acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
-                        acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
-                        acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
-                        acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
-                        acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
-                        acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                            acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                            acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                            acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                            acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                            acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                            acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                            acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                            acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+                        }
                     }
 
                     sumf[row] += dh[0] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +

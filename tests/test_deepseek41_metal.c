@@ -432,12 +432,12 @@ static int check_sparse_gather(void) {
         for (uint32_t r = 0; r < rows; r++) for (uint32_t c = 0; c < 512; c++)
             input[(size_t)r * 512 + c] = (float)r + (float)c / 512.0f;
         for (uint32_t r = 0; r < selected; r++) indices[r] = (int32_t)(rows - 1u - r);
-        CHECK(ds4_gpu_dsv41_gather_kv(out, source, ids, rows, selected));
+        CHECK(ds4_gpu_dsv41_gather_kv(out, source, ids, rows, selected, 0));
         const float *result = ds4_gpu_tensor_contents(out);
         for (uint32_t r = 0; r < selected; r++)
             CHECK(!memcmp(result + r * 512, input + (size_t)indices[r] * 512, 512 * 4));
-        CHECK(!ds4_gpu_dsv41_gather_kv(out, source, ids, rows + 1, selected));
-        CHECK(!ds4_gpu_dsv41_gather_kv(out, source, ids, rows, selected + 1));
+        CHECK(!ds4_gpu_dsv41_gather_kv(out, source, ids, rows + 1, selected, 0));
+        CHECK(!ds4_gpu_dsv41_gather_kv(out, source, ids, rows, selected + 1, 0));
         ds4_gpu_tensor_free(source); ds4_gpu_tensor_free(ids); ds4_gpu_tensor_free(out);
     }
     fprintf(stderr, "V4.1 bounded sparse KV gather: exact\n");
@@ -472,7 +472,7 @@ static int check_attention_output(void) {
         ds4_gpu_tensor *yr = ds4_gpu_tensor_view(out, (uint64_t)r * OUT * 4, OUT * 4);
         CHECK(xr && lr && yr);
         CHECK(ds4_gpu_attention_output_low_q8_tensor(lr, model, a_bytes + b_bytes,
-            0, GROUP, RANK, GROUPS, xr));
+            0, GROUP, RANK, GROUPS, xr, 0));
         CHECK(ds4_gpu_dsv41_quantize(lr, GROUPS * RANK, 1, DS4_V41_BF16));
         CHECK(ds4_gpu_matmul_q8_0_tensor(yr, model, a_bytes + b_bytes,
             a_bytes, GROUPS * RANK, OUT, lr, 1));
