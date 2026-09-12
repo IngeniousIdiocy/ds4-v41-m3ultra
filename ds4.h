@@ -216,6 +216,7 @@ typedef struct {
  * only ever called between requests, by ds4-server's --debug-levers endpoint.
  * ------------------------------------------------------------------------ */
 typedef struct {
+    int decode_chunks; /* DS4_DS41_DECODE_CHUNKS=0 restores one-stack-CB path */
     int queue_layers;
     int engram_async;
     int round_fuse_norm;
@@ -231,12 +232,17 @@ typedef struct {
     int router_fused_w;
     int shared_swiglu;
     int hc_norm_mix;
+    int ffn_producer; /* DS4_DS41_FFN_PRODUCER=0 restores separate HC expansion */
+    int qa_kv_flat; /* DS4_DS41_QA_KV_FLAT=0 restores separate projections */
+    int hc_stream; /* DS4_DS41_HC_STREAM=0 restores pre-wave-A sequence */
     int hc_tail;
     int hc_expand_fold;
     int mv_round;
     int producer_round;
     int ffn_add_fold;
     int kv_stage_f16;
+    int routed_down_split; /* DS4_DS41_ROUTED_DOWN_SPLIT=1 arms R4 (opt-in) */
+    int attn_cohort4;      /* DS4_DS41_ATTN_COHORT4=1 arms R6 (opt-in) */
 } ds41_levers;
 
 extern ds41_levers g_ds41_levers;

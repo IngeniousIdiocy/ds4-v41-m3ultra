@@ -900,6 +900,32 @@ int ds4_gpu_dsv41_hc_round_expand4_tensor(
         uint32_t              n_embd,
         uint32_t              n_hc);
 
+int ds4_gpu_dsv41_arch_qa_kv_tensor(ds4_gpu_tensor *qa, ds4_gpu_tensor *kv,
+    const ds4_gpu_tensor *input, const void *model_map, uint64_t model_size,
+    uint64_t qa_offset, uint64_t kv_offset);
+int ds4_gpu_dsv41_arch_ffn_begin(ds4_gpu_tensor *routed, ds4_gpu_tensor *shared,
+    ds4_gpu_tensor *residual, ds4_gpu_tensor *split, ds4_gpu_tensor *block,
+    ds4_gpu_tensor *hc, ds4_gpu_tensor *pre);
+int ds4_gpu_dsv41_arch_ffn_end(void);
+
+/* R4: arm the expert-parallel routed-down geometry for one synchronous encode.
+ * `slots` holds 6 F32 partials per output row, packed slot-minor.  Returns 1 if
+ * the hint was accepted; ds4_gpu_dsv41_routed_split_end() reports whether the
+ * routed-down encoder actually consumed it. */
+int ds4_gpu_dsv41_routed_split_begin(ds4_gpu_tensor *slots);
+int ds4_gpu_dsv41_routed_split_end(void);
+int ds4_gpu_dsv41_arch_hc_available(void);
+int ds4_gpu_dsv41_arch_collapse_tensor(ds4_gpu_tensor *collapsed, ds4_gpu_tensor *norm,
+    ds4_gpu_tensor *counter, const ds4_gpu_tensor *residual, const ds4_gpu_tensor *pre,
+    const void *model_map, uint64_t model_size, uint64_t norm_offset, float norm_eps);
+int ds4_gpu_dsv41_arch_hc_stream_tensor(ds4_gpu_tensor *output,
+    ds4_gpu_tensor *mix, ds4_gpu_tensor *split, ds4_gpu_tensor *counter,
+    const ds4_gpu_tensor *residual, const ds4_gpu_tensor *input,
+    const void *model_map, uint64_t model_size, uint64_t hc_offset,
+    uint64_t scale_offset, uint64_t base_offset, uint64_t weight_offset,
+    uint64_t up_offset, int shared_stream, uint32_t sinkhorn_iters,
+    float hc_eps, float norm_eps, float clamp);
+
 int ds4_gpu_dsv41_hc_tail_available(uint32_t n_embd);
 
 int ds4_gpu_dsv41_hc_tail_tensor(

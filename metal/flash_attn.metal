@@ -1393,6 +1393,224 @@ template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flas
 #undef FA_TYPES
 #undef FA_TYPES_F32
 
+/* R6 (wave 5): the same decode attention partial with FOUR virtual heads per
+ * threadgroup sharing one staged 32-key tile.
+ *
+ * V4.1 is MLA: the 64 heads all read the same 512-wide latent rows, and K and V
+ * are the same row, so the reference dispatch -- (1, 64, 32) threadgroups of 32
+ * threads, one 32-key tile each -- re-reads one 655 KiB per-layer working set 64
+ * times.  This kernel keeps every per-head quantity exactly as the reference
+ * computes it and changes only where the key words come from:
+ *
+ *   - the 32-key tile mapping and the ic0 = iwg, step NWG walk (NSG = 1);
+ *   - the per-key dot, its ii = 0..3 order over the four half4 lanes hold, and
+ *     the simd_sum that finishes it (NE = 1, so NL = 32, tx = tiisg, ty = 0);
+ *   - the softmax max/exp/scale update and the 1/sqrt(512) scale in args.scale;
+ *   - the V accumulation, cc = 0..31 in order, float4(v)*float4(ss[cc]);
+ *   - the sink applied once per VIRTUAL head at iwg == 0 with zero value
+ *     contribution (the reference's sgitg == 0 test selects its only simdgroup,
+ *     which here is each head's own);
+ *   - the partial layout dst4[rid*DV4*NWG + NWG*i + iwg] and the (S, M) pair.
+ *
+ * The reference's threadgroup arrays are replaced by registers, which is what
+ * frees the 32 KiB for the tile: sq4 becomes four half4 registers holding
+ * exactly sq4[tiisg + ii*32]; so4 becomes four float4 accumulators holding
+ * exactly so4[tiisg + ii*32] (the NSG/2 cross-simdgroup reduction the reference
+ * runs is empty at NSG = 1, so nothing else ever reads them); ss[cc] is read
+ * back with simd_shuffle from the lane that produced it; sm is the lane's own
+ * mask half.  Shapes are fixed and the host falls back to
+ * kernel_flash_attn_ext_vec for anything else. */
+kernel void kernel_dsv41_flash_attn_vec_cohort4_f16_dk512_dv512(
+        constant ds4_metal_args_flash_attn_ext_vec & args [[buffer(0)]],
+        device const char * q     [[buffer(1)]],
+        device const char * k     [[buffer(2)]],
+        device const char * v     [[buffer(3)]],
+        device const char * mask  [[buffer(4)]],
+        device const char * sinks [[buffer(5)]],
+        device const char * pad   [[buffer(6)]],
+        device       char * dst   [[buffer(7)]],
+        threadgroup half4 * sk4   [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
+#define NWG (FC_flash_attn_ext_vec_nwg)
+
+    constexpr short DK4 = 128;
+    constexpr short DV4 = 128;
+    constexpr short C   = OP_FLASH_ATTN_EXT_VEC_NCPSG;   // 32
+    constexpr short NW  = N_SIMDWIDTH;                   // 32
+    constexpr short NH  = 4;                             // heads per threadgroup
+
+    /* Uniform specialization guard; the host applies the same eligibility test.
+     * ne_12_2/ne_12_3 == 1 is what makes the tile head-independent (ikv2 and
+     * ikv3 are then 0 for every head), which is the premise of sharing it. */
+    if (!FC_flash_attn_ext_vec_has_mask ||
+         FC_flash_attn_ext_vec_has_bias ||
+         FC_flash_attn_ext_vec_has_scap ||
+         FC_flash_attn_ext_vec_nsg != 1 ||
+         FC_flash_attn_ext_vec_nwg <= 0 ||
+         FC_flash_attn_ext_vec_ns10 != 512 ||
+         FC_flash_attn_ext_vec_ns20 != 512 ||
+         args.ne01 != 1 || args.ne03 != 1 ||
+         args.ne_12_2 != 1 || args.ne_12_3 != 1 ||
+         args.ne31 != 1 || args.ne32 != 1 || args.ne33 != 1 ||
+         args.ne02 <= 0 || (args.ne02 % NH) != 0 ||
+         args.nb02 != 2048 || args.nb11 != 1024 || args.nb21 != 1024 ||
+         args.ne11 <= 0 || k != v ||
+        (FC_flash_attn_ext_vec_has_kvpad &&
+         !FC_flash_attn_ext_vec_shared_kvpad)) {
+        return;
+    }
+
+    const short  iwg = tgpig[2]%NWG;
+    const ushort iq3 = tgpig[2]/NWG;
+    const ushort iq2 = tgpig[1]*NH + sgitg;
+    const ushort iq1 = tgpig[0];
+
+    device const char * kb = k;
+    device const char * mb = mask;
+
+    q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+    device const float4 * q4 = (device const float4 *) q;
+
+    /* sq4[tiisg + ii*32], loaded exactly as the reference loads it. */
+    half4 rq[DK4/NW];
+    FOR_UNROLL (short ii = 0; ii < DK4/NW; ++ii) {
+        rq[ii] = iq1 < args.ne01 ? (half4) q4[ii*NW + tiisg] : (half4) 0.0f;
+    }
+
+    float4 acc[DV4/NW];
+    FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
+        acc[ii] = 0.0f;
+    }
+
+    float S = 0.0f;
+    float M = -FLT_MAX/2;
+
+    device const half * pm = (device const half *) (mb + iq1*args.nb31 +
+        (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+
+    for (int ic0 = iwg; ; ic0 += NWG) {
+        int ic = ic0*C;
+        if (ic >= args.ne11) {
+            break;
+        }
+
+        device const char * kt = kb;
+
+        if (FC_flash_attn_ext_vec_has_kvpad && ic + C > args.ne11) {
+            /* Shared-pad layout only (guarded above): v aliases k, and the mask
+             * follows both C-row blocks, which is where the reference lands for
+             * ne_12_2 = ne_12_3 = 1 in either branch. */
+            kt = pad;
+            pm  = (device const half *) (kt + args.nb11*C + args.nb21*C) +
+                  iq1*C + (iq2%args.ne32)*(C*args.ne31) +
+                  (iq3%args.ne33)*(C*args.ne31*args.ne32);
+            ic = 0;
+        }
+
+        /* Stage the tile once for the whole cohort.  The first barrier protects
+         * the previous iteration's readers, the second publishes this tile.
+         * Both are reached by every thread on every iteration: the mask is
+         * head-independent (ne32 == 1), so the skip below is threadgroup
+         * uniform, and it is taken after the second barrier. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            device const half4 * gk4 = (device const half4 *) (kt + (ulong)ic*args.nb11);
+            for (short i = tiitg; i < C*DK4; i += NH*NW) {
+                sk4[i] = gk4[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const half smv = pm[ic + tiisg];
+        if (simd_max(smv) <= -MAXHALF) {
+            continue;
+        }
+
+        float mqk[C];
+        FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+            mqk[cc] = 0.0f;
+        }
+        FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+            FOR_UNROLL (short ii = 0; ii < DK4/NW; ++ii) {
+                mqk[cc] += dot((float4) sk4[cc*DK4 + ii*NW + tiisg], (float4) rq[ii]);
+            }
+            mqk[cc] = simd_sum(mqk[cc]);
+        }
+
+        const float s = fma(mqk[tiisg], args.scale, (float) smv);
+
+        {
+            const float m = M;
+
+            M = simd_max(max(M, s));
+
+            const float ms = exp(m - M);
+            const float vs = exp(s - M);
+
+            S = S*ms + simd_sum(vs);
+
+            FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
+                acc[ii] *= ms;
+            }
+
+            float4 lo[DV4/NW];
+            FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
+                lo[ii] = 0.0f;
+            }
+            FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+                const float sc = simd_shuffle(vs, (ushort) cc);
+                FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
+                    lo[ii] += float4(sk4[cc*DV4 + ii*NW + tiisg])*float4(sc);
+                }
+            }
+            FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
+                acc[ii] += lo[ii];
+            }
+        }
+    }
+
+    if (FC_flash_attn_ext_vec_has_sinks && iwg == 0) {
+        const float m = M;
+        const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+
+        M = simd_max(max(M, s));
+
+        const float ms = exp(m - M);
+        const float vs = exp(s - M);
+
+        S = S*ms + simd_sum(vs);
+
+        FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
+            acc[ii] *= ms;
+        }
+    }
+
+    {
+        const int64_t nrows = args.ne3*args.ne2*args.ne1;
+        const int64_t rid   = iq3*args.ne2*args.ne1 + iq2 + iq1*args.ne1;
+
+        device float4 * dst4 = (device float4 *) dst;
+        device float  * dst1 = (device float  *) dst + nrows*4*DV4*NWG;
+
+        const float Sr = NWG == 1 ? (S == 0.0f ? 0.0f : 1.0f/S) : 1.0f;
+
+        FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
+            const short i = tiisg + ii*NW;
+            dst4[rid*DV4*NWG + NWG*i + iwg] = acc[ii]*Sr;
+        }
+
+        if (NWG > 1 && tiisg == 0) {
+            dst1[rid*(2*NWG) + 2*iwg + 0] = S;
+            dst1[rid*(2*NWG) + 2*iwg + 1] = M;
+        }
+    }
+
+#undef NWG
+}
+
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 
