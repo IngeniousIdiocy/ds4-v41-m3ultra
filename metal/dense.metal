@@ -216,6 +216,68 @@ void kernel_mul_mv_q8_0_f32_impl(
     helper_mv_reduce_and_write<NR0, ROUND>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
+// Two virtual token rows share each Q8 load. K/lane ownership and
+// both reduction trees match kernel_mul_mv_q8_0_f32_impl. Separate scratch
+// is necessary: helper_mv_reduce_and_write has no trailing barrier.
+template<typename args_t, bool ROUND = false>
+static inline void dsv41_q8_rows2(args_t args, device const char *src0,
+        device const char *src1, device char *dst, threadgroup char *shmem,
+        uint3 tg, ushort lane, ushort sg) {
+    constexpr short NR0 = N_R0_Q8_0, NQ = 8, NW = N_SIMDWIDTH;
+    const short NSG = FC_mul_mv_nsg;
+    const int r0 = tg.x * NR0, nb = args.ne00 / QK8_0;
+    device const block_q8_0 *ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row)
+        ax[row] = (device const block_q8_0 *)(src0 + (uint64_t)(r0 + row)*args.nb01);
+    device const float *y0 = (device const float *)src1;
+    device const float *y1 = (device const float *)(src1 + args.nb11);
+    float s0[NR0] = {0.f}, s1[NR0] = {0.f};
+    const short ix = lane/(NW/NQ), il = lane%(NW/NQ);
+    const int ib0 = sg*NQ + ix;
+    device const float *yb0 = y0 + ib0*QK8_0 + il*NQ;
+    device const float *yb1 = y1 + ib0*QK8_0 + il*NQ;
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        float yl0[NQ], yl1[NQ];
+        for (short i = 0; i < NQ; ++i) { yl0[i] = yb0[i]; yl1[i] = yb1[i]; }
+        for (short row = 0; row < NR0; ++row) {
+            device const int8_t *qs = ax[row][ib].qs + il*NQ;
+            float q0 = 0.f, q1 = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                const int8_t q = qs[i];
+                q0 += q * yl0[i]; q1 += q * yl1[i];
+            }
+            const half scale = ax[row][ib].d;
+            s0[row] += q0*scale; s1[row] += q1*scale;
+        }
+        yb0 += NSG*NQ*QK8_0; yb1 += NSG*NQ*QK8_0;
+    }
+    helper_mv_reduce_and_write<NR0, ROUND>((device float *)dst, s0,
+        r0, args.ne01, lane, sg, shmem);
+    helper_mv_reduce_and_write<NR0, ROUND>((device float *)dst + args.ne0, s1,
+        r0, args.ne01, lane, sg, shmem + NW*NR0*sizeof(float));
+}
+kernel void kernel_dsv41_q8_rows2(constant ds4_metal_args_mul_mv &args,
+        device const char *w, device const char *x, device char *out,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    dsv41_q8_rows2<constant ds4_metal_args_mul_mv &>(args,w,x,out,shmem,tg,lane,sg);
+}
+
+// Six tokens use three copies of the validated pair arithmetic. Only the
+// pair's input/output base changes; its weights, lane/K walk and scratch do not.
+kernel void kernel_dsv41_q8_pair6(constant ds4_metal_args_mul_mv &args,
+        device const char *w, device const char *x, device char *out,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tg [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint64_t row0 = 2u*tg.y;
+    x += row0*args.nb11;
+    out += row0*args.ne0*sizeof(float);
+    tg.y = 0;
+    dsv41_q8_rows2<constant ds4_metal_args_mul_mv &>(args,w,x,out,shmem,tg,lane,sg);
+}
+
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
 [[host_name("kernel_mul_mv_q8_0_f32")]]

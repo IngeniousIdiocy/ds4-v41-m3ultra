@@ -5972,7 +5972,20 @@ static inline uint dsv4_nth_set_bit(ushort mask, uint n) {
     return 15u;
 }
 
-template<bool LEAN>
+/* WAVE 4, LEVER 2: the same kernel at a different geometry.
+ *
+ * COHORT is how many heads share one threadgroup (and therefore how many
+ * simdgroups it has: 32 x COHORT threads); BLOCK is how many K/V rows are
+ * staged in threadgroup memory per barrier, which is also the threadgroup
+ * allocation the host asks for (BLOCK KiB).  Neither changes a head's
+ * computation: the same rows, in the same order, through the same QK dot, the
+ * same simd_sum reduction and the same online-softmax update -- a head's whole
+ * arithmetic is private to its simdgroup and never crosses one.  The output is
+ * byte-identical at every geometry, so each is Tier 1 by construction and the
+ * only question is occupancy.  Wave 3 measured the allocation axis to be
+ * non-monotonic (1 KiB worse than 16, 32 KiB much worse), so these are tested
+ * as independent jagged points and never interpolated. */
+template<bool LEAN, ushort COHORT = 8, ushort BLOCK = 16>
 kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t(
         constant ds4_metal_args_dsv4_indexed_attention & args,
         device const char *q,
@@ -5987,7 +6000,7 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t(
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
     const uint token = tgpig.x;
-    const uint head = tgpig.y * 8u + (uint)sg;
+    const uint head = tgpig.y * (uint)COHORT + (uint)sg;
     if (token >= args.n_tokens || head >= args.n_head) {
         return;
     }
@@ -6017,9 +6030,9 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t(
     uint last = min(qpos, raw_last_pos);
 
     if (first <= last) {
-        for (uint pos0 = first; pos0 <= last; pos0 += 16u) {
-            const uint n_rows = min(16u, last - pos0 + 1u);
-            for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+        for (uint pos0 = first; pos0 <= last; pos0 += (uint)BLOCK) {
+            const uint n_rows = min((uint)BLOCK, last - pos0 + 1u);
+            for (uint off = (uint)tid; off < n_rows * 128u; off += 32u * (uint)COHORT) {
                 const uint r = off >> 7;
                 const uint c = off & 127u;
                 const uint logical = pos0 + r - first_raw_pos;
@@ -6047,11 +6060,11 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t(
     device const int32_t *row_topk = (device const int32_t *)(topk +
         (uint64_t)token * args.topk_token_stride);
     bool stop = false;
-    for (uint i = 0; i < args.top_k && !stop; i += 16u) {
-        uint rows[LEAN ? 1 : 16];
+    for (uint i = 0; i < args.top_k && !stop; i += (uint)BLOCK) {
+        uint rows[LEAN ? 1 : BLOCK];
         ushort mask = 0;
         uint n_rows = 0;
-        for (uint j = 0; j < 16u && i + j < args.top_k; j++) {
+        for (uint j = 0; j < (uint)BLOCK && i + j < args.top_k; j++) {
             const int32_t idx = row_topk[i + j];
             if (idx < 0) {
                 continue;
@@ -6070,8 +6083,8 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t(
         if (n_rows == 0) {
             continue;
         }
-        const bool dense = LEAN && mask == (ushort)0xFFFFu;
-        for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+        const bool dense = LEAN && mask == (ushort)((1u << (uint)BLOCK) - 1u);
+        for (uint off = (uint)tid; off < n_rows * 128u; off += 32u * (uint)COHORT) {
             const uint r = off >> 7;
             const uint c = off & 127u;
             uint src_row;
@@ -6450,6 +6463,24 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t<true>(
         device const char *, device const char *, device const char *,
         device const char *, device const char *, device char *,
         threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+/* Wave 4 lever 2: geometry variants of the lean kernel.  Named
+ * ..._lean_c<COHORT>b<BLOCK>; the production geometry is c8b16 above. */
+#define DSV4_ATTN_GEOM(NAME, COHORT, BLOCK) \
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_lean_" NAME)]] \
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t<true, COHORT, BLOCK>( \
+        constant ds4_metal_args_dsv4_indexed_attention &, \
+        device const char *, device const char *, device const char *, \
+        device const char *, device const char *, device char *, \
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+DSV4_ATTN_GEOM("c8b8",   8,  8)
+DSV4_ATTN_GEOM("c8b4",   8,  4)
+DSV4_ATTN_GEOM("c4b16",  4, 16)
+DSV4_ATTN_GEOM("c16b16",16, 16)
+DSV4_ATTN_GEOM("c16b8", 16,  8)
+DSV4_ATTN_GEOM("c4b8",   4,  8)
+#undef DSV4_ATTN_GEOM
 
 // Long-context decode specialization of the indexed mixed-attention path.
 //

@@ -259,6 +259,22 @@ typedef struct {
     int prefill_stage_profile;  /* default off */
     int q8_prefill_profile;     /* default off */
     int attn_cohort4;      /* DS4_DS41_ATTN_COHORT4=1 arms R6 (opt-in) */
+    /* Decode pass 2, C1: elements-per-thread (in packed_float4 units) for the
+     * selected-KV gather.  0 = the scalar kernel_get_rows_f32_f16 the wave
+     * inherited; 1, 2 or 4 = the wide twin.  Bit-identical at every setting. */
+    int gather_wide;
+    /* Decode pass 2, C2: perform the selected-row gather inside the contiguous
+     * KV staging dispatch.  DS4_DS41_STAGE_GATHER=0 restores the standalone
+     * kernel_get_rows gather and its intermediate half buffer. */
+    int stage_gather;
+    /* Decode pass 2, D1: routed DOWN leg at NR0 = 1 (2,560 threadgroups).
+     * DS4_DS41_Q4_DN_NR1=0 restores the two-rows-per-simdgroup grid. */
+    int q4_dn_nr1;
+    /* Decode pass 2, D2: threadgroup width of kernel_dsv41_hc_round_expand4.
+     * 256 (the inherited value) puts 5,120 threads on 20 of this GPU's 80
+     * cores; 32/64/128 spread the same threads wider.  Elementwise, so every
+     * width is bit-identical. */
+    int hc_expand_nth;
     /* Prefill wave 1, bundle item (i): CULL_TAIL_SIMDGROUPS for the Q4_K
      * routed matmuls.  Production default; DS4_METAL_DISABLE_V41_ROUTED_TAIL_CULL=1
      * restores the uncculled kernels. */
@@ -284,12 +300,24 @@ typedef struct {
      * width and the threadgroup-barrier count change.
      * DS4_METAL_DISABLE_V41_PREFILL_ATTN_RB16=1 restores the one-row kernel. */
     int prefill_attn_rb16;
-    int prefill_hc_sum_round; /* compile-only prefill draft, opt-in */
-    int prefill_hc_expand_round; /* compile-only prefill draft, opt-in */
-    int prefill_hc_norm_round; /* compile-only prefill draft, opt-in */
-    int prefill_ffn_add_round; /* compile-only prefill draft, opt-in */
-    int prefill_embed_init; /* DS4_DS41_PREFILL_EMBED_INIT=1: opt-in draft */
-    int prefill_f16_rows2; /* DS4_DS41_PREFILL_F16_ROWS2=1: compile-only draft, opt-in */
+    int prefill_hc_sum_round; /* wave 3, ADOPTED: default 1, =0 is the kill switch */
+    int prefill_hc_expand_round; /* wave 3, ADOPTED: default 1, =0 is the kill switch */
+    int prefill_hc_norm_round; /* wave 3, ADOPTED: default 1, =0 is the kill switch */
+    int prefill_ffn_add_round; /* wave 3, ADOPTED: default 1, =0 is the kill switch */
+    int prefill_embed_init; /* wave 3, ADOPTED: default 1, DS4_DS41_PREFILL_EMBED_INIT=0 kills it */
+    int mtp_qa_kv_flat; /* F3: paired q_a/KV banks in one dispatch. */
+    int mtp_async_chunks; /* F2: submit every four verifier layers. */
+    int mtp_hc_mixed; /* F1: private HC rows mixed with paired Q8 projections. */
+    int mtp_hc_rows2; /* Private HC cohorts for two-row verification. */
+    int mtp_engram_rows6; /* Six private asynchronous Engram rows. */
+    int mtp_engram_rows2; /* Private asynchronous two-row Engram inputs. */
+    int dspark_excl_eos; /* Match the serial control's argmax_excluding(eos) rule. */
+    int mtp_capture_warmup; /* Complete target capture from decoder warmup inputs. */
+    int mtp_state_fix; /* Capture undo, truthful snapshots, seed generation. */
+    int mtp_gu_union2; /* Two-row routed gate/up only; down remains ordered. */
+    int mtp_q8_pair6; /* Six rows as three independent weight-sharing pairs. */
+    int mtp_q8_rows2; /* Opt-in; exactly two target rows. */
+    int prefill_f16_rows2; /* wave 3, ADOPTED: default 1, DS4_DS41_PREFILL_F16_ROWS2=0 kills it */
     /* Wave 3, task B.  DIAGNOSTIC ONLY, never adopted: an ablation arm of the
      * prefill attention core.  0 = production kernel; 1..5 select a variant
      * that deletes one stage (pv, exp, gather) or keeps only the gather, plus
@@ -308,6 +336,32 @@ typedef struct {
      * switch.  Prefill only: the decode path keeps the wave-2 kernel until
      * the decode gate has seen this. */
     int prefill_attn_lean_rows;
+    /* Wave 4, lever 1: bounded cross-sweep Engram prefetch.  A 62,000-token
+     * prompt runs three sweeps; wave 3's stage profile shows the layer-1
+     * Engram wait exposed 639.0 ms in sweep 2 and 64.7 + 65.2 ms in the 560-row
+     * sweep 3, because each sweep starts its module-0 disk delivery only at its
+     * own layer 0.  With this on, the tail of a sweep (after its module-1 rows
+     * have been consumed and the reader joined at layer 14) starts the NEXT
+     * sweep's delivery into the already-owned prefetch slab, using a PRIVATE
+     * copy of the hash history seeded from the current sweep's end and a
+     * PRIVATE id buffer, so the live history is not advanced early and the
+     * reader never shares the id array the next sweep recomputes.  The next
+     * sweep adopts the carried rows only after byte-comparing its own freshly
+     * hashed ids against the ids the reader actually used; any mismatch joins
+     * the carried reader and falls back to the ordinary in-sweep read.  Same
+     * rows, same values, same order -- Tier 1 by construction.
+     * DS4_DS41_PREFILL_ENGRAM_XSWEEP=0 is the kill switch. */
+    int prefill_engram_xsweep;
+    /* Wave 4, lever 2: attention-core geometry on the landed lean kernel.
+     * 0 = production (8 heads per threadgroup, 16 staged K/V rows, 16 KiB).
+     * Every non-zero value selects a different (cohort, staged rows) pair of
+     * the SAME kernel: each head still runs its own rows in the same order
+     * through the same dot, reduction and online-softmax trees, so the output
+     * is byte-identical and the arm is Tier 1 by construction.  Only how many
+     * heads share a threadgroup, how many rows are staged per barrier and how
+     * much threadgroup memory the dispatch asks for change.  Counted lever,
+     * per request: DS4_DS41_ATTN_GEOM=N. */
+    int attn_geom;
     /* Stage 5.  dspark_capture = 0 suppresses the target-hidden capture on an
      * armed session, which is the identity A/B for it; verify_wide_prefill
      * relaxes the five count > DS4_TP_BATCH_MAX_ROWS prefill gates so a 6-row
@@ -315,7 +369,8 @@ typedef struct {
     int dspark_capture;
     int verify_wide_prefill;
     /* dspark_verify_rows = 0 verifies the whole block (1 committed + 5 draft
-     * rows); 2..6 narrows the verify to a prefix of the proposal.
+     * rows); 2..6 selects a prefix of the proposal. 1 and out-of-range
+     * widths are invalid; use serial generation for the one-row control.
      * dspark_expert_union = 1 reads the routed selection back per layer. */
     int dspark_verify_rows;
     int dspark_expert_union;
@@ -326,6 +381,12 @@ typedef struct {
      * cycle and exercises the maximal rollback on every cycle. */
     int verify_batch_core;
     int dspark_force_reject;
+    /* dspark_draft_trace = 1 prints one line per cycle naming the drafter's
+     * block-5 proposal and every verified row's argmax, so per-position
+     * agreement can be read paired against the target's own next tokens
+     * (ACCEPTANCE.md).  Diagnostic only: it runs `rows` extra host argmaxes
+     * and writes to stderr, outside the phase timers. */
+    int dspark_draft_trace;
 } ds41_levers;
 
 extern ds41_levers g_ds41_levers;

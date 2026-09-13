@@ -136,7 +136,35 @@ struct ds4_metal_args_flash_kv_stage_f16 {
     uint n_comp;
     uint pad_rows;
     uint shared_pad;
+    /* Decode pass 2, C2: when set, comp_src is the WHOLE F32 compressed cache
+     * and `ids` holds the selected row numbers, so this dispatch performs the
+     * sparse gather that kernel_get_rows_f32_f16 used to do one pass earlier.
+     * Same rows, same selected order, same per-element half(float), and the
+     * intermediate half buffer's write and read both disappear. */
+    uint comp_gather;
+    uint comp_pad;
 };
+
+/* One 4-element chunk of a compressed key row, in destination (half) bits.
+ * `comp_row` is the index into the SELECTED rows, exactly as the contiguous
+ * copy indexed them. */
+static inline packed_ushort4 dsv41_stage_comp_vec(
+        constant ds4_metal_args_flash_kv_stage_f16 & args,
+        device const char * comp_src,
+        device const char * ids,
+        uint comp_row,
+        uint col) {
+    constexpr uint row_vecs = 128;
+    if (args.comp_gather) {
+        const int r = ((device const int *)ids)[comp_row];
+        device const packed_float4 *src =
+            (device const packed_float4 *)(comp_src + (uint64_t)r * (row_vecs * 16u));
+        const float4 value = float4(src[col]);
+        return as_type<packed_ushort4>(packed_half4(half4(value)));
+    }
+    device const packed_ushort4 *comp = (device const packed_ushort4 *)comp_src;
+    return comp[comp_row * row_vecs + col];
+}
 
 // Decode-time gathered attention consumes a logical raw-cache ring followed
 // by an already-F16 compressed cache. Pack both regions into the contiguous
@@ -149,6 +177,7 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
         device       char * dst,
         device const char * mask_src,
         device       char * pad_dst,
+        device const char * ids,
         uint gid [[thread_position_in_grid]]) {
     constexpr uint row_vecs = 128;
     const uint raw_vecs = args.n_raw * row_vecs;
@@ -172,10 +201,10 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
     }
 
     if (gid < total_vecs) {
-        device const packed_ushort4 *comp =
-            (device const packed_ushort4 *)comp_src;
+        const uint idx = gid - raw_vecs;
         device packed_ushort4 *dst_bits = (device packed_ushort4 *)dst;
-        dst_bits[gid] = comp[gid - raw_vecs];
+        dst_bits[gid] = dsv41_stage_comp_vec(args, comp_src, ids,
+                                             idx >> 7, idx & 127u);
         return;
     }
 
@@ -216,10 +245,9 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
                 pad_half[pad_vecs + pad_gid] = value_half;
             }
         } else {
-            device const packed_ushort4 *comp =
-                (device const packed_ushort4 *)comp_src;
             const packed_ushort4 value_bits =
-                comp[(logical_row - args.n_raw) * row_vecs + col];
+                dsv41_stage_comp_vec(args, comp_src, ids,
+                                     logical_row - args.n_raw, col);
             pad_bits[pad_gid] = value_bits;
             if (!args.shared_pad) {
                 pad_bits[pad_vecs + pad_gid] = value_bits;

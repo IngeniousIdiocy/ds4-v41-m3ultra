@@ -85,6 +85,56 @@ template [[host_name("kernel_get_rows_i32")]] kernel get_rows_f_t kernel_get_row
  * earlier, and lets the contiguous staging kernel take the rows verbatim. */
 template [[host_name("kernel_get_rows_f32_f16")]] kernel get_rows_f_t kernel_get_rows_f<float, half>;
 
+/* Decode pass 2, C1: the same F32 -> F16 sparse row gather with wide loads.
+ * kernel_get_rows_f copies ONE element per thread (one 4 B load, one 2 B
+ * store, then `break`), which is why the 512-row/512-column decode KV gather
+ * ran at ~140 GB/s.  This twin gives every thread `EPT` contiguous elements
+ * through packed_float4 loads and packed_half4 stores.  The per-element
+ * conversion is the identical `half(float)`, the row map is the identical
+ * ids[] lookup, and each destination element is written by exactly one thread,
+ * so the result is bit-identical by construction.
+ *
+ * Geometry contract: ne00 elements per row, a multiple of 4*EPT; one thread
+ * per (row, chunk of 4*EPT elements); grid laid out row-major so a threadgroup
+ * stays inside one or two source rows. */
+struct ds4_metal_args_gather_kv_wide {
+    uint   n_elem;      /* elements per row (512) */
+    uint   n_rows;      /* selected rows */
+    uint   vec_per_row; /* n_elem / (4*EPT) */
+    uint   pad;
+    uint64_t src_row_bytes;
+    uint64_t dst_row_bytes;
+};
+
+template<uint EPT>
+kernel void kernel_dsv41_gather_kv_f32_f16_w(
+        constant ds4_metal_args_gather_kv_wide & args,
+        device const char   * src0,
+        device const char   * ids,
+        device       char   * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.n_rows * args.vec_per_row;
+    if (gid >= total) return;
+    const uint row = gid / args.vec_per_row;
+    const uint chunk = gid - row * args.vec_per_row;
+    const int  r = ((device const int *)ids)[row];
+    device const packed_float4 *psrc =
+        (device const packed_float4 *)(src0 + (uint64_t)r * args.src_row_bytes);
+    device packed_half4 *pdst =
+        (device packed_half4 *)(dst + (uint64_t)row * args.dst_row_bytes);
+    const uint base = chunk * EPT;
+#pragma clang loop unroll(full)
+    for (uint k = 0; k < EPT; ++k) {
+        const float4 v = float4(psrc[base + k]);
+        pdst[base + k] = packed_half4(half4(v));
+    }
+}
+
+typedef decltype(kernel_dsv41_gather_kv_f32_f16_w<1>) gather_kv_wide_t;
+template [[host_name("kernel_dsv41_gather_kv_f32_f16_w1")]] kernel gather_kv_wide_t kernel_dsv41_gather_kv_f32_f16_w<1>;
+template [[host_name("kernel_dsv41_gather_kv_f32_f16_w2")]] kernel gather_kv_wide_t kernel_dsv41_gather_kv_f32_f16_w<2>;
+template [[host_name("kernel_dsv41_gather_kv_f32_f16_w4")]] kernel gather_kv_wide_t kernel_dsv41_gather_kv_f32_f16_w<4>;
+
 kernel void kernel_get_rows_q8_0_f32(
         constant ds4_metal_args_get_rows_q8_0 & args,
         device const char    * src0,
