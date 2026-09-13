@@ -5597,7 +5597,7 @@ static bench_fixture *bench_fixture_get(ds4_engine *e, const char *path,
 
 /* Returns a malloc'd JSON body, or NULL with err set. */
 static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
-                       int ctx_alloc, int gen_tokens, bool fresh,
+                       int ctx_alloc, int gen_tokens, bool fresh, bool dspark,
                        char *err, size_t errlen) {
     pthread_mutex_lock(&g_bench_mu);
     char *out = NULL;
@@ -5624,8 +5624,24 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     if (!toks) { snprintf(err, errlen, "oom"); goto out; }
     double first_sec = 0.0, steady_sec = 0.0;
     int done = 0;
+    /* The DSpark arm runs the same fixture, the same restored prefix and the
+     * same greedy rule; only the number of target rows per pass differs, so
+     * the text must match the serial arm token for token. */
+    ds4_dspark_decode_stats dstat = {0};
+    if (dspark) {
+        const double d0 = bench_now_sec_srv();
+        if (ds4_session_dspark_generate(f->session, gen_tokens, eos, toks, &done,
+                                        &dstat, serr, sizeof(serr)) != 0) {
+            snprintf(err, errlen, "dspark decode failed: %s", serr);
+            free(toks);
+            goto out;
+        }
+        const double gen_sec_d = bench_now_sec_srv() - d0;
+        steady_sec = dstat.total_ms / 1e3;
+        first_sec = gen_sec_d - steady_sec;
+    }
     const double gen_t0 = bench_now_sec_srv();
-    while (done < gen_tokens) {
+    while (!dspark && done < gen_tokens) {
         const int token = ds4_session_argmax_excluding(f->session, eos);
         if (token < 0) { snprintf(err, errlen, "argmax failed"); free(toks); goto out; }
         const double t0 = bench_now_sec_srv();
@@ -5638,7 +5654,7 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
         toks[done++] = token;
         if (done == 1) first_sec = t1 - t0; else steady_sec += t1 - t0;
     }
-    const double gen_sec = bench_now_sec_srv() - gen_t0;
+    const double gen_sec = dspark ? steady_sec + first_sec : bench_now_sec_srv() - gen_t0;
 
     buf b = {0};
     buf_printf(&b, "{\"prompt_tokens\":%d,\"gen_tokens\":%d", ctx_start, done);
@@ -5659,6 +5675,23 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     buf_printf(&b, ",\"gen_steady_tokens\":%d,\"gen_steady_tps\":%.4f",
                done > 1 ? done - 1 : 0,
                steady_sec > 0.0 ? (double)(done - 1) / steady_sec : 0.0);
+    buf_printf(&b, ",\"dspark\":%s", dspark ? "true" : "false");
+    if (dspark) {
+        buf_printf(&b, ",\"dspark_cycles\":%u,\"dspark_committed\":%u"
+                       ",\"dspark_verified_rows\":%u"
+                       ",\"dspark_tokens_per_cycle\":%.4f",
+                   dstat.cycles, dstat.committed, dstat.verified_rows,
+                   dstat.cycles ? (double)dstat.committed / (double)dstat.cycles : 0.0);
+        buf_printf(&b, ",\"dspark_propose_ms\":%.3f,\"dspark_verify_ms\":%.3f"
+                       ",\"dspark_commit_ms\":%.3f,\"dspark_cycle_ms\":%.4f",
+                   dstat.propose_ms, dstat.verify_ms, dstat.commit_ms,
+                   dstat.cycles ? dstat.total_ms / (double)dstat.cycles : 0.0);
+        buf_printf(&b, ",\"dspark_expert_union\":%.4f,\"dspark_union_layers\":%u",
+                   dstat.expert_union, dstat.union_layers);
+        buf_puts(&b, ",\"dspark_accept_hist\":[");
+        for (int i = 0; i < 8; i++) buf_printf(&b, "%s%u", i ? "," : "", dstat.accept_hist[i]);
+        buf_puts(&b, "]");
+    }
     buf_printf(&b, ",\"levers\":{");
     for (size_t i = 0; i < ds41_levers_count(); i++) {
         int v = 0;
@@ -14841,7 +14874,7 @@ static void *client_main(void *arg) {
         }
         char *bpath = NULL;
         int ctx_start = 8192, ctx_alloc = 0, gen = 512;
-        bool fresh = false;
+        bool fresh = false, dspark = false;
         if (hr.body) {
             const char *p = hr.body;
             json_ws(&p);
@@ -14865,6 +14898,8 @@ static void *client_main(void *arg) {
                         if (!json_int(&p, &gen)) { free(key); break; }
                     } else if (!strcmp(key, "fresh")) {
                         if (!json_bool(&p, &fresh)) { free(key); break; }
+                    } else if (!strcmp(key, "dspark")) {
+                        if (!json_bool(&p, &dspark)) { free(key); break; }
                     } else if (!strcmp(key, "levers")) {
                         json_ws(&p);
                         if (*p == '{') {
@@ -14904,7 +14939,7 @@ static void *client_main(void *arg) {
         if (ctx_alloc <= 0) ctx_alloc = s->ctx_size;
         char berr[256] = {0};
         char *body = bench_run(s->engine, bpath, ctx_start, ctx_alloc, gen, fresh,
-                               berr, sizeof(berr));
+                               dspark, berr, sizeof(berr));
         free(bpath);
         if (!body) {
             http_error(fd, s->enable_cors, 500, berr[0] ? berr : "bench failed");

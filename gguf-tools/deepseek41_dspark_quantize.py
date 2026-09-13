@@ -38,7 +38,17 @@ SOURCE_REVISION = "df42c109f1defefcbfcedbe7d905718a12266e40"
 QUANTIZATION = {
     "q4": "Q4_K routed experts; Q8_0 attention/shared/main_proj/markov",
     "q2": "IQ2_XXS gate/up; Q2_K down; Q8_0 attention/shared/main_proj/markov",
+    "q8": "Q8_0 routed experts; Q8_0 attention/shared/main_proj/markov",
+    "f16": "Q8_0 routed experts; F16 q/kv/shared/main_proj; Q8_0 attn output/markov",
 }
+
+# F16 routed experts are not reachable: ds4's binder accepts only
+# Q8_0/IQ2_XXS/Q2_K/Q4_K/Q5_K/Q6_K/MXFP4 for a routed expert tensor
+# (tensor_is_routed_expert_type, ds4.c), and every routed MoE kernel dispatches
+# on that set.  Q8_0 is therefore the drafter's precision ceiling for the 92 %
+# of the file that is routed experts, and the "f16" recipe raises only the
+# dense half.  The Markov head stays Q8_0 in every recipe because the GPU
+# runtime refuses anything else (ds4.c:35179-35182).
 
 ARCHITECTURE = "deepseek41-dspark"
 
@@ -161,13 +171,20 @@ def build_plan(db, text, quant="q4"):
                                     ("scale", (3,), QTYPE_F32)):
                 regular(f"{dst}.hc_{site}_{part}.weight", f"{src}.hc_{site}_{part}", shape, qt, "mhc")
             regular(f"{dst}.{site}_norm.weight", f"{src}.{site}_norm.weight", (dim,), QTYPE_F32, "norm")
+        dense = QTYPE_F16 if quant == "f16" else QTYPE_Q8_0
         for target, source, shape, qt, role in (
             ("attn_sinks.weight", "attn_sink", (heads,), QTYPE_F32, "norm"),
-            ("attn_q_a.weight", "wq_a.weight", (qrank, dim), QTYPE_Q8_0, "attention"),
-            ("attn_q_b.weight", "wq_b.weight", (heads * hd, qrank), QTYPE_Q8_0, "attention"),
+            ("attn_q_a.weight", "wq_a.weight", (qrank, dim), dense, "attention"),
+            ("attn_q_b.weight", "wq_b.weight", (heads * hd, qrank), dense, "attention"),
             ("attn_q_a_norm.weight", "q_norm.weight", (qrank,), QTYPE_F32, "norm"),
-            ("attn_kv.weight", "wkv.weight", (hd, dim), QTYPE_Q8_0, "attention"),
+            ("attn_kv.weight", "wkv.weight", (hd, dim), dense, "attention"),
             ("attn_kv_a_norm.weight", "kv_norm.weight", (hd,), QTYPE_F32, "norm"),
+            # The drafter's attention output runs through
+            # ds4_gpu_dsv41_attention_output_batch, a fused Q8_0-only kernel
+            # (the backbone gates its batched twin on attn_output_b->type ==
+            # Q8_0 and falls back; ds41_dspark_stage has no fallback because
+            # wo_a is block-diagonal over 8 groups and no plain matmul
+            # expresses that).  These two stay Q8_0 in every recipe.
             ("attn_output_a.weight", "wo_a.weight", (groups * orank, heads * hd // groups),
              QTYPE_Q8_0, "attention"),
             ("attn_output_b.weight", "wo_b.weight", (dim, groups * orank), QTYPE_Q8_0, "attention"),
@@ -185,17 +202,18 @@ def build_plan(db, text, quant="q4"):
                                             ("up", "w3", (inter, dim), QTYPE_IQ2_XXS),
                                             ("down", "w2", (dim, inter), QTYPE_Q2_K)):
             regular(f"{dst}.ffn_{part}_shexp.weight", f"{src}.ffn.shared_experts.{source}.weight",
-                    shape, QTYPE_Q8_0, "shared")
+                    shape, dense, "shared")
             pattern = f"{src}.ffn.experts.{{expert}}.{source}.weight"
             for expert in range(experts):
                 claim(pattern.format(expert=expert), (shape[0], shape[1] // 2), "I8")
             plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), experts),
-                                   QTYPE_Q4_K if quant == "q4" else routed,
+                                   QTYPE_Q4_K if quant == "q4" else
+                                   QTYPE_Q8_0 if quant in ("q8", "f16") else routed,
                                    "experts", source=pattern, expert_layer=stage,
                                    expert_part=part, expert_count=experts))
         if stage == 0:
             regular(f"{dst}.main_proj.weight", f"{src}.main_proj.weight",
-                    (dim, len(targets) * dim), QTYPE_Q8_0, "attention")
+                    (dim, len(targets) * dim), dense, "attention")
             regular(f"{dst}.main_norm.weight", f"{src}.main_norm.weight", (dim,), QTYPE_F32, "norm")
         if stage == stages - 1:
             regular(f"{dst}.norm.weight", f"{src}.norm.weight", (dim,), QTYPE_F32, "norm")

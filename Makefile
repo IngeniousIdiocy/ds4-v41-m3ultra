@@ -557,6 +557,12 @@ tests/test_deepseek41_gguf: tests/test_deepseek41_gguf.o ds4_engram.c $(filter-o
 test-deepseek41-gguf: tests/test_deepseek41_gguf
 	./tests/test_deepseek41_gguf
 
+tests/test_deepseek41_dspark_forward.o: tests/test_deepseek41_dspark_forward.c ds4.c ds4_gpu.h ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_deepseek41_dspark_forward: tests/test_deepseek41_dspark_forward.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_deepseek41_dspark_bind.o: tests/test_deepseek41_dspark_bind.c ds4.c ds4.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
 
@@ -856,7 +862,7 @@ clean:
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_dspark_bind tests/test_deepseek41_dspark_bind.o
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_dspark_forward
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch

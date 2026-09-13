@@ -209,6 +209,162 @@ def gguf_read_matrix(path, name, want_rows=None, want_cols=None, out_dtype=torch
 
 
 # ---------------------------------------------------------------------------
+# Quantized-reference mode: read the drafter's weights from the Stage-1 support
+# GGUF exactly as the Metal path binds them, and optionally apply V4.1's BF16
+# activation boundaries.  This is the arm that separates "the Metal forward is
+# wrong" from "Q4_K requantization of FP4 experts costs this much".
+# ---------------------------------------------------------------------------
+
+GGUF_F32 = 0
+GGUF_Q4_K = 12
+
+BF16 = False
+
+
+def rnd(x):
+    """dsv41_bf16(): V4.1's activation boundary, a pure function of the word."""
+    if not BF16:
+        return x
+    return x.to(torch.bfloat16).to(torch.float32)
+
+
+def _q4_k_scale_min(scales):
+    """get_scale_min_k4 over all 8 sub-blocks at once. scales: [..., 12] uint8."""
+    q = scales.long()
+    d = torch.empty(scales.shape[:-1] + (8,), dtype=torch.long)
+    m = torch.empty_like(d)
+    for j in range(4):
+        d[..., j] = q[..., j] & 63
+        m[..., j] = q[..., j + 4] & 63
+    for j in range(4, 8):
+        d[..., j] = (q[..., j + 4] & 0x0F) | ((q[..., j - 4] >> 6) << 4)
+        m[..., j] = (q[..., j + 4] >> 4) | ((q[..., j] >> 6) << 4)
+    return d.float(), m.float()
+
+
+def dequantize_q4_k(raw, n_values):
+    """ds4_dense_block_q4_K (metal/dense.metal:2017), 144 B per 256 values."""
+    if n_values % 256:
+        fail(f"Q4_K row of {n_values} values is not a multiple of 256")
+    nb = n_values // 256
+    buf = torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(-1, nb, 144)
+    rows = buf.shape[0]
+    d = buf[:, :, 0:2].contiguous().view(torch.float16).float().view(rows, nb, 1)
+    dmin = buf[:, :, 2:4].contiguous().view(torch.float16).float().view(rows, nb, 1)
+    sc, mn = _q4_k_scale_min(buf[:, :, 4:16])
+    qs = buf[:, :, 16:144].long().view(rows, nb, 4, 32)
+    out = torch.empty(rows, nb, 8, 32, dtype=torch.float32)
+    for half in range(4):
+        lo = (qs[:, :, half, :] & 0x0F).float()
+        hi = (qs[:, :, half, :] >> 4).float()
+        i0, i1 = 2 * half, 2 * half + 1
+        out[:, :, i0, :] = d * sc[:, :, i0:i0 + 1] * lo - dmin * mn[:, :, i0:i0 + 1]
+        out[:, :, i1, :] = d * sc[:, :, i1:i1 + 1] * hi - dmin * mn[:, :, i1:i1 + 1]
+    return out.view(rows, n_values)
+
+
+def dequantize_q8_0(raw, n_values):
+    if n_values % 32:
+        fail(f"Q8_0 row of {n_values} values is not a multiple of 32")
+    nb = n_values // 32
+    buf = torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(-1, nb, 34)
+    scales = buf[:, :, :2].contiguous().view(torch.float16).float()
+    values = buf[:, :, 2:].contiguous().view(torch.int8).float()
+    return (values * scales).view(-1, n_values)
+
+
+_GGUF_ROW_BYTES = {GGUF_F32: lambda n: n * 4, GGUF_F16: lambda n: n * 2,
+                   GGUF_Q8_0: lambda n: n // 32 * 34, GGUF_Q4_K: lambda n: n // 256 * 144}
+
+
+class GgufWeights:
+    """The drafter's weights as the runtime binds them, under HF names.
+
+    Name mapping is the inverse of deepseek41_dspark_quantize.build_plan, so the
+    two cannot drift.  Rows are [out, in] in both GGUF storage order and
+    PyTorch's Linear convention, so nothing is transposed.
+    """
+
+    def __init__(self, path, stages=3, experts=128):
+        self.path = path
+        self.directory, self.data_start = gguf_tensor_directory(path)
+        self.fp = open(path, "rb")
+        self.cache = {}
+        self.stages = stages
+        self.experts = experts
+
+    def close(self):
+        self.fp.close()
+
+    @staticmethod
+    def gguf_name(hf):
+        stage, rest = hf.split(".", 2)[1], hf.split(".", 2)[2]
+        table = {
+            "attn.attn_sink": "attn_sinks.weight",
+            "attn.wq_a.weight": "attn_q_a.weight",
+            "attn.wq_b.weight": "attn_q_b.weight",
+            "attn.q_norm.weight": "attn_q_a_norm.weight",
+            "attn.wkv.weight": "attn_kv.weight",
+            "attn.kv_norm.weight": "attn_kv_a_norm.weight",
+            "attn.wo_a.weight": "attn_output_a.weight",
+            "attn.wo_b.weight": "attn_output_b.weight",
+            "attn_norm.weight": "attn_norm.weight",
+            "ffn_norm.weight": "ffn_norm.weight",
+            "ffn.gate.weight": "ffn_gate_inp.weight",
+            "ffn.gate.bias": "exp_probs_b.bias",
+            "ffn.shared_experts.w1.weight": "ffn_gate_shexp.weight",
+            "ffn.shared_experts.w3.weight": "ffn_up_shexp.weight",
+            "ffn.shared_experts.w2.weight": "ffn_down_shexp.weight",
+            "main_proj.weight": "main_proj.weight",
+            "main_norm.weight": "main_norm.weight",
+            "norm.weight": "norm.weight",
+            "markov_head.embed.weight": "markov_head.markov_w1.weight",
+            "markov_head.head.weight": "markov_head.markov_w2.weight",
+            "confidence_head.proj.weight": "confidence_head.proj.weight",
+        }
+        for part in ("attn", "ffn"):
+            for piece in ("fn", "base", "scale"):
+                table[f"hc_{part}_{piece}"] = f"hc_{part}_{piece}.weight"
+        if rest not in table:
+            fail(f"no GGUF name for {hf}")
+        return f"mtp.{stage}.{table[rest]}"
+
+    def _read(self, name, expert=None):
+        if name not in self.directory:
+            fail(f"{self.path}: missing tensor {name}")
+        dims, qtype, offset = self.directory[name]
+        n_in = dims[0]
+        rows = dims[1] if len(dims) > 1 else 1
+        if qtype not in _GGUF_ROW_BYTES:
+            fail(f"{self.path}: {name} has unsupported quant type {qtype}")
+        row_bytes = _GGUF_ROW_BYTES[qtype](n_in)
+        base = self.data_start + offset
+        if expert is not None:
+            base += expert * rows * row_bytes
+        self.fp.seek(base)
+        raw = self.fp.read(rows * row_bytes)
+        if qtype == GGUF_F32:
+            out = torch.frombuffer(bytearray(raw), dtype=torch.float32).view(rows, n_in)
+        elif qtype == GGUF_F16:
+            out = torch.frombuffer(bytearray(raw), dtype=torch.float16).float().view(rows, n_in)
+        elif qtype == GGUF_Q8_0:
+            out = dequantize_q8_0(raw, n_in)
+        else:
+            out = dequantize_q4_k(raw, n_in)
+        return out.squeeze(0) if len(dims) == 1 else out
+
+    def get(self, hf_name):
+        key = self.gguf_name(hf_name)
+        if key not in self.cache:
+            self.cache[key] = self._read(key)
+        return self.cache[key]
+
+    def expert(self, stage, index, part):
+        name = f"mtp.{stage}.ffn_{ {'w1': 'gate', 'w3': 'up', 'w2': 'down'}[part] }_exps.weight"
+        return self._read(name, expert=index)
+
+
+# ---------------------------------------------------------------------------
 # Kernels reimplemented from inference/kernel.py
 # ---------------------------------------------------------------------------
 
@@ -246,6 +402,8 @@ def rope_tail_(x, cis, inverse=False):
 
 
 def act_quant_fp8(x, block=32):
+    # kernel_dsv41_quantize rounds the value it reads and the value it stores.
+    x = rnd(x)
     """act_quant(..., "ue8m0", float8_e8m0fnu, inplace=True): fused quant+dequant.
 
     kernel.py:41-95 -- per `block` elements along the last axis, amax floored at 1e-4,
@@ -391,9 +549,9 @@ class Stage:
     def seed_prefill(self, main_x, cis):
         """DSparkAttention.forward with start_pos == 0: seed the ring, return x."""
         seqlen = main_x.size(1)
-        main_kv = rms_norm(torch.nn.functional.linear(main_x, self.t("attn.wkv.weight")),
-                           self.t("attn.kv_norm.weight"))
-        main_kv = rope_tail_(main_kv, cis[:seqlen])
+        main_kv = rnd(rms_norm(torch.nn.functional.linear(main_x, self.t("attn.wkv.weight")),
+                           self.t("attn.kv_norm.weight")))
+        main_kv = rnd(rope_tail_(main_kv, cis[:seqlen]))
         main_kv = act_quant_fp8(main_kv)
         if seqlen <= WINDOW:
             self.ring[:, :seqlen] = main_kv
@@ -406,20 +564,20 @@ class Stage:
     def attention(self, x, start_pos, main_x, cis):
         """DSparkAttention.forward at decode, model.py:1032-1075."""
         main_cis = cis[start_pos:start_pos + 1]
-        main_kv = rms_norm(torch.nn.functional.linear(main_x, self.t("attn.wkv.weight")),
-                           self.t("attn.kv_norm.weight"))
-        main_kv = act_quant_fp8(rope_tail_(main_kv, main_cis))
+        main_kv = rnd(rms_norm(torch.nn.functional.linear(main_x, self.t("attn.wkv.weight")),
+                           self.t("attn.kv_norm.weight")))
+        main_kv = act_quant_fp8(rnd(rope_tail_(main_kv, main_cis)))
 
         block = x.size(1)
         draft_cis = cis[start_pos + 1:start_pos + 1 + block]
 
-        qr = rms_norm(torch.nn.functional.linear(x, self.t("attn.wq_a.weight")),
-                      self.t("attn.q_norm.weight"))
-        q = torch.nn.functional.linear(qr, self.t("attn.wq_b.weight")).unflatten(-1, (N_HEADS, HEAD_DIM))
-        q = rope_tail_(q, draft_cis)
-        kv = rms_norm(torch.nn.functional.linear(x, self.t("attn.wkv.weight")),
-                      self.t("attn.kv_norm.weight"))
-        kv = act_quant_fp8(rope_tail_(kv, draft_cis))
+        qr = rnd(rms_norm(rnd(torch.nn.functional.linear(x, self.t("attn.wq_a.weight"))),
+                      self.t("attn.q_norm.weight")))
+        q = rnd(torch.nn.functional.linear(qr, self.t("attn.wq_b.weight"))).unflatten(-1, (N_HEADS, HEAD_DIM))
+        q = rnd(rope_tail_(q, draft_cis))
+        kv = rnd(rms_norm(torch.nn.functional.linear(x, self.t("attn.wkv.weight")),
+                      self.t("attn.kv_norm.weight")))
+        kv = act_quant_fp8(rnd(rope_tail_(kv, draft_cis)))
 
         # get_dspark_topk_idxs: one index row, expanded across every draft slot.
         # The block is non-causal -- each slot sees all five, later ones included.
@@ -427,14 +585,20 @@ class Stage:
         topk_idxs = idx.int().view(1, 1, -1).expand(1, block, -1).contiguous()
 
         self.ring[:, start_pos % WINDOW] = main_kv.squeeze(1)
+        if self.trace is not None:
+            # The ring exactly as the attention reads it: FP8-quantized, RoPEd
+            # main_kv rows at slot `position % 128`. Stage 3's Metal ring must
+            # hold these values at the same absolute slots.
+            self.trace[f"ring{self.s}"] = self.ring.clone()
         keys = torch.cat([self.ring, kv], dim=1)
-        o = sparse_attn(q, keys, self.t("attn.attn_sink"), topk_idxs, HEAD_DIM ** -0.5)
-        o = rope_tail_(o, draft_cis, inverse=True)
+        o = rnd(sparse_attn(q, keys, self.t("attn.attn_sink"), topk_idxs, HEAD_DIM ** -0.5))
+        o = rnd(rope_tail_(o, draft_cis, inverse=True))
 
         o = o.view(1, block, O_GROUPS, -1)
         wo_a = self.t("attn.wo_a.weight").view(O_GROUPS, O_LORA_RANK, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        return torch.nn.functional.linear(o.flatten(2), self.t("attn.wo_b.weight"))
+        # ds4_gpu_dsv41_attention_output_batch rounds between the two projections.
+        o = rnd(torch.einsum("bsgd,grd->bsgr", o, wo_a))
+        return rnd(torch.nn.functional.linear(o.flatten(2), self.t("attn.wo_b.weight")))
 
     # -- MoE -----------------------------------------------------------------
 
@@ -455,10 +619,10 @@ class Stage:
                 y[row] += weights[row, slot] * swiglu_expert(
                     flat[row], self.w.expert(self.s, expert, "w1"),
                     self.w.expert(self.s, expert, "w3"), self.w.expert(self.s, expert, "w2"))
-        y = y + swiglu_expert(flat, self.t("ffn.shared_experts.w1.weight"),
+        shared = swiglu_expert(flat, self.t("ffn.shared_experts.w1.weight"),
                               self.t("ffn.shared_experts.w3.weight"),
                               self.t("ffn.shared_experts.w2.weight"))
-        return y.view(x.shape), indices, weights
+        return rnd(y + rnd(shared)).view(x.shape), indices, weights
 
     # -- block ---------------------------------------------------------------
 
@@ -467,8 +631,10 @@ class Stage:
         residual = x
         attn_pre, attn_post, attn_comb = hc_mixes(x, self.t("hc_attn_fn"), self.t("hc_attn_scale"),
                                                   self.t("hc_attn_base"))
-        h = rms_norm(hc_pre(x, pre_mix), self.t("attn_norm.weight"))
+        h = rnd(rms_norm(rnd(hc_pre(x, pre_mix)), self.t("attn_norm.weight")))
         h = self.attention(h, start_pos, main_x, cis)
+        if self.trace is not None:
+            self.trace[f"stage{self.s}_attn_block"] = h.clone()
         x = hc_post(h, residual, attn_post, attn_comb)
         if self.trace is not None:
             self.trace[f"stage{self.s}_post_attn"] = x.clone()
@@ -477,8 +643,10 @@ class Stage:
         residual = x
         ffn_pre, ffn_post, ffn_comb = hc_mixes(x, self.t("hc_ffn_fn"), self.t("hc_ffn_scale"),
                                                self.t("hc_ffn_base"))
-        h = rms_norm(hc_pre(x, attn_pre), self.t("ffn_norm.weight"))
+        h = rnd(rms_norm(rnd(hc_pre(x, attn_pre)), self.t("ffn_norm.weight")))
         h, indices, weights = self.moe(h)
+        if self.trace is not None:
+            self.trace[f"stage{self.s}_ffn_block"] = h.clone()
         x = hc_post(h, residual, ffn_post, ffn_comb)
         if self.trace is not None:
             self.trace[f"stage{self.s}_post_ffn"] = x.clone()
@@ -505,11 +673,22 @@ class Drafter:
     def main_x(self, main_hidden):
         """DSparkBlock.forward_embed's first half: main_norm(main_proj(main_hidden))."""
         projected = torch.nn.functional.linear(main_hidden, self.w.get("mtp.0.main_proj.weight"))
-        return rms_norm(projected, self.w.get("mtp.0.main_norm.weight"))
+        return rnd(rms_norm(projected, self.w.get("mtp.0.main_norm.weight")))
+
+    def trace_hidden(self, main_hidden):
+        """The stimulus itself, so a port can run main_proj rather than be handed
+        its output.  Concatenation order is target-layer order (37, 38, 39)."""
+        if self.trace is not None:
+            self.trace["main_hidden"] = main_hidden.clone()
 
     def prefill(self, main_hidden):
         cis = self.ensure_cis(main_hidden.size(1))
         main_x = self.main_x(main_hidden)
+        if self.trace is not None:
+            # Positions [0, start_pos): everything the three rings are seeded
+            # from. Stage 3 drives its own seeding from this rather than from a
+            # 550B backbone it must not load.
+            self.trace["main_x_prefill"] = main_x.clone()
         for stage in self.stages:
             stage.seed_prefill(main_x, cis)
         return main_x
@@ -540,8 +719,8 @@ class Drafter:
     def head(self, x, pre_mix, seed_token, temperature):
         """DSparkBlock.forward_head, model.py:1137-1156."""
         final = self.stages[-1]
-        collapsed = hc_pre(x, pre_mix)
-        normed = rms_norm(collapsed, final.t("norm.weight"))
+        collapsed = rnd(hc_pre(x, pre_mix))
+        normed = rnd(rms_norm(collapsed, final.t("norm.weight")))
         base_logits = torch.nn.functional.linear(normed.float(), self.output_head)
 
         markov_embed_table = final.t("markov_head.embed.weight")
@@ -644,6 +823,12 @@ def main():
                         help="0 = greedy, which is what ds4 drafts with")
     parser.add_argument("--positions", default=",".join(str(p) for p in DEFAULT_POSITIONS))
     parser.add_argument("--stages", type=int, default=3)
+    parser.add_argument("--support-gguf",
+                        help="read the drafter's weights from this Stage-1 support GGUF "
+                             "instead of the safetensors, i.e. exactly what the runtime binds")
+    parser.add_argument("--bf16", action="store_true",
+                        help="apply V4.1's BF16 activation boundaries at the points "
+                             "ds41_dspark_bf16 applies them")
     suffix = "dylib" if sys.platform == "darwin" else "so"
     parser.add_argument("--quants-library",
                         default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -654,11 +839,20 @@ def main():
     torch.set_num_threads(min(16, os.cpu_count() or 8))
     started = time.monotonic()
 
-    db = MtpSourceDB(args.hf)
-    quantizer = NativeQuantizer(args.quants_library)
-    weights = Weights(db, quantizer)
+    global BF16
+    BF16 = bool(args.bf16)
+    db = None
+    if args.support_gguf:
+        weights = GgufWeights(args.support_gguf, args.stages)
+        print(f"weights: {args.support_gguf} (quantized, as the runtime binds them), "
+              f"bf16_boundaries={BF16}", flush=True)
+    else:
+        db = MtpSourceDB(args.hf)
+        quantizer = NativeQuantizer(args.quants_library)
+        weights = Weights(db, quantizer)
 
-    print(f"source: {len(db.tensors)} mtp.* tensors in {sorted(set(db.weight_map.values()))}", flush=True)
+    if db is not None:
+        print(f"source: {len(db.tensors)} mtp.* tensors in {sorted(set(db.weight_map.values()))}", flush=True)
     # token_embd is only ever row-indexed, so it stays in its stored F16.
     token_embd = gguf_read_matrix(args.gguf, "token_embd.weight", VOCAB, DIM, torch.float16)
     output_head = gguf_read_matrix(args.gguf, "output.weight", VOCAB, DIM)
@@ -673,6 +867,7 @@ def main():
         main_hidden = synthetic_main_hidden(args.seed, start_pos)
         token = seed_token_for(args.seed, start_pos)
         step = time.monotonic()
+        drafter.trace_hidden(main_hidden)
         drafter.prefill(main_hidden[:, :start_pos])
         output_ids, _, confidence = drafter.decode(main_hidden[:, start_pos:start_pos + 1],
                                                    token, start_pos, args.temperature)
@@ -720,7 +915,10 @@ def main():
         json.dump(summary, fp, indent=2, sort_keys=True)
         fp.write("\n")
     print(f"done: {total:.1f}s, peak RSS {peak_bytes / (1 << 30):.2f} GiB", flush=True)
-    db.close()
+    if db is not None:
+        db.close()
+    elif hasattr(weights, "close"):
+        weights.close()
 
 
 if __name__ == "__main__":

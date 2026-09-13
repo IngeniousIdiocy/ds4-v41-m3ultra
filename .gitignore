@@ -67,3 +67,4 @@ __pycache__/
 .*.swp
 .DS_Store
 /tests/test_deepseek41_dspark_bind
+/tests/test_deepseek41_dspark_forward

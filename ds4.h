@@ -308,6 +308,24 @@ typedef struct {
      * switch.  Prefill only: the decode path keeps the wave-2 kernel until
      * the decode gate has seen this. */
     int prefill_attn_lean_rows;
+    /* Stage 5.  dspark_capture = 0 suppresses the target-hidden capture on an
+     * armed session, which is the identity A/B for it; verify_wide_prefill
+     * relaxes the five count > DS4_TP_BATCH_MAX_ROWS prefill gates so a 6-row
+     * verify pass can reach them (VERIFY-COST.md section 5). */
+    int dspark_capture;
+    int verify_wide_prefill;
+    /* dspark_verify_rows = 0 verifies the whole block (1 committed + 5 draft
+     * rows); 2..6 narrows the verify to a prefix of the proposal.
+     * dspark_expert_union = 1 reads the routed selection back per layer. */
+    int dspark_verify_rows;
+    int dspark_expert_union;
+    /* verify_batch_core = 1 runs the verify pass's attention through the
+     * prefill batch core instead of six per-row decode passes: faster, but a
+     * different attention kernel and therefore not byte-identical to serial.
+     * dspark_force_reject = 1 rejects every draft, which commits one token per
+     * cycle and exercises the maximal rollback on every cycle. */
+    int verify_batch_core;
+    int dspark_force_reject;
 } ds41_levers;
 
 extern ds41_levers g_ds41_levers;
@@ -621,6 +639,24 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
+
+/* V4.1 DSpark speculative decode (campaign Stage 5).  Greedy only: the emitted
+ * continuation is identical to serial greedy by construction.  `out_tokens`
+ * must hold at least `gen_tokens` ints; `eos_id` < 0 disables the stop check. */
+typedef struct {
+    uint32_t cycles;        /* draft + verify passes                       */
+    uint32_t committed;     /* target rows committed (tokens per cycle)    */
+    uint32_t verified_rows; /* rows evaluated by the verify passes         */
+    uint32_t accept_hist[8];/* accepted drafts per cycle, 0..block         */
+    double   propose_ms, verify_ms, commit_ms, total_ms;
+    double   expert_union;  /* mean routed experts read per layer per pass */
+    uint32_t union_layers;  /* layers sampled (0 unless DS4_DS41_EXPERT_UNION) */
+} ds4_dspark_decode_stats;
+
+int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
+                                int *out_tokens, int *n_out,
+                                ds4_dspark_decode_stats *st,
+                                char *err, size_t errlen);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode);
