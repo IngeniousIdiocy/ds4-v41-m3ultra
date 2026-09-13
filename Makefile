@@ -557,6 +557,16 @@ tests/test_deepseek41_gguf: tests/test_deepseek41_gguf.o ds4_engram.c $(filter-o
 test-deepseek41-gguf: tests/test_deepseek41_gguf
 	./tests/test_deepseek41_gguf
 
+tests/test_deepseek41_dspark_bind.o: tests/test_deepseek41_dspark_bind.c ds4.c ds4.h ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_deepseek41_dspark_bind: tests/test_deepseek41_dspark_bind.o ds4_engram.c $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $^ $(LDLIBS)
+
+.PHONY: test-deepseek41-dspark-bind
+test-deepseek41-dspark-bind: tests/test_deepseek41_dspark_bind
+	./tests/test_deepseek41_dspark_bind
+
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
@@ -776,7 +786,8 @@ test-frontends: ds4_test ds4_agent_test
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_deepseek41_dspark_bind \
+	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -786,6 +797,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
+	./tests/test_deepseek41_dspark_bind
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image
 
@@ -843,6 +855,7 @@ clean:
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_gguf
+	rm -f tests/test_deepseek41_dspark_bind tests/test_deepseek41_dspark_bind.o
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
