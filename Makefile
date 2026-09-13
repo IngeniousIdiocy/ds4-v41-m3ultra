@@ -355,7 +355,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_engram.h
+ds4.o: ds4.c ds4.h ds4_dspark_controller.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_engram.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -862,7 +862,7 @@ clean:
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_dspark_bind tests/test_deepseek41_dspark_bind.o
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_dspark_forward
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_dspark_forward tests/test_ds41_prefix tests/test_ds41_controller
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch
@@ -876,3 +876,13 @@ clean:
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+
+# Build separately from execution: controller/state gates are run by the campaign owner.
+tests/test_ds41_controller: tests/test_ds41_controller.c ds4_dspark_controller.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< -lm
+
+tests/test_ds41_prefix.o: tests/test_ds41_prefix.c ds4.c ds4.h ds4_gpu.h ds4_engram.h ds4_dspark_controller.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_ds41_prefix: tests/test_ds41_prefix.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)

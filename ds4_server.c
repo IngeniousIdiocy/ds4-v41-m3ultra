@@ -5598,6 +5598,7 @@ static bench_fixture *bench_fixture_get(ds4_engine *e, const char *path,
 /* Returns a malloc'd JSON body, or NULL with err set. */
 static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
                        int ctx_alloc, int gen_tokens, bool fresh, bool dspark,
+                       const char *bench_ledger_dump,
                        char *err, size_t errlen) {
     pthread_mutex_lock(&g_bench_mu);
     char *out = NULL;
@@ -5620,6 +5621,10 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     }
 
     const int eos = ds4_token_eos(e);
+    /* Kernel-ledger window = THIS decode and nothing else.  Reset after the
+     * prefix is restored and dump right after the decode loop, so a costmap
+     * never has to be reconstructed as all - 2 x prefill. */
+    if (bench_ledger_dump && *bench_ledger_dump) ds4_gpu_kernel_ledger_reset();
     int *toks = calloc((size_t)(gen_tokens > 0 ? gen_tokens : 1), sizeof(int));
     if (!toks) { snprintf(err, errlen, "oom"); goto out; }
     double first_sec = 0.0, steady_sec = 0.0;
@@ -5655,9 +5660,14 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
         if (done == 1) first_sec = t1 - t0; else steady_sec += t1 - t0;
     }
     const double gen_sec = dspark ? steady_sec + first_sec : bench_now_sec_srv() - gen_t0;
+    const int bench_ledger_mode = ds4_gpu_kernel_ledger_mode();
+    const bool bench_ledger_written = bench_ledger_dump && *bench_ledger_dump &&
+        ds4_gpu_kernel_ledger_dump_path(bench_ledger_dump) != 0;
 
     buf b = {0};
     buf_printf(&b, "{\"prompt_tokens\":%d,\"gen_tokens\":%d", ctx_start, done);
+    buf_printf(&b, ",\"ledger_mode\":%d,\"ledger_written\":%s", bench_ledger_mode,
+               bench_ledger_written ? "true" : "false");
     buf_printf(&b, ",\"prefilled_now\":%s", (created && !f->from_disk) ? "true" : "false");
     buf_printf(&b, ",\"prefix_from_disk\":%s", f->from_disk ? "true" : "false");
     buf_printf(&b, ",\"fixture_created\":%s", created ? "true" : "false");
@@ -5681,11 +5691,21 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
                        ",\"dspark_verified_rows\":%u"
                        ",\"dspark_tokens_per_cycle\":%.4f",
                    dstat.cycles, dstat.committed, dstat.verified_rows,
-                   dstat.cycles ? (double)dstat.committed / (double)dstat.cycles : 0.0);
+                   dstat.cycles ? (double)(dstat.committed-dstat.serial_rows) / (double)dstat.cycles : 0.0);
         buf_printf(&b, ",\"dspark_propose_ms\":%.3f,\"dspark_verify_ms\":%.3f"
-                       ",\"dspark_commit_ms\":%.3f,\"dspark_cycle_ms\":%.4f",
-                   dstat.propose_ms, dstat.verify_ms, dstat.commit_ms,
-                   dstat.cycles ? dstat.total_ms / (double)dstat.cycles : 0.0);
+                       ",\"dspark_commit_ms\":%.3f",
+                   dstat.propose_ms, dstat.verify_ms, dstat.commit_ms);
+        if (g_ds41_levers.dspark_controller)
+            buf_puts(&b, ",\"dspark_cycle_ms\":null");
+        else buf_printf(&b, ",\"dspark_cycle_ms\":%.4f",
+                        dstat.cycles ? dstat.total_ms / (double)dstat.cycles : 0.0);
+        buf_printf(&b, ",\"dspark_processed_rows\":%u,\"dspark_serial_rows\":%u"
+                       ",\"dspark_controller_attempts\":%llu,\"dspark_controller_declines\":%llu"
+                       ",\"dspark_controller_paid_ms\":%.3f,\"dspark_request_ms\":%.3f",
+                   dstat.committed, dstat.serial_rows,
+                   (unsigned long long)dstat.controller_attempts,
+                   (unsigned long long)dstat.controller_declines,
+                   dstat.controller_paid_ms, dstat.total_ms);
         buf_printf(&b, ",\"dspark_expert_union\":%.4f,\"dspark_union_layers\":%u",
                    dstat.expert_union, dstat.union_layers);
         buf_puts(&b, ",\"dspark_accept_hist\":[");
@@ -14867,12 +14887,13 @@ static void *client_main(void *arg) {
     }
 
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/bench")) {
+        char lever_reject[192] = {0};
         if (!s->debug_levers) {
             http_error(fd, s->enable_cors, 404, "unknown endpoint");
             http_request_free(&hr);
             goto done;
         }
-        char *bpath = NULL;
+        char *bpath = NULL, *bledger = NULL;
         int ctx_start = 8192, ctx_alloc = 0, gen = 512;
         bool fresh = false, dspark = false;
         if (hr.body) {
@@ -14890,6 +14911,8 @@ static void *client_main(void *arg) {
                     json_ws(&p);
                     if (!strcmp(key, "path")) {
                         if (!json_string(&p, &bpath)) { free(key); break; }
+                    } else if (!strcmp(key, "ledger_dump")) {
+                        if (!json_string(&p, &bledger)) { free(key); break; }
                     } else if (!strcmp(key, "ctx_start")) {
                         if (!json_int(&p, &ctx_start)) { free(key); break; }
                     } else if (!strcmp(key, "ctx_alloc")) {
@@ -14917,7 +14940,19 @@ static void *client_main(void *arg) {
                                 if (json_int(&p, &lv)) { /* numeric */ }
                                 else if (json_bool(&p, &lb)) { lv = lb ? 1 : 0; }
                                 else { free(lk); break; }
-                                ds41_levers_set(lk, lv);
+                                /* A rejected lever must refuse the request, not
+                                 * leave the previous value in place: a silent
+                                 * fallback makes an arm measure a width it did
+                                 * not ask for. */
+                                if (!ds41_levers_set(lk, lv) && !lever_reject[0]) {
+                                    if (!strcmp(lk, "dspark_verify_rows"))
+                                        snprintf(lever_reject, sizeof(lever_reject),
+                                                 "%s", DS41_DSPARK_ROWS_MSG);
+                                    else
+                                        snprintf(lever_reject, sizeof(lever_reject),
+                                                 "lever \"%s\" rejected value %d",
+                                                 lk, lv);
+                                }
                                 free(lk);
                                 json_ws(&p);
                                 if (*p == ',') { p++; json_ws(&p); }
@@ -14936,11 +14971,19 @@ static void *client_main(void *arg) {
             http_request_free(&hr);
             goto done;
         }
+        if (lever_reject[0]) {
+            http_error(fd, s->enable_cors, 400, lever_reject);
+            free(bpath);
+            free(bledger);
+            http_request_free(&hr);
+            goto done;
+        }
         if (ctx_alloc <= 0) ctx_alloc = s->ctx_size;
         char berr[256] = {0};
         char *body = bench_run(s->engine, bpath, ctx_start, ctx_alloc, gen, fresh,
-                               dspark, berr, sizeof(berr));
+                               dspark, bledger, berr, sizeof(berr));
         free(bpath);
+        free(bledger);
         if (!body) {
             http_error(fd, s->enable_cors, 500, berr[0] ? berr : "bench failed");
         } else {
@@ -14952,6 +14995,7 @@ static void *client_main(void *arg) {
     }
 
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/prefill")) {
+        char lever_reject[192] = {0};
         if (!s->debug_levers) {
             http_error(fd, s->enable_cors, 404, "unknown endpoint");
             http_request_free(&hr);
@@ -15004,7 +15048,19 @@ static void *client_main(void *arg) {
                                 if (json_int(&p, &lv)) { /* numeric */ }
                                 else if (json_bool(&p, &lb)) { lv = lb ? 1 : 0; }
                                 else { free(lk); break; }
-                                ds41_levers_set(lk, lv);
+                                /* A rejected lever must refuse the request, not
+                                 * leave the previous value in place: a silent
+                                 * fallback makes an arm measure a width it did
+                                 * not ask for. */
+                                if (!ds41_levers_set(lk, lv) && !lever_reject[0]) {
+                                    if (!strcmp(lk, "dspark_verify_rows"))
+                                        snprintf(lever_reject, sizeof(lever_reject),
+                                                 "%s", DS41_DSPARK_ROWS_MSG);
+                                    else
+                                        snprintf(lever_reject, sizeof(lever_reject),
+                                                 "lever \"%s\" rejected value %d",
+                                                 lk, lv);
+                                }
                                 free(lk);
                                 json_ws(&p);
                                 if (*p == ',') { p++; json_ws(&p); }
@@ -15020,6 +15076,14 @@ static void *client_main(void *arg) {
         }
         if (!ppath) {
             http_error(fd, s->enable_cors, 400, "missing \"path\"");
+            free(pledger);
+            free(plogits);
+            http_request_free(&hr);
+            goto done;
+        }
+        if (lever_reject[0]) {
+            http_error(fd, s->enable_cors, 400, lever_reject);
+            free(ppath);
             free(pledger);
             free(plogits);
             http_request_free(&hr);

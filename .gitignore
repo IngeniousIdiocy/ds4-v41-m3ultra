@@ -68,3 +68,6 @@ __pycache__/
 .DS_Store
 /tests/test_deepseek41_dspark_bind
 /tests/test_deepseek41_dspark_forward
+
+/tests/test_ds41_controller
+/tests/test_ds41_prefix

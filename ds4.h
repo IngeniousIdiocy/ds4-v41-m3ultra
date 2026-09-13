@@ -314,7 +314,20 @@ typedef struct {
     int dspark_excl_eos; /* Match the serial control's argmax_excluding(eos) rule. */
     int mtp_capture_warmup; /* Complete target capture from decoder warmup inputs. */
     int mtp_state_fix; /* Capture undo, truthful snapshots, seed generation. */
+    int mtp_gu_mma6; /* Probe: M8/N32/K32 routed GU, default0. */
+    int mtp_q8_mma6; /* Probe: M8/N32/K32 dense Q8, default0. */
+    int mtp_q8_mma6_mask; /* H1 family bits, default125 excludes q_b. */
+    int mtp_gu_f16acc6; /* Speed probe, parent GU geometry, default0. */
+    int mtp_q8_f16acc6; /* Speed probe, paired dense geometry, default0. */
+    int mtp_q8_f16acc6_mask; /* H1 family bits; default125 excludes q_b. */
+    int mtp_gu_mk6; /* Tier-2 GU, six-row verifier only, default0. */
+    int mtp_force_mm; /* G: lower the routed mm_id GEMM row threshold to six; default0. */
+    int mtp_gu_mk6_oracle; /* Test-only scalar replay with the new GU tree, default0. */
+    int mtp_gu_union6; /* H2: shared quant tiles, original per-row SIMD tree; default0. */
+    int mtp_gu_union6_mask; /* multiplicity bits1..5 (2..6 rows), default62. */
     int mtp_gu_union2; /* Two-row routed gate/up only; down remains ordered. */
+    int mtp_q8_stream6; /* H1: six accumulators, one logical Q8 weight stream; default0. */
+    int mtp_q8_stream6_mask; /* family bits0..6, default127; cleared bits use pair6. */
     int mtp_q8_pair6; /* Six rows as three independent weight-sharing pairs. */
     int mtp_q8_rows2; /* Opt-in; exactly two target rows. */
     int prefill_f16_rows2; /* wave 3, ADOPTED: default 1, DS4_DS41_PREFILL_F16_ROWS2=0 kills it */
@@ -373,6 +386,9 @@ typedef struct {
      * widths are invalid; use serial generation for the one-row control.
      * dspark_expert_union = 1 reads the routed selection back per layer. */
     int dspark_verify_rows;
+    int dspark_controller; /* D: calibrated admission, default off. */
+    int dspark_controller_confidence; /* use conditional confidence bins, default on */
+    int dspark_controller_widths; /* measured-width selection, default off (fixed cap) */
     int dspark_expert_union;
     /* verify_batch_core = 1 runs the verify pass's attention through the
      * prefill batch core instead of six per-row decode passes: faster, but a
@@ -388,6 +404,11 @@ typedef struct {
      * and writes to stderr, outside the phase timers. */
     int dspark_draft_trace;
 } ds41_levers;
+
+/* One text for the verify-width guard, so the session path and the debug
+ * lever paths refuse width 1 with the same message and cannot drift. */
+#define DS41_DSPARK_ROWS_MSG \
+    "dspark: verify rows must be 0 (full block) or 2..6; use serial for width 1"
 
 extern ds41_levers g_ds41_levers;
 
@@ -706,10 +727,13 @@ int ds4_session_argmax(ds4_session *s);
  * must hold at least `gen_tokens` ints; `eos_id` < 0 disables the stop check. */
 typedef struct {
     uint32_t cycles;        /* draft + verify passes                       */
-    uint32_t committed;     /* target rows committed (tokens per cycle)    */
+    uint32_t committed;     /* all processed target rows, including serial */
+    uint32_t serial_rows;   /* serial fallback/cooldown rows within committed */
     uint32_t verified_rows; /* rows evaluated by the verify passes         */
     uint32_t accept_hist[8];/* accepted drafts per cycle, 0..block         */
     double   propose_ms, verify_ms, commit_ms, total_ms;
+    uint64_t controller_attempts, controller_declines, controller_serial;
+    double controller_paid_ms; /* includes declined draft + serial fallback */
     double   expert_union;  /* mean routed experts read per layer per pass */
     uint32_t union_layers;  /* layers sampled (0 unless DS4_DS41_EXPERT_UNION) */
 } ds4_dspark_decode_stats;

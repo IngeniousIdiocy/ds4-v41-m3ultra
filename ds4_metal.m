@@ -52,6 +52,29 @@ enum {
 @class DS4MetalQ4ExpertTable;
 
 static id<MTLDevice> g_device;
+static id<MTLBuffer> g_ds41_h2_plan_buffer;
+static id<MTLBuffer> g_ds41_mk6_plan_buffer;
+static unsigned g_ds41_gu_mk6_rows;
+static bool g_ds41_verify6_active;
+bool ds4_gpu_dsv41_verify6_scope(bool active) {
+    const bool previous = g_ds41_verify6_active;
+    g_ds41_verify6_active = active;
+    return previous;
+}
+unsigned ds4_gpu_dsv41_gu_mk6_scope(unsigned rows) {
+    const unsigned previous = g_ds41_gu_mk6_rows;
+    g_ds41_gu_mk6_rows = rows;
+    return previous;
+}
+/* G (probe): the routed mm_id GEMM path is selected only at 32 rows or more,
+ * so a six-row verify always takes the GEMV family.  This scope lowers that one
+ * selection constant for the probe; zero keeps the production threshold. */
+static unsigned g_ds41_force_mm_rows;
+unsigned ds4_gpu_dsv41_force_mm_scope(unsigned min_rows) {
+    const unsigned previous = g_ds41_force_mm_rows;
+    g_ds41_force_mm_rows = min_rows;
+    return previous;
+}
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
@@ -1357,13 +1380,44 @@ static double   g_ledger_wall_first;       /* first cb GPUStartTime */
 static double   g_ledger_wall_last;        /* last cb GPUEndTime */
 static uint64_t g_ledger_pass_gpu_ns;      /* sum of resolved pass spans */
 
-/* mode 2 timing state */
-static id<MTLCounterSampleBuffer> g_ledger_sbuf;
+static int ds4_ledger_add_page(id<MTLDevice> device);
+
+/* mode 2 timing state.  Apple silicon caps one counter sample buffer at 32 KiB
+ * = 4096 timestamps = 2048 passes, but a six-row V4.1 verify cycle issues
+ * ~4,993 passes, so a single buffer times the head of a cycle and silently
+ * drops the rest (the defect that voided the phase-7 costmap: 173,369 of
+ * 319,558 decode passes untimed, a systematic suffix).  The sampler is
+ * therefore PAGED: each page is one 32 KiB counter buffer plus its own host
+ * attribution slots (DS4_LEDGER_SLOTS * sizeof(slot) = 48 KiB), pages are
+ * allocated lazily up to a bounded pool, and ALL used pages are resolved
+ * together at the existing full-sync point in ds4_gpu_end_commands().  No
+ * measurement-only drain is ever added: that would change the submission
+ * behaviour under study.  If the pool is exhausted the passes are counted
+ * untimed and the dump REFUSES totals and ratios. */
+/* Apple's Metal feature table caps a device at 32 counter sample buffers, and
+ * one page owns one buffer, so the pool can never exceed that.  There is no
+ * MTLDevice query for the limit, so the documented value is the bound; the
+ * allocation-failure path below is what actually enforces it at runtime, and it
+ * reports incomplete coverage and refuses timings rather than silently dropping
+ * passes.  A six-row cycle's high-water mark is 3 pages, so this is ample. */
+#ifndef DS4_LEDGER_DEVICE_SAMPLE_BUFFER_LIMIT
+#define DS4_LEDGER_DEVICE_SAMPLE_BUFFER_LIMIT 32
+#endif
+#ifndef DS4_LEDGER_PAGES_MAX
+#define DS4_LEDGER_PAGES_MAX DS4_LEDGER_DEVICE_SAMPLE_BUFFER_LIMIT
+#endif
+typedef struct { int kid[DS4_LEDGER_PASS_K]; int nk; int over; } ds4_ledger_slot_t;
+static id<MTLCounterSampleBuffer> g_ledger_sbuf_page[DS4_LEDGER_PAGES_MAX];
+static ds4_ledger_slot_t         *g_ledger_slot_page[DS4_LEDGER_PAGES_MAX];
 static id<MTLCounterSet>          g_ledger_cset;
-static int      g_ledger_cursor;
-static struct { int kid[DS4_LEDGER_PASS_K]; int nk; int over; }
-                g_ledger_slot[DS4_LEDGER_SLOTS];
-static int      g_ledger_cur_slot = -1;    /* slot of the pass being encoded */
+static int      g_ledger_pages;            /* pages allocated so far */
+static int      g_ledger_pages_cap;        /* pool bound (DS4_KERNEL_LEDGER_PAGES) */
+static int      g_ledger_page;             /* page being filled */
+static int      g_ledger_cursor;           /* slot within that page */
+static uint64_t g_ledger_pages_high;       /* max pages used in one window */
+static uint64_t g_ledger_pool_exhausted;   /* windows that ran out of pages */
+static uint64_t g_ledger_resolve_bad;      /* pages that failed to resolve */
+static ds4_ledger_slot_t *g_ledger_cur_slot_p;  /* slot of the pass being encoded */
 static int      g_ledger_cur_nk;
 
 static uint64_t g_ledger_reset_at;         /* DS4_KERNEL_LEDGER_RESET_AFTER */
@@ -1395,6 +1449,7 @@ static void ds4_ledger_reset_counters(void) {
     g_ledger_cb_gpu_s = 0.0;
     g_ledger_wall_first = g_ledger_wall_last = 0.0;
     g_ledger_pass_gpu_ns = 0;
+    g_ledger_pages_high = g_ledger_pool_exhausted = g_ledger_resolve_bad = 0;
 }
 
 static int ds4_ledger_kid_for_name(const char *name) {
@@ -1491,15 +1546,15 @@ static void *ds4_ledger_new_pso_desc(id self, SEL sel, id desc,
 }
 
 static void ds4_ledger_note_kernel(int kid) {
-    if (kid < 0 || g_ledger_cur_slot < 0) return;
-    int *ids = g_ledger_slot[g_ledger_cur_slot].kid;
+    if (kid < 0 || !g_ledger_cur_slot_p) return;
+    int *ids = g_ledger_cur_slot_p->kid;
     for (int i = 0; i < g_ledger_cur_nk; i++) if (ids[i] == kid) return;
     if (g_ledger_cur_nk >= DS4_LEDGER_PASS_K) {
-        g_ledger_slot[g_ledger_cur_slot].over = 1;
+        g_ledger_cur_slot_p->over = 1;
         return;
     }
     ids[g_ledger_cur_nk++] = kid;
-    g_ledger_slot[g_ledger_cur_slot].nk = g_ledger_cur_nk;
+    g_ledger_cur_slot_p->nk = g_ledger_cur_nk;
 }
 
 static void ds4_ledger_set_pso(id self, SEL sel, id pso) {
@@ -1658,18 +1713,24 @@ static void ds4_ledger_init_once(id<MTLDevice> device) {
                             "falling back to census only\n");
             g_ledger_mode = 1;
         } else {
-            MTLCounterSampleBufferDescriptor *sd =
-                [[MTLCounterSampleBufferDescriptor alloc] init];
-            sd.counterSet   = g_ledger_cset;
-            sd.storageMode  = MTLStorageModeShared;
-            sd.sampleCount  = (NSUInteger)DS4_LEDGER_SLOTS * 2u;
-            NSError *err = nil;
-            g_ledger_sbuf = [device newCounterSampleBufferWithDescriptor:sd error:&err];
-            if (!g_ledger_sbuf) {
-                fprintf(stderr, "ds4: ledger: counter sample buffer failed (%s); "
-                                "census only\n",
-                        err ? [[err localizedDescription] UTF8String] : "?");
+            const char *pe = getenv("DS4_KERNEL_LEDGER_PAGES");
+            const int want = pe && *pe ? atoi(pe) : 16;
+            g_ledger_pages_cap = want < 1 ? 1 : want;
+            if (g_ledger_pages_cap > DS4_LEDGER_PAGES_MAX) {
+                fprintf(stderr, "ds4: ledger: %d pages requested, clamped to the "
+                                "device limit of %d counter sample buffers\n",
+                        g_ledger_pages_cap, DS4_LEDGER_PAGES_MAX);
+                g_ledger_pages_cap = DS4_LEDGER_PAGES_MAX;
+            }
+            if (!ds4_ledger_add_page(device)) {
+                fprintf(stderr, "ds4: ledger: counter sample buffer failed; "
+                                "census only\n");
                 g_ledger_mode = 1;
+            } else {
+                fprintf(stderr, "ds4: ledger: paged sampler, %d pages max "
+                                "(%d passes per page, %d total)\n",
+                        g_ledger_pages_cap, DS4_LEDGER_SLOTS,
+                        g_ledger_pages_cap * DS4_LEDGER_SLOTS);
             }
         }
     }
@@ -1679,20 +1740,57 @@ static void ds4_ledger_init_once(id<MTLDevice> device) {
     atexit(ds4_ledger_dump);
 }
 
+/* One page = one 32 KiB counter sample buffer (2048 passes x 2 timestamps) plus
+ * its own host attribution slots.  Allocated lazily and kept for the process. */
+static int ds4_ledger_add_page(id<MTLDevice> device) {
+    if (g_ledger_pages >= g_ledger_pages_cap) return 0;
+    MTLCounterSampleBufferDescriptor *sd =
+        [[MTLCounterSampleBufferDescriptor alloc] init];
+    sd.counterSet   = g_ledger_cset;
+    sd.storageMode  = MTLStorageModeShared;
+    sd.sampleCount  = (NSUInteger)DS4_LEDGER_SLOTS * 2u;
+    NSError *err = nil;
+    id<MTLCounterSampleBuffer> buf =
+        [device newCounterSampleBufferWithDescriptor:sd error:&err];
+    if (!buf) return 0;
+    ds4_ledger_slot_t *slots = calloc(DS4_LEDGER_SLOTS, sizeof(*slots));
+    if (!slots) return 0;
+    g_ledger_sbuf_page[g_ledger_pages] = buf;
+    g_ledger_slot_page[g_ledger_pages] = slots;
+    g_ledger_pages++;
+    return 1;
+}
+
 /* mode 2: allocate a slot and hand back a pass descriptor, or nil. */
 static MTLComputePassDescriptor *ds4_ledger_pass_descriptor(BOOL concurrent) {
-    g_ledger_cur_slot = -1;
-    g_ledger_cur_nk   = 0;
-    if (g_ledger_mode < 2 || !g_ledger_sbuf) return nil;
-    if (g_ledger_cursor >= DS4_LEDGER_SLOTS) { g_ledger_untimed_passes++; return nil; }
+    g_ledger_cur_slot_p = NULL;
+    g_ledger_cur_nk     = 0;
+    if (g_ledger_mode < 2 || !g_ledger_pages) return nil;
+    if (g_ledger_cursor >= DS4_LEDGER_SLOTS) {
+        /* This page is full.  Move to the next, allocating one if the pool
+         * allows; never drain to free a page, which would change the
+         * submission behaviour this instrument exists to observe. */
+        if (g_ledger_page + 1 >= g_ledger_pages &&
+            !ds4_ledger_add_page(g_device)) {
+            g_ledger_untimed_passes++;
+            g_ledger_pool_exhausted++;
+            return nil;
+        }
+        g_ledger_page++;
+        g_ledger_cursor = 0;
+        if ((uint64_t)(g_ledger_page + 1) > g_ledger_pages_high)
+            g_ledger_pages_high = (uint64_t)(g_ledger_page + 1);
+    }
     const int slot = g_ledger_cursor++;
-    g_ledger_slot[slot].nk = 0;
-    g_ledger_slot[slot].over = 0;
-    g_ledger_cur_slot = slot;
+    ds4_ledger_slot_t *sp = &g_ledger_slot_page[g_ledger_page][slot];
+    sp->nk = 0;
+    sp->over = 0;
+    g_ledger_cur_slot_p = sp;
+    if (g_ledger_pages_high == 0) g_ledger_pages_high = 1;
     MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
     pd.dispatchType = concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
     MTLComputePassSampleBufferAttachmentDescriptor *at = pd.sampleBufferAttachments[0];
-    at.sampleBuffer              = g_ledger_sbuf;
+    at.sampleBuffer              = g_ledger_sbuf_page[g_ledger_page];
     at.startOfEncoderSampleIndex = (NSUInteger)(slot * 2);
     at.endOfEncoderSampleIndex   = (NSUInteger)(slot * 2 + 1);
     return pd;
@@ -1700,33 +1798,48 @@ static MTLComputePassDescriptor *ds4_ledger_pass_descriptor(BOOL concurrent) {
 
 /* Called after a full GPU sync, so every slot is resolvable. */
 static void ds4_ledger_resolve(void) {
-    if (g_ledger_mode < 2 || !g_ledger_sbuf || g_ledger_cursor <= 0) return;
-    const NSUInteger n = (NSUInteger)g_ledger_cursor * 2u;
-    NSData *data = [g_ledger_sbuf resolveCounterRange:NSMakeRange(0, n)];
-    if (data && data.length >= n * sizeof(MTLCounterResultTimestamp)) {
+    if (g_ledger_mode < 2 || !g_ledger_pages) return;
+    if (g_ledger_page == 0 && g_ledger_cursor <= 0) return;
+    /* Resolve every page used since the last full sync, in order. */
+    for (int pg = 0; pg <= g_ledger_page; pg++) {
+        const int used = (pg < g_ledger_page) ? DS4_LEDGER_SLOTS : g_ledger_cursor;
+        if (used <= 0) continue;
+        const NSUInteger n = (NSUInteger)used * 2u;
+        NSData *data = [g_ledger_sbuf_page[pg] resolveCounterRange:NSMakeRange(0, n)];
+        if (!data || data.length < n * sizeof(MTLCounterResultTimestamp)) {
+            /* A page that will not resolve is lost coverage, not zero cost. */
+            g_ledger_untimed_passes += (uint64_t)used;
+            g_ledger_resolve_bad++;
+            continue;
+        }
         const MTLCounterResultTimestamp *t = data.bytes;
-        for (int s = 0; s < g_ledger_cursor; s++) {
+        const ds4_ledger_slot_t *slots = g_ledger_slot_page[pg];
+        for (int s = 0; s < used; s++) {
             const uint64_t a = t[s * 2].timestamp, b = t[s * 2 + 1].timestamp;
-            if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) continue;
+            if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) {
+                g_ledger_untimed_passes++;
+                continue;
+            }
             const uint64_t ns = b - a;
             g_ledger_pass_gpu_ns += ns;
-            const int nk = g_ledger_slot[s].nk;
+            const int nk = slots[s].nk;
             if (nk == 0) { g_ledger_empty_passes++; continue; }
-            if (nk == 1 && !g_ledger_slot[s].over) {
-                const int kid = g_ledger_slot[s].kid[0];
+            if (nk == 1 && !slots[s].over) {
+                const int kid = slots[s].kid[0];
                 g_ledger_k[kid].solo_passes++;
                 g_ledger_k[kid].solo_gpu_ns += ns;
             } else {
                 g_ledger_multi_passes++;
                 for (int i = 0; i < nk; i++) {
-                    g_ledger_k[g_ledger_slot[s].kid[i]].shared_passes++;
-                    g_ledger_k[g_ledger_slot[s].kid[i]].shared_gpu_ns += ns;
+                    g_ledger_k[slots[s].kid[i]].shared_passes++;
+                    g_ledger_k[slots[s].kid[i]].shared_gpu_ns += ns;
                 }
             }
         }
     }
+    g_ledger_page = 0;
     g_ledger_cursor = 0;
-    g_ledger_cur_slot = -1;
+    g_ledger_cur_slot_p = NULL;
     g_ledger_cur_nk = 0;
 }
 
@@ -1760,12 +1873,42 @@ static void ds4_ledger_dump_stream(FILE *out) {
             (unsigned long long)g_ledger_multi_passes,
             (unsigned long long)g_ledger_empty_passes, g_ledger_nk,
             (unsigned long long)g_ledger_name_overflow);
+    /* Coverage certificate.  The phase-7 costmap was voided because a sampler
+     * that silently dropped 45.7 % of a six-row cycle's passes still printed
+     * totals.  Timing output is now refused outright unless coverage is
+     * complete; the census is always safe because only timing can be lost. */
+    const unsigned long long timed =
+        (unsigned long long)(g_ledger_passes > g_ledger_untimed_passes
+                             ? g_ledger_passes - g_ledger_untimed_passes : 0);
+    const int complete = g_ledger_mode >= 2 && g_ledger_untimed_passes == 0 &&
+        g_ledger_resolve_bad == 0 && g_ledger_pool_exhausted == 0;
+    fprintf(out, "#COVERAGE mode=%d timed=%llu of=%llu (%.3f%%) pages_high=%llu "
+                 "pages_cap=%d pool_exhausted=%llu resolve_failed=%llu complete=%s\n",
+            g_ledger_mode, timed, (unsigned long long)g_ledger_passes,
+            g_ledger_passes ? 100.0 * (double)timed / (double)g_ledger_passes : 0.0,
+            (unsigned long long)g_ledger_pages_high, g_ledger_pages_cap,
+            (unsigned long long)g_ledger_pool_exhausted,
+            (unsigned long long)g_ledger_resolve_bad,
+            complete ? "YES" : "NO");
+    if (g_ledger_mode >= 2 && !complete)
+        fprintf(out, "#REFUSED timing totals and ratios are NOT reportable from "
+                     "this run: coverage is incomplete and the loss is a "
+                     "systematic suffix of each cycle, not a sample. Raise "
+                     "DS4_KERNEL_LEDGER_PAGES and re-run. Census columns "
+                     "(dispatches, threadgroups) remain valid.\n");
     if (g_ledger_name_overflow)
         fprintf(out, "#LEDGER WARNING kernel table full; %llu dispatches "
                      "unattributed\n", (unsigned long long)g_ledger_name_overflow);
     fprintf(out, "#KERNEL\tdispatches\tthreadgroups\tsolo_passes\tsolo_us\t"
                  "shared_passes\tshared_us\tname\n");
     for (int i = 0; i < g_ledger_nk && sorted; i++) {
+        if (g_ledger_mode >= 2 && !complete) {
+            /* Census only: emit counts and withhold every timing field. */
+            fprintf(out, "K\t%llu\t%llu\t-\t-\t-\t-\t%s\n",
+                    (unsigned long long)sorted[i].dispatches,
+                    (unsigned long long)sorted[i].threadgroups, sorted[i].name);
+            continue;
+        }
         fprintf(out, "K\t%llu\t%llu\t%llu\t%.3f\t%llu\t%.3f\t%s\n",
                 (unsigned long long)sorted[i].dispatches,
                 (unsigned long long)sorted[i].threadgroups,
@@ -1939,6 +2082,8 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     return 1;
 }
 
+static void ds4_cbtrace_attach(id<MTLCommandBuffer> cb);
+
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
     static int initialized;
     static int use_unretained;
@@ -1949,6 +2094,7 @@ static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
     id<MTLCommandBuffer> cb = use_unretained
         ? [g_queue commandBufferWithUnretainedReferences]
         : [g_queue commandBuffer];
+    ds4_cbtrace_attach(cb);
     if (g_ledger_mode && cb) {
         g_ledger_cbs++;
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -2135,6 +2281,74 @@ static double g_batch_cb_created_ms;
 static double ds4_gpu_now_ms(void);
 static void ds4_gpu_queue_keepalive_start(void);
 static void ds4_gpu_queue_keepalive_stop_thread(void);
+/* ---- Command-buffer timeline (DS4_METAL_CB_TRACE=<file>) -------------------
+ * Phase-8 diagnostic. Hooked at command-buffer CREATION so it sees EVERY
+ * command buffer, whoever commits it -- the batch path, F2's independent chunk
+ * submissions and any one-off buffer alike. Per buffer it records the host
+ * instants of creation, scheduling and completion plus the GPU execution
+ * window. Scheduled/completed handlers are asynchronous callbacks: they add no
+ * passes, no encoder splitting and no drains, so unlike DS4_KERNEL_LEDGER=2
+ * this does not change the cycle under study. Off unless the env var is set;
+ * dumped at exit. Dispatch counts are deliberately NOT collected here -- they
+ * are a structural property of the graph and come from the ledger census. */
+#define DS4_CBTRACE_MAX 400000
+typedef struct {
+    double create_ms, sched_ms, done_ms, gpu_start_ms, gpu_end_ms;
+    uint32_t filled;
+} ds4_cbtrace_rec;
+static ds4_cbtrace_rec *g_cbtrace;
+static uint64_t g_cbtrace_n;
+static int g_cbtrace_on = -1;
+static void ds4_cbtrace_dump(void) {
+    const char *path = getenv("DS4_METAL_CB_TRACE");
+    if (!path || !*path || !g_cbtrace) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    uint64_t n = __atomic_load_n(&g_cbtrace_n, __ATOMIC_SEQ_CST);
+    if (n > DS4_CBTRACE_MAX) n = DS4_CBTRACE_MAX;
+    uint64_t incomplete = 0;
+    for (uint64_t i = 0; i < n; i++) if (g_cbtrace[i].filled != 7u) incomplete++;
+    fprintf(f, "#CBTRACE n=%llu incomplete=%llu\n",
+            (unsigned long long)n, (unsigned long long)incomplete);
+    fprintf(f, "#seq\tcreate_ms\tsched_ms\tdone_ms\tgpu_start_ms\tgpu_end_ms\tfilled\n");
+    for (uint64_t i = 0; i < n; i++) {
+        const ds4_cbtrace_rec *r = &g_cbtrace[i];
+        fprintf(f, "%llu\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%u\n", (unsigned long long)i,
+                r->create_ms, r->sched_ms, r->done_ms, r->gpu_start_ms, r->gpu_end_ms,
+                r->filled);
+    }
+    fclose(f);
+}
+static int ds4_cbtrace_enabled(void) {
+    if (g_cbtrace_on < 0) {
+        const char *e = getenv("DS4_METAL_CB_TRACE");
+        g_cbtrace_on = (e && *e) ? 1 : 0;
+        if (g_cbtrace_on) {
+            g_cbtrace = calloc(DS4_CBTRACE_MAX, sizeof(*g_cbtrace));
+            if (!g_cbtrace) g_cbtrace_on = 0; else atexit(ds4_cbtrace_dump);
+        }
+    }
+    return g_cbtrace_on;
+}
+static void ds4_cbtrace_attach(id<MTLCommandBuffer> cb) {
+    if (!ds4_cbtrace_enabled() || !cb) return;
+    const uint64_t idx = __atomic_fetch_add(&g_cbtrace_n, 1, __ATOMIC_SEQ_CST);
+    if (idx >= DS4_CBTRACE_MAX) return;
+    g_cbtrace[idx].create_ms = ds4_gpu_now_ms();
+    __atomic_fetch_or(&g_cbtrace[idx].filled, 1u, __ATOMIC_RELAXED);
+    [cb addScheduledHandler:^(id<MTLCommandBuffer> sched) {
+        (void)sched;
+        g_cbtrace[idx].sched_ms = ds4_gpu_now_ms();
+        __atomic_fetch_or(&g_cbtrace[idx].filled, 2u, __ATOMIC_RELAXED);
+    }];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        g_cbtrace[idx].done_ms = ds4_gpu_now_ms();
+        g_cbtrace[idx].gpu_start_ms = done.GPUStartTime * 1000.0;
+        g_cbtrace[idx].gpu_end_ms = done.GPUEndTime * 1000.0;
+        __atomic_fetch_or(&g_cbtrace[idx].filled, 4u, __ATOMIC_RELAXED);
+    }];
+}
+
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
 
@@ -12558,6 +12772,10 @@ void ds4_gpu_cleanup(void) {
         ds4_gpu_clear_zero_prefix_prefill_mask_cache();
         g_flash_attn_ring_buffer = nil;
         g_flash_attn_kv_buffer = nil;
+        g_ds41_h2_plan_buffer = nil;
+        g_ds41_mk6_plan_buffer = nil;
+        g_ds41_gu_mk6_rows = 0;
+        g_ds41_verify6_active = false;
         g_glm_flash_attn_mask_buffer = nil;
         g_compressor_pool_kv_buffer = nil;
         g_compressor_pool_score_buffer = nil;
@@ -20421,6 +20639,39 @@ int ds4_gpu_matmul_q8_0_tensor(
     return ok;
 }
 
+/* H1 only covers audited Q8 projection families, never the vocabulary head.
+ * A cleared family bit is the runtime profiler's pair6 spill/occupancy fallback.
+ * Pipeline limits below detect unsupported dispatches, not register spilling. */
+static unsigned ds4_gpu_dsv41_q8_family_bit(uint64_t k, uint64_t n, bool grouped) {
+    unsigned bit = 0;
+    if (grouped) { if (k == 4096u && n == 8192u) bit = 1u<<3; }
+    else if (k == 5120u && n == 1280u) bit = 1u<<0;
+    else if (k == 1280u && n == 32768u) bit = 1u<<1;
+    else if (k == 5120u && n == 512u) bit = 1u<<2;
+    else if (k == 8192u && n == 5120u) bit = 1u<<4;
+    else if (k == 5120u && n == 2304u) bit = 1u<<5;
+    else if (k == 2304u && n == 5120u) bit = 1u<<6;
+    return bit;
+}
+static bool ds4_gpu_dsv41_stream6_family(uint64_t k, uint64_t n, bool grouped) {
+    ds41_levers_init_from_env();
+    return g_ds41_levers.mtp_q8_stream6 &&
+        ((unsigned)g_ds41_levers.mtp_q8_stream6_mask & ds4_gpu_dsv41_q8_family_bit(k,n,grouped));
+}
+static bool ds4_gpu_dsv41_f16acc6_family(uint64_t k, uint64_t n, bool grouped) {
+    return g_ds41_verify6_active && g_ds41_levers.mtp_q8_f16acc6 &&
+        ((unsigned)g_ds41_levers.mtp_q8_f16acc6_mask & ds4_gpu_dsv41_q8_family_bit(k,n,grouped));
+}
+static bool ds4_gpu_dsv41_mma6_family(uint64_t k, uint64_t n, bool grouped) {
+    return g_ds41_verify6_active && g_ds41_levers.mtp_q8_mma6 &&
+        ((unsigned)g_ds41_levers.mtp_q8_mma6_mask & ds4_gpu_dsv41_q8_family_bit(k,n,grouped));
+}
+static bool ds4_gpu_dsv41_stream6_fits(id<MTLComputePipelineState> p,
+                                     NSUInteger nsg, NSUInteger shared) {
+    return p && p.maxTotalThreadsPerThreadgroup >= 32u*nsg &&
+        p.staticThreadgroupMemoryLength + shared <= g_device.maxThreadgroupMemoryLength;
+}
+
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -20479,11 +20730,27 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         const bool rows2 = n_rows == 2u && (out_dim % 2u) == 0 &&
             !g_quality_mode && !ds4_gpu_tp_world_is_two() && g_ds41_levers.mtp_q8_rows2;
         const bool pair6 = n_rows == 6u && (out_dim % 2u) == 0 &&
-            !g_quality_mode && !ds4_gpu_tp_world_is_two() && g_ds41_levers.mtp_q8_pair6;
+            !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
+            (g_ds41_levers.mtp_q8_pair6 || g_ds41_levers.mtp_q8_stream6);
         const bool paired = rows2 || pair6;
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+        const bool mma6 = n_rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
+            ds4_gpu_dsv41_mma6_family(in_dim, out_dim, false);
+        const bool f16acc6 = !mma6 && pair6 && ds4_gpu_dsv41_f16acc6_family(in_dim, out_dim, false);
+        bool stream6 = !mma6 && !f16acc6 && pair6 && ds4_gpu_dsv41_stream6_family(in_dim, out_dim, false);
+        id<MTLComputePipelineState> pipeline = stream6 ? ds4_gpu_get_mul_mv_pipeline(
+            "kernel_dsv41_q8_stream6", dispatch.nsg) : nil;
+        if (stream6 && !ds4_gpu_dsv41_stream6_fits(pipeline, dispatch.nsg, dispatch.smem*6u))
+            stream6 = false;
+        if (!stream6) pipeline = ds4_gpu_get_mul_mv_pipeline(
+            f16acc6 ? "kernel_dsv41_q8_pair6_f16acc" :
             pair6 ? "kernel_dsv41_q8_pair6" :
             rows2 ? "kernel_dsv41_q8_rows2" : dispatch.function_name, dispatch.nsg);
+        if (mma6) {
+            pipeline = ds4_gpu_get_pipeline("kernel_dsv41_q8_mma6");
+            dispatch.nr0 = args.nr0 = 32;
+            dispatch.nsg = 2;
+            if (!ds4_gpu_dsv41_stream6_fits(pipeline,2,2560u)) return 0;
+        }
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -20495,12 +20762,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:dispatch.smem * (paired ? 2u : 1u) atIndex:0];
+        [enc setThreadgroupMemoryLength:mma6 ? 2560u : dispatch.smem * (stream6 ? 6u : paired ? 2u : 1u) atIndex:0];
         [enc dispatchThreadgroups:
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)(paired ? n_rows/2u : n_rows),
+                            (NSUInteger)((mma6 || stream6) ? 1u : paired ? n_rows/2u : n_rows),
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
@@ -28341,10 +28608,28 @@ int ds4_gpu_dsv41_attention_low_paired_tensor(
             };
             /* R8': the rounding twin writes the same words the separate
              * kernel_dsv41_bf16_linear pass over this output would write. */
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(rows == 6u ?
-                    (round ? "kernel_dsv41_attn_low_pair6_bf16" : "kernel_dsv41_attn_low_pair6") :
+            const bool mma6 = rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
+                ds4_gpu_dsv41_mma6_family(group_dim, low_dim, true);
+            const bool f16acc6 = !mma6 && rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
+                ds4_gpu_dsv41_f16acc6_family(group_dim, low_dim, true);
+            bool stream6 = !mma6 && !f16acc6 && rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
+                ds4_gpu_dsv41_stream6_family(group_dim, low_dim, true);
+            id<MTLComputePipelineState> pipeline = stream6 ?
+                ds4_gpu_get_mul_mv_pipeline(round ? "kernel_dsv41_attn_low_stream6_bf16" :
+                    "kernel_dsv41_attn_low_stream6", 4) : nil;
+            if (stream6 && !ds4_gpu_dsv41_stream6_fits(pipeline, 4, 1536u)) stream6 = false;
+            if (stream6) args.nei1 = 1;
+            else pipeline = ds4_gpu_get_mul_mv_pipeline(rows == 6u ?
+                    (f16acc6 ? (round ? "kernel_dsv41_attn_low_pair6_f16acc_bf16" : "kernel_dsv41_attn_low_pair6_f16acc") :
+                     (round ? "kernel_dsv41_attn_low_pair6_bf16" : "kernel_dsv41_attn_low_pair6")) :
                     (round ? "kernel_dsv41_attn_low_rows2_bf16" : "kernel_dsv41_attn_low_rows2"), 4);
+            if (mma6) {
+                args.nei1 = 1;
+                args.nr0 = 32;
+                pipeline = ds4_gpu_get_pipeline(round ? "kernel_dsv41_attn_low_mma6_bf16" :
+                                                       "kernel_dsv41_attn_low_mma6");
+                if (!ds4_gpu_dsv41_stream6_fits(pipeline,2,2560u)) pipeline = nil;
+            }
             ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                          pipeline,
                                                          &args,
@@ -28354,8 +28639,8 @@ int ds4_gpu_dsv41_attention_low_paired_tensor(
                                                          ds4_gpu_tensor_offset(heads),
                                                          ds4_gpu_tensor_buffer(low),
                                                          ds4_gpu_tensor_offset(low),
-                                                         32u * 4u * sizeof(float),
-                                                         4,
+                                                         mma6 ? 2560u : stream6 ? 1536u : 32u * 4u * sizeof(float),
+                                                         mma6 ? 2 : 4,
                                                          true) != 0;
         }
 
@@ -33461,6 +33746,186 @@ static int ds4_gpu_encode_mul_mv_id_pair(
     return 1;
 }
 
+static int ds4_gpu_encode_ds41_h2(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+        id<MTLBuffer>               src0_a,
+        NSUInteger                  src0_a_off,
+        id<MTLBuffer>               src0_b,
+        NSUInteger                  src0_b_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst_a,
+        NSUInteger                  dst_a_off,
+        id<MTLBuffer>               dst_b,
+        NSUInteger                  dst_b_off,
+        id<MTLBuffer>               dst_mid,
+        NSUInteger                  dst_mid_off,
+        id<MTLBuffer>               ids,
+        NSUInteger                  ids_off,
+        id<MTLBuffer>               weights,
+        NSUInteger                  weights_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg,
+        bool                        rows_per_group_is_nr0) {
+    (void)pipeline; (void)threadgroup_bytes; (void)nsg; (void)rows_per_group_is_nr0;
+    // Return -1 only before any H2 command was encoded: parent fallback is safe.
+    if (!g_ds41_levers.mtp_gu_union6 || g_quality_mode || g_ssd_streaming_mode ||
+        args->tp_world != 1 || args->tp_expert_base != 0 || args->nei0 != 6 ||
+        (args->nei1 != 2 && args->nei1 != 6) || args->ne02 != 384 ||
+        args->ne00 != 5120 || args->ne01 != 2304 || args->ne0 != 2304 ||
+        args->nb01 != 2880u || args->nr0 != 2) return -1;
+    const char *names[]={"kernel_dsv41_h2_gu_1","kernel_dsv41_h2_gu_2",
+        "kernel_dsv41_h2_gu_3","kernel_dsv41_h2_gu_4","kernel_dsv41_h2_gu_5","kernel_dsv41_h2_gu_6"};
+    id<MTLComputePipelineState> stages[6];
+    uint32_t mask=(uint32_t)g_ds41_levers.mtp_gu_union6_mask & 62u;
+    id<MTLComputePipelineState> planner=ds4_gpu_get_pipeline("kernel_dsv41_gu_plan");
+    if (!planner || planner.maxTotalThreadsPerThreadgroup<32u) return -1;
+    for (unsigned b=0;b<6;b++) {
+        stages[b]=ds4_gpu_get_mul_mv_pipeline(names[b],2);
+        const NSUInteger shared=b ? 23040u : 16u;
+        if (!stages[b] || stages[b].maxTotalThreadsPerThreadgroup<64u*(b+1) ||
+            stages[b].staticThreadgroupMemoryLength+shared>g_device.maxThreadgroupMemoryLength) {
+            if (!b) return -1;
+            mask &= ~(1u<<b);
+        }
+    }
+    if (!g_ds41_h2_plan_buffer)
+        g_ds41_h2_plan_buffer=[g_device newBufferWithLength:6984u options:MTLResourceStorageModeShared];
+    if (!g_ds41_h2_plan_buffer) return -1;
+    id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    id<MTLResource> plan_resources[]={g_ds41_h2_plan_buffer};
+    // The queue reuses this GPU-written plan only after prior consumers finish.
+    [enc memoryBarrierWithResources:plan_resources count:1u];
+    [enc setComputePipelineState:planner];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:ids offset:ids_off atIndex:1];
+    [enc setBuffer:g_ds41_h2_plan_buffer offset:0 atIndex:2];
+    [enc setBytes:&mask length:sizeof(mask) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc memoryBarrierWithResources:plan_resources count:1u];
+    for (unsigned b=0;b<6;b++) {
+        if (b && !(mask & (1u<<b))) continue; // planner emitted these as singletons
+        [enc setComputePipelineState:stages[b]];
+        [enc setBytes:args length:sizeof(*args) atIndex:0];
+        [enc setBytes:act length:sizeof(*act) atIndex:1];
+        [enc setBuffer:src0_a offset:src0_a_off atIndex:2];
+        [enc setBuffer:src0_b offset:src0_b_off atIndex:3];
+        [enc setBuffer:src1 offset:src1_off atIndex:4];
+        [enc setBuffer:dst_a offset:dst_a_off atIndex:5];
+        [enc setBuffer:dst_b offset:dst_b_off atIndex:6];
+        [enc setBuffer:dst_mid offset:dst_mid_off atIndex:7];
+        [enc setBuffer:ids offset:ids_off atIndex:8];
+        [enc setBuffer:weights offset:weights_off atIndex:9];
+        [enc setBuffer:g_ds41_h2_plan_buffer offset:0 atIndex:10];
+        [enc setThreadgroupMemoryLength:b ? 23040u : 16u atIndex:0];
+        [enc dispatchThreadgroupsWithIndirectBuffer:g_ds41_h2_plan_buffer
+              indirectBufferOffset:b*12u threadsPerThreadgroup:MTLSizeMake(32,2u*(b+1u),1)];
+    }
+    id<MTLResource> output_resources[]={dst_a,dst_b,dst_mid,g_ds41_h2_plan_buffer};
+    [enc memoryBarrierWithResources:output_resources count:4u];
+    ds4_gpu_end_compute_encoder(cb,enc);
+    return 1;
+}
+
+static int ds4_gpu_encode_ds41_mk6(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mv_id_args *args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+        id<MTLBuffer>               src0_a,
+        NSUInteger                  src0_a_off,
+        id<MTLBuffer>               src0_b,
+        NSUInteger                  src0_b_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               dst_a,
+        NSUInteger                  dst_a_off,
+        id<MTLBuffer>               dst_b,
+        NSUInteger                  dst_b_off,
+        id<MTLBuffer>               dst_mid,
+        NSUInteger                  dst_mid_off,
+        id<MTLBuffer>               ids,
+        NSUInteger                  ids_off,
+        id<MTLBuffer>               weights,
+        NSUInteger                  weights_off,
+        NSUInteger                  threadgroup_bytes,
+        NSUInteger                  nsg,
+        bool                        rows_per_group_is_nr0) {
+    (void)pipeline; (void)threadgroup_bytes; (void)nsg; (void)rows_per_group_is_nr0;
+    // Only ds41 target scalar-oracle/verify callers may arm this scope.
+    // Once explicitly requested, fail closed if unsupported: no false oracle.
+    if (!g_ds41_gu_mk6_rows) return -1;
+    if (!cb || g_quality_mode || g_ssd_streaming_mode ||
+        args->tp_world != 1 || args->tp_expert_base != 0 || args->nei0 != 6 ||
+        args->nei1 != (int)g_ds41_gu_mk6_rows ||
+        (args->nei1 != 1 && args->nei1 != 6) || args->ne02 != 384 ||
+        args->ne00 != 5120 || args->ne01 != 2304 || args->ne0 != 2304 ||
+        args->ne11 != 1 || args->ne1 != 6 || args->nb01 != 2880u ||
+        args->nb02 != 2880ull*2304ull || act->write_clamped) {
+        fprintf(stderr, "ds41: GU mk6 requires exact resident TP1 Q4_K target shape\n");
+        return 0;
+    }
+    const char *names[]={"kernel_dsv41_gu_mk6_1","kernel_dsv41_gu_mk6_2",
+        "kernel_dsv41_gu_mk6_3","kernel_dsv41_gu_mk6_4","kernel_dsv41_gu_mk6_5","kernel_dsv41_gu_mk6_6"};
+    id<MTLComputePipelineState> stages[6];
+    const unsigned buckets=args->nei1 == 1 ? 1u : 6u;
+    const uint32_t mask=62u; // all supported multiplicities, NT1 always narrow
+    id<MTLComputePipelineState> planner=ds4_gpu_get_pipeline("kernel_dsv41_gu_mk6_plan");
+    if (!planner || planner.maxTotalThreadsPerThreadgroup<32u) return 0;
+    for (unsigned b=0;b<buckets;b++) {
+        stages[b]=ds4_gpu_get_pipeline(names[b]);
+        const NSUInteger columns=b ? 16u : 4u;
+        const NSUInteger shared=(2u*columns+(b+1u))*32u*sizeof(float);
+        if (!stages[b] || stages[b].threadExecutionWidth != 32u ||
+            stages[b].maxTotalThreadsPerThreadgroup<columns*16u ||
+            stages[b].staticThreadgroupMemoryLength+shared>g_device.maxThreadgroupMemoryLength) {
+            fprintf(stderr, "ds41: GU mk6 multiplicity %u unsupported; refusing requested arithmetic\n",b+1);
+            return 0;
+        }
+    }
+    if (!g_ds41_mk6_plan_buffer)
+        g_ds41_mk6_plan_buffer=[g_device newBufferWithLength:6984u options:MTLResourceStorageModeShared];
+    if (!g_ds41_mk6_plan_buffer) return 0;
+    id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    id<MTLResource> plan_resources[]={g_ds41_mk6_plan_buffer};
+    // The queue reuses this GPU-written plan only after prior consumers finish.
+    [enc memoryBarrierWithResources:plan_resources count:1u];
+    [enc setComputePipelineState:planner];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:ids offset:ids_off atIndex:1];
+    [enc setBuffer:g_ds41_mk6_plan_buffer offset:0 atIndex:2];
+    [enc setBytes:&mask length:sizeof(mask) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    [enc memoryBarrierWithResources:plan_resources count:1u];
+    for (unsigned b=0;b<buckets;b++) {
+        [enc setComputePipelineState:stages[b]];
+        [enc setBytes:args length:sizeof(*args) atIndex:0];
+        [enc setBytes:act length:sizeof(*act) atIndex:1];
+        [enc setBuffer:src0_a offset:src0_a_off atIndex:2];
+        [enc setBuffer:src0_b offset:src0_b_off atIndex:3];
+        [enc setBuffer:src1 offset:src1_off atIndex:4];
+        [enc setBuffer:dst_a offset:dst_a_off atIndex:5];
+        [enc setBuffer:dst_b offset:dst_b_off atIndex:6];
+        [enc setBuffer:dst_mid offset:dst_mid_off atIndex:7];
+        [enc setBuffer:ids offset:ids_off atIndex:8];
+        [enc setBuffer:weights offset:weights_off atIndex:9];
+        [enc setBuffer:g_ds41_mk6_plan_buffer offset:0 atIndex:10];
+        const NSUInteger columns=b ? 16u : 4u;
+        [enc setThreadgroupMemoryLength:(2u*columns+(b+1u))*32u*sizeof(float) atIndex:0];
+        [enc dispatchThreadgroupsWithIndirectBuffer:g_ds41_mk6_plan_buffer
+              indirectBufferOffset:b*12u threadsPerThreadgroup:MTLSizeMake(32,columns/2u,1)];
+    }
+    id<MTLResource> output_resources[]={dst_a,dst_b,dst_mid,g_ds41_mk6_plan_buffer};
+    [enc memoryBarrierWithResources:output_resources count:4u];
+    ds4_gpu_end_compute_encoder(cb,enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -33489,6 +33954,27 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
         !src0_a || !src0_b || !src1 || !dst_a || !dst_b || !dst_mid || !ids || !weights ||
         args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 <= 0 || args->nei1 <= 0) {
         return 0;
+    }
+
+    const bool f16acc6 = g_ds41_verify6_active && g_ds41_levers.mtp_gu_f16acc6 &&
+        !g_quality_mode && !g_ssd_streaming_mode && args->nei1 == 6 &&
+        args->nei0 == 6 && args->ne02 == 384 && args->ne00 == 5120 &&
+        args->ne01 == 2304 && args->nb01 == 2880 && args->tp_world == 1 &&
+        args->tp_expert_base == 0 && args->nr0 == 2;
+    if (f16acc6) {
+        pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_dsv41_q4_gu_f16acc6", nsg);
+        if (!pipeline) return 0;
+    } else {
+        const int mk6=ds4_gpu_encode_ds41_mk6(cb,pipeline,args,act,
+            src0_a,src0_a_off,src0_b,src0_b_off,src1,src1_off,dst_a,dst_a_off,dst_b,dst_b_off,
+            dst_mid,dst_mid_off,ids,ids_off,weights,weights_off,threadgroup_bytes,nsg,rows_per_group_is_nr0);
+        if (mk6>=0) return mk6;
+
+        const int h2=ds4_gpu_encode_ds41_h2(cb,pipeline,args,act,
+            src0_a,src0_a_off,src0_b,src0_b_off,src1,src1_off,dst_a,dst_a_off,dst_b,dst_b_off,
+            dst_mid,dst_mid_off,ids,ids_off,weights,weights_off,threadgroup_bytes,nsg,rows_per_group_is_nr0);
+        if (h2>=0) return h2;
+
     }
 
     const NSUInteger nr0 = (NSUInteger)args->nr0;
@@ -35082,6 +35568,7 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
         bool                        compact_tile,
+        bool                        verify_mma6,
         const ds4_gpu_mul_mm_id_args *mm_args,
         const ds4_gpu_dsv4_moe_swiglu_weight_args *act_args,
         id<MTLBuffer>               gate_src0,
@@ -35102,6 +35589,10 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
         return 0;
     }
 
+    if (verify_mma6 && (!compact_tile || mm_args->ne21 != 6 ||
+        mm_args->ne20 != 6 || mm_args->ne00 != 5120 || mm_args->ne0 != 2304 ||
+        !ds4_gpu_dsv41_stream6_fits(pipeline,2,4608u))) return 0;
+
     const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
     const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
     if (tpe_bytes > NSUIntegerMax - hids_bytes) {
@@ -35110,7 +35601,9 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     const NSUInteger work_offset = (tpe_bytes + hids_bytes + 7u) & ~7u;
     const uint64_t pair_rows =
         (uint64_t)(uint32_t)mm_args->ne20 * (uint32_t)mm_args->ne21;
-    const uint64_t work_cap =
+    // Six distinct selections per token: each expert has at most six rows.
+    // Keep the existing allocation/map capacity, but bound the launch to at most36 occupied slots.
+    const uint64_t work_cap = verify_mma6 ? pair_rows :
         (pair_rows + 31u * (uint32_t)mm_args->ne02 + 31u) / 32u;
     const NSUInteger work_item_bytes = 2u * sizeof(uint32_t);
     if (work_cap > NSUIntegerMax ||
@@ -35135,7 +35628,7 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     [enc setBuffer:weights offset:weights_off atIndex:8];
     [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:9];
     const NSUInteger tile_m = compact_tile ? 32u : 64u;
-    [enc setThreadgroupMemoryLength:compact_tile ? 8192u : 16384u atIndex:0];
+    [enc setThreadgroupMemoryLength:verify_mma6 ? 4608u : compact_tile ? 8192u : 16384u atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
                                           ((NSUInteger)mm_args->ne0 + tile_m - 1u) / tile_m,
                                           1)
@@ -44897,6 +45390,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline != nil &&
         g_moe_mul_mv_addr_q4_k_sum6_pipeline != nil;
     const bool use_single_token_q4_one_tensor =
+        !g_ds41_gu_mk6_rows &&
         gate_type == DS4_METAL_TENSOR_Q4_K &&
         down_type == DS4_METAL_TENSOR_Q4_K &&
         n_tokens == 1 &&
@@ -45110,10 +45604,16 @@ int ds4_gpu_routed_moe_batch_tensor(
              getenv("DS4_METAL_Q4_TABLE_RESIDENCY_SET") != NULL ||
              q4_batch_table_queue_residency ||
              ds4_gpu_q4_table_model_residency_enabled());
+        const bool gu_mma6 = g_ds41_verify6_active && g_ds41_levers.mtp_gu_mma6 &&
+            n_tokens == 6u && n_expert == 6u && n_total_expert == 384u &&
+            expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u &&
+            gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K &&
+            !g_quality_mode && !g_ssd_streaming_mode && g_tp_split_world == 1;
         const bool use_mm_id =
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr &&
-            n_tokens >= 32u &&
+            (n_tokens >= 32u || gu_mma6 ||
+             (g_ds41_force_mm_rows && n_tokens >= g_ds41_force_mm_rows)) &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         /* Reuse half activations across gate/up and all output tiles. V4.1
          * admits 512 MiB for 8k tiles; other shapes retain the 256 MiB limit. */
@@ -45188,7 +45688,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         // It changes only GU. Exact selected-slot accumulation in down is untouched.
         if (use_tiny_pair_mv && n_tokens == 2u && v41_decode_batch &&
             gate_type == DS4_METAL_TENSOR_Q4_K && !g_ssd_streaming_mode &&
-            g_tp_split_world == 1 && g_ds41_levers.mtp_gu_union2) {
+            g_tp_split_world == 1 && g_ds41_levers.mtp_gu_union2 && !g_ds41_levers.mtp_gu_union6) {
             tiny_pair_swiglu_pipeline = ds4_gpu_get_mul_mv_pipeline(
                 "kernel_dsv41_q4_gu_union2", 2);
             if (!tiny_pair_swiglu_pipeline) return 0;
@@ -45198,6 +45698,12 @@ int ds4_gpu_routed_moe_batch_tensor(
             tiny_pair_swiglu_pipeline != nil &&
             getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL;
+        if (g_ds41_gu_mk6_rows && (!use_tiny_pair_swiglu ||
+            gate_type != DS4_METAL_TENSOR_Q4_K || down_type != DS4_METAL_TENSOR_Q4_K ||
+            n_tokens != g_ds41_gu_mk6_rows || out_dim != 5120u)) {
+            fprintf(stderr, "ds41: requested GU mk6 arithmetic bypassed by incompatible MoE path\n");
+            return 0;
+        }
         ds4_gpu_mul_mm_id_map_args gate_map_args = { 0 };
         ds4_gpu_mul_mm_id_args gate_mm_args = { 0 };
         ds4_gpu_mul_mm_id_args down_mm_args = { 0 };
@@ -45234,6 +45740,10 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+        if (gu_mma6 && (!use_mm_id_pair_swiglu || g_ds41_gu_mk6_rows)) {
+            fprintf(stderr, "ds41: GU MMA6 requires resident fused Q4 mapping, mk6 off\n");
+            return 0;
+        }
         /*
          * The MXFP4 32x32 specialization uses two SIMDgroups and 8 KiB of
          * threadgroup memory, and exactly culls SIMDgroup 1 on at-most-16-row
@@ -45422,6 +45932,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                     g_tp_split_world == 1;
                 pair_swiglu_mm_pipeline =
                     ds4_gpu_get_pipeline(
+                        gu_mma6 ? "kernel_dsv41_gu_mma6" :
                         gate_type == DS4_METAL_TENSOR_Q4_K ?
                             (g_ds41_levers.routed_tail_cull ?
                                 "kernel_mul_mm_id_q4_K_pair_swiglu_f16_tail_cull" :
@@ -45711,10 +46222,14 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool direct_down_sum =
             !g_quality_mode &&
             !use_q4_batch_expert_table &&
-            !use_mm_id &&
+            (!use_mm_id || gu_mma6) &&
             n_expert == 6 &&
             (n_tokens <= 4u || v41_decode_batch || use_tp_mxfp4_static_batch) &&
             down_sum6_pipeline != nil;
+        if ((g_ds41_gu_mk6_rows || gu_mma6) && !direct_down_sum) {
+            fprintf(stderr, "ds41: GU mk6/MMA6 requires the parent sum6 down path\n");
+            return 0;
+        }
         int ok = 0;
         if (use_iq2_batch_selected_addr) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
@@ -45816,14 +46331,15 @@ int ds4_gpu_routed_moe_batch_tensor(
                     .rows = pair_rows,
                     .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
                     .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
-                    .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(uint16_t),
+                    .mid_row_stride = (uint64_t)expert_mid_dim * (gu_mma6 ? sizeof(float) : sizeof(uint16_t)),
                     .weight_stride = sizeof(float),
                     .write_clamped = 0,
                     .clamp_value = clamp,
                 };
                 ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
                                                                    pair_swiglu_mm_pipeline,
-                                                                   use_mxfp4_mm_id_pair_swiglu_compact_tile,
+                                                                   gu_mma6 || use_mxfp4_mm_id_pair_swiglu_compact_tile,
+                                                                   gu_mma6,
                                                                    &gate_mm_args,
                                                                    &act_args,
                                                                    gate_buf,
@@ -45987,7 +46503,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         DS4_METAL_PROFILE_MOE_STAGE("gate_up");
         const bool use_fused_activation = !g_quality_mode && !use_q4_batch_expert_table;
         const bool use_mid_f16 =
-            use_mm_id &&
+            use_mm_id && !gu_mma6 &&
             use_fused_activation &&
             request_mid_f16;
         if (mid_is_f16) *mid_is_f16 = use_mid_f16;
