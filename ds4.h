@@ -305,31 +305,14 @@ typedef struct {
     int prefill_hc_norm_round; /* wave 3, ADOPTED: default 1, =0 is the kill switch */
     int prefill_ffn_add_round; /* wave 3, ADOPTED: default 1, =0 is the kill switch */
     int prefill_embed_init; /* wave 3, ADOPTED: default 1, DS4_DS41_PREFILL_EMBED_INIT=0 kills it */
-    int mtp_qa_kv_flat; /* F3: paired q_a/KV banks in one dispatch. */
     int mtp_async_chunks; /* F2: submit every four verifier layers. */
-    int mtp_hc_mixed; /* F1: private HC rows mixed with paired Q8 projections. */
-    int mtp_hc_rows2; /* Private HC cohorts for two-row verification. */
     int mtp_engram_rows6; /* Six private asynchronous Engram rows. */
-    int mtp_engram_rows2; /* Private asynchronous two-row Engram inputs. */
     int dspark_excl_eos; /* Match the serial control's argmax_excluding(eos) rule. */
     int mtp_capture_warmup; /* Complete target capture from decoder warmup inputs. */
     int mtp_state_fix; /* Capture undo, truthful snapshots, seed generation. */
-    int mtp_gu_mma6; /* Probe: M8/N32/K32 routed GU, default0. */
-    int mtp_q8_mma6; /* Probe: M8/N32/K32 dense Q8, default0. */
-    int mtp_q8_mma6_mask; /* H1 family bits, default125 excludes q_b. */
-    int mtp_gu_f16acc6; /* Speed probe, parent GU geometry, default0. */
-    int mtp_q8_f16acc6; /* Speed probe, paired dense geometry, default0. */
-    int mtp_q8_f16acc6_mask; /* H1 family bits; default125 excludes q_b. */
-    int mtp_gu_mk6; /* Tier-2 GU, six-row verifier only, default0. */
-    int mtp_force_mm; /* G: lower the routed mm_id GEMM row threshold to six; default0. */
-    int mtp_gu_mk6_oracle; /* Test-only scalar replay with the new GU tree, default0. */
-    int mtp_gu_union6; /* H2: shared quant tiles, original per-row SIMD tree; default0. */
-    int mtp_gu_union6_mask; /* multiplicity bits1..5 (2..6 rows), default62. */
-    int mtp_gu_union2; /* Two-row routed gate/up only; down remains ordered. */
     int mtp_q8_stream6; /* H1: six accumulators, one logical Q8 weight stream; default0. */
     int mtp_q8_stream6_mask; /* family bits0..6, default127; cleared bits use pair6. */
     int mtp_q8_pair6; /* Six rows as three independent weight-sharing pairs. */
-    int mtp_q8_rows2; /* Opt-in; exactly two target rows. */
     int prefill_f16_rows2; /* wave 3, ADOPTED: default 1, DS4_DS41_PREFILL_F16_ROWS2=0 kills it */
     /* Wave 3, task B.  DIAGNOSTIC ONLY, never adopted: an ablation arm of the
      * prefill attention core.  0 = production kernel; 1..5 select a variant

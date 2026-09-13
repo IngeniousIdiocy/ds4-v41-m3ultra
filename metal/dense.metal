@@ -258,45 +258,6 @@ static inline void dsv41_q8_rows2(args_t args, device const char *src0,
 }
 // Speed-only variant: FP32 products, FP16 per-block and running sums.
 // Keep paired row geometry and the final FP32 reduction/scratch unchanged.
-template<typename args_t, bool ROUND = false>
-static inline void dsv41_q8_rows2_f16acc(args_t args, device const char *src0,
-        device const char *src1, device char *dst, threadgroup char *shmem,
-        uint3 tg, ushort lane, ushort sg) {
-    constexpr short NR0 = N_R0_Q8_0, NQ = 8, NW = N_SIMDWIDTH;
-    const short NSG = FC_mul_mv_nsg;
-    const int r0 = tg.x * NR0, nb = args.ne00 / QK8_0;
-    device const block_q8_0 *ax[NR0];
-    FOR_UNROLL (short row = 0; row < NR0; ++row)
-        ax[row] = (device const block_q8_0 *)(src0 + (uint64_t)(r0 + row)*args.nb01);
-    device const float *y0 = (device const float *)src1;
-    device const float *y1 = (device const float *)(src1 + args.nb11);
-    half s0[NR0] = {0.h}, s1[NR0] = {0.h};
-    const short ix = lane/(NW/NQ), il = lane%(NW/NQ);
-    const int ib0 = sg*NQ + ix;
-    device const float *yb0 = y0 + ib0*QK8_0 + il*NQ;
-    device const float *yb1 = y1 + ib0*QK8_0 + il*NQ;
-    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        float yl0[NQ], yl1[NQ];
-        for (short i = 0; i < NQ; ++i) { yl0[i] = yb0[i]; yl1[i] = yb1[i]; }
-        for (short row = 0; row < NR0; ++row) {
-            device const int8_t *qs = ax[row][ib].qs + il*NQ;
-            half q0 = 0.h, q1 = 0.h;
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                const int8_t q = qs[i];
-                q0 += half(float(q)*yl0[i]); q1 += half(float(q)*yl1[i]);
-            }
-            const half scale = ax[row][ib].d;
-            s0[row] += half(float(q0)*float(scale)); s1[row] += half(float(q1)*float(scale));
-        }
-        yb0 += NSG*NQ*QK8_0; yb1 += NSG*NQ*QK8_0;
-    }
-    float f0[NR0], f1[NR0];
-    FOR_UNROLL (short row=0;row<NR0;row++) { f0[row]=float(s0[row]); f1[row]=float(s1[row]); }
-    helper_mv_reduce_and_write<NR0, ROUND>((device float *)dst, f0,
-        r0, args.ne01, lane, sg, shmem);
-    helper_mv_reduce_and_write<NR0, ROUND>((device float *)dst + args.ne0, f1,
-        r0, args.ne01, lane, sg, shmem + NW*NR0*sizeof(float));
-}
 // H1: six token rows share each quant block. Source live FP32 values:
 // 6x2 sumf + 6x8 input lanes + 6 partial sumq = 66, plus scale/indices/pointers.
 // Keep each row's original expression and reduction helper. Each helper gets
@@ -384,17 +345,6 @@ kernel void kernel_dsv41_q8_pair6(constant ds4_metal_args_mul_mv &args,
     dsv41_q8_rows2<constant ds4_metal_args_mul_mv &>(args,w,x,out,shmem,tg,lane,sg);
 }
 
-kernel void kernel_dsv41_q8_pair6_f16acc(constant ds4_metal_args_mul_mv &args,
-        device const char *w, device const char *x, device char *out,
-        threadgroup char *shmem [[threadgroup(0)]],
-        uint3 tg [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const uint64_t row0 = 2u*tg.y;
-    x += row0*args.nb11;
-    out += row0*args.ne0*sizeof(float);
-    tg.y = 0;
-    dsv41_q8_rows2_f16acc<constant ds4_metal_args_mul_mv &>(args,w,x,out,shmem,tg,lane,sg);
-}
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
@@ -2191,71 +2141,6 @@ void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg
 
 // Same compact weight layout as routed prefill, M8/N32/K32.
 // Dynamic TG memory:2048B weights +512B inputs; reused for1024B output.
-template<typename args_t, bool ROUND = false>
-static inline void dsv41_q8_mma6(args_t args,
-        device const char *weights, device const char *input, device char *output,
-        threadgroup char *shmem, uint3 tg, ushort lane, ushort sg) {
-    const ushort tid = 32*sg + lane;
-    const int col = 32*tg.x;
-    const int weight_row = min(col + int(tid/2), int(args.ne01)-1);
-    const short il = tid%2;
-    const short row = tid/4;
-    const short ks = tid%4;
-    device const block_q8_0 *w = (device const block_q8_0 *)(weights + weight_row*args.nb01);
-    device const float *x = (device const float *)(input + min(int(row),5)*args.nb11) + 8*ks;
-    threadgroup half *sa = (threadgroup half *)shmem;
-    threadgroup half *sb = (threadgroup half *)(shmem+2048);
-    simdgroup_float8x8 mc[2];
-    mc[0] = make_filled_simdgroup_matrix<float,8>(0.f);
-    mc[1] = make_filled_simdgroup_matrix<float,8>(0.f);
-    for (int k=0; k<args.ne00; k+=32) {
-        half4x4 q;
-        dequantize_q8_0(w,il,q);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < 32) {
-            const half2x4 values = row < 6 ?
-                half2x4(*((device const float2x4 *)x)) : half2x4(0);
-            *(threadgroup half2x4 *)(sb+64*ks+8*row) = values;
-        }
-        FOR_UNROLL (short i=0; i<16; ++i) {
-            const short sx = 2*il+i/8;
-            const short sy = (tid/2)/8;
-            const short lx = (tid/2)%8;
-            const short ly = i%8;
-            sa[64*(4*sx+sy)+8*ly+lx] = q[i/4][i%4];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        FOR_UNROLL (short ik=0; ik<4; ++ik) {
-            simdgroup_half8x8 a[2], b;
-            simdgroup_load(b,sb+64*ik,8,0,false);
-            FOR_UNROLL (short i=0; i<2; ++i) {
-                simdgroup_load(a[i],sa+256*ik+128*sg+64*i,8,0,false);
-                simdgroup_multiply_accumulate(mc[i],b,a[i],mc[i]);
-            }
-        }
-        ++w;
-        x += 32;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup float *tmp = (threadgroup float *)shmem;
-    simdgroup_store(mc[0],tmp+16*sg,32,0,false);
-    simdgroup_store(mc[1],tmp+16*sg+8,32,0,false);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i=tid; i<6*32; i+=64) {
-        const int n=i%32;
-        if (col+n<args.ne01) {
-            const float v=tmp[i];
-            ((device float *)output)[(i/32)*args.ne0+col+n] = ROUND ? dsv41_bf16(v) : v;
-        }
-    }
-}
-kernel void kernel_dsv41_q8_mma6(constant ds4_metal_args_mul_mv &args,
-        device const char *w, device const char *x, device char *out,
-        threadgroup char *shmem [[threadgroup(0)]],
-        uint3 tg [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
-    dsv41_q8_mma6<constant ds4_metal_args_mul_mv &,false>(args,w,x,out,shmem,tg,lane,sg);
-}
 
 struct ds4_dense_block_q4_0 {
     half d;

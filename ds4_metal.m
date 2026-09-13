@@ -52,29 +52,6 @@ enum {
 @class DS4MetalQ4ExpertTable;
 
 static id<MTLDevice> g_device;
-static id<MTLBuffer> g_ds41_h2_plan_buffer;
-static id<MTLBuffer> g_ds41_mk6_plan_buffer;
-static unsigned g_ds41_gu_mk6_rows;
-static bool g_ds41_verify6_active;
-bool ds4_gpu_dsv41_verify6_scope(bool active) {
-    const bool previous = g_ds41_verify6_active;
-    g_ds41_verify6_active = active;
-    return previous;
-}
-unsigned ds4_gpu_dsv41_gu_mk6_scope(unsigned rows) {
-    const unsigned previous = g_ds41_gu_mk6_rows;
-    g_ds41_gu_mk6_rows = rows;
-    return previous;
-}
-/* G (probe): the routed mm_id GEMM path is selected only at 32 rows or more,
- * so a six-row verify always takes the GEMV family.  This scope lowers that one
- * selection constant for the probe; zero keeps the production threshold. */
-static unsigned g_ds41_force_mm_rows;
-unsigned ds4_gpu_dsv41_force_mm_scope(unsigned min_rows) {
-    const unsigned previous = g_ds41_force_mm_rows;
-    g_ds41_force_mm_rows = min_rows;
-    return previous;
-}
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
@@ -12772,10 +12749,6 @@ void ds4_gpu_cleanup(void) {
         ds4_gpu_clear_zero_prefix_prefill_mask_cache();
         g_flash_attn_ring_buffer = nil;
         g_flash_attn_kv_buffer = nil;
-        g_ds41_h2_plan_buffer = nil;
-        g_ds41_mk6_plan_buffer = nil;
-        g_ds41_gu_mk6_rows = 0;
-        g_ds41_verify6_active = false;
         g_glm_flash_attn_mask_buffer = nil;
         g_compressor_pool_kv_buffer = nil;
         g_compressor_pool_score_buffer = nil;
@@ -20658,14 +20631,6 @@ static bool ds4_gpu_dsv41_stream6_family(uint64_t k, uint64_t n, bool grouped) {
     return g_ds41_levers.mtp_q8_stream6 &&
         ((unsigned)g_ds41_levers.mtp_q8_stream6_mask & ds4_gpu_dsv41_q8_family_bit(k,n,grouped));
 }
-static bool ds4_gpu_dsv41_f16acc6_family(uint64_t k, uint64_t n, bool grouped) {
-    return g_ds41_verify6_active && g_ds41_levers.mtp_q8_f16acc6 &&
-        ((unsigned)g_ds41_levers.mtp_q8_f16acc6_mask & ds4_gpu_dsv41_q8_family_bit(k,n,grouped));
-}
-static bool ds4_gpu_dsv41_mma6_family(uint64_t k, uint64_t n, bool grouped) {
-    return g_ds41_verify6_active && g_ds41_levers.mtp_q8_mma6 &&
-        ((unsigned)g_ds41_levers.mtp_q8_mma6_mask & ds4_gpu_dsv41_q8_family_bit(k,n,grouped));
-}
 static bool ds4_gpu_dsv41_stream6_fits(id<MTLComputePipelineState> p,
                                      NSUInteger nsg, NSUInteger shared) {
     return p && p.maxTotalThreadsPerThreadgroup >= 32u*nsg &&
@@ -20727,30 +20692,17 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.nr0 = dispatch.nr0;
 
         ds41_levers_init_from_env();
-        const bool rows2 = n_rows == 2u && (out_dim % 2u) == 0 &&
-            !g_quality_mode && !ds4_gpu_tp_world_is_two() && g_ds41_levers.mtp_q8_rows2;
         const bool pair6 = n_rows == 6u && (out_dim % 2u) == 0 &&
             !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
             (g_ds41_levers.mtp_q8_pair6 || g_ds41_levers.mtp_q8_stream6);
-        const bool paired = rows2 || pair6;
-        const bool mma6 = n_rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
-            ds4_gpu_dsv41_mma6_family(in_dim, out_dim, false);
-        const bool f16acc6 = !mma6 && pair6 && ds4_gpu_dsv41_f16acc6_family(in_dim, out_dim, false);
-        bool stream6 = !mma6 && !f16acc6 && pair6 && ds4_gpu_dsv41_stream6_family(in_dim, out_dim, false);
+        const bool paired = pair6;
+        bool stream6 = pair6 && ds4_gpu_dsv41_stream6_family(in_dim, out_dim, false);
         id<MTLComputePipelineState> pipeline = stream6 ? ds4_gpu_get_mul_mv_pipeline(
             "kernel_dsv41_q8_stream6", dispatch.nsg) : nil;
         if (stream6 && !ds4_gpu_dsv41_stream6_fits(pipeline, dispatch.nsg, dispatch.smem*6u))
             stream6 = false;
         if (!stream6) pipeline = ds4_gpu_get_mul_mv_pipeline(
-            f16acc6 ? "kernel_dsv41_q8_pair6_f16acc" :
-            pair6 ? "kernel_dsv41_q8_pair6" :
-            rows2 ? "kernel_dsv41_q8_rows2" : dispatch.function_name, dispatch.nsg);
-        if (mma6) {
-            pipeline = ds4_gpu_get_pipeline("kernel_dsv41_q8_mma6");
-            dispatch.nr0 = args.nr0 = 32;
-            dispatch.nsg = 2;
-            if (!ds4_gpu_dsv41_stream6_fits(pipeline,2,2560u)) return 0;
-        }
+            pair6 ? "kernel_dsv41_q8_pair6" : dispatch.function_name, dispatch.nsg);
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -20762,12 +20714,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:mma6 ? 2560u : dispatch.smem * (stream6 ? 6u : paired ? 2u : 1u) atIndex:0];
+        [enc setThreadgroupMemoryLength:dispatch.smem * (stream6 ? 6u : paired ? 2u : 1u) atIndex:0];
         [enc dispatchThreadgroups:
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)((mma6 || stream6) ? 1u : paired ? n_rows/2u : n_rows),
+                            (NSUInteger)(stream6 ? 1u : paired ? n_rows/2u : n_rows),
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
@@ -28608,11 +28560,7 @@ int ds4_gpu_dsv41_attention_low_paired_tensor(
             };
             /* R8': the rounding twin writes the same words the separate
              * kernel_dsv41_bf16_linear pass over this output would write. */
-            const bool mma6 = rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
-                ds4_gpu_dsv41_mma6_family(group_dim, low_dim, true);
-            const bool f16acc6 = !mma6 && rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
-                ds4_gpu_dsv41_f16acc6_family(group_dim, low_dim, true);
-            bool stream6 = !mma6 && !f16acc6 && rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
+            bool stream6 = rows == 6u && !g_quality_mode && !ds4_gpu_tp_world_is_two() &&
                 ds4_gpu_dsv41_stream6_family(group_dim, low_dim, true);
             id<MTLComputePipelineState> pipeline = stream6 ?
                 ds4_gpu_get_mul_mv_pipeline(round ? "kernel_dsv41_attn_low_stream6_bf16" :
@@ -28620,16 +28568,8 @@ int ds4_gpu_dsv41_attention_low_paired_tensor(
             if (stream6 && !ds4_gpu_dsv41_stream6_fits(pipeline, 4, 1536u)) stream6 = false;
             if (stream6) args.nei1 = 1;
             else pipeline = ds4_gpu_get_mul_mv_pipeline(rows == 6u ?
-                    (f16acc6 ? (round ? "kernel_dsv41_attn_low_pair6_f16acc_bf16" : "kernel_dsv41_attn_low_pair6_f16acc") :
-                     (round ? "kernel_dsv41_attn_low_pair6_bf16" : "kernel_dsv41_attn_low_pair6")) :
+                    (round ? "kernel_dsv41_attn_low_pair6_bf16" : "kernel_dsv41_attn_low_pair6") :
                     (round ? "kernel_dsv41_attn_low_rows2_bf16" : "kernel_dsv41_attn_low_rows2"), 4);
-            if (mma6) {
-                args.nei1 = 1;
-                args.nr0 = 32;
-                pipeline = ds4_gpu_get_pipeline(round ? "kernel_dsv41_attn_low_mma6_bf16" :
-                                                       "kernel_dsv41_attn_low_mma6");
-                if (!ds4_gpu_dsv41_stream6_fits(pipeline,2,2560u)) pipeline = nil;
-            }
             ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                          pipeline,
                                                          &args,
@@ -28639,8 +28579,8 @@ int ds4_gpu_dsv41_attention_low_paired_tensor(
                                                          ds4_gpu_tensor_offset(heads),
                                                          ds4_gpu_tensor_buffer(low),
                                                          ds4_gpu_tensor_offset(low),
-                                                         mma6 ? 2560u : stream6 ? 1536u : 32u * 4u * sizeof(float),
-                                                         mma6 ? 2 : 4,
+                                                         stream6 ? 1536u : 32u * 4u * sizeof(float),
+                                                         4,
                                                          true) != 0;
         }
 
@@ -33746,186 +33686,6 @@ static int ds4_gpu_encode_mul_mv_id_pair(
     return 1;
 }
 
-static int ds4_gpu_encode_ds41_h2(
-        id<MTLCommandBuffer>        cb,
-        id<MTLComputePipelineState> pipeline,
-        const ds4_gpu_mul_mv_id_args *args,
-        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
-        id<MTLBuffer>               src0_a,
-        NSUInteger                  src0_a_off,
-        id<MTLBuffer>               src0_b,
-        NSUInteger                  src0_b_off,
-        id<MTLBuffer>               src1,
-        NSUInteger                  src1_off,
-        id<MTLBuffer>               dst_a,
-        NSUInteger                  dst_a_off,
-        id<MTLBuffer>               dst_b,
-        NSUInteger                  dst_b_off,
-        id<MTLBuffer>               dst_mid,
-        NSUInteger                  dst_mid_off,
-        id<MTLBuffer>               ids,
-        NSUInteger                  ids_off,
-        id<MTLBuffer>               weights,
-        NSUInteger                  weights_off,
-        NSUInteger                  threadgroup_bytes,
-        NSUInteger                  nsg,
-        bool                        rows_per_group_is_nr0) {
-    (void)pipeline; (void)threadgroup_bytes; (void)nsg; (void)rows_per_group_is_nr0;
-    // Return -1 only before any H2 command was encoded: parent fallback is safe.
-    if (!g_ds41_levers.mtp_gu_union6 || g_quality_mode || g_ssd_streaming_mode ||
-        args->tp_world != 1 || args->tp_expert_base != 0 || args->nei0 != 6 ||
-        (args->nei1 != 2 && args->nei1 != 6) || args->ne02 != 384 ||
-        args->ne00 != 5120 || args->ne01 != 2304 || args->ne0 != 2304 ||
-        args->nb01 != 2880u || args->nr0 != 2) return -1;
-    const char *names[]={"kernel_dsv41_h2_gu_1","kernel_dsv41_h2_gu_2",
-        "kernel_dsv41_h2_gu_3","kernel_dsv41_h2_gu_4","kernel_dsv41_h2_gu_5","kernel_dsv41_h2_gu_6"};
-    id<MTLComputePipelineState> stages[6];
-    uint32_t mask=(uint32_t)g_ds41_levers.mtp_gu_union6_mask & 62u;
-    id<MTLComputePipelineState> planner=ds4_gpu_get_pipeline("kernel_dsv41_gu_plan");
-    if (!planner || planner.maxTotalThreadsPerThreadgroup<32u) return -1;
-    for (unsigned b=0;b<6;b++) {
-        stages[b]=ds4_gpu_get_mul_mv_pipeline(names[b],2);
-        const NSUInteger shared=b ? 23040u : 16u;
-        if (!stages[b] || stages[b].maxTotalThreadsPerThreadgroup<64u*(b+1) ||
-            stages[b].staticThreadgroupMemoryLength+shared>g_device.maxThreadgroupMemoryLength) {
-            if (!b) return -1;
-            mask &= ~(1u<<b);
-        }
-    }
-    if (!g_ds41_h2_plan_buffer)
-        g_ds41_h2_plan_buffer=[g_device newBufferWithLength:6984u options:MTLResourceStorageModeShared];
-    if (!g_ds41_h2_plan_buffer) return -1;
-    id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb);
-    if (!enc) return 0;
-    id<MTLResource> plan_resources[]={g_ds41_h2_plan_buffer};
-    // The queue reuses this GPU-written plan only after prior consumers finish.
-    [enc memoryBarrierWithResources:plan_resources count:1u];
-    [enc setComputePipelineState:planner];
-    [enc setBytes:args length:sizeof(*args) atIndex:0];
-    [enc setBuffer:ids offset:ids_off atIndex:1];
-    [enc setBuffer:g_ds41_h2_plan_buffer offset:0 atIndex:2];
-    [enc setBytes:&mask length:sizeof(mask) atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
-    [enc memoryBarrierWithResources:plan_resources count:1u];
-    for (unsigned b=0;b<6;b++) {
-        if (b && !(mask & (1u<<b))) continue; // planner emitted these as singletons
-        [enc setComputePipelineState:stages[b]];
-        [enc setBytes:args length:sizeof(*args) atIndex:0];
-        [enc setBytes:act length:sizeof(*act) atIndex:1];
-        [enc setBuffer:src0_a offset:src0_a_off atIndex:2];
-        [enc setBuffer:src0_b offset:src0_b_off atIndex:3];
-        [enc setBuffer:src1 offset:src1_off atIndex:4];
-        [enc setBuffer:dst_a offset:dst_a_off atIndex:5];
-        [enc setBuffer:dst_b offset:dst_b_off atIndex:6];
-        [enc setBuffer:dst_mid offset:dst_mid_off atIndex:7];
-        [enc setBuffer:ids offset:ids_off atIndex:8];
-        [enc setBuffer:weights offset:weights_off atIndex:9];
-        [enc setBuffer:g_ds41_h2_plan_buffer offset:0 atIndex:10];
-        [enc setThreadgroupMemoryLength:b ? 23040u : 16u atIndex:0];
-        [enc dispatchThreadgroupsWithIndirectBuffer:g_ds41_h2_plan_buffer
-              indirectBufferOffset:b*12u threadsPerThreadgroup:MTLSizeMake(32,2u*(b+1u),1)];
-    }
-    id<MTLResource> output_resources[]={dst_a,dst_b,dst_mid,g_ds41_h2_plan_buffer};
-    [enc memoryBarrierWithResources:output_resources count:4u];
-    ds4_gpu_end_compute_encoder(cb,enc);
-    return 1;
-}
-
-static int ds4_gpu_encode_ds41_mk6(
-        id<MTLCommandBuffer>        cb,
-        id<MTLComputePipelineState> pipeline,
-        const ds4_gpu_mul_mv_id_args *args,
-        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
-        id<MTLBuffer>               src0_a,
-        NSUInteger                  src0_a_off,
-        id<MTLBuffer>               src0_b,
-        NSUInteger                  src0_b_off,
-        id<MTLBuffer>               src1,
-        NSUInteger                  src1_off,
-        id<MTLBuffer>               dst_a,
-        NSUInteger                  dst_a_off,
-        id<MTLBuffer>               dst_b,
-        NSUInteger                  dst_b_off,
-        id<MTLBuffer>               dst_mid,
-        NSUInteger                  dst_mid_off,
-        id<MTLBuffer>               ids,
-        NSUInteger                  ids_off,
-        id<MTLBuffer>               weights,
-        NSUInteger                  weights_off,
-        NSUInteger                  threadgroup_bytes,
-        NSUInteger                  nsg,
-        bool                        rows_per_group_is_nr0) {
-    (void)pipeline; (void)threadgroup_bytes; (void)nsg; (void)rows_per_group_is_nr0;
-    // Only ds41 target scalar-oracle/verify callers may arm this scope.
-    // Once explicitly requested, fail closed if unsupported: no false oracle.
-    if (!g_ds41_gu_mk6_rows) return -1;
-    if (!cb || g_quality_mode || g_ssd_streaming_mode ||
-        args->tp_world != 1 || args->tp_expert_base != 0 || args->nei0 != 6 ||
-        args->nei1 != (int)g_ds41_gu_mk6_rows ||
-        (args->nei1 != 1 && args->nei1 != 6) || args->ne02 != 384 ||
-        args->ne00 != 5120 || args->ne01 != 2304 || args->ne0 != 2304 ||
-        args->ne11 != 1 || args->ne1 != 6 || args->nb01 != 2880u ||
-        args->nb02 != 2880ull*2304ull || act->write_clamped) {
-        fprintf(stderr, "ds41: GU mk6 requires exact resident TP1 Q4_K target shape\n");
-        return 0;
-    }
-    const char *names[]={"kernel_dsv41_gu_mk6_1","kernel_dsv41_gu_mk6_2",
-        "kernel_dsv41_gu_mk6_3","kernel_dsv41_gu_mk6_4","kernel_dsv41_gu_mk6_5","kernel_dsv41_gu_mk6_6"};
-    id<MTLComputePipelineState> stages[6];
-    const unsigned buckets=args->nei1 == 1 ? 1u : 6u;
-    const uint32_t mask=62u; // all supported multiplicities, NT1 always narrow
-    id<MTLComputePipelineState> planner=ds4_gpu_get_pipeline("kernel_dsv41_gu_mk6_plan");
-    if (!planner || planner.maxTotalThreadsPerThreadgroup<32u) return 0;
-    for (unsigned b=0;b<buckets;b++) {
-        stages[b]=ds4_gpu_get_pipeline(names[b]);
-        const NSUInteger columns=b ? 16u : 4u;
-        const NSUInteger shared=(2u*columns+(b+1u))*32u*sizeof(float);
-        if (!stages[b] || stages[b].threadExecutionWidth != 32u ||
-            stages[b].maxTotalThreadsPerThreadgroup<columns*16u ||
-            stages[b].staticThreadgroupMemoryLength+shared>g_device.maxThreadgroupMemoryLength) {
-            fprintf(stderr, "ds41: GU mk6 multiplicity %u unsupported; refusing requested arithmetic\n",b+1);
-            return 0;
-        }
-    }
-    if (!g_ds41_mk6_plan_buffer)
-        g_ds41_mk6_plan_buffer=[g_device newBufferWithLength:6984u options:MTLResourceStorageModeShared];
-    if (!g_ds41_mk6_plan_buffer) return 0;
-    id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb);
-    if (!enc) return 0;
-    id<MTLResource> plan_resources[]={g_ds41_mk6_plan_buffer};
-    // The queue reuses this GPU-written plan only after prior consumers finish.
-    [enc memoryBarrierWithResources:plan_resources count:1u];
-    [enc setComputePipelineState:planner];
-    [enc setBytes:args length:sizeof(*args) atIndex:0];
-    [enc setBuffer:ids offset:ids_off atIndex:1];
-    [enc setBuffer:g_ds41_mk6_plan_buffer offset:0 atIndex:2];
-    [enc setBytes:&mask length:sizeof(mask) atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
-    [enc memoryBarrierWithResources:plan_resources count:1u];
-    for (unsigned b=0;b<buckets;b++) {
-        [enc setComputePipelineState:stages[b]];
-        [enc setBytes:args length:sizeof(*args) atIndex:0];
-        [enc setBytes:act length:sizeof(*act) atIndex:1];
-        [enc setBuffer:src0_a offset:src0_a_off atIndex:2];
-        [enc setBuffer:src0_b offset:src0_b_off atIndex:3];
-        [enc setBuffer:src1 offset:src1_off atIndex:4];
-        [enc setBuffer:dst_a offset:dst_a_off atIndex:5];
-        [enc setBuffer:dst_b offset:dst_b_off atIndex:6];
-        [enc setBuffer:dst_mid offset:dst_mid_off atIndex:7];
-        [enc setBuffer:ids offset:ids_off atIndex:8];
-        [enc setBuffer:weights offset:weights_off atIndex:9];
-        [enc setBuffer:g_ds41_mk6_plan_buffer offset:0 atIndex:10];
-        const NSUInteger columns=b ? 16u : 4u;
-        [enc setThreadgroupMemoryLength:(2u*columns+(b+1u))*32u*sizeof(float) atIndex:0];
-        [enc dispatchThreadgroupsWithIndirectBuffer:g_ds41_mk6_plan_buffer
-              indirectBufferOffset:b*12u threadsPerThreadgroup:MTLSizeMake(32,columns/2u,1)];
-    }
-    id<MTLResource> output_resources[]={dst_a,dst_b,dst_mid,g_ds41_mk6_plan_buffer};
-    [enc memoryBarrierWithResources:output_resources count:4u];
-    ds4_gpu_end_compute_encoder(cb,enc);
-    return 1;
-}
-
 static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -33954,27 +33714,6 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
         !src0_a || !src0_b || !src1 || !dst_a || !dst_b || !dst_mid || !ids || !weights ||
         args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 <= 0 || args->nei1 <= 0) {
         return 0;
-    }
-
-    const bool f16acc6 = g_ds41_verify6_active && g_ds41_levers.mtp_gu_f16acc6 &&
-        !g_quality_mode && !g_ssd_streaming_mode && args->nei1 == 6 &&
-        args->nei0 == 6 && args->ne02 == 384 && args->ne00 == 5120 &&
-        args->ne01 == 2304 && args->nb01 == 2880 && args->tp_world == 1 &&
-        args->tp_expert_base == 0 && args->nr0 == 2;
-    if (f16acc6) {
-        pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_dsv41_q4_gu_f16acc6", nsg);
-        if (!pipeline) return 0;
-    } else {
-        const int mk6=ds4_gpu_encode_ds41_mk6(cb,pipeline,args,act,
-            src0_a,src0_a_off,src0_b,src0_b_off,src1,src1_off,dst_a,dst_a_off,dst_b,dst_b_off,
-            dst_mid,dst_mid_off,ids,ids_off,weights,weights_off,threadgroup_bytes,nsg,rows_per_group_is_nr0);
-        if (mk6>=0) return mk6;
-
-        const int h2=ds4_gpu_encode_ds41_h2(cb,pipeline,args,act,
-            src0_a,src0_a_off,src0_b,src0_b_off,src1,src1_off,dst_a,dst_a_off,dst_b,dst_b_off,
-            dst_mid,dst_mid_off,ids,ids_off,weights,weights_off,threadgroup_bytes,nsg,rows_per_group_is_nr0);
-        if (h2>=0) return h2;
-
     }
 
     const NSUInteger nr0 = (NSUInteger)args->nr0;
@@ -45390,7 +45129,6 @@ int ds4_gpu_routed_moe_batch_tensor(
         g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline != nil &&
         g_moe_mul_mv_addr_q4_k_sum6_pipeline != nil;
     const bool use_single_token_q4_one_tensor =
-        !g_ds41_gu_mk6_rows &&
         gate_type == DS4_METAL_TENSOR_Q4_K &&
         down_type == DS4_METAL_TENSOR_Q4_K &&
         n_tokens == 1 &&
@@ -45604,16 +45342,10 @@ int ds4_gpu_routed_moe_batch_tensor(
              getenv("DS4_METAL_Q4_TABLE_RESIDENCY_SET") != NULL ||
              q4_batch_table_queue_residency ||
              ds4_gpu_q4_table_model_residency_enabled());
-        const bool gu_mma6 = g_ds41_verify6_active && g_ds41_levers.mtp_gu_mma6 &&
-            n_tokens == 6u && n_expert == 6u && n_total_expert == 384u &&
-            expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u &&
-            gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K &&
-            !g_quality_mode && !g_ssd_streaming_mode && g_tp_split_world == 1;
         const bool use_mm_id =
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr &&
-            (n_tokens >= 32u || gu_mma6 ||
-             (g_ds41_force_mm_rows && n_tokens >= g_ds41_force_mm_rows)) &&
+            n_tokens >= 32u &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         /* Reuse half activations across gate/up and all output tiles. V4.1
          * admits 512 MiB for 8k tiles; other shapes retain the 256 MiB limit. */
@@ -45684,26 +45416,11 @@ int ds4_gpu_routed_moe_batch_tensor(
                 g_moe_mul_mv_id_mxfp4_pair_swiglu_tp_static_pipeline_nsg1 :
                 g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline;
         }
-        // Union ownership is computed on-device from the unchanged two route lists.
-        // It changes only GU. Exact selected-slot accumulation in down is untouched.
-        if (use_tiny_pair_mv && n_tokens == 2u && v41_decode_batch &&
-            gate_type == DS4_METAL_TENSOR_Q4_K && !g_ssd_streaming_mode &&
-            g_tp_split_world == 1 && g_ds41_levers.mtp_gu_union2 && !g_ds41_levers.mtp_gu_union6) {
-            tiny_pair_swiglu_pipeline = ds4_gpu_get_mul_mv_pipeline(
-                "kernel_dsv41_q4_gu_union2", 2);
-            if (!tiny_pair_swiglu_pipeline) return 0;
-        }
         const bool use_tiny_pair_swiglu =
             use_tiny_pair_mv &&
             tiny_pair_swiglu_pipeline != nil &&
             getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL;
-        if (g_ds41_gu_mk6_rows && (!use_tiny_pair_swiglu ||
-            gate_type != DS4_METAL_TENSOR_Q4_K || down_type != DS4_METAL_TENSOR_Q4_K ||
-            n_tokens != g_ds41_gu_mk6_rows || out_dim != 5120u)) {
-            fprintf(stderr, "ds41: requested GU mk6 arithmetic bypassed by incompatible MoE path\n");
-            return 0;
-        }
         ds4_gpu_mul_mm_id_map_args gate_map_args = { 0 };
         ds4_gpu_mul_mm_id_args gate_mm_args = { 0 };
         ds4_gpu_mul_mm_id_args down_mm_args = { 0 };
@@ -45740,10 +45457,6 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
-        if (gu_mma6 && (!use_mm_id_pair_swiglu || g_ds41_gu_mk6_rows)) {
-            fprintf(stderr, "ds41: GU MMA6 requires resident fused Q4 mapping, mk6 off\n");
-            return 0;
-        }
         /*
          * The MXFP4 32x32 specialization uses two SIMDgroups and 8 KiB of
          * threadgroup memory, and exactly culls SIMDgroup 1 on at-most-16-row
@@ -45932,7 +45645,6 @@ int ds4_gpu_routed_moe_batch_tensor(
                     g_tp_split_world == 1;
                 pair_swiglu_mm_pipeline =
                     ds4_gpu_get_pipeline(
-                        gu_mma6 ? "kernel_dsv41_gu_mma6" :
                         gate_type == DS4_METAL_TENSOR_Q4_K ?
                             (g_ds41_levers.routed_tail_cull ?
                                 "kernel_mul_mm_id_q4_K_pair_swiglu_f16_tail_cull" :
@@ -46222,14 +45934,10 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool direct_down_sum =
             !g_quality_mode &&
             !use_q4_batch_expert_table &&
-            (!use_mm_id || gu_mma6) &&
+            !use_mm_id &&
             n_expert == 6 &&
             (n_tokens <= 4u || v41_decode_batch || use_tp_mxfp4_static_batch) &&
             down_sum6_pipeline != nil;
-        if ((g_ds41_gu_mk6_rows || gu_mma6) && !direct_down_sum) {
-            fprintf(stderr, "ds41: GU mk6/MMA6 requires the parent sum6 down path\n");
-            return 0;
-        }
         int ok = 0;
         if (use_iq2_batch_selected_addr) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
@@ -46331,15 +46039,15 @@ int ds4_gpu_routed_moe_batch_tensor(
                     .rows = pair_rows,
                     .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
                     .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
-                    .mid_row_stride = (uint64_t)expert_mid_dim * (gu_mma6 ? sizeof(float) : sizeof(uint16_t)),
+                    .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(uint16_t),
                     .weight_stride = sizeof(float),
                     .write_clamped = 0,
                     .clamp_value = clamp,
                 };
                 ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
                                                                    pair_swiglu_mm_pipeline,
-                                                                   gu_mma6 || use_mxfp4_mm_id_pair_swiglu_compact_tile,
-                                                                   gu_mma6,
+                                                                   use_mxfp4_mm_id_pair_swiglu_compact_tile,
+                                                                   false,
                                                                    &gate_mm_args,
                                                                    &act_args,
                                                                    gate_buf,
@@ -46503,7 +46211,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         DS4_METAL_PROFILE_MOE_STAGE("gate_up");
         const bool use_fused_activation = !g_quality_mode && !use_q4_batch_expert_table;
         const bool use_mid_f16 =
-            use_mm_id && !gu_mma6 &&
+            use_mm_id &&
             use_fused_activation &&
             request_mid_f16;
         if (mid_is_f16) *mid_is_f16 = use_mid_f16;

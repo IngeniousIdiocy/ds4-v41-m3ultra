@@ -39716,7 +39716,6 @@ static int ds41_lever_counted(const char *name) {
     return !strcmp(name, "engram_readers") || !strcmp(name, "attn_diag") ||
            !strcmp(name, "attn_geom") || !strcmp(name, "gather_wide") ||
            !strcmp(name, "hc_expand_nth") || !strcmp(name, "mtp_q8_stream6_mask") ||
-           !strcmp(name, "mtp_gu_union6_mask") || !strcmp(name, "mtp_q8_f16acc6_mask") || !strcmp(name, "mtp_q8_mma6_mask") ||
            !strcmp(name, "dspark_verify_rows");
 }
 
@@ -39760,31 +39759,14 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "prefill_tail_absorb", offsetof(ds41_levers, prefill_tail_absorb), "DS4_DS41_PREFILL_TAIL_ABSORB" },
     { "engram_readers",     offsetof(ds41_levers, engram_readers),     "DS4_DS41_ENGRAM_READERS" },
     { "prefill_attn_rb16",  offsetof(ds41_levers, prefill_attn_rb16),  "DS4_METAL_DISABLE_V41_PREFILL_ATTN_RB16" },
-    { "mtp_qa_kv_flat", offsetof(ds41_levers, mtp_qa_kv_flat), "DS4_DS41_MTP_QA_KV_FLAT" },
     { "mtp_async_chunks", offsetof(ds41_levers, mtp_async_chunks), "DS4_DS41_MTP_ASYNC_CHUNKS" },
-    { "mtp_hc_mixed", offsetof(ds41_levers, mtp_hc_mixed), "DS4_DS41_MTP_HC_MIXED" },
-    { "mtp_hc_rows2", offsetof(ds41_levers, mtp_hc_rows2), "DS4_DS41_MTP_HC_ROWS2" },
     { "mtp_engram_rows6", offsetof(ds41_levers, mtp_engram_rows6), "DS4_DS41_MTP_ENGRAM_ROWS6" },
-    { "mtp_engram_rows2", offsetof(ds41_levers, mtp_engram_rows2), "DS4_DS41_MTP_ENGRAM_ROWS2" },
     { "dspark_excl_eos", offsetof(ds41_levers, dspark_excl_eos), "DS4_DS41_DSPARK_EXCL_EOS" },
     { "mtp_capture_warmup", offsetof(ds41_levers, mtp_capture_warmup), "DS4_DS41_MTP_CAPTURE_WARMUP" },
     { "mtp_state_fix", offsetof(ds41_levers, mtp_state_fix), "DS4_DS41_MTP_STATE_FIX" },
-    { "mtp_gu_mma6", offsetof(ds41_levers, mtp_gu_mma6), "DS4_DS41_MTP_GU_MMA6" },
-    { "mtp_q8_mma6", offsetof(ds41_levers, mtp_q8_mma6), "DS4_DS41_MTP_Q8_MMA6" },
-    { "mtp_q8_mma6_mask", offsetof(ds41_levers, mtp_q8_mma6_mask), "DS4_DS41_MTP_Q8_MMA6_MASK" },
-    { "mtp_gu_f16acc6", offsetof(ds41_levers, mtp_gu_f16acc6), "DS4_DS41_MTP_GU_F16ACC6" },
-    { "mtp_q8_f16acc6", offsetof(ds41_levers, mtp_q8_f16acc6), "DS4_DS41_MTP_Q8_F16ACC6" },
-    { "mtp_q8_f16acc6_mask", offsetof(ds41_levers, mtp_q8_f16acc6_mask), "DS4_DS41_MTP_Q8_F16ACC6_MASK" },
-    { "mtp_gu_mk6", offsetof(ds41_levers, mtp_gu_mk6), "DS4_DS41_MTP_GU_MK6" },
-    { "mtp_gu_mk6_oracle", offsetof(ds41_levers, mtp_gu_mk6_oracle), "DS4_DS41_MTP_GU_MK6_ORACLE" },
-    { "mtp_force_mm",  offsetof(ds41_levers, mtp_force_mm),  "DS4_DS41_MTP_FORCE_MM" },
-    { "mtp_gu_union6", offsetof(ds41_levers, mtp_gu_union6), "DS4_DS41_MTP_GU_UNION6" },
-    { "mtp_gu_union6_mask", offsetof(ds41_levers, mtp_gu_union6_mask), "DS4_DS41_MTP_GU_UNION6_MASK" },
-    { "mtp_gu_union2", offsetof(ds41_levers, mtp_gu_union2), "DS4_DS41_MTP_GU_UNION2" },
     { "mtp_q8_stream6", offsetof(ds41_levers, mtp_q8_stream6), "DS4_DS41_MTP_Q8_STREAM6" },
     { "mtp_q8_stream6_mask", offsetof(ds41_levers, mtp_q8_stream6_mask), "DS4_DS41_MTP_Q8_STREAM6_MASK" },
     { "mtp_q8_pair6", offsetof(ds41_levers, mtp_q8_pair6), "DS4_DS41_MTP_Q8_PAIR6" },
-    { "mtp_q8_rows2", offsetof(ds41_levers, mtp_q8_rows2), "DS4_DS41_MTP_Q8_ROWS2" },
     { "prefill_f16_rows2", offsetof(ds41_levers, prefill_f16_rows2), "DS4_DS41_PREFILL_F16_ROWS2" },
     { "prefill_embed_init", offsetof(ds41_levers, prefill_embed_init), "DS4_DS41_PREFILL_EMBED_INIT" },
     { "prefill_hc_sum_round", offsetof(ds41_levers, prefill_hc_sum_round), "DS4_DS41_PREFILL_HC_SUM_ROUND" },
@@ -39895,49 +39877,14 @@ void ds41_levers_init_from_env(void) {
         }
     }
     g_ds41_levers.prefill_attn_rb16 = ds41_env_disable_form("DS4_METAL_DISABLE_V41_PREFILL_ATTN_RB16");
-    g_ds41_levers.mtp_qa_kv_flat = getenv("DS4_DS41_MTP_QA_KV_FLAT") &&
-        ds41_env_enable_form("DS4_DS41_MTP_QA_KV_FLAT");
     g_ds41_levers.mtp_async_chunks = getenv("DS4_DS41_MTP_ASYNC_CHUNKS") &&
         ds41_env_enable_form("DS4_DS41_MTP_ASYNC_CHUNKS");
-    g_ds41_levers.mtp_hc_mixed = getenv("DS4_DS41_MTP_HC_MIXED") &&
-        ds41_env_enable_form("DS4_DS41_MTP_HC_MIXED");
-    g_ds41_levers.mtp_hc_rows2 = getenv("DS4_DS41_MTP_HC_ROWS2") &&
-        ds41_env_enable_form("DS4_DS41_MTP_HC_ROWS2");
     g_ds41_levers.mtp_engram_rows6 = getenv("DS4_DS41_MTP_ENGRAM_ROWS6") &&
         ds41_env_enable_form("DS4_DS41_MTP_ENGRAM_ROWS6");
-    g_ds41_levers.mtp_engram_rows2 = getenv("DS4_DS41_MTP_ENGRAM_ROWS2") &&
-        ds41_env_enable_form("DS4_DS41_MTP_ENGRAM_ROWS2");
     g_ds41_levers.dspark_excl_eos = getenv("DS4_DS41_DSPARK_EXCL_EOS") &&
         atoi(getenv("DS4_DS41_DSPARK_EXCL_EOS")) != 0;
     g_ds41_levers.mtp_capture_warmup = ds41_env_enable_form("DS4_DS41_MTP_CAPTURE_WARMUP");
     g_ds41_levers.mtp_state_fix = ds41_env_enable_form("DS4_DS41_MTP_STATE_FIX");
-    g_ds41_levers.mtp_gu_mma6 = getenv("DS4_DS41_MTP_GU_MMA6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_GU_MMA6");
-    g_ds41_levers.mtp_q8_mma6 = getenv("DS4_DS41_MTP_Q8_MMA6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_Q8_MMA6");
-    { const char *v = getenv("DS4_DS41_MTP_Q8_MMA6_MASK");
-      int mask = v ? atoi(v) : 125;
-      g_ds41_levers.mtp_q8_mma6_mask = mask >= 0 && mask <= 127 ? mask : 0; }
-    g_ds41_levers.mtp_gu_f16acc6 = getenv("DS4_DS41_MTP_GU_F16ACC6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_GU_F16ACC6");
-    g_ds41_levers.mtp_q8_f16acc6 = getenv("DS4_DS41_MTP_Q8_F16ACC6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_Q8_F16ACC6");
-    { const char *v = getenv("DS4_DS41_MTP_Q8_F16ACC6_MASK");
-      int mask = v ? atoi(v) : 125;
-      g_ds41_levers.mtp_q8_f16acc6_mask = mask >= 0 && mask <= 127 ? mask : 0; }
-    g_ds41_levers.mtp_gu_mk6 = getenv("DS4_DS41_MTP_GU_MK6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_GU_MK6");
-    g_ds41_levers.mtp_gu_mk6_oracle = getenv("DS4_DS41_MTP_GU_MK6_ORACLE") &&
-        ds41_env_enable_form("DS4_DS41_MTP_GU_MK6_ORACLE");
-    g_ds41_levers.mtp_force_mm = getenv("DS4_DS41_MTP_FORCE_MM") &&
-        getenv("DS4_DS41_MTP_FORCE_MM")[0] == '1';
-    g_ds41_levers.mtp_gu_union6 = getenv("DS4_DS41_MTP_GU_UNION6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_GU_UNION6");
-    { const char *v = getenv("DS4_DS41_MTP_GU_UNION6_MASK");
-      int mask = v ? atoi(v) : 62;
-      g_ds41_levers.mtp_gu_union6_mask = mask >= 0 && mask <= 62 ? mask : 0; }
-    g_ds41_levers.mtp_gu_union2 = getenv("DS4_DS41_MTP_GU_UNION2") &&
-        ds41_env_enable_form("DS4_DS41_MTP_GU_UNION2");
     g_ds41_levers.mtp_q8_stream6 = getenv("DS4_DS41_MTP_Q8_STREAM6") &&
         ds41_env_enable_form("DS4_DS41_MTP_Q8_STREAM6");
     { const char *v = getenv("DS4_DS41_MTP_Q8_STREAM6_MASK");
@@ -39945,8 +39892,6 @@ void ds41_levers_init_from_env(void) {
       g_ds41_levers.mtp_q8_stream6_mask = mask >= 0 && mask <= 127 ? mask : 0; }
     g_ds41_levers.mtp_q8_pair6 = getenv("DS4_DS41_MTP_Q8_PAIR6") &&
         ds41_env_enable_form("DS4_DS41_MTP_Q8_PAIR6");
-    g_ds41_levers.mtp_q8_rows2 = getenv("DS4_DS41_MTP_Q8_ROWS2") &&
-        ds41_env_enable_form("DS4_DS41_MTP_Q8_ROWS2");
     g_ds41_levers.prefill_f16_rows2 = ds41_env_enable_form("DS4_DS41_PREFILL_F16_ROWS2");
     g_ds41_levers.prefill_embed_init = ds41_env_enable_form("DS4_DS41_PREFILL_EMBED_INIT");
     g_ds41_levers.prefill_hc_sum_round = ds41_env_enable_form("DS4_DS41_PREFILL_HC_SUM_ROUND");
@@ -40015,12 +39960,8 @@ int ds41_levers_set(const char *name, int value) {
                 const int lo = !strcmp(name, "attn_diag") ||
                                !strcmp(name, "gather_wide") ||
                                !strcmp(name, "dspark_verify_rows") ||
-                               !strcmp(name, "mtp_q8_stream6_mask") ||
-                               !strcmp(name, "mtp_gu_union6_mask") ||
-                               !strcmp(name, "mtp_q8_f16acc6_mask") || !strcmp(name, "mtp_q8_mma6_mask") ? 0 : 1;
-                const int hi = !strcmp(name, "mtp_gu_union6_mask") ? 62 :
-                               (!strcmp(name, "mtp_q8_stream6_mask") ||
-                                !strcmp(name, "mtp_q8_f16acc6_mask") || !strcmp(name, "mtp_q8_mma6_mask")) ? 127 :
+                               !strcmp(name, "mtp_q8_stream6_mask") ? 0 : 1;
+                const int hi = !strcmp(name, "mtp_q8_stream6_mask") ? 127 :
                                !strcmp(name, "attn_diag") ? 9 :
                                !strcmp(name, "dspark_verify_rows") ? 6 : 256;
                 if (value < lo || value > hi ||
@@ -40674,35 +40615,17 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     if ((!shared_owner || g->tp_rank == (il & 1u)) &&
         (!ds41_shared_mid(g, m, l) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
-    const bool mk_oracle = g->arch_scalar_step && g_ds41_levers.mtp_gu_mk6_oracle != 0;
-    if (mk_oracle && (g->streaming || g->tp_world != 1 ||
-        l->ffn_gate_exps->type != DS4_TENSOR_Q4_K ||
-        l->ffn_down_exps->type != DS4_TENSOR_Q4_K)) {
-        fprintf(stderr, "ds41: GU mk6 scalar oracle requires resident TP1 Q4_K target\n");
-        return false;
-    }
     g->ffn_expand_done = 0;
-    const bool fold = !mk_oracle && g->arch_scalar_step && g->tp_world != 2 && !g->streaming &&
+    const bool fold = g->arch_scalar_step && g->tp_world != 2 && !g->streaming &&
         g_ds41_levers.ffn_producer && g_ds41_levers.ffn_add_fold && ds41_hc_expand_fold(g);
     if (fold) (void)ds4_gpu_dsv41_arch_ffn_begin(routed, g->shared, g->after_attn,
         g->ffn_split, g->block, g->residual, g->pre);
     /* R4: same scalar-step/non-TP/non-streaming scope as the folded epilogue. */
-    const bool split_down = !mk_oracle && g->arch_scalar_step && g->tp_world != 2 && !g->streaming &&
+    const bool split_down = g->arch_scalar_step && g->tp_world != 2 && !g->streaming &&
         g_ds41_levers.routed_down_split && g_ds41_levers.q4_group6 &&
         ds4_gpu_dsv41_routed_split_begin(g->routed_slots);
     bool routed_ok;
-    if (mk_oracle) {
-        bool mid_f16 = false;
-        const unsigned previous = ds4_gpu_dsv41_gu_mk6_scope(1);
-        routed_ok = ds4_gpu_routed_moe_batch_tensor(routed, g->gate, g->up, g->mid, g->experts,
-            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
-            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
-            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm,
-            il, 1, &mid_f16, true) != 0 && !mid_f16;
-        (void)ds4_gpu_dsv41_gu_mk6_scope(previous);
-    } else routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
+    routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
@@ -40950,67 +40873,9 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
             DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
 
-/* Exactly two private rows. Collapse uses the PREVIOUS sublayer's mixer;
- * only afterwards may the current predictor publish its new split. */
-static bool ds41_mtp_hc_rows2(ds41_prefill_row *b, const ds4_model *m,
-        const ds4_layer_weights *l, bool ffn, uint32_t il, ds4_gpu_tensor *counters) {
-    const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
-    const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
-    const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
-    const ds4_tensor *nw = ffn ? l->ffn_norm : l->attn_norm;
-    for (uint32_t t = 0; t < 2u; ++t) {
-        ds4_gpu_tensor *v[7] = {0};
-        ds4_gpu_tensor *parent[7] = {ffn ? b->after_attn : b->residual,
-            ffn ? b->attn_split : il ? b->ffn_split : b->pre,
-            b->x, b->norm, b->mix, ffn ? b->ffn_split : b->attn_split, counters};
-        const uint32_t width[7] = {20480, ffn || il ? 24u : 4u, 5120, 5120, 24, 24, 1};
-        bool ok = true;
-        for (unsigned j = 0; j < 7; ++j) {
-            v[j] = ds4_gpu_tensor_view(parent[j], (uint64_t)t*width[j]*4u, width[j]*4u);
-            ok = ok && v[j];
-        }
-        if (ok) ok = ds4_gpu_dsv41_arch_collapse_tensor(v[2], v[3], v[6], v[0], v[1],
-            m->map, m->size, nw->abs_offset, DS4_RMS_EPS) &&
-            ds4_gpu_dsv41_mtp_hc_tensor(v[4], v[5], v[6], v[0], m->map, m->size,
-                fn->abs_offset, scale->abs_offset, base->abs_offset,
-                DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS);
-        for (unsigned j = 0; j < 7; ++j) ds4_gpu_tensor_free(v[j]);
-        if (!ok) return false;
-    }
-    return true;
-}
-
-/* Current HC prediction is independent of the old-pre normalized projection. */
-static bool ds41_mtp_collapse(ds41_prefill_row *b, const ds4_model *m,
-        const ds4_layer_weights *l, bool ffn, uint32_t il, uint32_t rows,
-        ds4_gpu_tensor *counters) {
-    return ds4_gpu_dsv41_mtp_collapse_rows(b->x, b->norm, counters,
-        ffn ? b->after_attn : b->residual,
-        ffn ? b->attn_split : il ? b->ffn_split : b->pre,
-        m->map, m->size, (ffn ? l->ffn_norm : l->attn_norm)->abs_offset,
-        DS4_RMS_EPS, rows, ffn || il ? 24u : 4u);
-}
-static bool ds41_mtp_hc_mixed(ds41_prefill_row *b, const ds4_model *m,
-        const ds4_layer_weights *l, bool ffn, uint32_t rows, ds4_gpu_tensor *counters) {
-    return ds4_gpu_dsv41_mtp_hc_stream_rows(ffn ? b->shared_gate : b->q,
-        b->mix, ffn ? b->ffn_split : b->attn_split, counters,
-        ffn ? b->after_attn : b->residual, ffn ? b->norm : b->qr,
-        m->map, m->size, (ffn ? l->hc_ffn_fn : l->hc_attn_fn)->abs_offset,
-        (ffn ? l->hc_ffn_scale : l->hc_attn_scale)->abs_offset,
-        (ffn ? l->hc_ffn_base : l->hc_attn_base)->abs_offset,
-        (ffn ? l->ffn_gate_shexp : l->attn_q_b)->abs_offset,
-        (ffn ? l->ffn_up_shexp : l->attn_q_b)->abs_offset, ffn,
-        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS, DS4_SWIGLU_CLAMP_EXP,
-        rows, ffn ? b->shared_up : b->q);
-}
-
-/* `pos0` is the absolute position of row 0, or UINT32_MAX when the rows do
- * not occupy consecutive absolute positions (independent sessions in one
- * batch), in which case nothing is captured. */
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
-                                         uint32_t il, uint32_t count, uint32_t pos0,
-                                         ds4_gpu_tensor *mtp_counters, bool mtp_mixed) {
+                                         uint32_t il, uint32_t count, uint32_t pos0) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
         if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
@@ -41021,8 +40886,6 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     }
     if (g->dspark_capture &&
         !ds41_dspark_capture_rows(g, b->residual, il, pos0, count)) return false;
-    if (mtp_mixed) return ds41_mtp_collapse(b, m, l, false, il, count, mtp_counters);
-    if (mtp_counters) return ds41_mtp_hc_rows2(b, m, l, false, il, mtp_counters);
     if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
     return ds41_hc_sum_batch(b->x, b->residual, il ? b->ffn_split : b->pre,
@@ -41030,12 +40893,7 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
 }
 
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
-                                        const ds4_layer_weights *l, uint32_t count,
-                                        ds4_gpu_tensor *mtp_counters, bool mtp_mixed) {
-    if (mtp_mixed) return ds41_hc_expand_batch(b->after_attn, b->block, b->residual,
-        b->attn_split, count) && ds41_mtp_collapse(b, m, l, true, 0, count, mtp_counters);
-    if (mtp_counters) return ds41_hc_expand_batch(b->after_attn, b->block, b->residual,
-        b->attn_split, count) && ds41_mtp_hc_rows2(b, m, l, true, 0, mtp_counters);
+                                        const ds4_layer_weights *l, uint32_t count) {
     return ds41_hc_expand_batch(b->after_attn, b->block, b->residual,
         b->attn_split, count) && ds41_hc_mix_batch(b, m, l, true, count) &&
         ds41_hc_sum_batch(b->x, b->after_attn, b->attn_split, true, count) &&
@@ -41043,20 +40901,16 @@ static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
 }
 
 static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
-                                         const ds4_layer_weights *l, uint32_t count, ds4_gpu_tensor *mixed, bool flat) {
+                                         const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
-    flat = flat && l->attn_q_a->type == DS4_TENSOR_Q8_0 && l->attn_kv->type == DS4_TENSOR_Q8_0;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
-    return (flat ? ds4_gpu_dsv41_mtp_qa_kv_pairs(b->qr, b->kv, b->norm, m->map, m->size,
-                l->attn_q_a->abs_offset, l->attn_kv->abs_offset, count) :
-            ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true)) &&
+    return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
         ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
-        (mixed ? ds41_mtp_hc_mixed(b, m, l, false, count, mixed) :
-         ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
-                               g->tp_rank * q_dim, q_dim, count)) &&
-        (flat || ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true)) &&
+        ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
+                               g->tp_rank * q_dim, q_dim, count) &&
+        ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
             l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
         ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16);
@@ -41569,109 +41423,19 @@ static void ds41_expert_union_note(ds41_gpu_graph *g, uint32_t count) {
     (void)ds4_gpu_begin_commands();
 }
 
-/* Diagnostic B (mtp_gu_union2) first-difference dump.  DS4_DS41_B_DUMP=<layer|all>
- * drains after that layer's two-row batch MoE and prints an FNV-1a hash of every
- * named stage; with DS4_DS41_B_DUMP_DIR=<dir> the matching layer's raw
- * bytes are written as <dir>/<name>.bin in [token, route, channel] order.
- * Diagnostic only: it forces a drain and must never be set in a measurement. */
-static void ds41_b_dump_tensor(const char *dir, const char *name,
-                               ds4_gpu_tensor *t, uint64_t bytes) {
-    if (!t || !bytes) return;
-    void *buf = malloc((size_t)bytes);
-    if (!buf) return;
-    if (ds4_gpu_tensor_read(t, 0, buf, bytes)) {
-        uint64_t h = 1469598103934665603ull;
-        const unsigned char *p = (const unsigned char *)buf;
-        for (uint64_t i = 0; i < bytes; i++) { h ^= p[i]; h *= 1099511628211ull; }
-        fprintf(stderr, "ds4: b-dump %-14s bytes=%-9llu fnv=%016llx\n", name,
-                (unsigned long long)bytes, (unsigned long long)h);
-        if (dir) {
-            char path[512];
-            snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
-            FILE *fp = fopen(path, "wb");
-            if (fp) { fwrite(buf, 1, (size_t)bytes, fp); fclose(fp); }
-        }
-    }
-    free(buf);
-}
-
-static void ds41_b_dump_layer(ds41_gpu_graph *g, uint32_t il, uint32_t count) {
-    static int want = -2;   /* -2 unread, -1 off, -3 every layer */
-    static const char *root;
-    /* One slot per distinct GU configuration seen in this process, so a single
-     * server captures the reference and each union setting from identical rows. */
-    static int slot_key[8];
-    static int slot_done[8];
-    static int slot_last[8];
-    static int slots;
-    if (want == -2) {
-        const char *e = getenv("DS4_DS41_B_DUMP");
-        want = !e ? -1 : (strcmp(e, "all") == 0 ? -3 : atoi(e));
-        root = getenv("DS4_DS41_B_DUMP_DIR");
-        for (int i = 0; i < 8; i++) slot_last[i] = -1;
-    }
-    if (want == -1 || count != 2u) return;
-    if (want >= 0 && (uint32_t)want != il) return;
-    /* Key 0 = neither union (the reference), 1 = B's union2,
-     * 100 + mask = H2's union6 at that multiplicity mask. */
-    const int key = g_ds41_levers.mtp_gu_union6 ?
-        100 + g_ds41_levers.mtp_gu_union6_mask :
-        (g_ds41_levers.mtp_gu_union2 ? 1 : 0);
-    int u = -1;
-    for (int i = 0; i < slots; i++) if (slot_key[i] == key) { u = i; break; }
-    if (u < 0) { if (slots >= 8) return; u = slots++; slot_key[u] = key; }
-    if (slot_done[u]) return;
-    /* Layers sweep 0..N-1 inside one cycle; a non-increasing layer means the
-     * second cycle has begun and the first (the one we dump) is complete. */
-    if ((int)il <= slot_last[u]) { slot_done[u] = 1; return; }
-    slot_last[u] = (int)il;
-    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) return;
-    ds41_prefill_row *b = &g->batch;
-    char dir[512];
-    const char *d = NULL;
-    if (root) {
-        snprintf(dir, sizeof(dir), "%s/u%d", root, key);
-        mkdir(dir, 0755);
-        snprintf(dir, sizeof(dir), "%s/u%d/L%02u", root, key, il);
-        mkdir(dir, 0755);
-        d = dir;
-    }
-    fprintf(stderr, "ds4: b-dump layer %u (count=%u key=%d union2=%d union6=%d mask=%d)\n",
-            il, count, key, g_ds41_levers.mtp_gu_union2, g_ds41_levers.mtp_gu_union6,
-            g_ds41_levers.mtp_gu_union6_mask);
-#define DS41_BD(field, elems) \
-    ds41_b_dump_tensor(d, #field, b->field, (uint64_t)(elems) * 4u * count)
-    DS41_BD(norm,          DS4_N_EMBD);
-    DS41_BD(route_logits,  DS4_N_EXPERT);
-    DS41_BD(selected,      DS4_N_EXPERT_USED);
-    DS41_BD(route_weights, DS4_N_EXPERT_USED);
-    DS41_BD(gate,          DS4_N_EXPERT_USED * DS4_N_FF_EXP);
-    DS41_BD(up,            DS4_N_EXPERT_USED * DS4_N_FF_EXP);
-    DS41_BD(mid,           DS4_N_EXPERT_USED * DS4_N_FF_EXP);
-    DS41_BD(routed,        DS4_N_EMBD);
-    DS41_BD(shared,        DS4_N_EMBD);
-#undef DS41_BD
-    (void)ds4_gpu_begin_commands();
-}
-
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
-                           bool shared_owner, ds4_gpu_tensor *mixed, bool verify) {
+                           bool shared_owner) {
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
-    const unsigned previous = ds4_gpu_dsv41_gu_mk6_scope(
-        verify && count == 6 && g_ds41_levers.mtp_gu_mk6 ? 6u : 0u);
-    const unsigned previous_mm = ds4_gpu_dsv41_force_mm_scope(
-        verify && count == 6 && g_ds41_levers.mtp_force_mm ? 6u : 0u);
     const bool ok = ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count) &&
         (ds41_expert_union_note(g, count), true) &&
         ((shared_owner && g->tp_rank != (il & 1u)) ||
-        ((mixed ? ds41_mtp_hc_mixed(b, m, l, true, count, mixed) :
-         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-          ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true))) &&
+        ((ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+          ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true)) &&
         ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
             count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
@@ -41686,9 +41450,6 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         (!shared_owner || g->tp_rank != (il & 1u) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
-    (void)ds4_gpu_dsv41_force_mm_scope(previous_mm);
-    (void)ds4_gpu_dsv41_gu_mk6_scope(previous);
-    if (ok) ds41_b_dump_layer(g, il, count);
     return ok;
 }
 
@@ -42417,7 +42178,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                          (engram_src_row + off) * bytes, count * bytes) != 0;
             }
             if (ok && batch_hc)
-                ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count, start, NULL, false);
+                ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count, start);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -42442,7 +42203,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_attention) {
                 const ds4_layer_weights *l = &w->layer[il];
-                ok = ds41_attention_project_batch(g, m, l, count, NULL, false);
+                ok = ds41_attention_project_batch(g, m, l, count);
                 DS41_STAGE("attention projections");
                 if (ok && batch_core) ok = ds41_attention_batch(g, m, l, il, count, NULL);
                 for (uint32_t t = 0; ok && !batch_core && t < count; t++) {
@@ -42474,7 +42235,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                                    g->batch.low, count, true);
                 }
                 DS41_STAGE("attention output");
-                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count, NULL, false);
+                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count);
                 DS41_STAGE("hc/ffn norm");
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                     row.pos = start + t;
@@ -42487,7 +42248,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
-                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, NULL, false);
+                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds41_ffn_add_batch(&active, count) &&
@@ -42617,28 +42378,7 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         malloc(prefill_rows * sizeof(*engram)) : NULL;
     const bool mtp_shape = vc && (rows == 2u || rows == 6u) && g->tp_world == 1 &&
         !g->quality && !g->streaming && !g->imatrix && DS4_N_EMBD == 5120u && DS4_N_HC == 4u;
-    bool hc_mixed = mtp_shape && g_ds41_levers.mtp_hc_mixed &&
-        !(rows == 6u && g_ds41_levers.mtp_q8_stream6) &&
-        ((rows == 2u && g_ds41_levers.mtp_q8_rows2) ||
-         (rows == 6u && g_ds41_levers.mtp_q8_pair6)) && ds4_gpu_dsv41_arch_hc_available();
-    for (uint32_t l = 0; hc_mixed && l < DS4_N_LAYER; ++l) {
-        const ds4_layer_weights *w = &weights->layer[l];
-        hc_mixed = w->hc_attn_fn->type == DS4_TENSOR_F16 && w->hc_ffn_fn->type == DS4_TENSOR_F16 &&
-            w->attn_norm->type == DS4_TENSOR_F32 && w->ffn_norm->type == DS4_TENSOR_F32 &&
-            w->attn_q_b->type == DS4_TENSOR_Q8_0 && w->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
-            w->ffn_up_shexp->type == DS4_TENSOR_Q8_0;
-    }
-    bool hc_rows2 = !hc_mixed && mtp_shape && rows == 2u && g_ds41_levers.mtp_hc_rows2 && ds4_gpu_dsv41_arch_hc_available();
-    for (uint32_t l = 0; hc_rows2 && l < DS4_N_LAYER; ++l) {
-        const ds4_layer_weights *w = &weights->layer[l];
-        hc_rows2 = w->hc_attn_fn->type == DS4_TENSOR_F16 && w->hc_ffn_fn->type == DS4_TENSOR_F16 &&
-            w->attn_norm->type == DS4_TENSOR_F32 && w->ffn_norm->type == DS4_TENSOR_F32;
-    }
-    if ((hc_rows2 || hc_mixed) && !vc->mtp_counters) vc->mtp_counters = ds4_gpu_tensor_alloc(rows*4u);
-    ds4_gpu_tensor *mtp_counters = hc_rows2 || hc_mixed ? vc->mtp_counters : NULL;
-    const bool engram_async = mtp_shape &&
-        ((rows == 2u && g_ds41_levers.mtp_engram_rows2) ||
-         (rows == 6u && g_ds41_levers.mtp_engram_rows6));
+    const bool engram_async = mtp_shape && rows == 6u && g_ds41_levers.mtp_engram_rows6;
     const uint64_t engram_row_bytes = DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float);
     if (engram_async && !vc->mtp_engram_late)
         vc->mtp_engram_late = ds4_gpu_tensor_alloc(rows*engram_row_bytes);
@@ -42646,9 +42386,8 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
     ds4_engram_fetch fetch[DS4_TP_BATCH_MAX_ROWS][2] = {0};
     ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
     ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
-    const bool previous_verify6 = ds4_gpu_dsv41_verify6_scope(mtp_shape && rows == 6u);
     bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram) &&
-        (!(hc_rows2 || hc_mixed) || (mtp_counters && ds4_gpu_tensor_bytes(mtp_counters) >= rows*4u)) && (!engram_async ||
+        (!engram_async ||
         (late_engram && ds4_gpu_tensor_bytes(late_engram) >= rows*engram_row_bytes));
 #define DS41_SESSION_VIEW(name, width) \
     if (ok) ok = (active.name = ds4_gpu_tensor_view(g->batch.name, 0, \
@@ -42715,12 +42454,8 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
         if (ok && vc) ok = ds41_verify_save_window(vc, graphs[0], il);
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows,
-                                                 contiguous ? positions[0] : UINT32_MAX, mtp_counters, hc_mixed) &&
-            ds41_attention_project_batch(g, model, l, rows, hc_mixed ? mtp_counters : NULL,
-                mtp_shape && g_ds41_levers.mtp_qa_kv_flat &&
-                !(rows == 6u && g_ds41_levers.mtp_q8_stream6) &&
-                ((rows == 2u && g_ds41_levers.mtp_q8_rows2) ||
-                 (rows == 6u && g_ds41_levers.mtp_q8_pair6)));
+                                                 contiguous ? positions[0] : UINT32_MAX) &&
+            ds41_attention_project_batch(g, model, l, rows);
         /* A verify pass is one session at consecutive positions, which is the
          * shape ds41_attention_batch was written for: one batched index pass,
          * one batched attention over the staged chronological window and one
@@ -42735,8 +42470,7 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
                     l->attn_output_b->abs_offset, active.heads, rows);
         const bool output_rows2 = !batch_core && g->tp_world == 1 &&
             !g->quality && !g->streaming &&
-            ((rows == 2u && g_ds41_levers.mtp_q8_rows2) ||
-             (vc && rows == 6u && (g_ds41_levers.mtp_q8_pair6 || g_ds41_levers.mtp_q8_stream6))) &&
+            vc && rows == 6u && (g_ds41_levers.mtp_q8_pair6 || g_ds41_levers.mtp_q8_stream6) &&
             l->attn_output_a->type == DS4_TENSOR_Q8_0 && l->attn_output_b->type == DS4_TENSOR_Q8_0;
         for (int i = 0; ok && !batch_core && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
@@ -42761,8 +42495,8 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         }
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(&active, model, l, rows, mtp_counters, hc_mixed) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner, hc_mixed ? mtp_counters : NULL, vc != NULL) &&
+            ds41_after_attention_batch(&active, model, l, rows) &&
+            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
@@ -42826,7 +42560,6 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
     for (unsigned i = 0; i < DS4_TP_BATCH_MAX_ROWS; ++i)
         for (unsigned table = 0; table < 2; ++table) ds4_engram_fetch_release(&fetch[i][table]);
     free(engram);
-    (void)ds4_gpu_dsv41_verify6_scope(previous_verify6);
     return ok;
 }
 

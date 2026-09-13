@@ -938,10 +938,6 @@ int ds4_gpu_dsv41_arch_ffn_begin(ds4_gpu_tensor *routed, ds4_gpu_tensor *shared,
 int ds4_gpu_dsv41_arch_ffn_end(void);
 /* Scoped target GU selection: 0=parent, 1=scalar oracle, 6=verifier.
  * Returns the previous scope; the caller restores it after synchronous encode. */
-unsigned ds4_gpu_dsv41_gu_mk6_scope(unsigned rows);
-unsigned ds4_gpu_dsv41_force_mm_scope(unsigned min_rows);
-/* Synchronous six-row verify scope for precision probes; returns previous value. */
-bool ds4_gpu_dsv41_verify6_scope(bool active);
 
 /* R4: arm the expert-parallel routed-down geometry for one synchronous encode.
  * `slots` holds 6 F32 partials per output row, packed slot-minor.  Returns 1 if
