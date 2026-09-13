@@ -5949,7 +5949,31 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
 // heads in a group. This variant stages sixteen selected rows at once and then
 // consumes them sequentially, preserving the row order and online softmax math
 // while cutting threadgroup barriers in the long top-k scan.
-kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
+// WAVE 3.  LEAN selects the register-lean selected-id form.  The wave-3
+// decomposition (prefill/wave3/ATTN-DECOMP.md) measured this kernel to be
+// register/occupancy bound, not memory, barrier or softmax bound: deleting the
+// sixteen-word `uint rows[16]` private array while keeping every row, every
+// order and every arithmetic operation took the 8,192-row call from 100.26 to
+// 84.13 ms, -16.1 %.  LEAN=1 keeps the same rows in the same order using a
+// sixteen-bit mask -- one register instead of sixteen.  The mask is identical
+// in all 256 threads, and is 0xFFFF whenever every scanned id is valid and
+// visible, which is the overwhelmingly common case, so the fast path is a
+// single compare.  LEAN=0 is the wave-2 kernel, bit for bit.
+static inline uint dsv4_nth_set_bit(ushort mask, uint n) {
+    // The n-th set bit of mask, counting from the least significant.  Only
+    // reached when the sixteen-entry window contains an absent or invisible
+    // id; with a full window the caller uses the identity mapping.
+    for (uint j = 0; j < 16u; j++) {
+        if (mask & (ushort)(1u << j)) {
+            if (n == 0u) return j;
+            n--;
+        }
+    }
+    return 15u;
+}
+
+template<bool LEAN>
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t(
         constant ds4_metal_args_dsv4_indexed_attention & args,
         device const char *q,
         device const char *raw_kv,
@@ -6024,7 +6048,8 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
         (uint64_t)token * args.topk_token_stride);
     bool stop = false;
     for (uint i = 0; i < args.top_k && !stop; i += 16u) {
-        uint rows[16];
+        uint rows[LEAN ? 1 : 16];
+        ushort mask = 0;
         uint n_rows = 0;
         for (uint j = 0; j < 16u && i + j < args.top_k; j++) {
             const int32_t idx = row_topk[i + j];
@@ -6035,17 +6060,33 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
                 stop = true;
                 break;
             }
-            rows[n_rows++] = (uint)idx;
+            if (LEAN) {
+                mask |= (ushort)(1u << j);
+            } else {
+                rows[n_rows] = (uint)idx;
+            }
+            n_rows++;
         }
         if (n_rows == 0) {
             continue;
         }
+        const bool dense = LEAN && mask == (ushort)0xFFFFu;
         for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
             const uint r = off >> 7;
             const uint c = off & 127u;
+            uint src_row;
+            if (LEAN) {
+                /* The r-th set bit of mask is exactly the entry the wave-2
+                 * kernel stored at rows[r], so the rows and their order are
+                 * unchanged. */
+                const uint j = dense ? r : dsv4_nth_set_bit(mask, r);
+                src_row = (uint)row_topk[i + j];
+            } else {
+                src_row = rows[r];
+            }
             kv_shared[off] = dsv4_load_cache_h4(comp_kv,
                                                 args.comp_row_stride,
-                                                rows[r],
+                                                src_row,
                                                 c,
                                                 args.comp_kv_f16 != 0u);
         }
@@ -6073,6 +6114,342 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
     dst4[lane + 64] = o2 * inv_s;
     dst4[lane + 96] = o3 * inv_s;
 }
+
+
+// ---------------------------------------------------------------------------
+// WAVE 3, TASK B: attention-core ablation arms.  DIAGNOSTIC ONLY.
+//
+// These kernels are never adopted and never produce correct attention output.
+// They exist to answer "what is kernel_dsv4_indexed_mixed_attention_heads8_rb16
+// bound by?"  Each arm deletes exactly one stage of the per-row work and keeps
+// the dispatch shape, the grid, the threadgroup size, the threadgroup-memory
+// length, the loop trip counts and the barrier count identical to the
+// production kernel, so the delta is the stage's cost and nothing else.
+//
+//   DIAG_PV     : delete the PV accumulation and the output rescale
+//                 (o *= old_scale; o += k * row_scale).  Keeps the gather,
+//                 the QK dot, the simd_sum reduction and the exp/M/S chain.
+//   DIAG_EXP    : delete the online-softmax exponentials and the running max
+//                 (old_scale = 1, row_scale = score).  Keeps the gather, the
+//                 QK dot, the simd_sum reduction and the full PV chain.
+//   DIAG_GATHER : delete the device K/V loads after the first staged block --
+//                 every later block re-consumes whatever is already in
+//                 threadgroup memory.  Keeps every barrier, every loop
+//                 iteration and all of the arithmetic.
+//   DIAG_ONLY   : keep ONLY the gather and the barriers; each staged row is
+//                 consumed by one add so the loads cannot be eliminated.
+//   DIAG_QK     : keep the gather, the QK dot and the simd_sum reduction and
+//                 delete BOTH the softmax and the PV accumulation (the
+//                 "QK-only" control).  With DIAG_ONLY it brackets
+//                 the reduction's own cost.
+//   DIAG_LEAN   : DIAG_NONE with the sixteen-entry `uint rows[16]` register
+//                 array deleted -- the selected row id is recomputed from
+//                 row_topk inside the staging loop instead of being held.
+//                 Identical arithmetic, identical rows, sixteen fewer live
+//                 registers per thread.  Against DIAG_NONE it is a pure
+//                 register-pressure measurement, and a Tier-1 candidate if it
+//                 wins, because nothing about the computation changes.
+//   DIAG_NONE   : the production kernel's arithmetic, unablated.  This is the
+//                 control every other arm is read against, because all five
+//                 share one property the production kernel does not have: the
+//                 selected-row list is CLAMPED, not broken out of.
+//
+// Why the clamp.  An ablated kernel writes wrong attention output, the wrong
+// output feeds the indexer of the next layer, and a corrupted selected-ID list
+// can contain out-of-range ids -- which in the production kernel BREAK the
+// scan early and silently shorten the row count.  Then an arm would look fast
+// because it did less work, not because the deleted stage was expensive.  In
+// every diag arm an invalid or out-of-range id is replaced by a deterministic
+// in-range row instead, so all five arms consume exactly the same number of
+// rows whatever the state is.  On uncorrupted state the clamp never fires, so
+// DIAG_NONE also prices the clamp itself against the production kernel.
+// ---------------------------------------------------------------------------
+#define DSV4_ATTN_DIAG_NONE   0
+#define DSV4_ATTN_DIAG_PV     1
+#define DSV4_ATTN_DIAG_EXP    2
+#define DSV4_ATTN_DIAG_GATHER 3
+#define DSV4_ATTN_DIAG_ONLY   4
+#define DSV4_ATTN_DIAG_NONE_ARM 5
+#define DSV4_ATTN_DIAG_QK    6
+#define DSV4_ATTN_DIAG_LEAN  9
+
+template<ushort DIAG>
+static inline void dsv4_attend_shared_h4_row_diag(
+        threadgroup const half4 *kv4,
+        uint row_in_tg,
+        half4 q0,
+        half4 q1,
+        half4 q2,
+        half4 q3,
+        float scale,
+        ushort lane,
+        thread float &M,
+        thread float &S,
+        thread float4 &o0,
+        thread float4 &o1,
+        thread float4 &o2,
+        thread float4 &o3) {
+    threadgroup const half4 *kv = kv4 + row_in_tg * 128u;
+    const half4 k0 = kv[lane +  0];
+    const half4 k1 = kv[lane + 32];
+    const half4 k2 = kv[lane + 64];
+    const half4 k3 = kv[lane + 96];
+
+    if (DIAG == DSV4_ATTN_DIAG_ONLY) {
+        // Consume the staged row with one add so the gather survives DCE.
+        S += (float)k0.x + (float)k1.x + (float)k2.x + (float)k3.x;
+        return;
+    }
+
+    float score = dot((float4)q0, (float4)k0) +
+                  dot((float4)q1, (float4)k1) +
+                  dot((float4)q2, (float4)k2) +
+                  dot((float4)q3, (float4)k3);
+    score = simd_sum(score) * scale;
+
+    if (DIAG == DSV4_ATTN_DIAG_QK) {
+        // Consume the reduced score so the dot and the reduction survive DCE.
+        S += score;
+        return;
+    }
+
+    float old_scale;
+    float row_scale;
+    if (DIAG == DSV4_ATTN_DIAG_EXP) {
+        old_scale = 1.0f;
+        row_scale = score;
+    } else {
+        const float old_m = M;
+        const float new_m = max(M, score);
+        old_scale = exp(old_m - new_m);
+        row_scale = exp(score - new_m);
+        M = new_m;
+    }
+
+    S = S * old_scale + row_scale;
+
+    if (DIAG != DSV4_ATTN_DIAG_PV) {
+        o0 *= old_scale;
+        o1 *= old_scale;
+        o2 *= old_scale;
+        o3 *= old_scale;
+
+        o0 += (float4)k0 * row_scale;
+        o1 += (float4)k1 * row_scale;
+        o2 += (float4)k2 * row_scale;
+        o3 += (float4)k3 * row_scale;
+    }
+}
+
+template<ushort DIAG>
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint token = tgpig.x;
+    const uint head = tgpig.y * 8u + (uint)sg;
+    if (token >= args.n_tokens || head >= args.n_head) {
+        return;
+    }
+
+    device const float4 *q4 = (device const float4 *)(q +
+        (uint64_t)token * args.q_token_stride +
+        (uint64_t)head  * args.q_head_stride);
+    const half4 q0 = (half4)q4[lane +  0];
+    const half4 q1 = (half4)q4[lane + 32];
+    const half4 q2 = (half4)q4[lane + 64];
+    const half4 q3 = (half4)q4[lane + 96];
+
+    float M = -FLT_MAX/2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f;
+    float4 o1 = 0.0f;
+    float4 o2 = 0.0f;
+    float4 o3 = 0.0f;
+
+    const uint qpos = args.pos0 + token;
+    const uint last_pos = args.pos0 + args.n_tokens - 1u;
+    const uint first_raw_pos = last_pos + 1u - args.n_raw;
+    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
+    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ?
+        qpos + 1u - args.window : 0u;
+    uint first = max(first_raw_pos, window_first);
+    uint last = min(qpos, raw_last_pos);
+
+    // DIAG_GATHER keeps the first staged block and then stops issuing loads.
+    bool staged_once = false;
+
+    if (first <= last) {
+        for (uint pos0 = first; pos0 <= last; pos0 += 16u) {
+            const uint n_rows = min(16u, last - pos0 + 1u);
+            if (DIAG != DSV4_ATTN_DIAG_GATHER || !staged_once) {
+                for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+                    const uint r = off >> 7;
+                    const uint c = off & 127u;
+                    const uint logical = pos0 + r - first_raw_pos;
+                    const uint row = (args.raw_start + logical) % args.raw_cap;
+                    device const float4 *src = (device const float4 *)(raw_kv +
+                        (uint64_t)row * args.raw_row_stride);
+                    kv_shared[off] = (half4)src[c];
+                }
+                staged_once = true;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint r = 0; r < n_rows; r++) {
+                dsv4_attend_shared_h4_row_diag<DIAG>(kv_shared,
+                                             r,
+                                             q0, q1, q2, q3,
+                                             args.scale,
+                                             lane,
+                                             M, S,
+                                             o0, o1, o2, o3);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    uint visible = (qpos + 1u) / args.ratio;
+    visible = min(visible, args.n_comp);
+    device const int32_t *row_topk = (device const int32_t *)(topk +
+        (uint64_t)token * args.topk_token_stride);
+    const uint scan = min(args.top_k, visible);
+    for (uint i = 0; i < scan; i += 16u) {
+        uint rows[DIAG == DSV4_ATTN_DIAG_LEAN ? 1 : 16];
+        uint n_rows = 0;
+        if (DIAG == DSV4_ATTN_DIAG_LEAN) {
+            /* The clamp makes every scanned entry yield exactly one row, so
+             * the count is arithmetic and the ids need not be held. */
+            n_rows = min(16u, scan - i);
+        } else {
+            for (uint j = 0; j < 16u && i + j < scan; j++) {
+                /* Clamp, never break: the row COUNT must not depend on state
+                 * that an ablation arm has corrupted.  See the note above. */
+                const int32_t idx = row_topk[i + j];
+                rows[n_rows++] = (idx >= 0 && (uint)idx < visible) ?
+                    (uint)idx : ((i + j) % visible);
+            }
+        }
+        if (n_rows == 0) {
+            continue;
+        }
+        if (DIAG != DSV4_ATTN_DIAG_GATHER || !staged_once) {
+            for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
+                const uint r = off >> 7;
+                const uint c = off & 127u;
+                uint src_row;
+                if (DIAG == DSV4_ATTN_DIAG_LEAN) {
+                    const int32_t idx = row_topk[i + r];
+                    src_row = (idx >= 0 && (uint)idx < visible) ?
+                        (uint)idx : ((i + r) % visible);
+                } else {
+                    src_row = rows[r];
+                }
+                kv_shared[off] = dsv4_load_cache_h4(comp_kv,
+                                                    args.comp_row_stride,
+                                                    src_row,
+                                                    c,
+                                                    args.comp_kv_f16 != 0u);
+            }
+            staged_once = true;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < n_rows; r++) {
+            dsv4_attend_shared_h4_row_diag<DIAG>(kv_shared,
+                                         r,
+                                         q0, q1, q2, q3,
+                                         args.scale,
+                                         lane,
+                                         M, S,
+                                         o0, o1, o2, o3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (DIAG != DSV4_ATTN_DIAG_ONLY && DIAG != DSV4_ATTN_DIAG_QK) {
+        dsv4_attend_sink(((device const float *)sinks)[head], M, S, o0, o1, o2, o3);
+    }
+
+    const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
+    device float4 *dst4 = (device float4 *)(dst +
+        (uint64_t)token * args.dst_token_stride +
+        (uint64_t)head  * args.dst_head_stride);
+    dst4[lane +  0] = o0 * inv_s;
+    dst4[lane + 32] = o1 * inv_s;
+    dst4[lane + 64] = o2 * inv_s;
+    dst4[lane + 96] = o3 * inv_s;
+}
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_pv")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag<DSV4_ATTN_DIAG_PV>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_exp")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag<DSV4_ATTN_DIAG_EXP>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_gather")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag<DSV4_ATTN_DIAG_GATHER>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_lean")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag<DSV4_ATTN_DIAG_LEAN>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_qk")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag<DSV4_ATTN_DIAG_QK>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_none")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag<DSV4_ATTN_DIAG_NONE_ARM>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_only")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag<DSV4_ATTN_DIAG_ONLY>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t<false>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
+
+template [[host_name("kernel_dsv4_indexed_mixed_attention_heads8_rb16_lean")]]
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16_t<true>(
+        constant ds4_metal_args_dsv4_indexed_attention &,
+        device const char *, device const char *, device const char *,
+        device const char *, device const char *, device char *,
+        threadgroup half4 *, uint2, ushort, ushort, ushort);
 
 // Long-context decode specialization of the indexed mixed-attention path.
 //

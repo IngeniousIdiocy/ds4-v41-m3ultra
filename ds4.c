@@ -137,6 +137,14 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
  * never reach the multi-tier branches and never include ds4_gpu.h, so
  * we cannot reference ds4_tensor_range there — those stubs are guarded
  * by !DS4_NO_GPU below. */
+/* DS4_KERNEL_LEDGER lives in ds4_metal.m; every other backend stubs it out so
+ * ds4-server's /debug/prefill can call it unconditionally. */
+#if !defined(__APPLE__) || defined(DS4_NO_GPU)
+int  ds4_gpu_kernel_ledger_mode(void) { return 0; }
+void ds4_gpu_kernel_ledger_reset(void) {}
+int  ds4_gpu_kernel_ledger_dump_path(const char *path) { (void)path; return 0; }
+#endif
+
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 /* Decode-island graph capture is CUDA-only; Metal decodes eagerly. */
 int ds4_gpu_decode_graphs_supported(void) { return 0; }
@@ -39093,9 +39101,23 @@ typedef struct {
 #undef DS41_ROW_FIELD
 } ds41_prefill_row;
 
+/* g->prefill_cap sizes every batch buffer, the packed activation arena and
+ * prefill_ids/rows_view, so the 8k-chunk decision it makes is fixed for the
+ * life of the graph.  Latch the lever's startup value here; the runtime arm of
+ * the same lever lives in ds41_encoder_chunk_cap(), which only narrows the
+ * chunk actually swept and therefore never outruns an existing allocation. */
+static int ds41_prefill_8k_chunk_at_alloc(void) {
+    static int latched = -1;
+    if (latched < 0) {
+        ds41_levers_init_from_env();
+        latched = g_ds41_levers.prefill_8k_chunk ? 1 : 0;
+    }
+    return latched;
+}
+
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
     const uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
-        (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : DS41_PREFILL_CAP;
+        (ctx < 16384u || !ds41_prefill_8k_chunk_at_alloc()) ? 4096u : DS41_PREFILL_CAP;
     return ctx < limit ? ctx : limit;
 }
 
@@ -39440,6 +39462,25 @@ ds41_levers g_ds41_levers = {
     .ffn_add_fold = 1,
     .kv_stage_f16 = 1,
     .routed_down_split = 0, /* R4: opt-in until the four-manifest gate passes */
+    .prefill_8k_chunk = 1,
+    .prefill_decoder_suffix = 1,
+    .prefill_stage_profile = 0,
+    .q8_prefill_profile = 0,
+    .prefill_tail_absorb = 0, /* T2: the split changes the decoder cone's rows */
+    .engram_readers = 32,
+    .prefill_attn_rb16 = 1,
+    /* Prefill wave 3: the six batch-glue drafts, all gated Tier 1 -- the raw
+     * 129,280-float frontier row is byte-identical to the wave-2 production
+     * configuration at 16,384 and 32,768 over two interleaved reps each -- and
+     * adopted as production defaults.  Each keeps an =0 kill switch. */
+    .prefill_f16_rows2 = 1,
+    .prefill_embed_init = 1,
+    .prefill_hc_sum_round = 1,
+    .prefill_hc_expand_round = 1,
+    .prefill_hc_norm_round = 1,
+    .prefill_ffn_add_round = 1,
+    .attn_diag = 0, /* diagnostic ablation arm; 0 is the production kernel */
+    .prefill_attn_lean_rows = 1,
 };
 static int g_ds41_levers_ready;
 
@@ -39461,6 +39502,12 @@ static int ds41_env_disable_form(const char *name) {
  * DS4_METAL_ENABLE_* / DS4_METAL_DISABLE_* pair, collapsed into one field. */
 static int ds41_env_optin_form(const char *enable, const char *disable) {
     return getenv(enable) != NULL && getenv(disable) == NULL;
+}
+
+/* A counted lever carries a quantity, not a switch, so /debug/levers stores it
+ * as given (inside its own range) instead of coercing it to 0/1. */
+static int ds41_lever_counted(const char *name) {
+    return !strcmp(name, "engram_readers") || !strcmp(name, "attn_diag");
 }
 
 static const struct { const char *name; size_t off; const char *env; } g_ds41_lever_map[] = {
@@ -39490,7 +39537,23 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "ffn_add_fold",       offsetof(ds41_levers, ffn_add_fold),       "DS4_DS41_FFN_ADD_FOLD" },
     { "kv_stage_f16",       offsetof(ds41_levers, kv_stage_f16),       "DS4_DS41_KV_STAGE_F16" },
     { "routed_down_split",  offsetof(ds41_levers, routed_down_split),  "DS4_DS41_ROUTED_DOWN_SPLIT" },
+    { "prefill_8k_chunk",   offsetof(ds41_levers, prefill_8k_chunk),   "DS4_METAL_DISABLE_V41_8K_CHUNK" },
+    { "prefill_decoder_suffix", offsetof(ds41_levers, prefill_decoder_suffix), "DS4_METAL_DISABLE_V41_DECODER_SUFFIX" },
+    { "prefill_stage_profile",  offsetof(ds41_levers, prefill_stage_profile),  "DS4_METAL_V41_STAGE_PROFILE" },
+    { "q8_prefill_profile",     offsetof(ds41_levers, q8_prefill_profile),     "DS4_METAL_Q8_PREFILL_PROFILE" },
     { "attn_cohort4",       offsetof(ds41_levers, attn_cohort4),       "DS4_DS41_ATTN_COHORT4" },
+    { "routed_tail_cull",   offsetof(ds41_levers, routed_tail_cull),   "DS4_METAL_DISABLE_V41_ROUTED_TAIL_CULL" },
+    { "prefill_tail_absorb", offsetof(ds41_levers, prefill_tail_absorb), "DS4_DS41_PREFILL_TAIL_ABSORB" },
+    { "engram_readers",     offsetof(ds41_levers, engram_readers),     "DS4_DS41_ENGRAM_READERS" },
+    { "prefill_attn_rb16",  offsetof(ds41_levers, prefill_attn_rb16),  "DS4_METAL_DISABLE_V41_PREFILL_ATTN_RB16" },
+    { "prefill_f16_rows2", offsetof(ds41_levers, prefill_f16_rows2), "DS4_DS41_PREFILL_F16_ROWS2" },
+    { "prefill_embed_init", offsetof(ds41_levers, prefill_embed_init), "DS4_DS41_PREFILL_EMBED_INIT" },
+    { "prefill_hc_sum_round", offsetof(ds41_levers, prefill_hc_sum_round), "DS4_DS41_PREFILL_HC_SUM_ROUND" },
+    { "prefill_hc_expand_round", offsetof(ds41_levers, prefill_hc_expand_round), "DS4_DS41_PREFILL_HC_EXPAND_ROUND" },
+    { "prefill_hc_norm_round", offsetof(ds41_levers, prefill_hc_norm_round), "DS4_DS41_PREFILL_HC_NORM_ROUND" },
+    { "prefill_ffn_add_round", offsetof(ds41_levers, prefill_ffn_add_round), "DS4_DS41_PREFILL_FFN_ADD_ROUND" },
+    { "attn_diag",          offsetof(ds41_levers, attn_diag),          "DS4_DS41_ATTN_DIAG" },
+    { "prefill_attn_lean_rows", offsetof(ds41_levers, prefill_attn_lean_rows), "DS4_METAL_DISABLE_V41_PREFILL_ATTN_LEAN_ROWS" },
 };
 
 void ds41_levers_init_from_env(void) {
@@ -39532,9 +39595,56 @@ void ds41_levers_init_from_env(void) {
                                        ds41_env_enable_form("DS4_DS41_ROUTED_DOWN_SPLIT");
     g_ds41_levers.q4_gu_nr1          = getenv("DS4_DS41_Q4_GU_NR1") != NULL &&
                                        getenv("DS4_DS41_Q4_GU_NR1")[0] != '0';
+    /* Prefill cost map.  The two DISABLE_ variables keep their historical
+     * names and inversions; as everywhere else in this table, a value that
+     * starts with '0' is read as "not disabled". */
+    g_ds41_levers.prefill_8k_chunk       = ds41_env_disable_form("DS4_METAL_DISABLE_V41_8K_CHUNK");
+    g_ds41_levers.prefill_decoder_suffix = ds41_env_disable_form("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+    g_ds41_levers.prefill_stage_profile   = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL &&
+                                            getenv("DS4_METAL_V41_STAGE_PROFILE")[0] != '0';
+    g_ds41_levers.q8_prefill_profile      = getenv("DS4_METAL_Q8_PREFILL_PROFILE") != NULL &&
+                                            getenv("DS4_METAL_Q8_PREFILL_PROFILE")[0] != '0';
     /* Wave 5: R6, the four-head attention cohort.  Opt-in until it is gated. */
     g_ds41_levers.attn_cohort4       = getenv("DS4_DS41_ATTN_COHORT4") != NULL &&
                                        ds41_env_enable_form("DS4_DS41_ATTN_COHORT4");
+    /* Prefill wave 1, bundle item (i).  Adopted as the production default:
+     * frontier logits byte-identical at 16k over two interleaved reps, +1.40 %
+     * on the 16k cold prefill and 872.8 -> 737.0 ms (-15.6 %) on 111-token
+     * agent-turn appends (runs/wave1-cull).  The historical DISABLE_ form is
+     * the kill switch. */
+    g_ds41_levers.routed_tail_cull   = ds41_env_disable_form("DS4_METAL_DISABLE_V41_ROUTED_TAIL_CULL");
+    /* Prefill wave 2.  Lever 1 is a plain disable-form switch; lever 2 carries
+     * a count, so its variable is read as a number and anything outside
+     * 1..256 leaves the compiled-in default in place. */
+    /* Wave 2 measured this at +7.28 % on the 15,000-token gate-(b) shape, but
+     * the frontier logits MOVE: a single 15,000-row sweep and a 14,336 + 664
+     * pair give the decoder suffix different rows to approximate over.  That is
+     * Tier 2, so the lever is opt-in until the four-manifest gate passes. */
+    g_ds41_levers.prefill_tail_absorb = getenv("DS4_DS41_PREFILL_TAIL_ABSORB") != NULL &&
+                                        ds41_env_enable_form("DS4_DS41_PREFILL_TAIL_ABSORB");
+    {
+        const char *readers = getenv("DS4_DS41_ENGRAM_READERS");
+        if (readers) {
+            const long n = strtol(readers, NULL, 10);
+            if (n >= 1 && n <= 256) g_ds41_levers.engram_readers = (int)n;
+        }
+    }
+    g_ds41_levers.prefill_attn_rb16 = ds41_env_disable_form("DS4_METAL_DISABLE_V41_PREFILL_ATTN_RB16");
+    g_ds41_levers.prefill_f16_rows2 = ds41_env_enable_form("DS4_DS41_PREFILL_F16_ROWS2");
+    g_ds41_levers.prefill_embed_init = ds41_env_enable_form("DS4_DS41_PREFILL_EMBED_INIT");
+    g_ds41_levers.prefill_hc_sum_round = ds41_env_enable_form("DS4_DS41_PREFILL_HC_SUM_ROUND");
+    g_ds41_levers.prefill_hc_expand_round = ds41_env_enable_form("DS4_DS41_PREFILL_HC_EXPAND_ROUND");
+    g_ds41_levers.prefill_hc_norm_round = ds41_env_enable_form("DS4_DS41_PREFILL_HC_NORM_ROUND");
+    g_ds41_levers.prefill_ffn_add_round = ds41_env_enable_form("DS4_DS41_PREFILL_FFN_ADD_ROUND");
+    g_ds41_levers.prefill_attn_lean_rows =
+        ds41_env_disable_form("DS4_METAL_DISABLE_V41_PREFILL_ATTN_LEAN_ROWS");
+    {   /* Wave 3 task B: the attention ablation arm.  Diagnostic only. */
+        const char *diag = getenv("DS4_DS41_ATTN_DIAG");
+        if (diag) {
+            const long n = strtol(diag, NULL, 10);
+            if (n >= 0 && n <= 9) g_ds41_levers.attn_diag = (int)n;
+        }
+    }
     g_ds41_levers_ready = 1;
 }
 
@@ -39565,7 +39675,14 @@ int ds41_levers_set(const char *name, int value) {
     ds41_levers_init_from_env();
     for (size_t i = 0; i < ds41_levers_count(); i++) {
         if (!strcmp(name, g_ds41_lever_map[i].name)) {
-            *(int *)((char *)&g_ds41_levers + g_ds41_lever_map[i].off) = value ? 1 : 0;
+            if (ds41_lever_counted(name)) {
+                const int lo = !strcmp(name, "attn_diag") ? 0 : 1;
+                const int hi = !strcmp(name, "attn_diag") ? 9 : 256;
+                if (value < lo || value > hi) return 0;
+                *(int *)((char *)&g_ds41_levers + g_ds41_lever_map[i].off) = value;
+            } else {
+                *(int *)((char *)&g_ds41_levers + g_ds41_lever_map[i].off) = value ? 1 : 0;
+            }
             return 1;
         }
     }
@@ -40282,6 +40399,47 @@ static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
         ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[0], count, DS4_V41_BF16);
 }
 
+/* Virtual-row batching: only the HC sublayer's batch producers select these
+ * store rounds.
+ * Keep the old materialized BF16 values and all old-pre/mixer dependencies.
+ * Publication/indexer norms and the small/verify path retain their reference. */
+static bool ds41_hc_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+                                const ds4_model *m, const ds4_tensor *weight,
+                                uint32_t count) {
+    const bool round = count > DS4_TP_BATCH_MAX_ROWS && g_ds41_levers.prefill_hc_norm_round;
+    if (!round) return ds41_norm_batch(out, in, m, weight, count);
+    return ds4_gpu_rms_norm_weight_rows_round_tensor(out, in, m->map, m->size,
+        weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS, 1);
+}
+
+static bool ds41_hc_sum_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual,
+                               const ds4_gpu_tensor *weights, bool split, uint32_t count) {
+    const bool round = count > DS4_TP_BATCH_MAX_ROWS && g_ds41_levers.prefill_hc_sum_round;
+    const bool ok = split ?
+        ds4_gpu_hc_weighted_sum_split_round_tensor(out, residual, weights,
+            DS4_N_EMBD, DS4_N_HC, round) :
+        ds4_gpu_hc_weighted_sum_round_tensor(out, residual, weights,
+            DS4_N_EMBD, DS4_N_HC, round);
+    return ok && (round || ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, count, DS4_V41_BF16));
+}
+
+static bool ds41_hc_expand_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+                                  const ds4_gpu_tensor *residual,
+                                  const ds4_gpu_tensor *split, uint32_t count) {
+    const bool round = count > DS4_TP_BATCH_MAX_ROWS && g_ds41_levers.prefill_hc_expand_round;
+    return ds4_gpu_hc_expand_split_round_tensor(out, block, residual, split,
+        DS4_N_EMBD, DS4_N_HC, round) &&
+        (round || ds4_gpu_dsv41_quantize(out, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16));
+}
+
+static bool ds41_ffn_add_batch(ds41_prefill_row *b, uint32_t count) {
+    if (count > DS4_TP_BATCH_MAX_ROWS && g_ds41_levers.prefill_ffn_add_round)
+        return ds4_gpu_dsv41_add_bf16_rows(b->block, b->routed, b->shared,
+            DS4_N_EMBD, count);
+    return ds4_gpu_add_tensor(b->block, b->routed, b->shared, count * DS4_N_EMBD) &&
+        ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, count, DS4_V41_BF16);
+}
+
 static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
                               const ds4_layer_weights *l, bool ffn, uint32_t count) {
     const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
@@ -40314,22 +40472,16 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     }
     if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
-    const bool mixed = il ?
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC);
-    return mixed && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
-        ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
+    return ds41_hc_sum_batch(b->x, b->residual, il ? b->ffn_split : b->pre,
+        il != 0u, count) && ds41_hc_norm_batch(b->norm, b->x, m, l->attn_norm, count);
 }
 
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count) {
-    return ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
-        b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16) &&
-        ds41_hc_mix_batch(b, m, l, true, count) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
-        ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count);
+    return ds41_hc_expand_batch(b->after_attn, b->block, b->residual,
+        b->attn_split, count) && ds41_hc_mix_batch(b, m, l, true, count) &&
+        ds41_hc_sum_batch(b->x, b->after_attn, b->attn_split, true, count) &&
+        ds41_hc_norm_batch(b->norm, b->x, m, l->ffn_norm, count);
 }
 
 static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -40351,10 +40503,19 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool bf16) {
-    if (weight->type == DS4_TENSOR_F16)
-        return ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
-            (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) &&
-            (!bf16 || ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[1], count, DS4_V41_BF16));
+    if (weight->type == DS4_TENSOR_F16) {
+        /* Virtual-row batching: pair independent token rows, preserving the scalar-row
+         * K/SIMD tree. Keep small/verify rows on their existing route. */
+        ds41_levers_init_from_env();
+        const bool paired = count > DS4_TP_BATCH_MAX_ROWS && g_ds41_levers.prefill_f16_rows2;
+        const bool ok = paired ?
+            ds4_gpu_dsv41_projection_rows2(out, m->map, m->size, weight->abs_offset,
+                (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) :
+            ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
+                (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in);
+        return ok && (!bf16 || ds4_gpu_dsv41_quantize(out,
+            (uint32_t)weight->dim[1], count, DS4_V41_BF16));
+    }
     return ds41_matmul_batch(out, m, weight, in, count, bf16);
 }
 
@@ -40885,6 +41046,13 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
     if (g->carry_cap && remaining >= 4096u &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
         const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
+        /* Wave 2 lever 1.  When this sweep already covers the whole remainder,
+         * the 2048 rounding buys nothing and costs a second full-depth sweep
+         * over the rows it shaves off: 62,000 becomes 32,768 + 28,672 + 560
+         * rather than 32,768 + 29,232.  The rounding stays wherever a further
+         * sweep follows, so every sweep boundary that another sweep continues
+         * from is still a multiple of 2048. */
+        if (g_ds41_levers.prefill_tail_absorb && count == remaining) return count;
         return count - count % 2048u;
     }
     const uint32_t tail_cap = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;
@@ -41115,10 +41283,18 @@ static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *
 }
 
 static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) {
-    if (count < 8192u && g->prefill_cap > 2048u) return 2048u;
+    ds41_levers_init_from_env();
+    /* Runtime arm of the 8k-chunk ablation (prefill/PLAN.md Phase 1 run 9).
+     * Setting prefill_8k_chunk=0 on a resident server reproduces the chunk
+     * staircase a process started with DS4_METAL_DISABLE_V41_8K_CHUNK=1 would
+     * have used.  It does NOT shrink the buffers that the startup value sized;
+     * this arm prices the chunk, not the allocation. */
+    uint32_t cap = g->prefill_cap;
+    if (!g_ds41_levers.prefill_8k_chunk && cap > 4096u) cap = 4096u;
+    if (count < 8192u && cap > 2048u) return 2048u;
     /* Keep the decoder suffix optimization for 8k prompts. */
-    if (count < 16384u && g->prefill_cap > 4096u) return 4096u;
-    return g->prefill_cap;
+    if (count < 16384u && cap > 4096u) return 4096u;
+    return cap;
 }
 
 /* Process rows in causal order within each layer. Selection/candidate rows
@@ -41130,20 +41306,23 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
                               bool encoder_only, bool resume_encoder) {
+    ds41_levers_init_from_env();
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
     const bool wide = total_count > encoder_chunk;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
-    const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
+    /* Read once per sweep, exactly where the getenv() used to be, so a lever
+     * flipped between two requests takes effect on the next prefill. */
+    const bool stage_profile = g_ds41_levers.prefill_stage_profile != 0;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
     const bool batch_attention = !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN");
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
     const bool decoder_suffix = wide && total_count >= 8192u &&
-        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+        g_ds41_levers.prefill_decoder_suffix != 0;
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
     ds4_engram_history next_history = g->history;
@@ -41156,6 +41335,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * decode cache from it before advancing to the next layer. */
     row.streaming = false;
     ds41_engram_prefetch engram_prefetch = {0};
+    /* Wave 2 lever 2: timing only.  Read once per sweep, like every other
+     * lever here, so /debug/levers takes effect on the next prefill. */
+    ds4_engram_set_readers((unsigned)g_ds41_levers.engram_readers);
     const bool overlap_engram = total_count >= 1024u &&
         !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PREFETCH") &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_ENGRAM");
@@ -41233,11 +41415,23 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok) ok = ds4_gpu_begin_commands() != 0;
             if (!il) {
-                const float initial_pre[] = {1, 0, 0, 0};
-                for (uint32_t t = 0; ok && t < count; t++) {
-                    ok = ds4_gpu_tensor_write(g->rows_view[t].pre, 0, initial_pre, sizeof(initial_pre)) &&
-                        ds41_embed(g, m, w, g->rows_view[t].residual, g->rows_view[t].x,
-                                    tokens[off + t], start + t);
+                if (batch_hc && g->tp_world == 1 && !g->image_count &&
+                    count > DS4_TP_BATCH_MAX_ROWS && w->token_embd->type == DS4_TENSOR_F16 &&
+                    g_ds41_levers.prefill_embed_init) {
+                    /* Preserve scalar embed's invalid-token rejection before
+                     * the batched gather. x is scratch until HC collapse. */
+                    for (uint32_t t = 0; ok && t < count; t++)
+                        ok = (uint32_t)tokens[off + t] < DS4_N_VOCAB;
+                    if (ok) ok = ds4_gpu_dsv41_embed_init_rows(active.residual,
+                        active.pre, active.x, g->prefill_tokens, m->map, m->size,
+                        w->token_embd->abs_offset, DS4_N_VOCAB, count, DS4_N_EMBD);
+                } else {
+                    const float initial_pre[] = {1, 0, 0, 0};
+                    for (uint32_t t = 0; ok && t < count; t++) {
+                        ok = ds4_gpu_tensor_write(g->rows_view[t].pre, 0, initial_pre, sizeof(initial_pre)) &&
+                            ds41_embed(g, m, w, g->rows_view[t].residual, g->rows_view[t].x,
+                                        tokens[off + t], start + t);
+                    }
                 }
             } else if (wide) {
                 if (ok) ok = ds41_carry_copy(g, off, count, false);
@@ -41339,11 +41533,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
-                    ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
-                        ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
-                        ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                            active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+                    ok = ds41_ffn_add_batch(&active, count) &&
+                        ds41_hc_expand_batch(active.residual, active.block, active.after_attn,
+                            active.ffn_split, count);
                 }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
@@ -70370,6 +70562,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = false;
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
+        ds41_levers_init_from_env();
         ds41_encoder_residency encoder = {0};
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
@@ -70384,9 +70577,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const uint32_t count = g->encoder_resident ?
                 (remaining - 512u < g->prefill_cap ? remaining - 512u : g->prefill_cap) :
                 ds41_prefill_count(g, remaining);
+            /* Same lever, same place in the decision as the getenv() it
+             * replaces.  It is read per chunk, and `decoder_pending` pairs a
+             * deferred decoder with a later sweep inside ONE prompt, so the
+             * lever must only ever change between requests -- which is all
+             * /debug/levers ever does on a single-slot server. */
             const bool defer_decoder = !g->encoder_resident && count >= 16384u &&
                 remaining - count >= 8192u &&
-                !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX") &&
+                g_ds41_levers.prefill_decoder_suffix != 0 &&
                 !getenv("DS4_METAL_DISABLE_V41_DEFER_DECODER");
             /* Never add an encoder sweep just to defer the decoder. A short
              * remainder finishes the pending decoder here, then runs normally. */

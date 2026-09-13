@@ -167,6 +167,11 @@ int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t row_offset,
                             ds4_gpu_tensor *plain, uint32_t width, uint32_t rows,
                             uint32_t format, bool pack);
 /* Batched F16 projections with the same arithmetic as individual matvecs. */
+/* Two virtual token rows, same per-row F16 matvec reduction. */
+int ds4_gpu_dsv41_projection_rows2(ds4_gpu_tensor *out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t width, uint32_t outputs, uint32_t rows, const ds4_gpu_tensor *in);
+
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const void *model_map, uint64_t model_size,
                                  uint64_t weight_offset, uint32_t width,
@@ -572,6 +577,17 @@ int ds4_gpu_attention_output_q8_tp_tensor(
  * These kernels seed HC state from token embeddings and implement the ratio-4
  * compressed-attention indexer that chooses visible compressed rows.
  */
+
+/* Materialize BF16(a+b), without rounding either operand first. */
+int ds4_gpu_dsv41_add_bf16_rows(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t width, uint32_t rows);
+
+/* F16 batched gather into caller scratch, then HC4 repeat + old-pre init.
+ * Caller validates token IDs; all tensors are retained until command drain. */
+int ds4_gpu_dsv41_embed_init_rows(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *pre,
+        ds4_gpu_tensor *scratch, const ds4_gpu_tensor *tokens,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_vocab, uint32_t rows, uint32_t width);
 
 int ds4_gpu_embed_token_hc_tensor(
         ds4_gpu_tensor *out_hc,

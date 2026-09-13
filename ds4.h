@@ -212,6 +212,14 @@ typedef struct {
  *   ffn_add_fold DS4_DS41_FFN_ADD_FOLD=0 disables                      (L3/R8')
  *   kv_stage_f16 DS4_DS41_KV_STAGE_F16=0 disables                      (L3/R3a)
  *
+ * Prefill cost-map levers (prefill/PLAN.md Phase 1; the whole cost map runs
+ * inside ONE resident server instead of ~8 process starts):
+ *
+ *   prefill_8k_chunk       DS4_METAL_DISABLE_V41_8K_CHUNK=1 disables
+ *   prefill_decoder_suffix DS4_METAL_DISABLE_V41_DECODER_SUFFIX=1 disables
+ *   prefill_stage_profile  DS4_METAL_V41_STAGE_PROFILE=1 enables (default off)
+ *   q8_prefill_profile     DS4_METAL_Q8_PREFILL_PROFILE=1 enables (default off)
+ *
  * The graph reads g_ds41_levers with plain global loads.  ds41_levers_set() is
  * only ever called between requests, by ds4-server's --debug-levers endpoint.
  * ------------------------------------------------------------------------ */
@@ -242,7 +250,64 @@ typedef struct {
     int ffn_add_fold;
     int kv_stage_f16;
     int routed_down_split; /* DS4_DS41_ROUTED_DOWN_SPLIT=1 arms R4 (opt-in) */
+    /* Prefill cost map.  prefill_8k_chunk moves the ENCODER CHUNK only: the
+     * graph's batch buffers are sized from the startup value of the same
+     * switch, so flipping it at runtime shrinks the chunk without shrinking
+     * the allocation (see ds41_encoder_chunk_cap). */
+    int prefill_8k_chunk;
+    int prefill_decoder_suffix;
+    int prefill_stage_profile;  /* default off */
+    int q8_prefill_profile;     /* default off */
     int attn_cohort4;      /* DS4_DS41_ATTN_COHORT4=1 arms R6 (opt-in) */
+    /* Prefill wave 1, bundle item (i): CULL_TAIL_SIMDGROUPS for the Q4_K
+     * routed matmuls.  Production default; DS4_METAL_DISABLE_V41_ROUTED_TAIL_CULL=1
+     * restores the uncculled kernels. */
+    int routed_tail_cull;
+    /* Prefill wave 2, lever 1: absorb a sub-2048 remainder into the sweep that
+     * precedes it instead of leaving a separate full-depth tail sweep.
+     * 62,000 tokens split 32,768 + 28,672 + 560 today; the 560-row sweep
+     * re-reads all 40 layers and costs 4.5 % against the prompt's own 32k
+     * trend (prefill/phase1/COSTMAP.md S1).  Host-only; no per-row arithmetic
+     * changes, but the decoder suffix then approximates over different rows and
+     * the frontier logits move -- Tier 2, opt-in with DS4_DS41_PREFILL_TAIL_ABSORB=1
+     * until the four-manifest gate passes. */
+    int prefill_tail_absorb;
+    /* Prefill wave 2, lever 2: concurrent readers in ds4_engram_read_batch.
+     * 16 is the historical value; the SSD saturates at 32 (ds4_engram.c).
+     * Timing only -- same rows, same order, same values. */
+    int engram_readers;
+    /* Prefill wave 2, lever 3: stage sixteen K/V rows at a time in the prefill
+     * attention core instead of one, by dispatching the existing
+     * kernel_dsv4_indexed_mixed_attention_heads8_rb16 (the decode path's
+     * production kernel) for multi-token chunks.  Same rows, same order, same
+     * online-softmax updates, same dot and reduction trees -- only the gather
+     * width and the threadgroup-barrier count change.
+     * DS4_METAL_DISABLE_V41_PREFILL_ATTN_RB16=1 restores the one-row kernel. */
+    int prefill_attn_rb16;
+    int prefill_hc_sum_round; /* compile-only prefill draft, opt-in */
+    int prefill_hc_expand_round; /* compile-only prefill draft, opt-in */
+    int prefill_hc_norm_round; /* compile-only prefill draft, opt-in */
+    int prefill_ffn_add_round; /* compile-only prefill draft, opt-in */
+    int prefill_embed_init; /* DS4_DS41_PREFILL_EMBED_INIT=1: opt-in draft */
+    int prefill_f16_rows2; /* DS4_DS41_PREFILL_F16_ROWS2=1: compile-only draft, opt-in */
+    /* Wave 3, task B.  DIAGNOSTIC ONLY, never adopted: an ablation arm of the
+     * prefill attention core.  0 = production kernel; 1..5 select a variant
+     * that deletes one stage (pv, exp, gather) or keeps only the gather, plus
+     * an unablated control that shares the arms' clamped row scan.  Every
+     * non-zero value makes the attention output deliberately WRONG, so no
+     * speed or identity claim may ever be made from a run with it set.
+     * DS4_DS41_ATTN_DIAG=N, counted lever, per request. */
+    int attn_diag;
+    /* Wave 3: the register-lean selected-id form of the prefill attention
+     * core.  The wave-3 decomposition measured the kernel to be
+     * register/occupancy bound; deleting the sixteen-word `uint rows[16]`
+     * private array while keeping every row, every order and every arithmetic
+     * operation took the 8,192-row call 100.26 -> 84.13 ms.  Same rows, same
+     * order, same online-softmax updates -- a sixteen-bit mask replaces the
+     * array.  DS4_METAL_DISABLE_V41_PREFILL_ATTN_LEAN_ROWS=1 is the kill
+     * switch.  Prefill only: the decode path keeps the wave-2 kernel until
+     * the decode gate has seen this. */
+    int prefill_attn_lean_rows;
 } ds41_levers;
 
 extern ds41_levers g_ds41_levers;
@@ -253,6 +318,23 @@ const char *ds41_levers_name(size_t i);
 const char *ds41_levers_env_name(size_t i);
 int         ds41_levers_get(const char *name, int *out);
 int         ds41_levers_set(const char *name, int value);
+
+/* DS4_KERNEL_LEDGER, per request.  The MODE is process-level: it installs
+ * Objective-C swizzles and (mode 2) a counter sample buffer before any
+ * pipeline is built, and mode 2 additionally disables encoder batching, so it
+ * cannot be changed after ds4_gpu_init().  Reset and dump, however, are free
+ * to run per request, which is what lets one resident server produce a
+ * separate prefill ledger for every arm of the cost map.
+ *   ds4_gpu_kernel_ledger_mode()      0 when the ledger is off.
+ *   ds4_gpu_kernel_ledger_reset()     zero every accumulator, keep the
+ *                                     pipeline-object -> kernel-name map.
+ *   ds4_gpu_kernel_ledger_dump_path() write the ledger to a path (NULL or ""
+ *                                     = the DS4_KERNEL_LEDGER_DUMP default);
+ *                                     1 on success, 0 when off or unwritable.
+ * All three are no-ops returning 0 on non-Metal builds. */
+int  ds4_gpu_kernel_ledger_mode(void);
+void ds4_gpu_kernel_ledger_reset(void);
+int  ds4_gpu_kernel_ledger_dump_path(const char *path);
 
 typedef struct {
     float *data;

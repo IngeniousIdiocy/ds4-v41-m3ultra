@@ -5680,6 +5680,221 @@ out:
     return out;
 }
 
+/* ---------------------------------------------------------------------------
+ * /debug/prefill - resident prefill cost map for the V4.1 prefill campaign.
+ *
+ * prefill/PLAN.md Phase 1 was planned as ~8 ds4-bench processes, each paying a
+ * 294 GiB weight load (104 s cold) to read one start-up environment variable.
+ * Every one of those switches is now a lever (prefill_8k_chunk,
+ * prefill_decoder_suffix, prefill_stage_profile, q8_prefill_profile), so the
+ * whole map can run inside one resident server: set the levers, reset the
+ * kernel ledger, prefill, dump the ledger, read the frontier logits.
+ *
+ * Unlike /debug/bench this endpoint never snapshots and never restores.  A
+ * prefill IS the measurement, so the session is invalidated first (which
+ * resets the V4.1 graph and drops the checkpoint) and ds4_session_sync() then
+ * runs a genuine cold prefill of exactly ctx_start tokens.  The only work
+ * inside the ledger window is that prefill.
+ *
+ * Reachable only with --debug-levers; serialised on the /debug/bench mutex.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    char        *path;
+    int          ctx_alloc;
+    ds4_tokens   prompt;
+    ds4_session *session;
+} prefill_fixture;
+
+#define PREFILL_FIXTURES 2
+static prefill_fixture g_prefill_fix[PREFILL_FIXTURES];
+
+static void prefill_fixture_reset(prefill_fixture *f) {
+    if (!f) return;
+    if (f->session) { ds4_session_free(f->session); f->session = NULL; }
+    ds4_tokens_free(&f->prompt);
+    free(f->path);
+    memset(f, 0, sizeof(*f));
+}
+
+/* One tokenized prompt file and one session per (path, ctx_alloc).  Both are
+ * reused across arms: tokenizing 1.3 MB and allocating a 62k context are not
+ * part of what the cost map measures. */
+static prefill_fixture *prefill_fixture_get(ds4_engine *e, const char *path,
+                                            int ctx_start, int ctx_alloc,
+                                            char *err, size_t errlen) {
+    prefill_fixture *free_slot = NULL;
+    for (int i = 0; i < PREFILL_FIXTURES; i++) {
+        prefill_fixture *f = &g_prefill_fix[i];
+        if (f->path && !strcmp(f->path, path) && f->ctx_alloc == ctx_alloc) {
+            if (f->prompt.len < ctx_start) {
+                snprintf(err, errlen, "prompt has %d tokens, need %d",
+                         f->prompt.len, ctx_start);
+                return NULL;
+            }
+            return f;
+        }
+        if (!f->path && !free_slot) free_slot = f;
+    }
+    if (!free_slot) { free_slot = &g_prefill_fix[0]; prefill_fixture_reset(free_slot); }
+
+    size_t text_len = 0;
+    char *text = bench_read_file(path, &text_len);
+    if (!text) { snprintf(err, errlen, "cannot read %s", path); return NULL; }
+    prefill_fixture *f = free_slot;
+    memset(f, 0, sizeof(*f));
+    ds4_tokenize_text(e, text, &f->prompt);
+    free(text);
+    if (f->prompt.len < ctx_start) {
+        snprintf(err, errlen, "prompt has %d tokens, need %d", f->prompt.len, ctx_start);
+        ds4_tokens_free(&f->prompt);
+        return NULL;
+    }
+    if (ds4_session_create(&f->session, e, ctx_alloc) != 0) {
+        snprintf(err, errlen, "session create failed at ctx %d", ctx_alloc);
+        ds4_tokens_free(&f->prompt);
+        return NULL;
+    }
+    f->path = xstrdup(path);
+    f->ctx_alloc = ctx_alloc;
+    return f;
+}
+
+/* Frontier logits, Tier-1 identity artifact #1 (prefill/GATES.md).  Raw
+ * little-endian float32, vocab floats, NO header and no metadata: ds4-bench's
+ * JSON form embeds the model path, the backend name and the quant bits, so
+ * whole-file JSON hashes compare the run and not the arithmetic.  Two arms are
+ * identical iff these raw rows are identical. */
+static bool prefill_write_logits(const float *logits, int vocab, const char *path) {
+    if (!logits || vocab <= 0) return false;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return false;
+    bool ok = fwrite(logits, sizeof(float), (size_t)vocab, fp) == (size_t)vocab;
+    if (fclose(fp) != 0) ok = false;
+    return ok;
+}
+
+/* Returns a malloc'd JSON body, or NULL with err set.
+ *
+ * gen_tokens defaults to 0 and every cost-map arm leaves it there.  ds4-bench's
+ * `--gen-tokens 1` is NOT a pure prefill: it still runs a ds4_session_eval()
+ * scalar step (ds4_bench.c:898-952), so a "prefill-only" number taken with a
+ * generated token is contaminated.  Here the measured window ends at the
+ * frontier logits, and both the ledger dump and the identity artifact are taken
+ * before any decode can happen.  gen_tokens > 0 exists only for gate (b), where
+ * TTFT is defined as prefill wall + gen_first_ms. */
+static char *prefill_run(ds4_engine *e, const char *path, int ctx_start,
+                         int ctx_alloc, int gen_tokens, bool reset,
+                         const char *ledger_dump,
+                         const char *logits_path, char *err, size_t errlen) {
+    pthread_mutex_lock(&g_bench_mu);
+    char *out = NULL;
+    float *logits = NULL;
+    prefill_fixture *f = prefill_fixture_get(e, path, ctx_start, ctx_alloc, err, errlen);
+    if (!f) goto out;
+
+    char serr[256];
+    /* reset (the default): drop the checkpoint and reset the V4.1 graph, so the
+     * next sync is a real cold prefill.  reset=false keeps the frontier where
+     * the previous request left it, which is how gate (c)'s 111-token appends
+     * are measured - a continued append at real depth, never a cold 111-token
+     * prompt, which has completely different physics. */
+    if (reset) ds4_session_invalidate(f->session);
+    const int pos_before = ds4_session_pos(f->session);
+    const int appended = ctx_start > pos_before ? ctx_start - pos_before : 0;
+    if (appended == 0) {
+        snprintf(err, errlen, "nothing to prefill: frontier is already at %d", pos_before);
+        goto out;
+    }
+
+    ds4_tokens prefix = { .v = f->prompt.v, .len = ctx_start, .cap = ctx_start };
+    ds4_gpu_kernel_ledger_reset();
+    const double t0 = bench_now_sec_srv();
+    if (ds4_session_sync(f->session, &prefix, serr, sizeof(serr)) != 0) {
+        snprintf(err, errlen, "prefill failed: %s", serr);
+        goto out;
+    }
+    const double sync_sec = bench_now_sec_srv() - t0;
+
+    /* Request-to-frontier-logits: the prefill is only finished when its output
+     * row is readable on the host.  No decode step is involved. */
+    const int vocab = ds4_engine_vocab_size(e);
+    logits = vocab > 0 ? malloc((size_t)vocab * sizeof(float)) : NULL;
+    const bool have_logits = logits && ds4_session_copy_logits(f->session, logits, vocab) == vocab;
+    const double frontier_sec = bench_now_sec_srv() - t0;
+
+    /* Dump before any decode, so this is a pure prefill ledger. */
+    const int ledger_mode = ds4_gpu_kernel_ledger_mode();
+    const bool ledger_written = ds4_gpu_kernel_ledger_dump_path(ledger_dump) != 0;
+
+    const bool logits_written = have_logits && logits_path && *logits_path &&
+        prefill_write_logits(logits, vocab, logits_path);
+    int frontier_argmax = -1;
+    if (have_logits) {
+        frontier_argmax = 0;
+        for (int i = 1; i < vocab; i++)
+            if (logits[i] > logits[frontier_argmax]) frontier_argmax = i;
+    }
+
+    const int eos = ds4_token_eos(e);
+    if (gen_tokens < 0) gen_tokens = 0;
+    if (gen_tokens > 8) gen_tokens = 8;
+    int *toks = calloc((size_t)(gen_tokens > 0 ? gen_tokens : 1), sizeof(int));
+    if (!toks) { snprintf(err, errlen, "oom"); goto out; }
+    double first_sec = 0.0;
+    int done = 0;
+    while (done < gen_tokens) {
+        const int token = ds4_session_argmax_excluding(f->session, eos);
+        if (token < 0) { snprintf(err, errlen, "argmax failed"); free(toks); goto out; }
+        const double g0 = bench_now_sec_srv();
+        if (ds4_session_eval(f->session, token, serr, sizeof(serr)) != 0) {
+            snprintf(err, errlen, "decode failed: %s", serr);
+            free(toks);
+            goto out;
+        }
+        const double g1 = bench_now_sec_srv();
+        toks[done++] = token;
+        if (done == 1) first_sec = g1 - g0;
+    }
+
+    buf b = {0};
+    buf_printf(&b, "{\"prompt_tokens\":%d,\"ctx_alloc\":%d", ctx_start, ctx_alloc);
+    buf_printf(&b, ",\"reset\":%s,\"pos_before\":%d,\"prefill_tokens\":%d",
+               reset ? "true" : "false", pos_before, appended);
+    /* prefill_ms is the ds4_session_sync span; prefill_to_logits_ms is the same
+     * window extended to the frontier row being readable on the host.  t/s is
+     * over the tokens this request actually prefilled, which for an append is
+     * the append and not the whole prefix. */
+    buf_printf(&b, ",\"prefill_ms\":%.3f,\"prefill_to_logits_ms\":%.3f,\"prefill_tps\":%.4f",
+               sync_sec * 1e3, frontier_sec * 1e3,
+               sync_sec > 0.0 ? (double)appended / sync_sec : 0.0);
+    buf_printf(&b, ",\"gen_tokens\":%d,\"gen_first_ms\":%.3f", done, first_sec * 1e3);
+    buf_printf(&b, ",\"frontier_argmax\":%d", frontier_argmax);
+    buf_printf(&b, ",\"ledger_mode\":%d,\"ledger_written\":%s", ledger_mode,
+               ledger_written ? "true" : "false");
+    buf_printf(&b, ",\"logits_written\":%s,\"logits_floats\":%d",
+               logits_written ? "true" : "false", have_logits ? vocab : 0);
+    buf_printf(&b, ",\"levers\":{");
+    for (size_t i = 0; i < ds41_levers_count(); i++) {
+        int v = 0;
+        ds41_levers_get(ds41_levers_name(i), &v);
+        buf_printf(&b, "%s\"%s\":%d", i ? "," : "", ds41_levers_name(i), v);
+    }
+    buf_puts(&b, "},\"text\":\"");
+    for (int i = 0; i < done; i++) {
+        size_t tlen = 0;
+        char *txt = ds4_token_text(e, toks[i], &tlen);
+        if (txt) { json_escape_fragment_n(&b, txt, tlen); free(txt); }
+    }
+    buf_puts(&b, "\"}");
+    free(toks);
+    out = buf_take(&b);
+    buf_free(&b);
+out:
+    free(logits);
+    pthread_mutex_unlock(&g_bench_mu);
+    return out;
+}
+
 static long long wall_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -14693,6 +14908,97 @@ static void *client_main(void *arg) {
         free(bpath);
         if (!body) {
             http_error(fd, s->enable_cors, 500, berr[0] ? berr : "bench failed");
+        } else {
+            http_response(fd, s->enable_cors, 200, "application/json", body);
+            free(body);
+        }
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/prefill")) {
+        if (!s->debug_levers) {
+            http_error(fd, s->enable_cors, 404, "unknown endpoint");
+            http_request_free(&hr);
+            goto done;
+        }
+        char *ppath = NULL, *pledger = NULL, *plogits = NULL;
+        int ctx_start = 8192, ctx_alloc = 0, gen = 0;
+        bool reset = true;
+        if (hr.body) {
+            const char *p = hr.body;
+            json_ws(&p);
+            if (*p == '{') {
+                p++;
+                json_ws(&p);
+                while (*p && *p != '}') {
+                    char *key = NULL;
+                    if (!json_string(&p, &key)) break;
+                    json_ws(&p);
+                    if (*p != ':') { free(key); break; }
+                    p++;
+                    json_ws(&p);
+                    if (!strcmp(key, "path")) {
+                        if (!json_string(&p, &ppath)) { free(key); break; }
+                    } else if (!strcmp(key, "ledger_dump")) {
+                        if (!json_string(&p, &pledger)) { free(key); break; }
+                    } else if (!strcmp(key, "logits_path")) {
+                        if (!json_string(&p, &plogits)) { free(key); break; }
+                    } else if (!strcmp(key, "ctx_start")) {
+                        if (!json_int(&p, &ctx_start)) { free(key); break; }
+                    } else if (!strcmp(key, "ctx_alloc")) {
+                        if (!json_int(&p, &ctx_alloc)) { free(key); break; }
+                    } else if (!strcmp(key, "gen_tokens")) {
+                        if (!json_int(&p, &gen)) { free(key); break; }
+                    } else if (!strcmp(key, "reset")) {
+                        if (!json_bool(&p, &reset)) { free(key); break; }
+                    } else if (!strcmp(key, "levers")) {
+                        json_ws(&p);
+                        if (*p == '{') {
+                            p++;
+                            json_ws(&p);
+                            while (*p && *p != '}') {
+                                char *lk = NULL;
+                                if (!json_string(&p, &lk)) break;
+                                json_ws(&p);
+                                if (*p != ':') { free(lk); break; }
+                                p++;
+                                json_ws(&p);
+                                int lv = 0;
+                                bool lb = false;
+                                if (json_int(&p, &lv)) { /* numeric */ }
+                                else if (json_bool(&p, &lb)) { lv = lb ? 1 : 0; }
+                                else { free(lk); break; }
+                                ds41_levers_set(lk, lv);
+                                free(lk);
+                                json_ws(&p);
+                                if (*p == ',') { p++; json_ws(&p); }
+                            }
+                            if (*p == '}') p++;
+                        } else if (!json_skip_value(&p)) { free(key); break; }
+                    } else if (!json_skip_value(&p)) { free(key); break; }
+                    free(key);
+                    json_ws(&p);
+                    if (*p == ',') { p++; json_ws(&p); }
+                }
+            }
+        }
+        if (!ppath) {
+            http_error(fd, s->enable_cors, 400, "missing \"path\"");
+            free(pledger);
+            free(plogits);
+            http_request_free(&hr);
+            goto done;
+        }
+        if (ctx_alloc <= 0) ctx_alloc = s->ctx_size;
+        char perr[256] = {0};
+        char *body = prefill_run(s->engine, ppath, ctx_start, ctx_alloc, gen,
+                                 reset, pledger, plogits, perr, sizeof(perr));
+        free(ppath);
+        free(pledger);
+        free(plogits);
+        if (!body) {
+            http_error(fd, s->enable_cors, 500, perr[0] ? perr : "prefill failed");
         } else {
             http_response(fd, s->enable_cors, 200, "application/json", body);
             free(body);

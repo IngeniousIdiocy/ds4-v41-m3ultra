@@ -59,6 +59,10 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
  * On macOS, large batches use bounded concurrent pread readers. */
 bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out);
+/* Concurrency of the batch reader (prefill wave 2 lever `engram_readers`).
+ * Timing only: the rows read, their order and their values are unchanged.
+ * Values outside 1..256 are ignored. */
+void ds4_engram_set_readers(unsigned readers);
 
 /* One decode step's DS4_ENGRAM_COLS rows, fetched off the caller's thread on a
  * bounded worker pool. Row order, the e4m3 -> BF16-rounded F32 conversion and

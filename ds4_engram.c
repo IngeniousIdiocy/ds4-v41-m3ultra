@@ -189,14 +189,27 @@ static int request_order(const void *a, const void *b) {
     return (x->row > y->row) - (x->row < y->row);
 }
 
-enum { ENGRAM_READERS = 16 };
+/* Prefill wave 2, lever `engram_readers`.  The reader count is the only
+ * tunable here: a 264-byte uncached pread costs ~113 us on this SSD, so the
+ * batch's wall time is latency/concurrency, not bandwidth.  Measured on the
+ * real table (offset 315838021632, 384,006,168 rows), 2,048 tokens = 49,152
+ * rows per batch: 1 reader 8.8k rows/s, 8 70.5k, 16 121.8k, 32 202.0k, 64
+ * 202.4k, 128 205.4k -- linear to 32, flat above it.  Nothing about the bytes,
+ * the row order or the e4m3 -> BF16-rounded F32 conversion changes with it. */
+enum { ENGRAM_READERS = 16, ENGRAM_READERS_MAX = 256 };
+
+static unsigned g_engram_readers = ENGRAM_READERS;
+
+void ds4_engram_set_readers(unsigned readers) {
+    if (readers >= 1u && readers <= ENGRAM_READERS_MAX) g_engram_readers = readers;
+}
 
 typedef struct {
     const ds4_engram_table *table;
     const engram_request *request;
     float *out;
     size_t count, readers;
-    int error[ENGRAM_READERS];
+    int error[ENGRAM_READERS_MAX];
 } engram_batch;
 
 static void read_batch_part(void *context, size_t part) {
@@ -257,7 +270,7 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= 256) {
-            batch.readers = ENGRAM_READERS;
+            batch.readers = g_engram_readers;
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
         } else

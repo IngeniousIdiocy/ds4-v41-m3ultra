@@ -1737,16 +1737,7 @@ static int ds4_ledger_cmp(const void *a, const void *b) {
     return 0;
 }
 
-static void ds4_ledger_dump(void) {
-    if (!ds4_ledger_on()) return;
-    FILE *out = stderr;
-    const char *path = getenv("DS4_KERNEL_LEDGER_DUMP");
-    /* Alias: some campaign briefs spell this DS4_KERNEL_LEDGER_FILE. */
-    if (!path || !*path) path = getenv("DS4_KERNEL_LEDGER_FILE");
-    if (path && *path) {
-        FILE *f = fopen(path, "w");
-        if (f) out = f;
-    }
+static void ds4_ledger_dump_stream(FILE *out) {
     ds4_ledger_kernel *sorted = calloc((size_t)g_ledger_nk, sizeof(*sorted));
     if (sorted) {
         memcpy(sorted, g_ledger_k, (size_t)g_ledger_nk * sizeof(*sorted));
@@ -1784,7 +1775,44 @@ static void ds4_ledger_dump(void) {
     }
     free(sorted);
     fflush(out);
-    if (out != stderr) fclose(out);
+}
+
+static FILE *ds4_ledger_open_dump(const char *path) {
+    if (!path || !*path) {
+        path = getenv("DS4_KERNEL_LEDGER_DUMP");
+        /* Alias: some campaign briefs spell this DS4_KERNEL_LEDGER_FILE. */
+        if (!path || !*path) path = getenv("DS4_KERNEL_LEDGER_FILE");
+    }
+    if (!path || !*path) return NULL;
+    return fopen(path, "w");
+}
+
+static void ds4_ledger_dump(void) {
+    if (!ds4_ledger_on()) return;
+    FILE *f = ds4_ledger_open_dump(NULL);
+    ds4_ledger_dump_stream(f ? f : stderr);
+    if (f) fclose(f);
+}
+
+/* Per-request ledger control (see ds4.h).  The mode is process-level; reset
+ * and dump are not, which is what lets one resident server produce a separate
+ * prefill ledger per arm of the cost map instead of one process per arm. */
+int ds4_gpu_kernel_ledger_mode(void) {
+    return g_ledger_mode;
+}
+
+void ds4_gpu_kernel_ledger_reset(void) {
+    if (!ds4_ledger_on()) return;
+    ds4_ledger_reset_counters();
+}
+
+int ds4_gpu_kernel_ledger_dump_path(const char *path) {
+    if (!ds4_ledger_on()) return 0;
+    FILE *f = ds4_ledger_open_dump(path);
+    if (!f) return 0;
+    ds4_ledger_dump_stream(f);
+    fclose(f);
+    return 1;
 }
 
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void);
@@ -3191,6 +3219,61 @@ static id<MTLComputePipelineState> ds4_gpu_hot_pipeline(
         const char *fallback_name) {
     if (!ds4_gpu_disable_hot_pipeline_statics()) return pipeline;
     return ds4_gpu_get_pipeline(fallback_name);
+}
+
+/* WAVE 3, TASK B.  DIAGNOSTIC ONLY -- an ablation arm of the prefill attention
+ * core.  The counted lever attn_diag (DS4_DS41_ATTN_DIAG=N, or per request
+ * through /debug/levers) swaps the production rb16 kernel for a variant that
+ * deletes exactly one stage and keeps the dispatch shape, the grid, the
+ * threadgroup size and the barrier count identical.  The attention output is
+ * WRONG in every non-zero arm, so no speed or identity claim about the model
+ * may ever come from a run with it set; only the attention family's own kernel
+ * time from the mode-2 ledger is meaningful.  0 is the production path. */
+static const char *ds4_gpu_attn_diag_kernel(void) {
+    switch (g_ds41_levers.attn_diag) {
+    case 1: return "kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_pv";
+    case 2: return "kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_exp";
+    case 3: return "kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_gather";
+    case 4: return "kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_only";
+    case 5: return "kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_none";
+    case 6: return "kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_qk";
+    /* Arm 7 is the allocation control: the ONE-row staging kernel run with
+     * rb16's 16 KiB threadgroup allocation, which separates the allocation and
+     * residency cost of that allocation from the staging benefit.  heads8 only
+     * ever touches kv_shared[0..127], so the wider allocation is harmless and
+     * this arm's attention output is EXACT -- it is the one diag arm whose
+     * frontier logits must still be byte-identical to the production row-1
+     * configuration (prefill_attn_rb16=0). */
+    case 7: return "kernel_dsv4_indexed_mixed_attention_heads8";
+    /* Arm 8 is the occupancy probe: the PRODUCTION rb16 kernel with twice the
+     * threadgroup allocation it uses (32 KiB instead of 16 KiB).  The kernel
+     * never touches the upper half, so this arm's output is EXACT too; the
+     * only thing that changes is how many threadgroups fit on a core.  With
+     * arm 7 against the row-1 control it gives two points on the
+     * threadgroup-memory occupancy curve. */
+    case 8: return NULL;
+    case 9: return "kernel_dsv4_indexed_mixed_attention_heads8_rb16_diag_lean";
+    default: return NULL;
+    }
+}
+
+/* WAVE 3, TASK B.  DS4_DS41_ATTN_PIPEINFO=1 prints the occupancy-relevant
+ * pipeline state of an attention pipeline once per distinct name. */
+static void ds4_gpu_attn_pipeinfo(id<MTLComputePipelineState> p, const char *name) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_DS41_ATTN_PIPEINFO") != NULL;
+    if (!enabled || !p) return;
+    static const char *seen[16];
+    static int n_seen;
+    for (int i = 0; i < n_seen; i++) if (seen[i] == name) return;
+    if (n_seen < 16) seen[n_seen++] = name;
+    fprintf(stderr,
+        "ds4: ATTN PIPEINFO %s: maxTotalThreadsPerThreadgroup=%lu "
+        "threadExecutionWidth=%lu staticThreadgroupMemoryLength=%lu\n",
+        name,
+        (unsigned long)p.maxTotalThreadsPerThreadgroup,
+        (unsigned long)p.threadExecutionWidth,
+        (unsigned long)p.staticThreadgroupMemoryLength);
 }
 
 static int ds4_gpu_use_compressor_pair_nr4(void) {
@@ -6006,6 +6089,12 @@ static ds4_gpu_mul_mm_args ds4_gpu_make_mm_args(
         uint64_t out_dim,
         uint64_t n_tok,
         uint64_t row_bytes) {
+    /* Ledger witness only, same contract as the matvec builders: BY_TG names a
+     * row "<kernel>#tg<N>@in<in_dim>".  One kernel_mul_mm_q8_0_f32 serves q_a,
+     * q_b, kv, out_b and the shared gate/up/down, and the threadgroup count
+     * alone cannot separate projections that land on the same grid, so the
+     * prefill cost map needs the K dimension as well. */
+    if (g_ledger_mode) g_ledger_shape_hint = in_dim;
     return (ds4_gpu_mul_mm_args) {
         .ne00 = (int32_t)in_dim,
         .ne02 = 1,
@@ -13303,6 +13392,81 @@ int ds4_gpu_embed_tokens_hc_tensor(
     return 1;
 }
 
+int ds4_gpu_dsv41_add_bf16_rows(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t width, uint32_t rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (width != 5120u || !rows || rows > 8192u) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> ab = ds4_gpu_tensor_buffer(a), bb = ds4_gpu_tensor_buffer(b);
+        id<MTLBuffer> ob = ds4_gpu_tensor_buffer(out);
+        const uint64_t bytes = (uint64_t)width * rows * sizeof(float);
+        if (!ab || !bb || !ob || ds4_gpu_tensor_bytes(a) < bytes ||
+            ds4_gpu_tensor_bytes(b) < bytes || ds4_gpu_tensor_bytes(out) < bytes) return 0;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_add_bf16_rows4");
+        if (!pipeline) return 0;
+        const uint32_t vectors = width / 4u * rows;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&vectors length:sizeof(vectors) atIndex:0];
+        [enc setBuffer:ab offset:ds4_gpu_tensor_offset(a) atIndex:1];
+        [enc setBuffer:bb offset:ds4_gpu_tensor_offset(b) atIndex:2];
+        [enc setBuffer:ob offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        const NSUInteger nth = MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreadgroups:MTLSizeMake((vectors + nth - 1u) / nth, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 batch add/BF16");
+    }
+}
+
+/* Reuse the graph's x rows, avoiding growth of global embedding scratch. */
+int ds4_gpu_dsv41_embed_init_rows(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *pre,
+        ds4_gpu_tensor *scratch, const ds4_gpu_tensor *tokens,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_vocab, uint32_t rows, uint32_t width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || !n_vocab || !rows || rows > 8192u || width != 5120u) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> ob = ds4_gpu_tensor_buffer(out_hc), pb = ds4_gpu_tensor_buffer(pre);
+        id<MTLBuffer> xb = ds4_gpu_tensor_buffer(scratch), tb = ds4_gpu_tensor_buffer(tokens);
+        const uint64_t row_bytes = (uint64_t)width * sizeof(float);
+        const uint64_t wb = (uint64_t)n_vocab * width * sizeof(uint16_t);
+        if (!ob || !pb || !xb || !tb ||
+            ds4_gpu_tensor_bytes(out_hc) < rows * row_bytes * 4u ||
+            ds4_gpu_tensor_bytes(pre) < (uint64_t)rows * 4u * sizeof(float) ||
+            ds4_gpu_tensor_bytes(scratch) < rows * row_bytes ||
+            ds4_gpu_tensor_bytes(tokens) < (uint64_t)rows * sizeof(int32_t) ||
+            weight_offset > model_size || wb > model_size - weight_offset) return 0;
+        uint64_t inner = 0;
+        id<MTLBuffer> weights = ds4_gpu_wrap_model_range(model_map, model_size,
+            weight_offset, wb, &inner);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_repeat_init4");
+        if (!weights || !pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        if (!ds4_gpu_encode_get_rows_f16(cb, weights, (NSUInteger)inner,
+                tb, ds4_gpu_tensor_offset(tokens), xb, ds4_gpu_tensor_offset(scratch),
+                n_vocab, rows, width)) return 0;
+        const uint32_t args[2] = {width, rows};
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:args length:sizeof(args) atIndex:0];
+        [enc setBuffer:xb offset:ds4_gpu_tensor_offset(scratch) atIndex:1];
+        [enc setBuffer:ob offset:ds4_gpu_tensor_offset(out_hc) atIndex:2];
+        [enc setBuffer:pb offset:ds4_gpu_tensor_offset(pre) atIndex:3];
+        const NSUInteger work = (NSUInteger)rows * (width / 4u);
+        const NSUInteger nth = MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreadgroups:MTLSizeMake((work + nth - 1u) / nth, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 batched embedding/init");
+    }
+}
+
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!model_map || model_size == 0) return 0;
@@ -20178,8 +20342,13 @@ int ds4_gpu_matmul_q8_0_tensor(
         return 0;
     }
 
+    /* Lever, not getenv: the prefill cost map flips this between requests on a
+     * resident server (prefill/PLAN.md Phase 1 run 8).  DS4_METAL_Q8_PREFILL_-
+     * PROFILE still sets the startup value.  The _FILTER companion below stays
+     * environment-only; it selects which GEMMs print, not whether any do. */
+    ds41_levers_init_from_env();
     const int profile_requested =
-        n_tok > 8u && ds4_gpu_env_bool("DS4_METAL_Q8_PREFILL_PROFILE") > 0;
+        n_tok > 8u && g_ds41_levers.q8_prefill_profile != 0;
     int profile_prefill = 0;
     int split_batch_for_profile = 0;
     const char *profile_label = NULL;
@@ -22150,6 +22319,58 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
     if (!width || !outputs || !rows || rows > 8192u || !model_map) return 0;
     return ds4_gpu_matmul_f16_tensor_impl(out, model_map, model_size,
         weight_offset, width, outputs, in, rows, true);
+}
+
+/* Bounded virtual-row batching, no model expansion or MMA rewrite.
+ * Unsupported/quality/small shapes fall back before encoding any new work. */
+int ds4_gpu_dsv41_projection_rows2(ds4_gpu_tensor *out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t width, uint32_t outputs, uint32_t rows, const ds4_gpu_tensor *in) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_quality_mode || rows <= 8u || rows > 8192u ||
+        (width != 512u && width != 1280u && width != 5120u))
+        return ds4_gpu_dsv41_projection_rows(out, model_map, model_size,
+            weight_offset, width, outputs, rows, in);
+    ds4_gpu_mv_dispatch mv = ds4_gpu_make_plain_mv_dispatch(width, 0);
+    if ((outputs == 512u || outputs == 1024u) && width >= 4096u) {
+        mv.nr0 = 4;
+        mv.smem = 32u * 4u * sizeof(float);
+    }
+    if (!outputs || outputs % (uint32_t)mv.nr0)
+        return ds4_gpu_dsv41_projection_rows(out, model_map, model_size,
+            weight_offset, width, outputs, rows, in);
+    @autoreleasepool {
+        const uint64_t wb = (uint64_t)width * outputs * sizeof(uint16_t);
+        id<MTLBuffer> xb = ds4_gpu_tensor_buffer(in), ob = ds4_gpu_tensor_buffer(out);
+        if (!model_map || !xb || !ob ||
+            ds4_gpu_tensor_bytes(in) < (uint64_t)rows * width * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < (uint64_t)rows * outputs * sizeof(float) ||
+            weight_offset > model_size || wb > model_size - weight_offset) return 0;
+        uint64_t inner = 0;
+        id<MTLBuffer> weights = ds4_gpu_wrap_model_range(model_map, model_size,
+            weight_offset, wb, &inner);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+            "kernel_dsv41_project_f16_rows2", mv.nsg);
+        if (!weights || !pipeline) return 0;
+        ds4_gpu_f16_matvec_args args = ds4_gpu_make_f16_mv_args(width, outputs);
+        args.ne11 = args.ne1 = (int32_t)rows;
+        args.nb12 = args.nb13 = (uint64_t)rows * width * sizeof(float);
+        args.nr0 = mv.nr0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:xb offset:ds4_gpu_tensor_offset(in) atIndex:2];
+        [enc setBuffer:ob offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:2u * mv.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(outputs / mv.nr0, (rows + 1u) / 2u, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, mv.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 F16 virtual rows2");
+    }
 }
 
 int ds4_gpu_matmul_f16_pair_tensor(
@@ -31720,14 +31941,25 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const uint32_t decode_splits =
             decode_one_token && !g_quality_mode ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
+        /* Prefill wave 2, lever 3.  The sixteen-row staging kernel is the
+         * decode path's production kernel and is arithmetically identical to
+         * the one-row kernel: the same rows in the same order through the same
+         * online-softmax update.  Batch prefill takes it too unless the dual
+         * heads kernel applies or the lever is off. */
+        const bool prefill_rb16 = !decode_one_token && !prefill_dual_heads &&
+            !g_quality_mode && g_ds41_levers.prefill_attn_rb16;
         id<MTLComputePipelineState> attn_pipeline =
             split_decode ?
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_pipeline,
                 "kernel_dsv4_indexed_mixed_attention_heads8_split") :
-            decode_one_token ?
-            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
-                                   "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
+            decode_one_token || prefill_rb16 ?
+            (!decode_one_token && ds4_gpu_attn_diag_kernel() ?
+                ds4_gpu_get_pipeline(ds4_gpu_attn_diag_kernel()) :
+             (!decode_one_token && g_ds41_levers.prefill_attn_lean_rows) ?
+                ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8_rb16_lean") :
+             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
+                                   "kernel_dsv4_indexed_mixed_attention_heads8_rb16")) :
             prefill_dual_heads ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads16_dual_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads16_dual") :
@@ -31742,6 +31974,34 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             (split_decode && !split_reduce_pipeline)) {
             return 0;
         }
+        /* Wave 3 task B: the shape receipt behind the same env flag.  The
+         * memory-traffic arithmetic needs the actual row counts, not a guess:
+         * bytes gathered per threadgroup = n_raw x raw_row_stride +
+         * min(top_k, n_comp) x comp_row_stride. */
+        if (getenv("DS4_DS41_ATTN_PIPEINFO")) {
+            static uint32_t seen_tokens[8];
+            static int n_seen_tokens;
+            int known = 0;
+            for (int i = 0; i < n_seen_tokens; i++)
+                if (seen_tokens[i] == n_tokens) known = 1;
+            if (!known) {
+                if (n_seen_tokens < 8) seen_tokens[n_seen_tokens++] = n_tokens;
+                fprintf(stderr,
+                    "ds4: ATTN SHAPE n_tokens=%u n_head=%u head_dim=%u pos0=%u "
+                    "n_raw=%u raw_cap=%u raw_row_stride=%llu n_comp=%u top_k=%u "
+                    "window=%u ratio=%u comp_kv_f16=%u comp_row_stride=%llu\n",
+                    n_tokens, n_head, head_dim, pos0, n_raw, raw_cap,
+                    (unsigned long long)row_bytes, n_comp, top_k,
+                    window, ratio, comp_kv_f16 ? 1u : 0u,
+                    (unsigned long long)(comp_kv_f16 ? row_bytes_f16 : row_bytes));
+            }
+        }
+        ds4_gpu_attn_pipeinfo(attn_pipeline,
+            split_decode ? "heads8_split" :
+            decode_one_token ? "heads8_rb16_decode" :
+            prefill_rb16 ? ((!decode_one_token && g_ds41_levers.prefill_attn_lean_rows) ?
+                            "heads8_rb16_prefill_lean" : "heads8_rb16_prefill") :
+            prefill_dual_heads ? "heads16_dual" : "heads8");
         if ((NSUInteger)top_k > sort_pipeline.maxTotalThreadsPerThreadgroup) {
             fprintf(stderr, "ds4: Metal indexed attention top-k exceeds sort threadgroup limit\n");
             return 0;
@@ -31865,9 +32125,14 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
-                                            128u * 4u * sizeof(uint16_t)
-                                    atIndex:0];
+            {
+                NSUInteger tgmem = (decode_one_token || prefill_rb16 ? 16u : 1u) *
+                                   128u * 4u * sizeof(uint16_t);
+                /* Wave 3 task B, arm 8: double the allocation without changing
+                 * the kernel, to price threadgroup-memory occupancy directly. */
+                if (!decode_one_token && g_ds41_levers.attn_diag == 8) tgmem *= 2u;
+                [enc setThreadgroupMemoryLength:tgmem atIndex:0];
+            }
             [enc dispatchThreadgroups:
                     MTLSizeMake((NSUInteger)n_tokens,
                                 ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) /
@@ -32595,6 +32860,9 @@ static ds4_gpu_mul_mm_id_args ds4_gpu_make_mul_mm_id_args_src1_size(
         uint32_t selected_experts,
         uint32_t n_tokens,
         uint32_t src1_elem_size) {
+    /* Ledger witness only: routed gate+up (K5120) and routed down (K2304) run
+     * the same mul_mm_id kernel at work_cap grids that can coincide. */
+    if (g_ledger_mode) g_ledger_shape_hint = src0_cols;
     const uint64_t src1_row_bytes = (uint64_t)src0_cols * src1_elem_size;
     return (ds4_gpu_mul_mm_id_args) {
         .ne00 = (int32_t)src0_cols,
@@ -32767,7 +33035,9 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
+        return ds4_gpu_get_mul_mm_id_pipeline(
+            g_ds41_levers.routed_tail_cull ? "kernel_mul_mm_id_q4_K_f32_tail_cull"
+                                           : "kernel_mul_mm_id_q4_K_f32", false);
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f32", false);
     case DS4_METAL_TENSOR_Q6_K:
@@ -32803,7 +33073,15 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+        /* V4.1 prefill bundle item (i).  With 384 experts and 6 routes per
+         * token the last live tile of most experts is under half full, and
+         * simdgroups 2/3 then run a whole MMA tree over rows that do not
+         * exist.  CULL_TAIL_SIMDGROUPS skips only that MMA; staging, barriers
+         * and the epilogue are unchanged, so every surviving row keeps its own
+         * accumulation order.  Bit-identical by construction. */
+        return ds4_gpu_get_mul_mm_id_pipeline(
+            g_ds41_levers.routed_tail_cull ? "kernel_mul_mm_id_q4_K_f16_tail_cull"
+                                           : "kernel_mul_mm_id_q4_K_f16", false);
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f16", false);
     case DS4_METAL_TENSOR_Q6_K:
@@ -44904,7 +45182,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                 pair_swiglu_mm_pipeline =
                     ds4_gpu_get_pipeline(
                         gate_type == DS4_METAL_TENSOR_Q4_K ?
-                            "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
+                            (g_ds41_levers.routed_tail_cull ?
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16_tail_cull" :
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16") :
                         gate_type == DS4_METAL_TENSOR_MXFP4 ?
                             (use_mxfp4_mm_id_pair_swiglu_compact_tile ?
                                 (use_mxfp4_mm_id_pair_half_scale ?
