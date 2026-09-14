@@ -352,6 +352,54 @@ static void check_speculative_distribution(void) {
            (double)counts[0] / trials,
            (double)counts[1] / trials,
            (double)counts[2] / trials);
+
+    /* V4.1 DSpark exact sampling.  Our drafter is deterministic, so
+     * every drafted token index must recover the target's FILTERED
+     * distribution exactly -- including under top_p/min_p, where the support
+     * has to be fixed BEFORE the drafted token is masked out.  A rule that
+     * masks first and filters afterwards fails this. */
+    {
+        const uint32_t n = 64, big = 200000;
+        float logits[64], probs[64], expect[64];
+        uint64_t seed = 0x1234abcd5678ef90ULL;
+        for (uint32_t i = 0; i < n; i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            logits[i] = (float)((int32_t)(seed >> 33) % 2000) / 200.0f;
+        }
+        const float tps[] = {1.0f, 0.95f, 0.5f};
+        const float mps[] = {0.0f, 0.05f};
+        for (unsigned a = 0; a < 3; a++) for (unsigned b = 0; b < 2; b++) {
+            CHECK(ds4_test_sampling_probabilities(logits, n, 1.0f, 0, tps[a],
+                                                  mps[b], expect) == 1,
+                  "v41 filtered probabilities");
+            /* Only tokens inside the filtered support can ever be drafted by
+               an argmax over the same logits, but the rule must be correct for
+               any proposal, so sweep several. */
+            for (uint32_t x = 0; x < 6; x++) {
+                uint32_t c[64] = {0};
+                uint64_t r = 0xfeedfacecafebeefULL + x;
+                for (uint32_t t = 0; t < big; t++) {
+                    const int tok = ds4_test_speculative_delta_sample(
+                        logits, n, (int)x, 1.0f, 0, tps[a], mps[b], &r, probs);
+                    CHECK(tok >= 0 && (uint32_t)tok < n, "v41 delta token %d", tok);
+                    if (tok >= 0 && (uint32_t)tok < n) c[tok]++;
+                }
+                double chi = 0.0; uint32_t dof = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    const double e = (double)expect[i] * big;
+                    if (e < 5.0) { CHECK(c[i] == 0 || e > 0.0,
+                        "v41 mass outside support tok=%u count=%u", i, c[i]); continue; }
+                    const double d = c[i] - e;
+                    chi += d * d / e; dof++;
+                }
+                /* dof <= 63; 150 is far beyond the 0.1% point for any dof here. */
+                CHECK(chi < 150.0, "v41 chi2=%.2f dof=%u top_p=%.2f min_p=%.2f draft=%u",
+                      chi, dof, (double)tps[a], (double)mps[b], x);
+            }
+        }
+        puts("v41 exact speculative sampling: filtered distribution recovered "
+             "for every drafted token at top_p 1.0/0.95/0.5 x min_p 0/0.05");
+    }
 }
 
 int main(void) {

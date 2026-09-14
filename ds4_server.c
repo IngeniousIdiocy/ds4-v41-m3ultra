@@ -979,6 +979,13 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
+/* Published V4.1 Flash benchmark settings use top_p 0.95 and no min_p, while
+ * ds4's compiled-in defaults are 1.0 and 0.05.  These carry the deployment's
+ * choice for requests that do not name the knob; a request that names it still
+ * wins, everywhere the defaults are applied. */
+static float g_default_top_p = DS4_DEFAULT_TOP_P;
+static float g_default_min_p = DS4_DEFAULT_MIN_P;
+
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
@@ -988,8 +995,8 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->max_tokens = max_tokens;
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
-    r->top_p = DS4_DEFAULT_TOP_P;
-    r->min_p = DS4_DEFAULT_MIN_P;
+    r->top_p = g_default_top_p;
+    r->min_p = g_default_min_p;
     r->think_mode = DS4_THINK_HIGH;
 }
 
@@ -13696,8 +13703,8 @@ decode_again:
              * same greedy request returns different text on every call. */
             if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
             if (!j->req.top_k_set) top_k = 0;
-            if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
-            if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
+            if (!j->req.top_p_set) top_p = g_default_top_p;
+            if (!j->req.min_p_set) min_p = g_default_min_p;
         }
         const bool greedy_tool_syntax = !thinking.inside && in_tool_call &&
             !dsml_decode_state_uses_payload_sampling(dsml_state);
@@ -15637,6 +15644,14 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.min_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-cold-max-tokens")) {
             c.kv_cache.cold_max_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--default-top-p")) {
+            g_default_top_p = strtof(need_arg(&i, argc, argv, arg), NULL);
+            if (!(g_default_top_p > 0.0f && g_default_top_p <= 1.0f))
+                die("--default-top-p must be in (0,1]");
+        } else if (!strcmp(arg, "--default-min-p")) {
+            g_default_min_p = strtof(need_arg(&i, argc, argv, arg), NULL);
+            if (!(g_default_min_p >= 0.0f && g_default_min_p < 1.0f))
+                die("--default-min-p must be in [0,1)");
         } else if (!strcmp(arg, "--kv-cache-continued-interval-tokens")) {
             c.kv_cache.continued_interval_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-boundary-trim-tokens")) {

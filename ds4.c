@@ -16182,6 +16182,14 @@ static void output_logits_one_decode_scratch(
     matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
 }
 
+/* Positive-temperature serving policy for the V4.1 verify cycle.  NULL means
+ * greedy, which keeps the byte-identical argmax acceptance rule. */
+typedef struct {
+    float temperature, top_p, min_p;
+    int   top_k;
+    uint64_t *rng;
+} ds41_sample_policy;
+
 #ifndef DS4_NO_GPU
 static int sample_argmax(const float *logits, uint32_t n_vocab);
 static bool sample_build_probabilities(const float *logits,
@@ -16193,6 +16201,10 @@ static bool sample_build_probabilities(const float *logits,
                                        float *probs);
 static int sample_probabilities(const float *probs, uint32_t n_vocab,
                                 uint64_t *rng);
+static float sample_rng_f32(uint64_t *state);
+static int ds41_accept_or_residual(float *probs, uint32_t n_vocab, int x,
+                                   bool force_reject, uint64_t *rng);
+
 #ifdef DS4_TEST_HOOKS
 static int sample_residual_probabilities(float *target_probs,
                                          const float *draft_probs,
@@ -43202,6 +43214,7 @@ typedef struct {
     float   *logits_rows;          /* block * vocab, host */
     int32_t  proposal[DS4_DSPARK_MAX_BLOCK_SIZE];
     ds41_ctl_state control;          /* reasoning-span tracker only */
+    float *sample_probs;             /* filtered target row distribution */
     ds41_dspark_adaptive adapt;      /* GLM-ported windowed admission */
     uint64_t control_generation;
     uint32_t control_end;
@@ -43217,6 +43230,7 @@ static void ds41_dspark_decode_free(ds41_dspark_decode *dd) {
     ds41_verify_free(&dd->vc);
     ds4_gpu_tensor_free(dd->hidden_rows);
     free(dd->logits_rows);
+    free(dd->sample_probs);
     memset(dd, 0, sizeof(*dd));
 }
 
@@ -43324,11 +43338,55 @@ static int ds41_accept_select(void *ctx, unsigned row) {
 
 /* One cycle.  `token` is the next token to feed on entry and the next token to
  * feed on exit; the tokens this cycle committed are appended to `out`. */
+/* Exact speculative sampling for a DETERMINISTIC drafter.  The V4.1 proposal
+ * is an argmax, so q(x) = 1 at the drafted token and the standard
+ * min(1, p/q) rule reduces to: accept the drafted token with probability
+ * p_j(x_j) under the target's FILTERED sampling distribution, and on rejection
+ * sample the residual -- p_j with x_j removed and renormalised.  The filters
+ * (temperature, top_k, top_p, min_p) are applied to the ORIGINAL row logits and
+ * the support is fixed BEFORE the drafted token is masked out; masking first
+ * and filtering afterwards is the bug docs/DFLASH_GLM53.md records.  The last
+ * row carries no proposal, so it is sampled outright: that is the bonus token.
+ *
+ * Returns the same `keep`/`next` contract as ds41_ctl_accept: keep-1 drafted
+ * tokens are committed and `next` is the token produced at row keep-1. */
+static uint32_t ds41_dspark_accept_sampled(ds41_dspark_decode *dd, uint32_t rows,
+        uint32_t limit, int excl_token, int stop_token,
+        const ds41_sample_policy *pol,
+        bool (*boundary)(void *, int), void *boundary_ctx, int *next) {
+    if (!rows || !limit || !dd->sample_probs || !pol || !pol->rng) return 0;
+    for (uint32_t j = 0; j < rows; j++) {
+        const float *row = dd->vc.row_logits + (size_t)j * DS4_N_VOCAB;
+        if (!sample_build_probabilities(row, DS4_N_VOCAB, pol->temperature,
+                                        pol->top_k, pol->top_p, pol->min_p,
+                                        dd->sample_probs)) return 0;
+        if (excl_token >= 0 && excl_token < (int)DS4_N_VOCAB)
+            dd->sample_probs[excl_token] = 0.0f;
+        int v;
+        if (j + 1u == rows) {
+            v = sample_probabilities(dd->sample_probs, DS4_N_VOCAB, pol->rng);
+        } else {
+            const int x = (int)dd->proposal[j];
+            const bool force = g_ds41_levers.dspark_force_reject != 0;
+            v = ds41_accept_or_residual(dd->sample_probs, DS4_N_VOCAB, x,
+                                        force, pol->rng);
+            if (!force && v == x) {
+                if (j + 1u != limit && v != stop_token &&
+                    !(boundary && boundary(boundary_ctx, v))) continue;
+            }
+        }
+        if (v < 0) return 0;
+        *next = v;
+        return j + 1u;
+    }
+    return 0;
+}
+
 static bool ds41_dspark_decode_cycle(ds41_gpu_graph *g, ds41_dspark_decode *dd,
                                      const ds4_model *m, const ds4_weights *w,
                                      int *token, int *out, uint32_t *n_out,
                                      float *session_logits, int excl_token, int stop_token,
-                                     uint32_t max_emit,
+                                     uint32_t max_emit, const ds41_sample_policy *pol,
                                      bool (*boundary)(void *, int), void *boundary_ctx) {
     ds41_dspark *d = &dd->drafter;
     const uint32_t P = g->pos;
@@ -43369,18 +43427,40 @@ static bool ds41_dspark_decode_cycle(ds41_gpu_graph *g, ds41_dspark_decode *dd,
      * exactly the same state, so the emitted sequence is serial greedy. */
     ds41_accept_logits selection = {dd->vc.row_logits, excl_token};
     int next = -1;
-    const uint32_t keep = ds41_ctl_accept(rows, max_emit, stop_token,
-        g_ds41_levers.dspark_force_reject != 0, ds41_accept_select, &selection,
-        dd->proposal, boundary, boundary_ctx, &next);
+    uint32_t keep;
+    if (pol) {
+        if (!dd->sample_probs)
+            dd->sample_probs = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        keep = ds41_dspark_accept_sampled(dd, rows, max_emit, excl_token,
+            stop_token, pol, boundary, boundary_ctx, &next);
+    } else {
+        keep = ds41_ctl_accept(rows, max_emit, stop_token,
+            g_ds41_levers.dspark_force_reject != 0, ds41_accept_select, &selection,
+            dd->proposal, boundary, boundary_ctx, &next);
+    }
     if (!keep) return false;
     const uint32_t j = keep-1;
     if (!ds41_verify_commit(g, &dd->vc, keep)) return false;
     /* The committed positions' main_kv rows are real, not draft rows: rewrite
      * them into the rings from their captured hiddens before the next cycle. */
     if (!ds41_dspark_seed_range(dd, g, P, keep)) return false;
-    if (session_logits)
-        memcpy(session_logits, dd->vc.row_logits + (size_t)j * DS4_N_VOCAB,
-               (size_t)DS4_N_VOCAB * sizeof(float));
+    if (session_logits) {
+        if (pol) {
+            /* The serving loop does not emit our trailing frontier token: it
+             * re-samples it from these logits.  Under greedy that reproduces
+             * the same argmax, but under exact sampling it would throw away
+             * the rejection RESIDUAL and redraw from p_j, which biases the
+             * slot towards the drafted token -- P(x) would become
+             * p(x)(2-p(x)) instead of p(x).  The acceptance rule has already
+             * decided this position, so hand the caller a distribution with
+             * only that decision in it. */
+            for (uint32_t i = 0; i < DS4_N_VOCAB; i++) session_logits[i] = DS4_NEG_INF;
+            session_logits[next] = 0.0f;
+        } else {
+            memcpy(session_logits, dd->vc.row_logits + (size_t)j * DS4_N_VOCAB,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+        }
+    }
     for (uint32_t i = 0; i < j; i++) out[(*n_out)++] = tokens[i + 1u];
     out[(*n_out)++] = next;
     *token = next;
@@ -45644,6 +45724,21 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+/* One row of exact speculative acceptance against a deterministic proposal.
+ * `probs` is the target's FILTERED distribution for this row, built from the
+ * ORIGINAL logits; it is modified in place on rejection.  Accept the drafted
+ * token with probability probs[x]; otherwise remove it and sample the residual
+ * over the support that was fixed before the removal.  q(x)=1 for an argmax
+ * drafter, so this is min(1, p/q) written out. */
+static int ds41_accept_or_residual(float *probs, uint32_t n_vocab, int x,
+                                   bool force_reject, uint64_t *rng) {
+    if (!probs || !rng || n_vocab == 0) return -1;
+    const bool valid = x >= 0 && (uint32_t)x < n_vocab;
+    if (!force_reject && valid && sample_rng_f32(rng) <= probs[x]) return x;
+    if (valid) probs[x] = 0.0f;
+    return sample_probabilities(probs, n_vocab, rng);
+}
+
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
@@ -45706,11 +45801,7 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
                                     top_k, top_p, min_p, target_probs)) {
         return -1;
     }
-    if (sample_rng_f32(rng) <= target_probs[draft_token]) {
-        return draft_token;
-    }
-    target_probs[draft_token] = 0.0f;
-    return sample_probabilities(target_probs, n_vocab, rng);
+    return ds41_accept_or_residual(target_probs, n_vocab, draft_token, false, rng);
 }
 
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
@@ -73542,6 +73633,9 @@ int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[6]
 #endif
 }
 
+/* The V4.1 DSpark decode path is Metal-only: its state types and graph
+ * live behind the same guard, so the helpers that drive it do too. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
 /* Everything both DSpark decode entry points need before the first cycle:
  * the session must be a prefilled V4.1 session with an armed capture ring and a
  * bound drafter and the decode state must exist.  Returns the decode state, or
@@ -73591,7 +73685,8 @@ static ds41_dspark_decode *ds41_dspark_ready(ds4_session *s,
  * the serial-cost sample and a verify cycle the window net. */
 static int ds41_dspark_step_core(ds4_session *s, ds41_dspark_decode *dd,
                                  bool serving, int feeding, int excluded, int stop_token,
-                                 uint32_t remaining, int *emitted, uint32_t *produced,
+                                 uint32_t remaining, const ds41_sample_policy *pol,
+                                 int *emitted, uint32_t *produced,
                                  bool *serial, char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
@@ -73607,11 +73702,16 @@ static int ds41_dspark_step_core(ds4_session *s, ds41_dspark_decode *dd,
     ds41_ctl_preview preview = {e, dd->control};
     if (attempt && !ds41_dspark_decode_cycle(g, dd, &e->model, &e->weights,
             &token, emitted, produced, s->logits, excluded, stop_token, remaining,
-            ds41_ctl_boundary, &preview))
+            pol, ds41_ctl_boundary, &preview))
         return 1;
     if (!attempt) {
         if (ds4_session_eval(s, feeding, err, errlen)) return 1;
-        token = ds4_session_argmax_excluding(s, excluded);
+        /* The serial fallback must sample from the same distribution the
+         * request asked for, or a cooled-down step would be greedy. */
+        token = pol ? sample_top_p_min_p(s->logits, DS4_N_VOCAB, pol->temperature,
+                                         pol->top_k, pol->top_p, pol->min_p,
+                                         pol->rng, s->sample_probs)
+                    : ds4_session_argmax_excluding(s, excluded);
         if (token < 0) return 1;
         emitted[0] = token; *produced = 1;
         *serial = true;
@@ -73629,6 +73729,8 @@ static int ds41_dspark_step_core(ds4_session *s, ds41_dspark_decode *dd,
     dd->control_end = g->pos; dd->control_generation = g->state_generation;
     return 0;
 }
+
+#endif
 
 int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
                                 int *out_tokens, int *n_out,
@@ -73673,7 +73775,7 @@ int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
         int emitted[DS4_TP_BATCH_MAX_ROWS];
         bool serial = false;
         if (ds41_dspark_step_core(s, dd, false, token, excluded, stop_token,
-                                  remaining, emitted, &produced, &serial, err, errlen))
+                                  remaining, NULL, emitted, &produced, &serial, err, errlen))
             goto dspark_generation_fail;
         if (serial) serial_processed++;
         for (uint32_t i = 0; i < produced; i++) out_tokens[(*n_out)++] = emitted[i];
@@ -73736,7 +73838,8 @@ static bool ds41_dspark_serve_enabled(void) {
  * Returns 0 when this session cannot draft, and the caller then takes the path
  * it would have taken anyway. */
 static int ds4_session_ds41_dspark_step(ds4_session *s, int first_token, int eos_token,
-                                        int max_tokens, int *accepted, int accepted_cap,
+                                        int max_tokens, const ds41_sample_policy *pol,
+                                        int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     static int warned = 0;
@@ -73760,7 +73863,7 @@ static int ds4_session_ds41_dspark_step(ds4_session *s, int first_token, int eos
      * policy, which suppresses EOS to fill a fixed token budget, is not a
      * serving policy. */
     if (ds41_dspark_step_core(s, dd, true, first_token, -1, eos_token,
-                              remaining, emitted, &produced, &serial, err, errlen)) {
+                              remaining, pol, emitted, &produced, &serial, err, errlen)) {
         s->checkpoint_valid = false;
         return -1;
     }
@@ -73768,7 +73871,7 @@ static int ds4_session_ds41_dspark_step(ds4_session *s, int first_token, int eos
     for (uint32_t i = 0; i + 1 < produced; i++) accepted[i+1] = emitted[i];
     return (int)produced;
 #else
-    (void)s; (void)first_token; (void)eos_token; (void)max_tokens;
+    (void)s; (void)first_token; (void)eos_token; (void)max_tokens; (void)pol;
     (void)accepted; (void)accepted_cap; (void)err; (void)errlen;
     return 0;
 #endif
@@ -80399,7 +80502,7 @@ static int ds4_session_eval_speculative_argmax_impl(
      * cycle does not know about. */
     if (ds4_session_is_ds41(s) && !ignore_eos) {
         const int n = ds4_session_ds41_dspark_step(s, first_token, eos_token,
-                                                   max_tokens, accepted, accepted_cap,
+                                                   max_tokens, NULL, accepted, accepted_cap,
                                                    err, errlen);
         if (n != 0) return n;
     }
@@ -81311,6 +81414,21 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         }
 #endif
         return rc;
+    }
+    /* V4.1 positive-temperature decode is exact speculative sampling, always.
+     * The opportunistic mode -- commit drafted rows while they match the
+     * target's GREEDY path -- is not distribution-equivalent to serial
+     * sampling, so it is not available on this lane at any setting. */
+    if (ds4_session_is_ds41(s) && e && e->support_kind == DS4_SUPPORT_DSPARK &&
+        e->dspark && !e->quality && !e->dspark_strict) {
+        const ds41_sample_policy pol = {temperature, top_p, min_p, top_k, rng};
+        const int n = ds4_session_ds41_dspark_step(s, first_token, eos_token,
+                                                   max_tokens, &pol, accepted,
+                                                   accepted_cap, err, errlen);
+        if (n != 0) return n;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
     }
     const bool opportunistic_dspark =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
