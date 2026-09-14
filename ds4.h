@@ -267,6 +267,9 @@ typedef struct {
      * KV staging dispatch.  DS4_DS41_STAGE_GATHER=0 restores the standalone
      * kernel_get_rows gather and its intermediate half buffer. */
     int stage_gather;
+    int index_topk_radix; /* Selector stage 3: exact conditional token selector. */
+    int index_compact_score; /* Selector stage 2, independent of stage 1. */
+    int index_mask_score; /* Exact masked scorer, candidate default off. */
     /* Decode pass 2, D1: routed DOWN leg at NR0 = 1 (2,560 threadgroups).
      * DS4_DS41_Q4_DN_NR1=0 restores the two-rows-per-simdgroup grid. */
     int q4_dn_nr1;

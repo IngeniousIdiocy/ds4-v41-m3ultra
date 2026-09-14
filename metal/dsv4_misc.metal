@@ -2015,6 +2015,162 @@ kernel void kernel_glm_indexer_score_one_direct(
     }
 }
 
+/* Compact index scorer, stage 1. Body retained from the direct scorer above. */
+kernel void kernel_dsv41_indexer_score_masked(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const float *block_mask [[buffer(5)]],
+        threadgroup float *shared [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (row >= args.n_rows || args.n_head != 32u || args.head_dim != 128u) {
+        return;
+    }
+
+    // Uniform across this threadgroup, before any barrier or key/query load.
+    // Match candidate_filter's comparison, including a nonzero/NaN mask.
+    if (!(block_mask[row / 8u] == 0.0f)) {
+        if (tid == 0) scores[row] = -INFINITY;
+        return;
+    }
+
+    threadgroup float *ktg = shared;
+    threadgroup float *psum = ktg + 128u;
+
+    if (tid < 128u) {
+        ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
+                                             (uint64_t)row * 128u + tid,
+                                             args.cache_f16);
+    }
+
+    float acc = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head0 = 0; head0 < 32u; head0 += 4u) {
+        const uint head = head0 + (uint)sg;
+        device const float4 *q4 = (device const float4 *)(q +
+            (uint64_t)head * 128u * sizeof(float));
+        threadgroup const float4 *k4 = (threadgroup const float4 *)ktg;
+
+        float s = dot(q4[lane], k4[lane]);
+        s = simd_sum(s);
+        if (lane == 0) {
+            psum[sg] = max(s * args.scale, 0.0f) * weights[head];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            acc += psum[0];
+            acc += psum[1];
+            acc += psum[2];
+            acc += psum[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        scores[row] = acc;
+    }
+}
+
+// Per-call scratch is reused only across ordered dispatches, never across rows
+// concurrently. The mask argument is the current verifier row's own view.
+kernel void kernel_dsv41_index_mask_fill(
+        constant uint &width [[buffer(0)]], device const float *mask [[buffer(1)]],
+        device float *scores [[buffer(2)]], uint row [[thread_position_in_grid]]) {
+    if (row < width && !(mask[row / 8u] == 0.0f)) scores[row] = -INFINITY;
+}
+
+kernel void kernel_dsv41_index_mask_plan(
+        constant uint &width [[buffer(0)]], device const float *mask [[buffer(1)]],
+        device uint *plan [[buffer(2)]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint count;
+    if (!tid) atomic_store_explicit(&count, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint block = tid; block < (width + 7u) / 8u; block += 256u) {
+        if (mask[block] == 0.0f) {
+            const uint slot = atomic_fetch_add_explicit(&count, 1u, memory_order_relaxed);
+            if (slot < 2048u) plan[4u + slot] = block;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!tid) {
+        const uint n = atomic_load_explicit(&count, memory_order_relaxed);
+        plan[0] = n;
+        plan[1] = n > 2048u ? width : n * 8u;
+        plan[2] = 1u;
+        plan[3] = 1u;
+    }
+}
+
+kernel void kernel_dsv41_indexer_score_compact(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const float *block_mask [[buffer(5)]],
+        device const uint *plan [[buffer(6)]],
+        threadgroup float *shared [[threadgroup(0)]],
+        uint job [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    // Overflow uses the full original row grid; no admitted block is dropped.
+    const uint row = plan[0] > 2048u ? job : plan[4u + job / 8u] * 8u + job % 8u;
+    if (row >= args.n_rows || args.n_head != 32u || args.head_dim != 128u) {
+        return;
+    }
+
+    // Uniform across this threadgroup, before any barrier or key/query load.
+    // Match candidate_filter's comparison, including a nonzero/NaN mask.
+    if (!(block_mask[row / 8u] == 0.0f)) {
+        if (tid == 0) scores[row] = -INFINITY;
+        return;
+    }
+
+    threadgroup float *ktg = shared;
+    threadgroup float *psum = ktg + 128u;
+
+    if (tid < 128u) {
+        ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
+                                             (uint64_t)row * 128u + tid,
+                                             args.cache_f16);
+    }
+
+    float acc = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head0 = 0; head0 < 32u; head0 += 4u) {
+        const uint head = head0 + (uint)sg;
+        device const float4 *q4 = (device const float4 *)(q +
+            (uint64_t)head * 128u * sizeof(float));
+        threadgroup const float4 *k4 = (threadgroup const float4 *)ktg;
+
+        float s = dot(q4[lane], k4[lane]);
+        s = simd_sum(s);
+        if (lane == 0) {
+            psum[sg] = max(s * args.scale, 0.0f) * weights[head];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            acc += psum[0];
+            acc += psum[1];
+            acc += psum[2];
+            acc += psum[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        scores[row] = acc;
+    }
+}
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,

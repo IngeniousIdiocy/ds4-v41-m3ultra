@@ -30098,6 +30098,23 @@ static int glm_indexer_scores_launch(
     return cuda_ok(cudaGetLastError(), "glm indexer scores f32 launch");
 }
 
+extern "C" int ds4_gpu_dsv41_indexer_topk_radix(ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *scores, uint32_t n_comp, bool allow_neg_inf) {
+    (void)allow_neg_inf;
+    return ds4_gpu_indexer_topk_tensor(selected,scores,n_comp,1u,512u);
+}
+extern "C" int ds4_gpu_dsv41_indexer_radix_stats(uint32_t out[16]) {
+    (void)out; return 0;
+}
+
+extern "C" int ds4_gpu_dsv41_indexer_score_masked(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *keys, const ds4_gpu_tensor *block_mask, uint32_t n_rows, int compact) {
+    (void)compact;
+    (void)block_mask; /* Caller retains the original candidate_filter. */
+    return ds4_gpu_glm_indexer_score_one_tensor(scores,q,weights,keys,n_rows,32u,128u,1.0f/64.0f,false);
+}
+
 extern "C" int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

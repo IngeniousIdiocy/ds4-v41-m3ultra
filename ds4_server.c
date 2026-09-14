@@ -5620,6 +5620,17 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
         restore_sec = bench_now_sec_srv() - r0;
     }
 
+    /* Declared in ds4_gpu.h, which this translation unit does not include;
+     * every backend that builds ds4-server provides it (ds4_metal.m,
+     * ds4_cuda.cu). */
+    extern int ds4_gpu_dsv41_indexer_radix_stats(uint32_t out[16]);
+    /* Depth stages: cumulative radix-selector telemetry, differenced across
+     * this decode.  ds4_gpu_dsv41_indexer_radix_stats copies counters only and
+     * requires the caller to have already synchronised the stream, which the
+     * snapshot restore above and the completed decode below both guarantee. */
+    uint32_t radix0[16] = {0}, radix1[16] = {0};
+    const int radix_have0 = ds4_gpu_dsv41_indexer_radix_stats(radix0);
+
     const int eos = ds4_token_eos(e);
     /* Kernel-ledger window = THIS decode and nothing else.  Reset after the
      * prefix is restored and dump right after the decode loop, so a costmap
@@ -5660,6 +5671,7 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
         if (done == 1) first_sec = t1 - t0; else steady_sec += t1 - t0;
     }
     const double gen_sec = dspark ? steady_sec + first_sec : bench_now_sec_srv() - gen_t0;
+    const int radix_have1 = ds4_gpu_dsv41_indexer_radix_stats(radix1);
     const int bench_ledger_mode = ds4_gpu_kernel_ledger_mode();
     const bool bench_ledger_written = bench_ledger_dump && *bench_ledger_dump &&
         ds4_gpu_kernel_ledger_dump_path(bench_ledger_dump) != 0;
@@ -5685,6 +5697,20 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     buf_printf(&b, ",\"gen_steady_tokens\":%d,\"gen_steady_tps\":%.4f",
                done > 1 ? done - 1 : 0,
                steady_sec > 0.0 ? (double)(done - 1) / steady_sec : 0.0);
+    buf_printf(&b, ",\"radix_stats\":%s", (radix_have0 && radix_have1) ? "true" : "false");
+    if (radix_have0 && radix_have1) {
+        buf_printf(&b, ",\"radix_calls\":%u,\"radix_accepted\":%u"
+                       ",\"radix_rejected\":%u,\"radix_reject_flags\":%u"
+                       ",\"radix_last_accept_n\":%u,\"radix_last_cand\":%u"
+                       ",\"radix_longest_reject_run\":%u",
+                   radix1[4]-radix0[4], radix1[5]-radix0[5],
+                   (radix1[4]-radix0[4]) - (radix1[5]-radix0[5]),
+                   radix1[6], radix1[2], radix1[3], radix1[14]);
+        buf_puts(&b, ",\"radix_causes\":[");
+        for (int i = 8; i <= 13; i++)
+            buf_printf(&b, "%s%u", i > 8 ? "," : "", radix1[i]-radix0[i]);
+        buf_puts(&b, "]");
+    }
     buf_printf(&b, ",\"dspark\":%s", dspark ? "true" : "false");
     if (dspark) {
         buf_printf(&b, ",\"dspark_cycles\":%u,\"dspark_committed\":%u"

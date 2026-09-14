@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#include <mach-o/dyld.h>
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -39752,6 +39753,9 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "q8_prefill_profile",     offsetof(ds41_levers, q8_prefill_profile),     "DS4_METAL_Q8_PREFILL_PROFILE" },
     { "attn_cohort4",       offsetof(ds41_levers, attn_cohort4),       "DS4_DS41_ATTN_COHORT4" },
     { "gather_wide",        offsetof(ds41_levers, gather_wide),        "DS4_DS41_GATHER_WIDE" },
+    { "index_topk_radix", offsetof(ds41_levers, index_topk_radix), "DS4_DS41_INDEX_TOPK_RADIX" },
+    { "index_compact_score", offsetof(ds41_levers, index_compact_score), "DS4_DS41_INDEX_COMPACT_SCORE" },
+    { "index_mask_score", offsetof(ds41_levers, index_mask_score), "DS4_DS41_INDEX_MASK_SCORE" },
     { "stage_gather",       offsetof(ds41_levers, stage_gather),       "DS4_DS41_STAGE_GATHER" },
     { "q4_dn_nr1",          offsetof(ds41_levers, q4_dn_nr1),          "DS4_DS41_Q4_DN_NR1" },
     { "hc_expand_nth",      offsetof(ds41_levers, hc_expand_nth),      "DS4_DS41_HC_EXPAND_NTH" },
@@ -39789,6 +39793,34 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "dspark_draft_trace", offsetof(ds41_levers, dspark_draft_trace), "DS4_DS41_DSPARK_DRAFT_TRACE" },
 };
 
+/* The shipped calibration. The controller is on by default, so a stock
+ * checkout has to find its calibration without being told where it is:
+ * DS4_DS41_DSPARK_CALIBRATION still wins when it is set, otherwise the file
+ * that ships beside the binary. Returns NULL only when the executable path
+ * cannot be read, which leaves the caller's existing refusal in place. */
+#define DS41_DSPARK_CALIB_RELPATH "dspark/calib-ds41-code.txt"
+
+static const char *ds41_dspark_calibration_path(void) {
+    const char *env = getenv("DS4_DS41_DSPARK_CALIBRATION");
+    if (env && *env) return env;
+    static char path[PATH_MAX];
+    if (path[0]) return path;
+    char exe[PATH_MAX];
+#if defined(__APPLE__)
+    uint32_t n = (uint32_t)sizeof(exe);
+    if (_NSGetExecutablePath(exe, &n) != 0) return NULL;
+#else
+    ssize_t r = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (r <= 0) return NULL;
+    exe[r] = 0;
+#endif
+    char *slash = strrchr(exe, '/');
+    if (!slash) return NULL;
+    *slash = 0;
+    snprintf(path, sizeof(path), "%s/%s", exe, DS41_DSPARK_CALIB_RELPATH);
+    return path;
+}
+
 void ds41_levers_init_from_env(void) {
     if (g_ds41_levers_ready) return;
     g_ds41_levers.decode_chunks      = ds41_env_enable_form("DS4_DS41_DECODE_CHUNKS");
@@ -39797,8 +39829,11 @@ void ds41_levers_init_from_env(void) {
                                                            "DS4_DS41_VERIFY_WIDE_PREFILL_OFF");
     { const char *v = getenv("DS4_V41_DSPARK_VERIFY_ROWS");
       g_ds41_levers.dspark_verify_rows = v && v[0] ? atoi(v) : 0; }
-    g_ds41_levers.dspark_controller = getenv("DS4_DS41_DSPARK_CONTROLLER") &&
-        getenv("DS4_DS41_DSPARK_CONTROLLER")[0] == '1';
+    /* The controller is the production default: it is the window that dials the
+     * draft back when it is losing, and without it a fixed six loses on traffic
+     * it was not calibrated for. DS4_DS41_DSPARK_CONTROLLER=0 turns it off. */
+    { const char *v = getenv("DS4_DS41_DSPARK_CONTROLLER");
+      g_ds41_levers.dspark_controller = !(v && v[0] == '0'); }
     g_ds41_levers.dspark_controller_confidence = ds41_env_enable_form("DS4_DS41_DSPARK_CONTROLLER_CONFIDENCE");
     g_ds41_levers.dspark_controller_widths = getenv("DS4_DS41_DSPARK_CONTROLLER_WIDTHS") &&
         getenv("DS4_DS41_DSPARK_CONTROLLER_WIDTHS")[0] == '1';
@@ -39910,6 +39945,16 @@ void ds41_levers_init_from_env(void) {
     { const char *v = getenv("DS4_DS41_ATTN_GEOM");
       if (v && v[0]) { const long n = strtol(v, NULL, 10);
                        if (n >= 0 && n <= 8) g_ds41_levers.attn_geom = (int)n; } }
+    /* Depth selection: the compact admitted-block scorer and the bounded radix
+     * token selector are on unless their variable is explicitly 0.  Both are
+     * byte-identical to the original path at every depth measured and both take
+     * >= 0.5 ms/token off a 300k serial step on their own.  The masked-scorer
+     * early exit stays opt-in: it is a win on its own but contributes nothing
+     * once the compact scorer, which supersedes it, is enabled. */
+    g_ds41_levers.index_topk_radix = ds41_env_enable_form("DS4_DS41_INDEX_TOPK_RADIX");
+    g_ds41_levers.index_compact_score = ds41_env_enable_form("DS4_DS41_INDEX_COMPACT_SCORE");
+    g_ds41_levers.index_mask_score = getenv("DS4_DS41_INDEX_MASK_SCORE") &&
+        ds41_env_enable_form("DS4_DS41_INDEX_MASK_SCORE");
     g_ds41_levers.stage_gather = ds41_env_enable_form("DS4_DS41_STAGE_GATHER");
     g_ds41_levers.q4_dn_nr1 = getenv("DS4_DS41_Q4_DN_NR1") != NULL &&
         getenv("DS4_DS41_Q4_DN_NR1")[0] != '0';
@@ -40467,7 +40512,9 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t n_comp = ratio ? (g->pos + 1u) / ratio : 0;
     const uint32_t top = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     return ds41_attention_candidates(g, il) && (!n_comp || !ds41_index_source(il) ||
-        ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
+        (g_ds41_levers.index_topk_radix && top == 512u ?
+            ds4_gpu_dsv41_indexer_topk_radix(g->selected_comp, g->index_scores, n_comp, il > 20u) :
+            ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top)));
 }
 
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
@@ -40480,8 +40527,11 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
-            !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
+            !(il > 20u && (g_ds41_levers.index_mask_score || g_ds41_levers.index_compact_score) && DS4_N_INDEXER_HEAD == 32u ?
+                ds4_gpu_dsv41_indexer_score_masked(g->index_scores, g->index_q, g->index_weights,
+                    g->index_cache[owner], g->block_mask, n_comp, g_ds41_levers.index_compact_score) :
+                ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+                    g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false))) return false;
     }
     return ds41_attention_pick(g, il);
 }
@@ -73494,9 +73544,13 @@ int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
     const bool controlled = g_ds41_levers.dspark_controller != 0;
     if (controlled && !dd->controller) {
         dd->controller = malloc(sizeof(*dd->controller));
-        if (!dd->controller || !ds41_ctl_load(dd->controller, getenv("DS4_DS41_DSPARK_CALIBRATION"))) {
+        const char *calib = ds41_dspark_calibration_path();
+        if (!dd->controller || !ds41_ctl_load(dd->controller, calib)) {
             free(dd->controller); dd->controller = NULL;
-            if (err && errlen) snprintf(err, errlen, "dspark: invalid or missing DS4_DS41_DSPARK_CALIBRATION");
+            if (err && errlen)
+                snprintf(err, errlen, "dspark: invalid or missing calibration \"%s\" "
+                         "(set DS4_DS41_DSPARK_CALIBRATION, or DS4_DS41_DSPARK_CONTROLLER=0 "
+                         "for a fixed width)", calib ? calib : DS41_DSPARK_CALIB_RELPATH);
             return 1;
         }
     }

@@ -1711,6 +1711,17 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
         float           beta_fast,
         float           beta_slow);
 
+/* Same retained-score arithmetic as the direct scorer, row-owned block mask. */
+int ds4_gpu_dsv41_indexer_score_masked(ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *keys, const ds4_gpu_tensor *block_mask, uint32_t n_rows, int compact);
+
+/* Token top512 only; ties/nonfinite/overflow use the unchanged legacy chain. */
+int ds4_gpu_dsv41_indexer_topk_radix(ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *scores, uint32_t n_comp, bool allow_neg_inf);
+/* Read-only telemetry; caller must finish/synchronize its command stream first. */
+int ds4_gpu_dsv41_indexer_radix_stats(uint32_t out[16]);
+
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
