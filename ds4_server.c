@@ -828,7 +828,9 @@ typedef struct {
      * cumulative counters.  have=0 when the session has no V4.1 DSpark state. */
     int      ds41_dspark_have;
     uint64_t ds41_dspark[5];   /* cycles, committed, serial rows, attempts, declines */
-    uint64_t ds41_adapt[6];    /* attempts, serial steps, skipped, windows, backoffs, losing */
+    uint64_t ds41_adapt[7];    /* attempts, serial steps, skipped, windows, backoffs, losing, declines */
+    uint64_t ds41_fault[4];    /* requests, attempts, failures, skips */
+    int      ds41_fault_state; /* 0 none, 1 healthy, 2 latched */
     double   ds41_adapt_ms[3]; /* median serial token, EMA cycle, request net */
     ds4_think_mode think_mode;
     bool has_tools;
@@ -5741,7 +5743,8 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
         buf_printf(&b, ",\"dspark_processed_rows\":%u,\"dspark_serial_rows\":%u"
                        ",\"dspark_attempts\":%llu,\"dspark_skipped_steps\":%llu"
                        ",\"dspark_windows\":%llu,\"dspark_backoffs\":%llu"
-                       ",\"dspark_losing_cycles\":%llu,\"dspark_serial_ms\":%.4f"
+                       ",\"dspark_losing_cycles\":%llu,\"dspark_declines\":%llu"
+                       ",\"dspark_serial_ms\":%.4f"
                        ",\"dspark_net_ms\":%.3f,\"dspark_request_ms\":%.3f",
                    dstat.committed, dstat.serial_rows,
                    (unsigned long long)dstat.controller_attempts,
@@ -5749,6 +5752,7 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
                    (unsigned long long)dstat.controller_windows,
                    (unsigned long long)dstat.controller_backoffs,
                    (unsigned long long)dstat.controller_losing,
+                   (unsigned long long)dstat.controller_confidence_declines,
                    dstat.controller_serial_ms,
                    dstat.controller_paid_ms, dstat.total_ms);
         buf_printf(&b, ",\"dspark_expert_union\":%.4f,\"dspark_union_layers\":%u",
@@ -7131,6 +7135,12 @@ static void append_openai_usage_json(buf *b, const request *r,
                       ",\"dspark_windows\":%llu"
                       ",\"dspark_backoffs\":%llu"
                       ",\"dspark_losing_cycles\":%llu"
+                      ",\"dspark_declines\":%llu"
+                      ",\"dspark_fault_latched\":%d"
+                      ",\"dspark_fault_requests\":%llu"
+                      ",\"dspark_fault_attempts\":%llu"
+                      ",\"dspark_fault_failures\":%llu"
+                      ",\"dspark_fault_skips\":%llu"
                       ",\"dspark_serial_ms\":%.4f"
                       ",\"dspark_cycle_ms\":%.4f"
                       ",\"dspark_net_ms\":%.3f}",
@@ -7142,6 +7152,12 @@ static void append_openai_usage_json(buf *b, const request *r,
                    (unsigned long long)r->ds41_adapt[3],
                    (unsigned long long)r->ds41_adapt[4],
                    (unsigned long long)r->ds41_adapt[5],
+                   (unsigned long long)r->ds41_adapt[6],
+                   r->ds41_fault_state == 2 ? 1 : 0,
+                   (unsigned long long)r->ds41_fault[0],
+                   (unsigned long long)r->ds41_fault[1],
+                   (unsigned long long)r->ds41_fault[2],
+                   (unsigned long long)r->ds41_fault[3],
                    r->ds41_adapt_ms[0], r->ds41_adapt_ms[1], r->ds41_adapt_ms[2]);
     }
     buf_puts(b, "}");
@@ -14177,6 +14193,8 @@ decode_again:
                     ? after[i] - ds41_dspark_before[i] : 0;
             (void)ds4_session_ds41_dspark_adaptive_stats(slot->session,
                 j->req.ds41_adapt, j->req.ds41_adapt_ms);
+            j->req.ds41_fault_state = ds4_session_ds41_dspark_fault_stats(
+                slot->session, j->req.ds41_fault);
         }
     }
     tool_calls parsed_calls = {0};

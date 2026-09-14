@@ -13,9 +13,12 @@ static void cycle(ds41_dspark_adaptive *a, double ms, uint32_t rows) {
 static void serial(ds41_dspark_adaptive *a, double ms) {
     ds41_adapt_record(a, ms, 1u, false);
 }
+static void decline(ds41_dspark_adaptive *a, double ms) {
+    ds41_adapt_record_decline(a, ms, 1u);
+}
 
 int main(void) {
-    const ds41_adapt_config c = {16u, true, true};
+    const ds41_adapt_config c = {16u, true, true, 0.75f, 3u};
     ds41_dspark_adaptive a;
     ds41_adapt_begin(&a, c);
     assert(a.active && !a.invalid && !a.engaged);
@@ -63,6 +66,28 @@ int main(void) {
     assert(!ds41_adapt_admit(&a) && a.skip_remaining == 128);
     ds41_adapt_reasoning(&a, false);
     assert(!a.skip_remaining && !a.bad_run && !a.window_calls && ds41_adapt_admit(&a));
+
+    /* Admission: the longest confident run from the anchor, nothing below the
+     * floor, and a run shorter than min_draft is no admission at all. */
+    const float conf[5] = {0.99f, 0.80f, 0.74f, 0.99f, 0.99f};
+    assert(ds41_adapt_prefix(conf, 5u, 0.75f, 2u) == 2u);
+    assert(ds41_adapt_prefix(conf, 5u, 0.75f, 3u) == 0u);
+    const float sure[5] = {0.99f, 0.99f, 0.99f, 0.99f, 0.99f};
+    assert(ds41_adapt_prefix(sure, 5u, 0.75f, 3u) == 5u);
+    const float nan_run[2] = {0.99f, 0.0f / 0.0f};
+    assert(ds41_adapt_prefix(nan_run, 2u, 0.75f, 1u) == 1u);
+    assert(!ds41_adapt_prefix(sure, 5u, 0.0f / 0.0f, 1u) && !ds41_adapt_prefix(NULL, 5u, 0.75f, 1u));
+
+    /* A decline is a chosen call: it takes a window slot at its drafter cost,
+     * three of them back off, and none of them is an attempt or a losing cycle. */
+    ds41_dspark_adaptive g;
+    ds41_adapt_begin(&g, c);
+    for (unsigned i = 0; i < 16; i++) serial(&g, 32.0);
+    decline(&g, 40.0); decline(&g, 40.0);
+    assert(g.window_calls == 2 && !g.skip_remaining);
+    decline(&g, 40.0);
+    assert(g.skip_remaining == 16 && g.backoffs == 1 && g.declines == 3);
+    assert(!g.attempts && !g.losing_cycles && g.serial_consumed == 19);
 
     /* With the controller off every eligible position is proposed. */
     ds41_adapt_config off = c; off.enabled = false;

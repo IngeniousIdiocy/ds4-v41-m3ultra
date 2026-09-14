@@ -725,6 +725,7 @@ typedef struct {
     uint64_t controller_declines;  /* serial steps the cooldown skipped        */
     uint64_t controller_serial;    /* serial steps of any kind                 */
     uint64_t controller_windows, controller_backoffs, controller_losing;
+    uint64_t controller_confidence_declines; /* proposals refused before verify */
     double controller_serial_ms;   /* median measured serial token, ms         */
     double controller_cycle_ms;    /* EMA verify cycle, ms                     */
     double controller_paid_ms;     /* request-cumulative wall minus rows*serial */
@@ -738,7 +739,10 @@ int ds4_session_ds41_dspark_usage(const ds4_session *s, uint64_t out[5]);
  * out = {attempts, serial steps, skipped steps, windows, backoffs, losing
  * cycles}; ms = {median serial token, EMA cycle, request net}. */
 void ds4_session_ds41_dspark_request_begin(ds4_session *s);
-int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[6],
+/* 0 no session, 1 drafter healthy, 2 latched; out = requests, attempts,
+ * failures, skips. */
+int ds4_session_ds41_dspark_fault_stats(const ds4_session *s, uint64_t out[4]);
+int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[7],
                                            double ms[3]);
 int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
                                 int *out_tokens, int *n_out,

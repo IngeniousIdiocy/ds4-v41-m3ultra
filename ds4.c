@@ -43180,6 +43180,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, uint32_t pos,
  * measured rather than assumed. */
 #include "ds4_dspark_controller.h"
 #include "ds4_ds41_dspark_adaptive.h"
+#include "ds4_ds41_dspark_fault.h"
 
 /* The controller's configuration, read from the levers every time a request
  * begins so /debug/levers takes effect on the next request.  GLM's default
@@ -43187,15 +43188,89 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, uint32_t pos,
  * moves it, and anything outside 0..64 leaves the default in place. */
 static ds41_adapt_config ds41_adapt_config_read(void) {
     ds41_levers_init_from_env();
-    ds41_adapt_config c = {16u, true, true};
+    /* GLM's defaults: p_min 0.75 verbatim, and MIN_DRAFT carried over as the
+     * same fraction of the trained block -- GLM declines below 4 of 7 (0.57),
+     * V4.1 below 3 of 5 (0.60).  Documented `=` knobs, not levers: they change
+     * which cycles are worth verifying, never what a verified cycle emits. */
+    ds41_adapt_config c = {16u, true, true, 0.75f, 3u};
     const char *entry = getenv("DS4_DS41_DSPARK_MIN_SERIAL_TOKENS");
     if (entry && entry[0]) {
         const long n = strtol(entry, NULL, 10);
         if (n >= 0 && n <= (long)DS41_ADAPT_ENTRY_MAX) c.min_serial_tokens = (uint32_t)n;
     }
+    const char *pmin = getenv("DS4_DS41_DSPARK_P_MIN");
+    if (pmin && pmin[0]) {
+        const double v = strtod(pmin, NULL);
+        if (v >= 0.0 && v <= 1.0) c.p_min = (float)v;
+    }
+    const char *mind = getenv("DS4_DS41_DSPARK_MIN_DRAFT");
+    if (mind && mind[0]) {
+        const long n = strtol(mind, NULL, 10);
+        if (n >= 0 && n <= (long)DS4_DSPARK_MAX_BLOCK_SIZE) c.min_draft = (uint32_t)n;
+    }
     c.enabled = g_ds41_levers.dspark_adaptive != 0;
     c.reasoning_serial = g_ds41_levers.dspark_reasoning_serial != 0;
     return c;
+}
+
+/* Injected failure points, so the fault latch can be exercised without a real
+ * drafter fault.  GLM's `DS4_DFLASH_FAIL` mechanism and matching rule, on
+ * DS4_DS41_DSPARK_FAIL: a comma- or space-separated list of whole point names.
+ * Test-only; unset, this is one cached getenv. */
+typedef enum {
+    DS41_DSPARK_FAIL_NONE = 0,
+    DS41_DSPARK_FAIL_DRAFTER_ONCE,
+    DS41_DSPARK_FAIL_STATE_SAVE,
+    DS41_DSPARK_FAIL_AFTER_VERIFY,
+} ds41_dspark_fail_point;
+
+static const char *ds41_dspark_fail_point_name(ds41_dspark_fail_point p) {
+    switch (p) {
+    case DS41_DSPARK_FAIL_DRAFTER_ONCE: return "drafter_once";
+    case DS41_DSPARK_FAIL_STATE_SAVE:   return "state_save";
+    case DS41_DSPARK_FAIL_AFTER_VERIFY: return "after_verify";
+    default:                            return "";
+    }
+}
+
+static bool ds41_dspark_fail_point_selected(const char *spec, const char *name) {
+    if (!spec || !name || !name[0]) return false;
+    const size_t n = strlen(name);
+    for (const char *p = spec; *p; ) {
+        while (*p == ',' || *p == ' ') p++;
+        const char *start = p;
+        while (*p && *p != ',' && *p != ' ') p++;
+        if ((size_t)(p - start) == n && memcmp(start, name, n) == 0) return true;
+    }
+    return false;
+}
+
+static bool ds41_dspark_fail_injected(ds41_dspark_fail_point point) {
+    static const char *spec;
+    static int cached;
+    if (!cached) { spec = getenv("DS4_DS41_DSPARK_FAIL"); cached = 1; }
+    if (!spec) return false;
+    return ds41_dspark_fail_point_selected(spec, ds41_dspark_fail_point_name(point));
+}
+
+/* Per-position confidence: the normalized top probability of the post-Markov
+ * proposal row, i.e. the probability the drafter itself assigns to the token it
+ * proposed for that slot.  `logits_rows` is already on the host -- the Markov
+ * pass read it once and added its bias in place -- so admission costs no GPU
+ * work.  Terms more than 30 nats below the row maximum contribute under 1e-13
+ * of the sum and are skipped; the compare is what the pass costs, not the exp. */
+static void ds41_dspark_row_confidence(const float *logits_rows, uint32_t block,
+                                       uint32_t vocab, float *out) {
+    for (uint32_t i = 0; i < block; i++) {
+        const float *row = logits_rows + (size_t)i * vocab;
+        float top = -1e30f;
+        for (uint32_t v = 0; v < vocab; v++) if (row[v] > top) top = row[v];
+        const float cut = top - 30.0f;
+        double sum = 0.0;
+        for (uint32_t v = 0; v < vocab; v++)
+            if (row[v] > cut) sum += exp((double)row[v] - (double)top);
+        out[i] = sum > 0.0 ? (float)(1.0 / sum) : 0.0f;
+    }
 }
 
 static uint32_t ds41_dspark_verify_rows(uint32_t block) {
@@ -43387,7 +43462,8 @@ static bool ds41_dspark_decode_cycle(ds41_gpu_graph *g, ds41_dspark_decode *dd,
                                      int *token, int *out, uint32_t *n_out,
                                      float *session_logits, int excl_token, int stop_token,
                                      uint32_t max_emit, const ds41_sample_policy *pol,
-                                     bool (*boundary)(void *, int), void *boundary_ctx) {
+                                     bool (*boundary)(void *, int), void *boundary_ctx,
+                                     bool *declined, bool *drained) {
     ds41_dspark *d = &dd->drafter;
     const uint32_t P = g->pos;
     uint32_t rows = ds41_dspark_verify_rows(d->block);
@@ -43396,11 +43472,33 @@ static bool ds41_dspark_decode_cycle(ds41_gpu_graph *g, ds41_dspark_decode *dd,
     const uint32_t p = P - 1u;
     if (p == 0) return false;                 /* get_dspark_topk_idxs: start_pos > 0 */
 
+    /* Everything up to the verify batch touches only the drafter's own graph
+     * and host buffers, so a failure here leaves the target's KV, position and
+     * checkpoint exactly as they were: drained. */
+    if (drained) *drained = true;
     double t0 = ds41_dspark_now_ms();
+    static bool ds41_fail_drafter_used;
     if (!ds41_dspark_seed_to(dd, g, p) ||
         !ds41_dspark_stage_input(dd, m, w, *token) ||
         !ds41_dspark_forward(d, p, m, w->output) ||
+        ds41_fault_inject_once(ds41_dspark_fail_injected(DS41_DSPARK_FAIL_DRAFTER_ONCE),
+                               &ds41_fail_drafter_used) ||
         !ds41_dspark_markov_greedy(d, *token, dd->logits_rows, dd->proposal)) return false;
+    if (ds41_dspark_fail_injected(DS41_DSPARK_FAIL_STATE_SAVE)) return false;
+    /* Confidence admission (GLM's `dflash_adaptive_prefix`).  The proposal is
+     * already paid for; what a decline avoids is the six-row target pass, which
+     * is the expensive half.  The target is never asked anything here, so no
+     * token can be fabricated and byte identity is untouched. */
+    if (dd->adapt.config.enabled && dd->adapt.config.min_draft) {
+        float conf[DS4_DSPARK_MAX_BLOCK_SIZE];
+        ds41_dspark_row_confidence(dd->logits_rows, d->block, d->vocab, conf);
+        if (!ds41_adapt_prefix(conf, d->block, dd->adapt.config.p_min,
+                               dd->adapt.config.min_draft)) {
+            dd->propose_ms += ds41_dspark_now_ms() - t0;
+            if (declined) *declined = true;
+            return true;
+        }
+    }
     if (rows != dd->vc.rows) {
         ds41_verify_free(&dd->vc);
         if (!ds41_verify_alloc(&dd->vc, rows)) return false;
@@ -43416,8 +43514,13 @@ static bool ds41_dspark_decode_cycle(ds41_gpu_graph *g, ds41_dspark_decode *dd,
     if (!ds4_gpu_begin_commands()) return false;
     bool ok = ds41_graph_step_batch(graphs, tokens, (int)rows, rows, m, w, &dd->vc);
     if (!ds4_gpu_end_commands()) ok = false;
+    /* The batch has advanced the target and written its KV.  Only
+     * ds41_verify_commit puts the frontier back, so a failure from here on is
+     * not drained and the latch must refuse to continue serially. */
+    if (drained) *drained = false;
     if (ok) ok = ds4_gpu_tensor_read(dd->vc.logits, 0, dd->vc.row_logits,
         (uint64_t)rows * DS4_N_VOCAB * sizeof(float)) != 0;
+    if (ok && ds41_dspark_fail_injected(DS41_DSPARK_FAIL_AFTER_VERIFY)) ok = false;
     if (!ok) return false;
     const double t2 = ds41_dspark_now_ms();
     dd->verify_ms += t2 - t1;
@@ -59333,6 +59436,9 @@ struct ds4_session {
     /* Stage 5: the V4.1 drafter plus its verify transaction, allocated on the
      * first speculative decode of this session. */
     ds41_dspark_decode *ds41_dspark;
+    /* Session-scoped, per ds4_ds41_dspark_fault.h: a drafter that failed
+     * once is not retried by the next request on this session. */
+    ds41_dspark_fault ds41_dspark_fault;
 #endif
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
@@ -72387,6 +72493,16 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "missing session or prompt");
         return 1;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* An unsafe drafter failure is one the engine could not drain: the target
+     * has already consumed rows this session cannot un-feed, so continuing
+     * would answer from a state no serial decode would have reached.  GLM
+     * refuses the sync and so does this; only a new session clears it. */
+    if (s->ds41_dspark_fault.unsafe) {
+        snprintf(err, errlen, "dspark: unsafe drafter failure requires a new session");
+        return 1;
+    }
+#endif
     if (prompt->len <= 0) {
         snprintf(err, errlen, "empty prompt");
         return 1;
@@ -73629,30 +73745,54 @@ int ds4_session_ds41_dspark_usage(const ds4_session *s, uint64_t out[5]) {
  * so the controller is begun here and nowhere else: the sixteen-token serial
  * entry, the serial-cost window, the open three-attempt window and the cooldown
  * all start fresh, exactly as GLM begins its controller in decode_begin(). */
+static void ds4_session_ds41_dspark_fault_report(const ds4_session *s, const char *event);
+
 void ds4_session_ds41_dspark_request_begin(ds4_session *s) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (s && s->ds41_dspark) ds41_adapt_begin(&s->ds41_dspark->adapt, ds41_adapt_config_read());
+    if (!s) return;
+    ds41_fault_begin_request(&s->ds41_dspark_fault);
+    if (s->ds41_dspark_fault.disabled)
+        ds4_session_ds41_dspark_fault_report(s, "request_begin");
+    if (s->ds41_dspark) ds41_adapt_begin(&s->ds41_dspark->adapt, ds41_adapt_config_read());
 #else
     (void)s;
 #endif
 }
 
-int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[6],
+int ds4_session_ds41_dspark_fault_stats(const ds4_session *s, uint64_t out[4]) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (out) memset(out, 0, 4 * sizeof(out[0]));
+    if (!s) return 0;
+    const ds41_dspark_fault *f = &s->ds41_dspark_fault;
+    if (out) {
+        out[0] = f->requests; out[1] = f->attempts;
+        out[2] = f->failures; out[3] = f->skips;
+    }
+    return f->disabled ? 2 : 1;
+#else
+    (void)s;
+    if (out) memset(out, 0, 4 * sizeof(out[0]));
+    return 0;
+#endif
+}
+
+int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[7],
                                            double ms[3]) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (out) memset(out, 0, 6 * sizeof(out[0]));
+    if (out) memset(out, 0, 7 * sizeof(out[0]));
     if (ms) ms[0] = ms[1] = ms[2] = 0.0;
     if (!s || !s->ds41_dspark) return 0;
     const ds41_dspark_adaptive *a = &s->ds41_dspark->adapt;
     if (out) {
         out[0] = a->attempts; out[1] = a->serial_steps; out[2] = a->skipped_steps;
         out[3] = a->windows;  out[4] = a->backoffs;     out[5] = a->losing_cycles;
+        out[6] = a->declines;
     }
     if (ms) { ms[0] = a->serial_ms; ms[1] = a->cycle_ms; ms[2] = a->net_ms; }
     return 1;
 #else
     (void)s;
-    if (out) memset(out, 0, 6 * sizeof(out[0]));
+    if (out) memset(out, 0, 7 * sizeof(out[0]));
     if (ms) ms[0] = ms[1] = ms[2] = 0.0;
     return 0;
 #endif
@@ -73665,6 +73805,16 @@ int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[6]
  * the session must be a prefilled V4.1 session with an armed capture ring and a
  * bound drafter and the decode state must exist.  Returns the decode state, or
  * NULL with `err` set. */
+/* GLM's `ds4_session_dflash_fault_report` line, same fields and same shape. */
+static void ds4_session_ds41_dspark_fault_report(const ds4_session *s, const char *event) {
+    const ds41_dspark_fault *f = &s->ds41_dspark_fault;
+    fprintf(stderr, "ds4: dspark fault event=%s request=%llu attempts=%llu "
+            "failures=%llu skips=%llu disabled=%d safe=%d\n",
+            event, (unsigned long long)f->requests, (unsigned long long)f->attempts,
+            (unsigned long long)f->failures, (unsigned long long)f->skips,
+            f->disabled, !f->unsafe);
+}
+
 static ds41_dspark_decode *ds41_dspark_ready(ds4_session *s,
                                              char *err, size_t errlen) {
     ds4_engine *e = s->engine;
@@ -73723,13 +73873,30 @@ static int ds41_dspark_step_core(ds4_session *s, ds41_dspark_decode *dd,
     *produced = 0;
     *serial = false;
     const bool eligible = before >= 2 && before+cap <= g->ctx && remaining > 1;
-    const bool attempt = eligible && ds41_adapt_admit(&dd->adapt);
+    /* A latched session never asks the drafter again. */
+    const bool faulted = s->ds41_dspark_fault.disabled;
+    const bool attempt = eligible && !faulted && ds41_adapt_admit(&dd->adapt) &&
+        ds41_fault_attempt(&s->ds41_dspark_fault);
+    bool declined = false, drained = true;
     ds41_ctl_preview preview = {e, dd->control};
     if (attempt && !ds41_dspark_decode_cycle(g, dd, &e->model, &e->weights,
             &token, emitted, produced, s->logits, excluded, stop_token, remaining,
-            pol, ds41_ctl_boundary, &preview))
-        return 1;
-    if (!attempt) {
+            pol, ds41_ctl_boundary, &preview, &declined, &drained)) {
+        /* A drafter fault is not a request failure.  Latch the session and, when
+         * the attempt was drained, finish this step -- and the request -- on the
+         * serial path.  An undrained failure left the target's conditioning
+         * unknown and still has to surface. */
+        ds41_fault_latch(&s->ds41_dspark_fault, drained);
+        ds4_session_ds41_dspark_fault_report(s, "latched");
+        if (!ds41_fault_skip(&s->ds41_dspark_fault)) return 1;
+        *produced = 0;
+        declined = false;
+        token = feeding;
+    }
+    if (faulted && !ds41_fault_skip(&s->ds41_dspark_fault)) return 1;
+    /* A declined proposal, and a drained fault, both leave the target exactly
+     * as an unadmitted position would: take the ordinary serial step. */
+    if (!attempt || declined || !*produced) {
         if (ds4_session_eval(s, feeding, err, errlen)) return 1;
         /* The serial fallback must sample from the same distribution the
          * request asked for, or a cooled-down step would be greedy. */
@@ -73748,8 +73915,12 @@ static int ds41_dspark_step_core(ds4_session *s, ds41_dspark_decode *dd,
             token_vec_push(&s->checkpoint, i ? emitted[i-1] : feeding);
     }
     for (uint32_t i = 0; i < *produced; i++) ds41_ctl_token(e, &dd->control, emitted[i]);
-    ds41_adapt_record(&dd->adapt, ds41_dspark_now_ms()-attempt_start,
-                      g->pos-before, attempt);
+    if (declined)
+        ds41_adapt_record_decline(&dd->adapt, ds41_dspark_now_ms()-attempt_start,
+                                  g->pos-before);
+    else
+        ds41_adapt_record(&dd->adapt, ds41_dspark_now_ms()-attempt_start,
+                          g->pos-before, attempt && !*serial);
     ds41_adapt_reasoning(&dd->adapt, dd->control.thinking);
     dd->control_end = g->pos; dd->control_generation = g->state_generation;
     return 0;
@@ -73827,6 +73998,7 @@ int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
         st->controller_windows   = dd->adapt.windows;
         st->controller_backoffs  = dd->adapt.backoffs;
         st->controller_losing    = dd->adapt.losing_cycles;
+        st->controller_confidence_declines = dd->adapt.declines;
         st->controller_serial_ms = dd->adapt.serial_ms;
         st->controller_cycle_ms  = dd->adapt.cycle_ms;
         st->controller_paid_ms   = dd->adapt.net_ms;
