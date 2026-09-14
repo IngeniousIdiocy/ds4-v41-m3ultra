@@ -11,6 +11,9 @@
 #define DS4_KVSTORE_FIXED_HEADER 48u
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
+/* The score baseline decays too (slower): an entry never used again must not
+ * outrank fresh entries forever on density alone. */
+#define DS4_KVSTORE_BASE_HALF_LIFE_SECONDS (24ull * 60ull * 60ull)
 
 #define DS4_KVSTORE_EXT_TOOL_MAP          (1u << 0)
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
@@ -25,6 +28,10 @@ typedef enum {
     DS4_KVSTORE_REASON_SHUTDOWN  = 4,
     DS4_KVSTORE_REASON_AGENT_SYSTEM  = 5,
     DS4_KVSTORE_REASON_AGENT_SESSION = 6,
+    /* Interval catch-up waypoints previously mapped to UNKNOWN, leaving them
+     * outside the superseded-chain policies entirely (they were the first
+     * disk-cache-full victims on 2026-08-21 while their own chat was live). */
+    DS4_KVSTORE_REASON_INTERVAL  = 7,
 } ds4_kvstore_reason;
 
 typedef enum {
@@ -150,6 +157,12 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
                                 uint64_t trailer_bytes,
                                 uint64_t *file_bytes_out,
                                 uint64_t *required_bytes_out);
+/* Waypoint-ladder selection (pure, unit-tested): depths sorted descending,
+ * keep[] filled per the dense-window + geometric-ratio retention rule.
+ * Returns the kept count. */
+int ds4_kvstore_ladder_select(uint32_t frontier_tokens, const uint32_t *depths,
+                              int n, bool *keep);
+
 double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
                                         uint64_t now,

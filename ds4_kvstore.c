@@ -55,6 +55,28 @@
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
 
+/* Waypoint ladder (2026-08-23): a live chain's full 10k-interval waypoint set
+ * for a 300k conversation is ~60 GB — it cannot all be kept, and leaving the
+ * older rungs as cheap eviction victims let the 2026-08-21 chat cannibalize
+ * its own shallow waypoints (compaction then re-prefilled from token zero).
+ * Instead, thin deliberately at store time: keep every rung within
+ * LADDER_DENSE_WINDOW of the frontier, then a geometric ladder where each
+ * deeper kept rung is at most RATIO_NUM/RATIO_DEN of the previous kept depth.
+ * Kept rungs are touched on every chain store, so an active chat's ladder
+ * outscores idle chains and idle ladders age out via the base decay.
+ * DS4_KV_LADDER=0 restores the old cheap-victim behavior. */
+#define KV_CACHE_LADDER_DENSE_WINDOW 32768u
+#define KV_CACHE_LADDER_RATIO_NUM 5ull
+#define KV_CACHE_LADDER_RATIO_DEN 7ull
+static bool kv_cache_ladder_enabled(void) {
+    const char *v = getenv("DS4_KV_LADDER");
+    return !(v && v[0] == '0');
+}
+static bool kv_cache_reason_is_chain_waypoint(uint8_t reason) {
+    return reason == DS4_KVSTORE_REASON_CONTINUED ||
+           reason == DS4_KVSTORE_REASON_INTERVAL;
+}
+
 typedef struct {
     char *ptr;
     size_t len;
@@ -175,6 +197,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!reason) return DS4_KVSTORE_REASON_UNKNOWN;
     if (!strcmp(reason, "cold")) return DS4_KVSTORE_REASON_COLD;
     if (!strcmp(reason, "continued")) return DS4_KVSTORE_REASON_CONTINUED;
+    if (!strcmp(reason, "interval-catchup")) return DS4_KVSTORE_REASON_INTERVAL;
     if (!strcmp(reason, "evict")) return DS4_KVSTORE_REASON_EVICT;
     if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
     if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
@@ -505,7 +528,7 @@ static bool kv_cache_incoming_supersedes_continued(
         const ds4_kvstore_entry *e,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
-    if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
+    if (!kv_cache_reason_is_chain_waypoint(e->reason)) return false;
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -537,6 +560,12 @@ double ds4_kvstore_entry_eviction_score(
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
     double effective_hits = (double)e->hits;
+    /* The baseline ("+1.0") must age as well: without decay, a dense
+     * never-reused entry keeps a permanent score floor and outranks fresh
+     * waypoints indefinitely — observed as 10-day-old anchor entries
+     * surviving eviction passes that culled the live session's own
+     * waypoints minutes after they were written. */
+    double base = 1.0;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
     if (used_at == 0) {
         effective_hits = 0.0;
@@ -544,18 +573,131 @@ double ds4_kvstore_entry_eviction_score(
         double elapsed = (double)(now - used_at);
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
+        base = exp2(-elapsed / (double)DS4_KVSTORE_BASE_HALF_LIFE_SECONDS);
+        /* Floor keeps relative factors (anchor, superseded) meaningful for
+         * arbitrarily old entries instead of underflowing everything to a
+         * 0.0 tie. */
+        if (base < 1e-6) base = 1e-6;
     }
-    double score = (effective_hits + 1.0) *
+    double score = (effective_hits + base) *
                    (double)e->tokens / (double)e->file_size;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
     if (kv_cache_incoming_supersedes_continued(e, incoming)) {
-        double h = effective_hits > 0.0 ?
-            effective_hits / (effective_hits + 1.0) : 0.0;
-        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
-                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+        /* Keep the immediately previous continued waypoint as a rebuild
+         * anchor. With the default 10k interval aligned to 2048, adjacent
+         * waypoints are 10240 tokens apart. An agent harness can rewrite a
+         * several-k token tail after tool/runtime-context normalization;
+         * retaining one prior waypoint prevents a canonical rebuild from
+         * falling back to token zero.
+         *
+         * Older superseded waypoints keep the original cheap-victim policy.
+         * 16384 intentionally covers one default/aligned interval, but not two
+         * (20480), so disk growth remains bounded by the normal eviction pass. */
+        const bool adjacent_rebuild_anchor =
+            live && live->len > (int)e->tokens &&
+            live->len - (int)e->tokens <= 16384;
+
+        if (adjacent_rebuild_anchor) {
+            score *= 8.0;
+        } else if (!kv_cache_ladder_enabled()) {
+            double h = effective_hits > 0.0 ?
+                effective_hits / (effective_hits + 1.0) : 0.0;
+            score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
+                     KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+        }
+        else {
+            /* Ladder mode: surviving rungs were deliberately kept and are
+             * touched on every chain store, so only idle chains' ladders decay
+             * into victims.  Within the chain, weight by inverse depth: a deep
+             * rung frees the most bytes and loses the least coverage (the live
+             * slot serves near-frontier divergences), so under pressure the
+             * chain sheds its deepest superseded rungs first and keeps the
+             * shallow skeleton that mid-history divergences restore from.
+             * (Observed without this: the 3 GB-budget e2e evicted 10240/20480
+             * by the age tie-break and a shallow divergence fell to token 0.) */
+            score *= (double)KV_CACHE_LADDER_DENSE_WINDOW /
+                     (double)(e->tokens ? e->tokens : 1u);
+        }
     }
     return score;
+}
+
+int ds4_kvstore_ladder_select(uint32_t frontier_tokens, const uint32_t *depths,
+                              int n, bool *keep) {
+    int kept = 0;
+    uint32_t last_kept = frontier_tokens;
+    for (int i = 0; i < n; i++) {
+        bool k;
+        if (depths[i] >= frontier_tokens) {
+            k = false; /* not behind the frontier: not this ladder's business */
+        } else if (frontier_tokens - depths[i] <= KV_CACHE_LADDER_DENSE_WINDOW) {
+            k = true;
+        } else {
+            k = (uint64_t)depths[i] * KV_CACHE_LADDER_RATIO_DEN <=
+                (uint64_t)last_kept * KV_CACHE_LADDER_RATIO_NUM;
+        }
+        keep[i] = k;
+        if (k) { last_kept = depths[i]; kept++; }
+    }
+    return kept;
+}
+
+/* Deliberate chain thinning at store time.  Chain-mates are superseded
+ * waypoints of the incoming store's own lineage (prefix-sha match).  Kept
+ * rungs are touched so the base decay treats them as live; dropped rungs are
+ * unlinked immediately so the disk budget is spent on the ladder, not on
+ * whatever the eviction pass would have kept. */
+static void kv_cache_ladder_thin(ds4_kvstore *kc,
+                                 const ds4_kvstore_eviction_context *incoming,
+                                 uint32_t frontier_tokens) {
+    if (!kc->enabled || !kv_cache_ladder_enabled()) return;
+    if (!incoming || !incoming->text) return;
+    kv_cache_refresh(kc);
+    int *idx = malloc(sizeof(int) * (size_t)(kc->len > 0 ? kc->len : 1));
+    if (!idx) return;
+    int n = 0;
+    for (int i = 0; i < kc->len; i++) {
+        const ds4_kvstore_entry *e = &kc->entry[i];
+        if (!kv_cache_reason_is_chain_waypoint(e->reason)) continue;
+        if (e->tokens >= frontier_tokens) continue;
+        if (!kv_cache_incoming_supersedes_continued(e, incoming)) continue;
+        idx[n++] = i;
+    }
+    if (n == 0) { free(idx); return; }
+    /* insertion sort desc by tokens (n is tens at most) */
+    for (int i = 1; i < n; i++) {
+        int v = idx[i], j = i - 1;
+        while (j >= 0 && kc->entry[idx[j]].tokens < kc->entry[v].tokens) {
+            idx[j + 1] = idx[j]; j--;
+        }
+        idx[j + 1] = v;
+    }
+    uint32_t *depths = malloc(sizeof(uint32_t) * (size_t)n);
+    bool *keep = malloc(sizeof(bool) * (size_t)n);
+    if (!depths || !keep) { free(idx); free(depths); free(keep); return; }
+    for (int i = 0; i < n; i++) depths[i] = kc->entry[idx[i]].tokens;
+    ds4_kvstore_ladder_select(frontier_tokens, depths, n, keep);
+    bool removed = false;
+    for (int i = 0; i < n; i++) {
+        ds4_kvstore_entry *e = &kc->entry[idx[i]];
+        if (keep[i]) {
+            if (ds4_kvstore_touch_file(e->path, e->hits))
+                e->last_used = (uint64_t)time(NULL);
+            continue;
+        }
+        if (unlink(e->path) == 0) {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache thinned reason=ladder tokens=%u size=%.2f MiB file=%s",
+                    kv_log_name(kc), e->tokens,
+                    (double)e->file_size / (1024.0 * 1024.0),
+                    e->path ? e->path : "?");
+        }
+        e->file_size = 0; /* dropped; refresh in the next evict pass re-scans */
+        removed = true;
+    }
+    (void)removed;
+    free(idx); free(depths); free(keep);
 }
 
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
@@ -1071,6 +1213,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
     };
+    kv_cache_ladder_thin(kc, &incoming, (uint32_t)store_tokens.len);
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
     kv_buf tmpb = {0};

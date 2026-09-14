@@ -20786,10 +20786,19 @@ static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
 }
 
 static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
+    /* This exercises the legacy cheap-victim policy (superseded continued
+     * prefix demoted to 0.05-0.5x), which lives on the DS4_KV_LADDER=0 path.
+     * With the ladder on (default) the same entry is a kept rung: 4096 tokens
+     * inside the 32768 dense window scores 32768/4096 = 8x and outranks the
+     * 2x cold anchor, so the old expectation inverts.  GLM ships this test
+     * without the guard and fails it under its own default (V4.1 port,
+     * 2026-09-14). */
+    const char *ladder_prev = getenv("DS4_KV_LADDER");
+    setenv("DS4_KV_LADDER", "0", 1);
     char tmpl[] = "/tmp/ds4-kv-prefix-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
-    if (!dir) return;
+    if (!dir) { if (ladder_prev) setenv("DS4_KV_LADDER", ladder_prev, 1); else unsetenv("DS4_KV_LADDER"); return; }
 
     const char *continued_text = "system: hello world";
     const char *cold_text = "different stable prefix";
@@ -20833,6 +20842,8 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
     free(continued_path);
     free(cold_path);
     rmdir(dir);
+    if (ladder_prev) setenv("DS4_KV_LADDER", ladder_prev, 1);
+    else unsetenv("DS4_KV_LADDER");
 }
 
 static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
@@ -20883,6 +20894,81 @@ static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
     free(continued_path);
     free(cold_path);
     rmdir(dir);
+}
+
+
+
+static void test_kv_ladder_shallow_rung_outscores_deep(void) {
+    /* Same chain (both superseded by the incoming text), same freshness:
+     * the deep rung must be the cheaper victim so pressure preserves the
+     * shallow skeleton. */
+    const uint64_t now = 5000;
+    static const char text[] = "0123456789";
+    ds4_kvstore_eviction_context inc = {.text = text, .text_len = 10};
+    kv_entry shallow = {.tokens = 10240, .file_size = 10240u * 16u,
+                        .reason = DS4_KVSTORE_REASON_CONTINUED,
+                        .last_used = now, .created_at = now, .text_bytes = 2};
+    kv_entry deep = shallow;
+    deep.tokens = 143360; deep.file_size = 143360u * 16u; deep.text_bytes = 4;
+    ds4_kvstore_sha1_bytes_hex((const uint8_t *)text, 2, shallow.sha);
+    ds4_kvstore_sha1_bytes_hex((const uint8_t *)text, 4, deep.sha);
+    double s = kv_entry_eviction_score(&shallow, NULL, now, &inc);
+    double d = kv_entry_eviction_score(&deep, NULL, now, &inc);
+    TEST_ASSERT(s > d);
+}
+
+static void test_kv_ladder_select_pattern(void) {
+    /* 300k conversation, waypoints every 10240 tokens (29 rungs). The ladder
+     * must keep everything within the 32768 dense window, then a geometric
+     * tail where each kept depth is <= 5/7 of the previous kept depth. */
+    enum { N = 29 };
+    uint32_t depths[N];
+    bool keep[N];
+    const uint32_t frontier = 307200;
+    for (int i = 0; i < N; i++) depths[i] = frontier - (uint32_t)(i + 1) * 10240u;
+    int kept = ds4_kvstore_ladder_select(frontier, depths, N, keep);
+
+    /* dense window: rungs at frontier-10240/-20480/-30720 all kept */
+    TEST_ASSERT(keep[0] && keep[1] && keep[2]);
+    /* geometric tail engaged: not everything survives */
+    TEST_ASSERT(kept < N);
+    /* ladder invariant: each kept rung after the dense window is <= 5/7 of
+     * the previously kept depth, and every DROPPED rung was > 5/7 of it */
+    uint32_t last = 0;
+    for (int i = 0; i < N; i++) {
+        if (frontier - depths[i] <= 32768u) { last = depths[i]; continue; }
+        if (keep[i]) {
+            TEST_ASSERT((uint64_t)depths[i] * 7ull <= (uint64_t)last * 5ull);
+            last = depths[i];
+        } else {
+            TEST_ASSERT((uint64_t)depths[i] * 7ull > (uint64_t)last * 5ull);
+        }
+    }
+    /* coverage: for the 2026-08-21 shape (divergence at 146090), a usable
+     * rung at or below the divergence point must survive, and it must not be
+     * catastrophically far below it (worst case one ratio step: >= 5/7). */
+    uint32_t best = 0;
+    for (int i = 0; i < N; i++)
+        if (keep[i] && depths[i] <= 146090u && depths[i] > best) best = depths[i];
+    TEST_ASSERT(best >= 146090u * 5u / 7u);
+    /* budget sanity: kept ladder for a 300k chain stays a small multiple of
+     * the conversation length, i.e. tens of GB cannot accumulate per chat
+     * like the dense chain did.  Measured: the three dense-window rungs alone
+     * sum to 2.8x the frontier and the geometric tail brings the kept set to
+     * 4.6x (10 of 29 rungs), against 14.5x un-thinned.  GLM's original bound
+     * (< 3x) is arithmetically unsatisfiable and fails there too (V4.1 port,
+     * 2026-09-14). */
+    uint64_t total = 0, unthinned = 0;
+    for (int i = 0; i < N; i++) { unthinned += depths[i]; if (keep[i]) total += depths[i]; }
+    TEST_ASSERT(total < 5ull * frontier);
+    TEST_ASSERT(2 * total < unthinned);
+}
+
+static void test_kv_ladder_interval_reason_is_chain_waypoint(void) {
+    /* interval-catchup used to map to UNKNOWN, excluding those waypoints from
+     * every superseded-chain policy (adjacent anchor, ladder). */
+    TEST_ASSERT(ds4_kvstore_reason_code("interval-catchup") == DS4_KVSTORE_REASON_INTERVAL);
+    TEST_ASSERT(ds4_kvstore_reason_code("continued") == DS4_KVSTORE_REASON_CONTINUED);
 }
 
 static void test_kv_cache_eviction_score_decays_stale_hits(void) {
@@ -20939,6 +21025,82 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     unlink(new_path);
     free(old_path);
     free(new_path);
+    rmdir(dir);
+}
+
+/* Reproduces the 2026-09-14 turn-1 failure at the kvstore layer, with no
+ * prefill: a live agentic session near the compaction threshold has just
+ * written its checkpoint ladder, the disk is full, and a stale anchor from an
+ * idle chat sits alongside.  Before the base-decay fix the never-reused anchor
+ * kept a permanent +1.0 score floor and outranked the live session's own fresh
+ * waypoints, so an eviction pass culled the checkpoints the summarizer needed
+ * minutes after they were written (observed: common=8, a 217k re-prefill).
+ * With decay the aged anchor is the victim and the live rungs survive; the
+ * contrast case (a fresh anchor) shows the age is what demotes it. */
+static void test_kv_ladder_survives_compaction_pressure(void) {
+    char tmpl[] = "/tmp/ds4-kv-compaction-pressure.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *frontier_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const char *mid_sha      = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const char *anchor_sha   = "cccccccccccccccccccccccccccccccccccccccc";
+    char fn[44], mn[44], an[44];
+    snprintf(fn, sizeof(fn), "%.40s.kv", frontier_sha);
+    snprintf(mn, sizeof(mn), "%.40s.kv", mid_sha);
+    snprintf(an, sizeof(an), "%.40s.kv", anchor_sha);
+    char *fp = path_join(dir, fn), *mp = path_join(dir, mn), *ap = path_join(dir, an);
+
+    /* kv_cache_evict scores against time(NULL), so timestamps must be real. */
+    const uint64_t ten_days = 10ull * 24ull * 60ull * 60ull;
+    const uint64_t now = (uint64_t)time(NULL);
+    const uint64_t stale = now > ten_days ? now - ten_days : 1;   /* aged 10 days */
+    /* payload ~ tokens/10 so all three share one tokens/byte density; the
+     * eviction ordering then turns only on reason and age, which is the point. */
+    /* live session's two freshest rungs: frontier (~287k) and a mid-history
+     * rung (~90k) near where a compaction summary + retained tail restarts. */
+    test_kv_stub_file(dir, frontier_sha, KV_REASON_CONTINUED, 287000u, 0, now, 28700u);
+    test_kv_stub_file(dir, mid_sha,      KV_REASON_CONTINUED,  90000u, 0, now,  9000u);
+
+    uint64_t fsz, msz, asz;
+    { struct stat st; TEST_ASSERT(stat(fp, &st) == 0); fsz = (uint64_t)st.st_size;
+      TEST_ASSERT(stat(mp, &st) == 0); msz = (uint64_t)st.st_size; }
+
+    /* Case 1: the stale foreign anchor. Budget holds the two live rungs plus
+     * only half the anchor, so exactly one file must go. */
+    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 12000u, 0, stale, 1200u);
+    { struct stat st; TEST_ASSERT(stat(ap, &st) == 0); asz = (uint64_t)st.st_size; }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = fsz + msz + asz / 2u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    /* The aged anchor is evicted; the live session keeps both its rungs, so a
+     * summary restore at the mid rung is still cheap. */
+    TEST_ASSERT(access(ap, F_OK) != 0);
+    TEST_ASSERT(access(fp, F_OK) == 0);
+    TEST_ASSERT(access(mp, F_OK) == 0);
+    kv_cache_close(&kc);
+
+    /* Case 2 (contrast): rewrite the anchor as freshly used.  Now its 2x
+     * anchor bonus is undecayed and it outranks the live rungs, so it survives
+     * a pass at the same budget — proving age, not reason alone, drove case 1. */
+    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 12000u, 0, now, 1200u);
+    kv_disk_cache kc2 = {0};
+    kc2.enabled = true;
+    kc2.dir = xstrdup(dir);
+    kc2.opt = kv_cache_default_options();
+    kc2.budget_bytes = fsz + msz + asz / 2u;
+    kv_cache_evict(&kc2, NULL, 0, NULL);
+    TEST_ASSERT(access(ap, F_OK) == 0);
+    kv_cache_close(&kc2);
+
+    unlink(fp); unlink(mp); unlink(ap);
+    free(fp); free(mp); free(ap);
     rmdir(dir);
 }
 
@@ -21779,8 +21941,12 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
+    test_kv_ladder_shallow_rung_outscores_deep();
+    test_kv_ladder_select_pattern();
+    test_kv_ladder_interval_reason_is_chain_waypoint();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
+    test_kv_ladder_survives_compaction_pressure();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 
