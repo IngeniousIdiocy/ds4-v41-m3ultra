@@ -70,4 +70,5 @@ __pycache__/
 /tests/test_deepseek41_dspark_forward
 
 /tests/test_ds41_controller
+/tests/test_ds41_dspark_adaptive
 /tests/test_ds41_prefix

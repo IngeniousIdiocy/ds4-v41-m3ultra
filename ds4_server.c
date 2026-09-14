@@ -824,6 +824,12 @@ typedef struct {
     bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
+    /* V4.1 DSpark usage extension: per-request deltas of the session's
+     * cumulative counters.  have=0 when the session has no V4.1 DSpark state. */
+    int      ds41_dspark_have;
+    uint64_t ds41_dspark[5];   /* cycles, committed, serial rows, attempts, declines */
+    uint64_t ds41_adapt[6];    /* attempts, serial steps, skipped, windows, backoffs, losing */
+    double   ds41_adapt_ms[3]; /* median serial token, EMA cycle, request net */
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -5717,20 +5723,26 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
                        ",\"dspark_verified_rows\":%u"
                        ",\"dspark_tokens_per_cycle\":%.4f",
                    dstat.cycles, dstat.committed, dstat.verified_rows,
-                   dstat.cycles ? (double)(dstat.committed-dstat.serial_rows) / (double)dstat.cycles : 0.0);
+                   dstat.cycles ? (double)(dstat.committed >= dstat.serial_rows ?
+                       dstat.committed-dstat.serial_rows : 0u) / (double)dstat.cycles : 0.0);
         buf_printf(&b, ",\"dspark_propose_ms\":%.3f,\"dspark_verify_ms\":%.3f"
                        ",\"dspark_commit_ms\":%.3f",
                    dstat.propose_ms, dstat.verify_ms, dstat.commit_ms);
-        if (g_ds41_levers.dspark_controller)
-            buf_puts(&b, ",\"dspark_cycle_ms\":null");
-        else buf_printf(&b, ",\"dspark_cycle_ms\":%.4f",
-                        dstat.cycles ? dstat.total_ms / (double)dstat.cycles : 0.0);
+        /* The controller's own EMA is the honest per-cycle figure once serial
+           steps are mixed into the request; total/cycles is not. */
+        buf_printf(&b, ",\"dspark_cycle_ms\":%.4f", dstat.controller_cycle_ms);
         buf_printf(&b, ",\"dspark_processed_rows\":%u,\"dspark_serial_rows\":%u"
-                       ",\"dspark_controller_attempts\":%llu,\"dspark_controller_declines\":%llu"
-                       ",\"dspark_controller_paid_ms\":%.3f,\"dspark_request_ms\":%.3f",
+                       ",\"dspark_attempts\":%llu,\"dspark_skipped_steps\":%llu"
+                       ",\"dspark_windows\":%llu,\"dspark_backoffs\":%llu"
+                       ",\"dspark_losing_cycles\":%llu,\"dspark_serial_ms\":%.4f"
+                       ",\"dspark_net_ms\":%.3f,\"dspark_request_ms\":%.3f",
                    dstat.committed, dstat.serial_rows,
                    (unsigned long long)dstat.controller_attempts,
                    (unsigned long long)dstat.controller_declines,
+                   (unsigned long long)dstat.controller_windows,
+                   (unsigned long long)dstat.controller_backoffs,
+                   (unsigned long long)dstat.controller_losing,
+                   dstat.controller_serial_ms,
                    dstat.controller_paid_ms, dstat.total_ms);
         buf_printf(&b, ",\"dspark_expert_union\":%.4f,\"dspark_union_layers\":%u",
                    dstat.expert_union, dstat.union_layers);
@@ -7091,9 +7103,41 @@ static void append_openai_usage_json(buf *b, const request *r,
      * cache hits. */
     buf_printf(b,
                "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
-               "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}",
+               "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}",
                prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
                cached_tokens, cache_write_tokens);
+    /* DS4 extension, additive and namespaced so an OpenAI-compatible client
+     * that does not know it simply ignores the key.  These are this request's
+     * deltas of the session's V4.1 DSpark counters: zero cycles means the
+     * request did not draft. */
+    if (r && r->ds41_dspark_have) {
+        /* dspark_committed already excludes serial rows, so it is the numerator
+           as it stands; subtracting them once more underflowed the unsigned. */
+        const double per_cycle = r->ds41_dspark[0]
+            ? (double)r->ds41_dspark[1] / (double)r->ds41_dspark[0] : 0.0;
+        buf_printf(b, ",\"ds4_dspark\":{\"dspark_cycles\":%llu"
+                      ",\"dspark_committed\":%llu"
+                      ",\"dspark_serial_rows\":%llu"
+                      ",\"dspark_tokens_per_cycle\":%.4f"
+                      ",\"dspark_attempts\":%llu"
+                      ",\"dspark_skipped_steps\":%llu"
+                      ",\"dspark_windows\":%llu"
+                      ",\"dspark_backoffs\":%llu"
+                      ",\"dspark_losing_cycles\":%llu"
+                      ",\"dspark_serial_ms\":%.4f"
+                      ",\"dspark_cycle_ms\":%.4f"
+                      ",\"dspark_net_ms\":%.3f}",
+                   (unsigned long long)r->ds41_dspark[0],
+                   (unsigned long long)r->ds41_dspark[1],
+                   (unsigned long long)r->ds41_dspark[2], per_cycle,
+                   (unsigned long long)r->ds41_adapt[0],
+                   (unsigned long long)r->ds41_adapt[2],
+                   (unsigned long long)r->ds41_adapt[3],
+                   (unsigned long long)r->ds41_adapt[4],
+                   (unsigned long long)r->ds41_adapt[5],
+                   r->ds41_adapt_ms[0], r->ds41_adapt_ms[1], r->ds41_adapt_ms[2]);
+    }
+    buf_puts(b, "}");
 }
 
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
@@ -13614,6 +13658,12 @@ decode_again:
     const char *stop_detail = max_tokens == room ? "context limit" : "output limit";
     int stop_token = -1;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
+    /* The decode state is created by the first verify cycle, so a session that
+     * has never drafted reports nothing here and everything after the loop. */
+    uint64_t ds41_dspark_before[5] = {0};
+    (void)ds4_session_ds41_dspark_usage(slot->session, ds41_dspark_before);
+    /* Transferred admission is accounted per request, not differenced. */
+    ds4_session_ds41_dspark_request_begin(slot->session);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
@@ -14088,6 +14138,20 @@ decode_again:
         return;
     }
 
+    /* V4.1 DSpark usage extension: difference the session's cumulative counters
+     * across this request's decode.  All zeros is the truthful answer for a
+     * request that never entered a verify cycle. */
+    {
+        uint64_t after[5] = {0};
+        if (ds4_session_ds41_dspark_usage(slot->session, after)) {
+            j->req.ds41_dspark_have = 1;
+            for (int i = 0; i < 5; i++)
+                j->req.ds41_dspark[i] = after[i] >= ds41_dspark_before[i]
+                    ? after[i] - ds41_dspark_before[i] : 0;
+            (void)ds4_session_ds41_dspark_adaptive_stats(slot->session,
+                j->req.ds41_adapt, j->req.ds41_adapt_ms);
+        }
+    }
     tool_calls parsed_calls = {0};
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;

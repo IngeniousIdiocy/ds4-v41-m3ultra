@@ -308,14 +308,14 @@ typedef struct {
     int prefill_hc_norm_round; /* wave 3, ADOPTED: default 1, =0 is the kill switch */
     int prefill_ffn_add_round; /* wave 3, ADOPTED: default 1, =0 is the kill switch */
     int prefill_embed_init; /* wave 3, ADOPTED: default 1, DS4_DS41_PREFILL_EMBED_INIT=0 kills it */
-    int mtp_async_chunks; /* F2: submit every four verifier layers. */
-    int mtp_engram_rows6; /* Six private asynchronous Engram rows. */
+    int mtp_async_chunks; /* F2: submit every four verifier layers. ADOPTED: default 1, =0 kills it. */
+    int mtp_engram_rows6; /* Six private asynchronous Engram rows. ADOPTED: default 1, =0 kills it. */
     int dspark_excl_eos; /* Match the serial control's argmax_excluding(eos) rule. */
     int mtp_capture_warmup; /* Complete target capture from decoder warmup inputs. */
     int mtp_state_fix; /* Capture undo, truthful snapshots, seed generation. */
-    int mtp_q8_stream6; /* H1: six accumulators, one logical Q8 weight stream; default0. */
-    int mtp_q8_stream6_mask; /* family bits0..6, default127; cleared bits use pair6. */
-    int mtp_q8_pair6; /* Six rows as three independent weight-sharing pairs. */
+    int mtp_q8_stream6; /* H1: six accumulators, one logical Q8 weight stream. ADOPTED: default 1, =0 kills it. */
+    int mtp_q8_stream6_mask; /* family bits0..6, ADOPTED default 2 (q_b only); cleared bits use pair6, out of range reads as 0. */
+    int mtp_q8_pair6; /* Six rows as three independent weight-sharing pairs. ADOPTED: default 1, =0 kills it. */
     int prefill_f16_rows2; /* wave 3, ADOPTED: default 1, DS4_DS41_PREFILL_F16_ROWS2=0 kills it */
     /* Wave 3, task B.  DIAGNOSTIC ONLY, never adopted: an ablation arm of the
      * prefill attention core.  0 = production kernel; 1..5 select a variant
@@ -372,9 +372,12 @@ typedef struct {
      * widths are invalid; use serial generation for the one-row control.
      * dspark_expert_union = 1 reads the routed selection back per layer. */
     int dspark_verify_rows;
-    int dspark_controller; /* D: calibrated admission, default off. */
-    int dspark_controller_confidence; /* use conditional confidence bins, default on */
-    int dspark_controller_widths; /* measured-width selection, default off (fixed cap) */
+    /* Windowed cost-feedback admission, ported from GLM DFlash2.  ADOPTED:
+     * default 1; DS4_DS41_DSPARK_ADAPTIVE=0 proposes at every eligible
+     * position and never backs off, which is the fixed-width control. */
+    int dspark_adaptive;
+    int dspark_reasoning_serial; /* <think> decodes serially; default 1, =0 lifts it */
+    int dspark_serve;      /* D: the serving loop drafts; =0 forces serial. */
     int dspark_expert_union;
     /* verify_batch_core = 1 runs the verify pass's attention through the
      * prefill batch core instead of six per-row decode passes: faster, but a
@@ -718,12 +721,25 @@ typedef struct {
     uint32_t verified_rows; /* rows evaluated by the verify passes         */
     uint32_t accept_hist[8];/* accepted drafts per cycle, 0..block         */
     double   propose_ms, verify_ms, commit_ms, total_ms;
-    uint64_t controller_attempts, controller_declines, controller_serial;
-    double controller_paid_ms; /* includes declined draft + serial fallback */
+    uint64_t controller_attempts;  /* verify cycles the controller admitted    */
+    uint64_t controller_declines;  /* serial steps the cooldown skipped        */
+    uint64_t controller_serial;    /* serial steps of any kind                 */
+    uint64_t controller_windows, controller_backoffs, controller_losing;
+    double controller_serial_ms;   /* median measured serial token, ms         */
+    double controller_cycle_ms;    /* EMA verify cycle, ms                     */
+    double controller_paid_ms;     /* request-cumulative wall minus rows*serial */
     double   expert_union;  /* mean routed experts read per layer per pass */
     uint32_t union_layers;  /* layers sampled (0 unless DS4_DS41_EXPERT_UNION) */
 } ds4_dspark_decode_stats;
 
+int ds4_session_ds41_dspark_usage(const ds4_session *s, uint64_t out[5]);
+/* One served request is one admission ledger: begin it at the top of the
+ * request's decode, read it back with the usage extension.
+ * out = {attempts, serial steps, skipped steps, windows, backoffs, losing
+ * cycles}; ms = {median serial token, EMA cycle, request net}. */
+void ds4_session_ds41_dspark_request_begin(ds4_session *s);
+int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[6],
+                                           double ms[3]);
 int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
                                 int *out_tokens, int *n_out,
                                 ds4_dspark_decode_stats *st,

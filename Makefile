@@ -355,7 +355,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_dspark_controller.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_engram.h
+ds4.o: ds4.c ds4.h ds4_dspark_controller.h ds4_ds41_dspark_adaptive.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h ds4_engram.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -862,7 +862,7 @@ clean:
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_dspark_bind tests/test_deepseek41_dspark_bind.o
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_dspark_forward tests/test_ds41_prefix tests/test_ds41_controller
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_dspark_forward tests/test_ds41_prefix tests/test_ds41_controller tests/test_ds41_dspark_adaptive
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch
@@ -881,7 +881,10 @@ clean:
 tests/test_ds41_controller: tests/test_ds41_controller.c ds4_dspark_controller.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< -lm
 
-tests/test_ds41_prefix.o: tests/test_ds41_prefix.c ds4.c ds4.h ds4_gpu.h ds4_engram.h ds4_dspark_controller.h
+tests/test_ds41_dspark_adaptive: tests/test_ds41_dspark_adaptive.c ds4_ds41_dspark_adaptive.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< -lm
+
+tests/test_ds41_prefix.o: tests/test_ds41_prefix.c ds4.c ds4.h ds4_gpu.h ds4_engram.h ds4_dspark_controller.h ds4_ds41_dspark_adaptive.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
 tests/test_ds41_prefix: tests/test_ds41_prefix.o $(filter-out ds4.o,$(CORE_OBJS))

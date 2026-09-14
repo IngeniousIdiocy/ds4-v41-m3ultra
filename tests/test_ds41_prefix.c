@@ -285,7 +285,7 @@ int main(int argc,char **argv) {
         CHECK(r == 6);
         fprintf(stderr,"GU mk6: six-row / same-arithmetic scalar replay; exact state checks unchanged\n");
     }
-    CHECK(ds41_levers_set("dspark_controller",0));
+    CHECK(ds41_levers_set("dspark_adaptive",0));
     CHECK(ds41_levers_set("dspark_verify_rows",(int)r));
     CHECK(ds41_levers_set("mtp_state_fix",1));
     CHECK(ds41_levers_set("dspark_capture",1));

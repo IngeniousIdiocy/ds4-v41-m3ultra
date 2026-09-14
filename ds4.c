@@ -2701,11 +2701,13 @@ static void print_size(uint64_t bytes) {
  * and 7.  The switch is therefore a runtime opt-in rather than a flipped
  * compile-time constant: DS4_V41_DSPARK_DECODE_READY=1 admits --dspark. */
 #define DS4_V41_DSPARK_DECODE_READY ds4_v41_dspark_decode_ready()
+/* Asking for --dspark IS the opt-in.  The variable remains the escape hatch:
+ * DS4_V41_DSPARK_DECODE_READY=0 still refuses the switch. */
 static int ds4_v41_dspark_decode_ready(void) {
     static int ready = -1;
     if (ready < 0) {
         const char *v = getenv("DS4_V41_DSPARK_DECODE_READY");
-        ready = v && v[0] && v[0] != '0' ? 1 : 0;
+        ready = !v || !v[0] || v[0] != '0' ? 1 : 0;
     }
     return ready;
 }
@@ -39784,42 +39786,14 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "dspark_capture",     offsetof(ds41_levers, dspark_capture),     "DS4_DS41_DSPARK_CAPTURE" },
     { "verify_wide_prefill", offsetof(ds41_levers, verify_wide_prefill), "DS4_DS41_VERIFY_WIDE_PREFILL" },
     { "dspark_verify_rows", offsetof(ds41_levers, dspark_verify_rows), "DS4_V41_DSPARK_VERIFY_ROWS" },
-    { "dspark_controller", offsetof(ds41_levers, dspark_controller), "DS4_DS41_DSPARK_CONTROLLER" },
-    { "dspark_controller_confidence", offsetof(ds41_levers, dspark_controller_confidence), "DS4_DS41_DSPARK_CONTROLLER_CONFIDENCE" },
-    { "dspark_controller_widths", offsetof(ds41_levers, dspark_controller_widths), "DS4_DS41_DSPARK_CONTROLLER_WIDTHS" },
+    { "dspark_adaptive",   offsetof(ds41_levers, dspark_adaptive),   "DS4_DS41_DSPARK_ADAPTIVE" },
+    { "dspark_serve",      offsetof(ds41_levers, dspark_serve),      "DS4_DS41_DSPARK_SERVE" },
+    { "dspark_reasoning_serial", offsetof(ds41_levers, dspark_reasoning_serial), "DS4_DS41_DSPARK_REASONING_SERIAL" },
     { "dspark_expert_union", offsetof(ds41_levers, dspark_expert_union), "DS4_DS41_EXPERT_UNION" },
     { "verify_batch_core",  offsetof(ds41_levers, verify_batch_core),  "DS4_DS41_VERIFY_BATCH_CORE" },
     { "dspark_force_reject", offsetof(ds41_levers, dspark_force_reject), "DS4_DS41_DSPARK_FORCE_REJECT" },
     { "dspark_draft_trace", offsetof(ds41_levers, dspark_draft_trace), "DS4_DS41_DSPARK_DRAFT_TRACE" },
 };
-
-/* The shipped calibration. The controller is on by default, so a stock
- * checkout has to find its calibration without being told where it is:
- * DS4_DS41_DSPARK_CALIBRATION still wins when it is set, otherwise the file
- * that ships beside the binary. Returns NULL only when the executable path
- * cannot be read, which leaves the caller's existing refusal in place. */
-#define DS41_DSPARK_CALIB_RELPATH "dspark/calib-ds41-code.txt"
-
-static const char *ds41_dspark_calibration_path(void) {
-    const char *env = getenv("DS4_DS41_DSPARK_CALIBRATION");
-    if (env && *env) return env;
-    static char path[PATH_MAX];
-    if (path[0]) return path;
-    char exe[PATH_MAX];
-#if defined(__APPLE__)
-    uint32_t n = (uint32_t)sizeof(exe);
-    if (_NSGetExecutablePath(exe, &n) != 0) return NULL;
-#else
-    ssize_t r = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (r <= 0) return NULL;
-    exe[r] = 0;
-#endif
-    char *slash = strrchr(exe, '/');
-    if (!slash) return NULL;
-    *slash = 0;
-    snprintf(path, sizeof(path), "%s/%s", exe, DS41_DSPARK_CALIB_RELPATH);
-    return path;
-}
 
 void ds41_levers_init_from_env(void) {
     if (g_ds41_levers_ready) return;
@@ -39829,14 +39803,22 @@ void ds41_levers_init_from_env(void) {
                                                            "DS4_DS41_VERIFY_WIDE_PREFILL_OFF");
     { const char *v = getenv("DS4_V41_DSPARK_VERIFY_ROWS");
       g_ds41_levers.dspark_verify_rows = v && v[0] ? atoi(v) : 0; }
-    /* The controller is the production default: it is the window that dials the
-     * draft back when it is losing, and without it a fixed six loses on traffic
-     * it was not calibrated for. DS4_DS41_DSPARK_CONTROLLER=0 turns it off. */
-    { const char *v = getenv("DS4_DS41_DSPARK_CONTROLLER");
-      g_ds41_levers.dspark_controller = !(v && v[0] == '0'); }
-    g_ds41_levers.dspark_controller_confidence = ds41_env_enable_form("DS4_DS41_DSPARK_CONTROLLER_CONFIDENCE");
-    g_ds41_levers.dspark_controller_widths = getenv("DS4_DS41_DSPARK_CONTROLLER_WIDTHS") &&
-        getenv("DS4_DS41_DSPARK_CONTROLLER_WIDTHS")[0] == '1';
+    /* The windowed cost-feedback controller ported from GLM DFlash2 is the
+     * production default: propose at every eligible position, judge three
+     * complete attempts against the measured serial step, back a losing window
+     * off for 16/32/64/128 serial tokens.  DS4_DS41_DSPARK_ADAPTIVE=0 proposes
+     * everywhere and never backs off, which is the fixed-six control. */
+    g_ds41_levers.dspark_adaptive = ds41_env_enable_form("DS4_DS41_DSPARK_ADAPTIVE");
+    /* Reasoning spans decode serially by default, as they do on GLM.
+     * DS4_DS41_DSPARK_REASONING_SERIAL=0 lets the controller propose inside
+     * <think>; measured acceptance there is 3.46 rows/cycle (THINK-ACCEPTANCE.md). */
+    g_ds41_levers.dspark_reasoning_serial =
+        ds41_env_enable_form("DS4_DS41_DSPARK_REASONING_SERIAL");
+    /* The serving loop drafts by default once --dspark is on.  =0 puts every
+     * served request back on the serial path it took before, for an A/B that
+     * needs no rebuild; /debug/levers flips the same field in one process. */
+    { const char *v = getenv("DS4_DS41_DSPARK_SERVE");
+      g_ds41_levers.dspark_serve = !(v && v[0] == '0'); }
     g_ds41_levers.dspark_expert_union = getenv("DS4_DS41_EXPERT_UNION") != NULL;
     g_ds41_levers.verify_batch_core  = getenv("DS4_DS41_VERIFY_BATCH_CORE") != NULL;
     g_ds41_levers.dspark_force_reject= getenv("DS4_DS41_DSPARK_FORCE_REJECT") != NULL;
@@ -39912,21 +39894,27 @@ void ds41_levers_init_from_env(void) {
         }
     }
     g_ds41_levers.prefill_attn_rb16 = ds41_env_disable_form("DS4_METAL_DISABLE_V41_PREFILL_ATTN_RB16");
-    g_ds41_levers.mtp_async_chunks = getenv("DS4_DS41_MTP_ASYNC_CHUNKS") &&
-        ds41_env_enable_form("DS4_DS41_MTP_ASYNC_CHUNKS");
-    g_ds41_levers.mtp_engram_rows6 = getenv("DS4_DS41_MTP_ENGRAM_ROWS6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_ENGRAM_ROWS6");
+    /* The five MTP decode levers below are the production default.  Every
+     * benched arm set them explicitly, so their measured cycle cost -- 121 ms
+     * at 8k against 188 ms without them -- is the cost a served request now
+     * pays, and the controller's calibrated cost records (draft 9.740, tail
+     * 111.151 at 8k) were fitted with them on.  Leaving them opt-in shipped a
+     * server whose own cost model understated its draft by half and whose
+     * fixed-six arm lost to serial at every depth.  =0 is the kill switch. */
+    g_ds41_levers.mtp_async_chunks = ds41_env_enable_form("DS4_DS41_MTP_ASYNC_CHUNKS");
+    g_ds41_levers.mtp_engram_rows6 = ds41_env_enable_form("DS4_DS41_MTP_ENGRAM_ROWS6");
     g_ds41_levers.dspark_excl_eos = getenv("DS4_DS41_DSPARK_EXCL_EOS") &&
         atoi(getenv("DS4_DS41_DSPARK_EXCL_EOS")) != 0;
     g_ds41_levers.mtp_capture_warmup = ds41_env_enable_form("DS4_DS41_MTP_CAPTURE_WARMUP");
     g_ds41_levers.mtp_state_fix = ds41_env_enable_form("DS4_DS41_MTP_STATE_FIX");
-    g_ds41_levers.mtp_q8_stream6 = getenv("DS4_DS41_MTP_Q8_STREAM6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_Q8_STREAM6");
+    g_ds41_levers.mtp_q8_stream6 = ds41_env_enable_form("DS4_DS41_MTP_Q8_STREAM6");
+    /* Mask 2 (H1 on q_b only) is the value every winning arm used and the value
+     * the shipped cost records were fitted under; 127 was never a measured
+     * production setting.  Out of range is read as off, as before. */
     { const char *v = getenv("DS4_DS41_MTP_Q8_STREAM6_MASK");
-      int mask = v ? atoi(v) : 127;
+      int mask = v && v[0] ? atoi(v) : 2;
       g_ds41_levers.mtp_q8_stream6_mask = mask >= 0 && mask <= 127 ? mask : 0; }
-    g_ds41_levers.mtp_q8_pair6 = getenv("DS4_DS41_MTP_Q8_PAIR6") &&
-        ds41_env_enable_form("DS4_DS41_MTP_Q8_PAIR6");
+    g_ds41_levers.mtp_q8_pair6 = ds41_env_enable_form("DS4_DS41_MTP_Q8_PAIR6");
     g_ds41_levers.prefill_f16_rows2 = ds41_env_enable_form("DS4_DS41_PREFILL_F16_ROWS2");
     g_ds41_levers.prefill_embed_init = ds41_env_enable_form("DS4_DS41_PREFILL_EMBED_INIT");
     g_ds41_levers.prefill_hc_sum_round = ds41_env_enable_form("DS4_DS41_PREFILL_HC_SUM_ROUND");
@@ -43179,6 +43167,24 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, uint32_t pos,
  * it can still accept, which is the cost curve VERIFY-COST section 4 wants
  * measured rather than assumed. */
 #include "ds4_dspark_controller.h"
+#include "ds4_ds41_dspark_adaptive.h"
+
+/* The controller's configuration, read from the levers every time a request
+ * begins so /debug/levers takes effect on the next request.  GLM's default
+ * entry is sixteen consumed serial tokens; DS4_DS41_DSPARK_MIN_SERIAL_TOKENS
+ * moves it, and anything outside 0..64 leaves the default in place. */
+static ds41_adapt_config ds41_adapt_config_read(void) {
+    ds41_levers_init_from_env();
+    ds41_adapt_config c = {16u, true, true};
+    const char *entry = getenv("DS4_DS41_DSPARK_MIN_SERIAL_TOKENS");
+    if (entry && entry[0]) {
+        const long n = strtol(entry, NULL, 10);
+        if (n >= 0 && n <= (long)DS41_ADAPT_ENTRY_MAX) c.min_serial_tokens = (uint32_t)n;
+    }
+    c.enabled = g_ds41_levers.dspark_adaptive != 0;
+    c.reasoning_serial = g_ds41_levers.dspark_reasoning_serial != 0;
+    return c;
+}
 
 static uint32_t ds41_dspark_verify_rows(uint32_t block) {
     const int cap = g_ds41_levers.dspark_verify_rows;
@@ -43195,11 +43201,10 @@ typedef struct {
     ds4_gpu_tensor *hidden_rows;   /* gathered capture rows, 128 * 3 * 5120 */
     float   *logits_rows;          /* block * vocab, host */
     int32_t  proposal[DS4_DSPARK_MAX_BLOCK_SIZE];
-    ds41_ctl_config *controller;
-    ds41_ctl_state control;
+    ds41_ctl_state control;          /* reasoning-span tracker only */
+    ds41_dspark_adaptive adapt;      /* GLM-ported windowed admission */
     uint64_t control_generation;
     uint32_t control_end;
-    float *confidence_hidden, *confidence_markov, *confidence_features;
     /* statistics */
     uint64_t cycles, committed, verified_rows;
     uint32_t accept_hist[DS4_DSPARK_MAX_BLOCK_SIZE + 2u];
@@ -43212,8 +43217,6 @@ static void ds41_dspark_decode_free(ds41_dspark_decode *dd) {
     ds41_verify_free(&dd->vc);
     ds4_gpu_tensor_free(dd->hidden_rows);
     free(dd->logits_rows);
-    free(dd->controller);
-    free(dd->confidence_hidden); free(dd->confidence_markov); free(dd->confidence_features);
     memset(dd, 0, sizeof(*dd));
 }
 
@@ -43325,12 +43328,11 @@ static bool ds41_dspark_decode_cycle(ds41_gpu_graph *g, ds41_dspark_decode *dd,
                                      const ds4_model *m, const ds4_weights *w,
                                      int *token, int *out, uint32_t *n_out,
                                      float *session_logits, int excl_token, int stop_token,
-                                     uint32_t max_emit, bool *declined,
+                                     uint32_t max_emit,
                                      bool (*boundary)(void *, int), void *boundary_ctx) {
     ds41_dspark *d = &dd->drafter;
     const uint32_t P = g->pos;
     uint32_t rows = ds41_dspark_verify_rows(d->block);
-    *declined = false;
     if (rows < 2u || max_emit == 0u) return false;
     if (P == 0 || P + rows > g->ctx) return false;
     const uint32_t p = P - 1u;
@@ -43341,29 +43343,6 @@ static bool ds41_dspark_decode_cycle(ds41_gpu_graph *g, ds41_dspark_decode *dd,
         !ds41_dspark_stage_input(dd, m, w, *token) ||
         !ds41_dspark_forward(d, p, m, w->output) ||
         !ds41_dspark_markov_greedy(d, *token, dd->logits_rows, dd->proposal)) return false;
-    if (g_ds41_levers.dspark_controller) {
-        float conf[5] = {0}; uint32_t clen = 0;
-        if (g_ds41_levers.dspark_controller_confidence) {
-            if (!dd->confidence_hidden) {
-                dd->confidence_hidden = malloc((size_t)d->block * DS4_N_EMBD * sizeof(float));
-                dd->confidence_markov = malloc((size_t)d->markov_rank * sizeof(float));
-                dd->confidence_features = malloc(((size_t)DS4_N_EMBD+d->markov_rank)*sizeof(float));
-            }
-            if (!dd->confidence_hidden || !dd->confidence_markov || !dd->confidence_features ||
-                !ds4_gpu_tensor_read(d->head_x, 0, dd->confidence_hidden,
-                    (uint64_t)d->block*DS4_N_EMBD*sizeof(float)) ||
-                !dspark_eval_confidence_probe(conf, dd->confidence_hidden, d->model, d->dw,
-                    *token, dd->proposal, dd->confidence_markov, dd->confidence_features, &clen) ||
-                clen != 5u) return false;
-        }
-        rows = ds41_ctl_choose(dd->controller, P, rows, max_emit, conf,
-            g_ds41_levers.dspark_controller_confidence != 0,
-            g_ds41_levers.dspark_controller_widths != 0, ds41_dspark_now_ms()-t0);
-        if (!rows) {
-            dd->propose_ms += ds41_dspark_now_ms()-t0;
-            *declined = true; return true; /* target still at the original frontier */
-        }
-    }
     if (rows != dd->vc.rows) {
         ds41_verify_free(&dd->vc);
         if (!ds41_verify_alloc(&dd->vc, rows)) return false;
@@ -73471,10 +73450,8 @@ int ds4_session_argmax(ds4_session *s) {
 typedef struct { ds4_engine *engine; ds41_ctl_state state; } ds41_ctl_preview;
 static void ds41_ctl_token(ds4_engine *e, ds41_ctl_state *c, int token) {
     if (token == e->vocab.think_start_id) { c->thinking = true; c->tag_len = 0; }
-    else if (token == e->vocab.think_end_id) {
-        c->thinking = false; c->tag_len = 0;
-        c->cooldown = c->level = c->count = c->next = 0;
-    } else {
+    else if (token == e->vocab.think_end_id) { c->thinking = false; c->tag_len = 0; }
+    else {
         size_t len = 0; char *text = ds4_token_text(e, token, &len);
         ds41_ctl_text(c, text, len); free(text);
     }
@@ -73486,7 +73463,12 @@ static bool ds41_ctl_boundary(void *ctx, int token) {
 }
 static void ds41_ctl_reconstruct(ds4_session *s, ds41_dspark_decode *dd) {
     if (dd->control_generation != s->ds41_graph.state_generation ||
-        dd->control_end != s->ds41_graph.pos) memset(&dd->control, 0, sizeof(dd->control));
+        dd->control_end != s->ds41_graph.pos) {
+        memset(&dd->control, 0, sizeof(dd->control));
+        /* This session's prefix is no longer an extension of the one the costs
+         * were measured on: drop the evidence, keep the request's cooldown. */
+        ds41_adapt_reset_evidence(&dd->adapt);
+    }
     /* Only the active assistant turn, never a literal tag in user content. */
     int start = s->checkpoint.len;
     for (int i = s->checkpoint.len-1; i >= 0; i--) {
@@ -73503,6 +73485,151 @@ static void ds41_ctl_reconstruct(ds4_session *s, ds41_dspark_decode *dd) {
 }
 #endif
 
+/* Cumulative V4.1 DSpark counters for this session, for the serving path's
+ * usage extension.  out = {cycles, committed, serial rows, admitted attempts,
+ * steps skipped by the cooldown}.  Returns 0 when this session has no V4.1
+ * DSpark decode state, which is the honest answer for a session that has never
+ * drafted. */
+int ds4_session_ds41_dspark_usage(const ds4_session *s, uint64_t out[5]) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!out) return 0;
+    for (int i = 0; i < 5; i++) out[i] = 0;
+    if (!s || !s->ds41_dspark) return 0;
+    const ds41_dspark_decode *dd = s->ds41_dspark;
+    out[0] = dd->cycles;
+    out[1] = dd->committed;
+    out[2] = dd->adapt.serial_steps;
+    out[3] = dd->adapt.attempts;
+    out[4] = dd->adapt.skipped_steps;
+    return 1;
+#else
+    (void)s;
+    if (out) for (int i = 0; i < 5; i++) out[i] = 0;
+    return 0;
+#endif
+}
+
+/* One served request = one admission ledger.  The session outlives the request,
+ * so the controller is begun here and nowhere else: the sixteen-token serial
+ * entry, the serial-cost window, the open three-attempt window and the cooldown
+ * all start fresh, exactly as GLM begins its controller in decode_begin(). */
+void ds4_session_ds41_dspark_request_begin(ds4_session *s) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s && s->ds41_dspark) ds41_adapt_begin(&s->ds41_dspark->adapt, ds41_adapt_config_read());
+#else
+    (void)s;
+#endif
+}
+
+int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[6],
+                                           double ms[3]) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (out) memset(out, 0, 6 * sizeof(out[0]));
+    if (ms) ms[0] = ms[1] = ms[2] = 0.0;
+    if (!s || !s->ds41_dspark) return 0;
+    const ds41_dspark_adaptive *a = &s->ds41_dspark->adapt;
+    if (out) {
+        out[0] = a->attempts; out[1] = a->serial_steps; out[2] = a->skipped_steps;
+        out[3] = a->windows;  out[4] = a->backoffs;     out[5] = a->losing_cycles;
+    }
+    if (ms) { ms[0] = a->serial_ms; ms[1] = a->cycle_ms; ms[2] = a->net_ms; }
+    return 1;
+#else
+    (void)s;
+    if (out) memset(out, 0, 6 * sizeof(out[0]));
+    if (ms) ms[0] = ms[1] = ms[2] = 0.0;
+    return 0;
+#endif
+}
+
+/* Everything both DSpark decode entry points need before the first cycle:
+ * the session must be a prefilled V4.1 session with an armed capture ring and a
+ * bound drafter and the decode state must exist.  Returns the decode state, or
+ * NULL with `err` set. */
+static ds41_dspark_decode *ds41_dspark_ready(ds4_session *s,
+                                             char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    if (!ds4_session_is_ds41(s) || !s->ds41_graph_ready || !s->checkpoint_valid ||
+        e->support_kind != DS4_SUPPORT_DSPARK) {
+        if (err && errlen) snprintf(err, errlen,
+            "dspark: requires a V4.1 session with a bound DSpark support model");
+        return NULL;
+    }
+    if (!s->ds41_graph.dspark_capture) {
+        if (err && errlen) snprintf(err, errlen,
+            "dspark: target-hidden capture was not armed before prefill");
+        return NULL;
+    }
+    if (!ds41_dspark_verify_rows(e->dspark_weights.block_size)) {
+        if (err && errlen) snprintf(err, errlen, "%s", DS41_DSPARK_ROWS_MSG);
+        return NULL;
+    }
+    if (!s->ds41_dspark) {
+        s->ds41_dspark = xcalloc(1, sizeof(*s->ds41_dspark));
+        if (!ds41_dspark_decode_alloc(s->ds41_dspark, &e->mtp_model, &e->dspark_weights)) {
+            free(s->ds41_dspark);
+            s->ds41_dspark = NULL;
+            if (err && errlen) snprintf(err, errlen, "dspark: drafter allocation failed");
+            return NULL;
+        }
+    }
+    ds41_dspark_decode *dd = s->ds41_dspark;
+    ds41_ctl_reconstruct(s, dd);
+    if (!dd->adapt.active) ds41_adapt_begin(&dd->adapt, ds41_adapt_config_read());
+    return dd;
+}
+
+/* One decode step from the current frontier.  Feeds `feeding`, then either runs
+ * a verify cycle or, when the position or the controller refuses one, a single
+ * serial evaluation.  On return *produced >= 1 tokens are in emitted[], the
+ * session has advanced by exactly *produced rows, and the LAST emitted token is
+ * the new frontier: committed, but not yet fed.  That invariant is what lets the
+ * serving loop rewind to block_start + kept after a partial batch.
+ *
+ * The step is also the controller's unit of measurement: its wall time and the
+ * rows it produced are what the windowed ledger judges, a serial step supplying
+ * the serial-cost sample and a verify cycle the window net. */
+static int ds41_dspark_step_core(ds4_session *s, ds41_dspark_decode *dd,
+                                 bool serving, int feeding, int excluded, int stop_token,
+                                 uint32_t remaining, int *emitted, uint32_t *produced,
+                                 bool *serial, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    const double attempt_start = ds41_dspark_now_ms();
+    const uint32_t before = g->pos;
+    const uint32_t cap = ds41_dspark_verify_rows(dd->drafter.block);
+    int token = feeding;
+    (void)serving;
+    *produced = 0;
+    *serial = false;
+    const bool eligible = before >= 2 && before+cap <= g->ctx && remaining > 1;
+    const bool attempt = eligible && ds41_adapt_admit(&dd->adapt);
+    ds41_ctl_preview preview = {e, dd->control};
+    if (attempt && !ds41_dspark_decode_cycle(g, dd, &e->model, &e->weights,
+            &token, emitted, produced, s->logits, excluded, stop_token, remaining,
+            ds41_ctl_boundary, &preview))
+        return 1;
+    if (!attempt) {
+        if (ds4_session_eval(s, feeding, err, errlen)) return 1;
+        token = ds4_session_argmax_excluding(s, excluded);
+        if (token < 0) return 1;
+        emitted[0] = token; *produced = 1;
+        *serial = true;
+    } else {
+        /* Production serial eval updates its own checkpoint; only batch
+         * commit needs this explicit mirror of processed input rows. */
+        const uint32_t fed_n = g->pos-before;
+        for (uint32_t i = 0; i < fed_n; i++)
+            token_vec_push(&s->checkpoint, i ? emitted[i-1] : feeding);
+    }
+    for (uint32_t i = 0; i < *produced; i++) ds41_ctl_token(e, &dd->control, emitted[i]);
+    ds41_adapt_record(&dd->adapt, ds41_dspark_now_ms()-attempt_start,
+                      g->pos-before, attempt);
+    ds41_adapt_reasoning(&dd->adapt, dd->control.thinking);
+    dd->control_end = g->pos; dd->control_generation = g->state_generation;
+    return 0;
+}
+
 int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
                                 int *out_tokens, int *n_out,
                                 ds4_dspark_decode_stats *st,
@@ -73515,49 +73642,11 @@ int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
         return 1;
     }
     ds4_engine *e = s->engine;
-    if (!ds4_session_is_ds41(s) || !s->ds41_graph_ready || !s->checkpoint_valid ||
-        e->support_kind != DS4_SUPPORT_DSPARK) {
-        if (err && errlen) snprintf(err, errlen,
-            "dspark: requires a V4.1 session with a bound DSpark support model");
-        return 1;
-    }
-    if (!s->ds41_graph.dspark_capture) {
-        if (err && errlen) snprintf(err, errlen,
-            "dspark: target-hidden capture was not armed before prefill");
-        return 1;
-    }
-    if (!ds41_dspark_verify_rows(e->dspark_weights.block_size)) {
-        if (err && errlen) snprintf(err, errlen, "%s", DS41_DSPARK_ROWS_MSG);
-        return 1;
-    }
-    if (!s->ds41_dspark) {
-        s->ds41_dspark = xcalloc(1, sizeof(*s->ds41_dspark));
-        if (!ds41_dspark_decode_alloc(s->ds41_dspark, &e->mtp_model, &e->dspark_weights)) {
-            free(s->ds41_dspark);
-            s->ds41_dspark = NULL;
-            if (err && errlen) snprintf(err, errlen, "dspark: drafter allocation failed");
-            return 1;
-        }
-    }
-    ds41_dspark_decode *dd = s->ds41_dspark;
+    ds41_dspark_decode *dd = ds41_dspark_ready(s, err, errlen);
+    if (!dd) return 1;
+    /* One generate call is one request: begin the admission ledger. */
+    ds41_adapt_begin(&dd->adapt, ds41_adapt_config_read());
     ds41_gpu_graph *g = &s->ds41_graph;
-    const bool controlled = g_ds41_levers.dspark_controller != 0;
-    if (controlled && !dd->controller) {
-        dd->controller = malloc(sizeof(*dd->controller));
-        const char *calib = ds41_dspark_calibration_path();
-        if (!dd->controller || !ds41_ctl_load(dd->controller, calib)) {
-            free(dd->controller); dd->controller = NULL;
-            if (err && errlen)
-                snprintf(err, errlen, "dspark: invalid or missing calibration \"%s\" "
-                         "(set DS4_DS41_DSPARK_CALIBRATION, or DS4_DS41_DSPARK_CONTROLLER=0 "
-                         "for a fixed width)", calib ? calib : DS41_DSPARK_CALIB_RELPATH);
-            return 1;
-        }
-    }
-    if (controlled) ds41_ctl_reconstruct(s, dd);
-    const uint64_t attempts0 = dd->control.attempts, declines0 = dd->control.declines;
-    const uint64_t serial0 = dd->control.serial_steps;
-    const double paid0 = dd->control.paid_ms;
     const uint64_t cycles0 = dd->cycles, committed0 = dd->committed;
     const uint64_t rows0 = dd->verified_rows;
     const double propose0 = dd->propose_ms, verify0 = dd->verify_ms, commit0 = dd->commit_ms;
@@ -73576,60 +73665,19 @@ int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
     uint32_t serial_processed = 0;
     bool interrupted = false;
     const double t0 = ds41_dspark_now_ms();
-    if (controlled) ds41_ctl_token(e, &dd->control, token);
+    ds41_ctl_token(e, &dd->control, token);
     while (*n_out < gen_tokens && token != stop_token) {
         if (ds4_session_cancelled(s)) { interrupted = true; break; }
-        const double attempt_start = ds41_dspark_now_ms();
-        const uint32_t before = g->pos, remaining = (uint32_t)(gen_tokens-*n_out);
-        const uint32_t cap = ds41_dspark_verify_rows(dd->drafter.block);
-        const int feeding = token;
+        const uint32_t remaining = (uint32_t)(gen_tokens-*n_out);
         uint32_t produced = 0;
         int emitted[DS4_TP_BATCH_MAX_ROWS];
-        bool declined = false;
-        bool attempt = before >= 2 && before+cap <= g->ctx && remaining > 1;
-        if (controlled && attempt)
-            attempt = ds41_ctl_preflight(dd->controller, &dd->control, before, cap,
-                remaining, g_ds41_levers.dspark_controller_widths != 0);
-        ds41_ctl_preview preview = {e, dd->control};
-        if (attempt && !ds41_dspark_decode_cycle(g, dd, &e->model, &e->weights,
-                &token, emitted, &produced, s->logits, excluded, stop_token, remaining,
-                &declined, controlled ? ds41_ctl_boundary : NULL, &preview))
+        bool serial = false;
+        if (ds41_dspark_step_core(s, dd, false, token, excluded, stop_token,
+                                  remaining, emitted, &produced, &serial, err, errlen))
             goto dspark_generation_fail;
-        if (!attempt || declined) {
-            if (ds4_session_eval(s, feeding, err, errlen)) goto dspark_generation_fail;
-            token = ds4_session_argmax_excluding(s, excluded);
-            if (token < 0) goto dspark_generation_fail;
-            emitted[0] = token; produced = 1;
-            serial_processed++;
-            if (controlled) dd->control.serial_steps++;
-        } else {
-            /* Production serial eval updates its own checkpoint; only batch
-             * commit needs this explicit mirror of processed input rows. */
-            const uint32_t fed_n = g->pos-before;
-            for (uint32_t i = 0; i < fed_n; i++)
-                token_vec_push(&s->checkpoint, i ? emitted[i-1] : feeding);
-        }
-        bool ended_thinking = false;
-        for (uint32_t i = 0; i < produced; i++) {
-            out_tokens[(*n_out)++] = emitted[i];
-            if (controlled) {
-                const bool was_thinking = dd->control.thinking;
-                ds41_ctl_token(e, &dd->control, emitted[i]);
-                ended_thinking |= was_thinking && !dd->control.thinking;
-            }
-        }
-        if (controlled && attempt) {
-            const ds41_ctl_cost *cost = NULL;
-            if (!declined) cost = ds41_ctl_cost_at(dd->controller, before, dd->vc.rows);
-            else for (unsigned r = 2; r <= cap && !cost; r++)
-                cost = ds41_ctl_cost_at(dd->controller, before, r);
-            if (!cost) goto dspark_generation_fail;
-            ds41_ctl_record(dd->controller, &dd->control, ds41_dspark_now_ms()-attempt_start,
-                            g->pos-before, cost->serial_ms, declined);
-        }
-        if (ended_thinking)
-            dd->control.cooldown = dd->control.level = dd->control.count = dd->control.next = 0;
-        dd->control_end = g->pos; dd->control_generation = g->state_generation;
+        if (serial) serial_processed++;
+        for (uint32_t i = 0; i < produced; i++) out_tokens[(*n_out)++] = emitted[i];
+        token = emitted[produced-1];
     }
     const double total = ds41_dspark_now_ms() - t0;
     if (st) {
@@ -73646,10 +73694,15 @@ int ds4_session_dspark_generate(ds4_session *s, int gen_tokens, int eos_id,
         st->verify_ms = dd->verify_ms - verify0;
         st->commit_ms = dd->commit_ms - commit0;
         st->total_ms = total;
-        st->controller_attempts = dd->control.attempts-attempts0;
-        st->controller_declines = dd->control.declines-declines0;
-        st->controller_serial = dd->control.serial_steps-serial0;
-        st->controller_paid_ms = dd->control.paid_ms-paid0;
+        st->controller_attempts  = dd->adapt.attempts;
+        st->controller_declines  = dd->adapt.skipped_steps;
+        st->controller_serial    = dd->adapt.serial_steps;
+        st->controller_windows   = dd->adapt.windows;
+        st->controller_backoffs  = dd->adapt.backoffs;
+        st->controller_losing    = dd->adapt.losing_cycles;
+        st->controller_serial_ms = dd->adapt.serial_ms;
+        st->controller_cycle_ms  = dd->adapt.cycle_ms;
+        st->controller_paid_ms   = dd->adapt.net_ms;
     }
     return interrupted ? DS4_SESSION_SYNC_INTERRUPTED : 0;
 dspark_generation_fail:
@@ -73665,6 +73718,61 @@ dspark_generation_fail:
 }
 
 
+
+/* Per-process opt-out for the serving path, so a serial A/B needs no rebuild.
+ * DS4_DS41_DSPARK_SERVE=0 makes every request take the path it took before the
+ * serving loop learned about V4.1 DSpark. */
+static bool ds41_dspark_serve_enabled(void) {
+    return g_ds41_levers.dspark_serve != 0;
+}
+
+/* One DSpark step for the serving decode loop, with the contract of
+ * ds4_session_eval_speculative_argmax: accepted[0] is the token just fed, the
+ * return value counts every token the caller may emit, and the session has
+ * advanced by exactly that many rows, so a caller that keeps only a prefix can
+ * rewind to block_start + kept.  The step's own trailing frontier token is not
+ * returned: it has not been fed, and the caller samples it itself on the next
+ * turn, which keeps every sampling decision where the server already makes it.
+ * Returns 0 when this session cannot draft, and the caller then takes the path
+ * it would have taken anyway. */
+static int ds4_session_ds41_dspark_step(ds4_session *s, int first_token, int eos_token,
+                                        int max_tokens, int *accepted, int accepted_cap,
+                                        char *err, size_t errlen) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    static int warned = 0;
+    if (!ds41_dspark_serve_enabled()) return 0;
+    if (!s || !accepted || accepted_cap <= 0 || max_tokens <= 0) return 0;
+    char why[256] = {0};
+    ds41_dspark_decode *dd = ds41_dspark_ready(s, why, sizeof(why));
+    if (!dd) {
+        if (!warned && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
+            warned = 1;
+            fprintf(stderr, "ds4: serving without V4.1 DSpark decode: %s\n", why);
+        }
+        return 0;
+    }
+    uint32_t remaining = (uint32_t)(max_tokens < accepted_cap ? max_tokens : accepted_cap);
+    uint32_t produced = 0;
+    int emitted[DS4_TP_BATCH_MAX_ROWS];
+    bool serial = false;
+    /* Serving lets EOS be produced and stops the cycle on it; the caller owns
+     * what a stop token means for its protocol.  The bench path's excl_eos
+     * policy, which suppresses EOS to fill a fixed token budget, is not a
+     * serving policy. */
+    if (ds41_dspark_step_core(s, dd, true, first_token, -1, eos_token,
+                              remaining, emitted, &produced, &serial, err, errlen)) {
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    accepted[0] = first_token;
+    for (uint32_t i = 0; i + 1 < produced; i++) accepted[i+1] = emitted[i];
+    return (int)produced;
+#else
+    (void)s; (void)first_token; (void)eos_token; (void)max_tokens;
+    (void)accepted; (void)accepted_cap; (void)err; (void)errlen;
+    return 0;
+#endif
+}
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
@@ -80283,6 +80391,17 @@ static int ds4_session_eval_speculative_argmax_impl(
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
+    }
+    /* V4.1 decodes through its own DSpark drafter.  The machinery below is the
+     * V4 one and never built a V4.1 proposal, so before this branch existed
+     * every served token was serial while /debug/bench drafted.  ignore_eos
+     * keeps the serial path: it suppresses a set of stop tokens the verify
+     * cycle does not know about. */
+    if (ds4_session_is_ds41(s) && !ignore_eos) {
+        const int n = ds4_session_ds41_dspark_step(s, first_token, eos_token,
+                                                   max_tokens, accepted, accepted_cap,
+                                                   err, errlen);
+        if (n != 0) return n;
     }
     if (ds4_session_is_glm(s)) {
         (void)max_tokens;
