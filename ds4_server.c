@@ -11397,6 +11397,17 @@ static int kv_cache_slot_continued_target(server *s, server_slot *slot,
     return kv_cache_continued_store_target(&view, live_tokens);
 }
 
+/* The schedule a prefill boundary is judged against when the backend's chunk
+ * boundaries are anchored at the resume position (V4.1): fire on the first
+ * boundary at or past the next multiple, and store that boundary's length. */
+static int kv_cache_slot_continued_target_crossing(server *s, server_slot *slot,
+                                                   int live_tokens) {
+    if (!s || !slot) return 0;
+    kv_disk_cache view = s->kv;
+    view.continued_last_store_tokens = slot->continued_last_store_tokens;
+    return ds4_kvstore_continued_store_target_crossing(&view, live_tokens);
+}
+
 static void kv_cache_slot_note_store(server_slot *slot, int tokens) {
     if (slot && tokens > slot->continued_last_store_tokens) {
         slot->continued_last_store_tokens = tokens;
@@ -11440,17 +11451,26 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+static void kv_cache_maybe_store_continued_ex(server *s, server_slot *slot,
+                                              bool prefill_boundary) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
-    const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
+    const bool crossing = prefill_boundary &&
+        ds4_session_prefill_boundaries_anchored(slot->session);
+    const int target = crossing ?
+        kv_cache_slot_continued_target_crossing(s, slot, tokens->len) :
+        kv_cache_slot_continued_target(s, slot, tokens->len);
     if (target == 0) return;
     if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
         (void)kc;
         kv_cache_slot_note_store(slot, target);
     }
+}
+
+static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
+    kv_cache_maybe_store_continued_ex(s, slot, false);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -12628,7 +12648,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && p->slot && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv, p->slot);
+            kv_cache_maybe_store_continued_ex(p->srv, p->slot, true);
         }
         return;
     }
@@ -12669,7 +12689,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && p->slot && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv, p->slot);
+        kv_cache_maybe_store_continued_ex(p->srv, p->slot, true);
     }
 }
 
@@ -20243,6 +20263,35 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 }
 
+/* The anchored-boundary schedule: V4.1 offers `resume + k*2048`, which is a
+ * multiple of the step only by accident, so the frontier is judged by whether
+ * it has reached the next multiple and stored at its own length. */
+static void test_kv_cache_continued_crossing_accepts_anchored_boundaries(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();          /* step 10240 */
+
+    TEST_ASSERT(ds4_kvstore_continued_store_target_crossing(&kc, 10239) == 0);
+    TEST_ASSERT(ds4_kvstore_continued_store_target_crossing(&kc, 12345) == 12345);
+
+    /* A 2,912-token chat anchor followed by 32,768-token sweeps. */
+    kc.continued_last_store_tokens = 2912;
+    TEST_ASSERT(ds4_kvstore_continued_store_target_crossing(&kc, 35680) == 35680);
+    kc.continued_last_store_tokens = 35680;
+    TEST_ASSERT(ds4_kvstore_continued_store_target_crossing(&kc, 38000) == 0);
+    TEST_ASSERT(ds4_kvstore_continued_store_target_crossing(&kc, 68314) == 68314);
+
+    /* Where a caller's boundaries are already multiples of the step, the two
+     * schedules agree exactly. */
+    kc.continued_last_store_tokens = 10240;
+    TEST_ASSERT(ds4_kvstore_continued_store_target_crossing(&kc, 10240) ==
+                kv_cache_continued_store_target(&kc, 10240));
+    TEST_ASSERT(ds4_kvstore_continued_store_target_crossing(&kc, 20480) ==
+                kv_cache_continued_store_target(&kc, 20480));
+    TEST_ASSERT(ds4_kvstore_continued_store_target_crossing(&kc, 30720) ==
+                kv_cache_continued_store_target(&kc, 30720));
+}
+
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -21699,6 +21748,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_crossing_accepts_anchored_boundaries();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();

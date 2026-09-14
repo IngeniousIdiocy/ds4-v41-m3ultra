@@ -747,6 +747,28 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     return live_tokens;
 }
 
+/* Same schedule, read as "the next multiple has been reached or passed" rather
+ * than "the live count IS the next multiple", and storing the length the caller
+ * actually has.  A payload is the live frontier and cannot be trimmed back to an
+ * aligned position, and it does not need to be: lookup is by text prefix and
+ * accepts any stored length, and the boundary offered here is a real backend
+ * chunk boundary, which is the property the 2048 grid was standing in for.
+ *
+ * On a caller whose boundaries already are multiples of the step this returns
+ * exactly what ds4_kvstore_continued_store_target() returns -- a multiple above
+ * `continued_last_store_tokens` is always at or past the next multiple, and one
+ * at or below it is always below -- so it differs only where a boundary
+ * overshoots the grid. */
+int ds4_kvstore_continued_store_target_crossing(const ds4_kvstore *kc, int live_tokens) {
+    const int step = kv_cache_continued_step(kc);
+    if (step <= 0) return 0;
+    if (live_tokens < kc->opt.min_tokens) return 0;
+    const int last = kc->continued_last_store_tokens;
+    if (live_tokens <= last) return 0;
+    const int next = (last / step + 1) * step;
+    return live_tokens >= next ? live_tokens : 0;
+}
+
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
     if (tokens > kc->continued_last_store_tokens) {
         kc->continued_last_store_tokens = tokens;

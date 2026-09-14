@@ -846,6 +846,10 @@ bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
+/* True when this backend's prefill chunk boundaries are anchored at the
+ * position the prefill resumed from, so a schedule that tests the absolute
+ * live token count for alignment can never fire on a resumed prefill. */
+bool ds4_session_prefill_boundaries_anchored(const ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
