@@ -2,6 +2,7 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
@@ -241,6 +242,74 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
+
+<a id="v41"></a>
+## DeepSeek V4.1 Flash on the M3 Ultra (this branch)
+
+This repository carries a Metal decode/prefill kernel set, server changes, an
+optional DSpark speculative decoder and a disk KV store with continuable
+checkpoints for DeepSeek-V4.1-Flash (Q4, 483 GiB) on a 512 GB M3 Ultra Mac
+Studio. Its DSpark speculative decoding is byte-identical to serial decoding. It is based on upstream [antirez/ds4](https://github.com/antirez/ds4) at
+`bd66c40` ("DeepSeek v4.1 Flash support for Metal") and has not been rebased onto
+later upstream commits; it is a standalone repository rather than a GitHub fork,
+so this paragraph is its provenance. Start with
+[the V4.1 M3 Ultra guide](docs/V41_M3ULTRA.md) — how to build and run it, the
+DSpark levers, the disk KV store, the memory budget, what is guaranteed, the
+evidence tables and the limits — and read [CHANGES-V41.md](CHANGES-V41.md) for
+what changed relative to upstream and why.
+
+Measured on the release build, bare defaults, the GPU sampled idle before each
+run. The upstream column is unmodified `bd66c40` on the same machine, file and
+prompts; the receipt directory and binary behind every row are listed in
+[bench/RELEASE-EVIDENCE-V41.md](bench/RELEASE-EVIDENCE-V41.md):
+
+| measurement | upstream `bd66c40` | this branch |
+|---|---:|---:|
+| serial decode, 8,192-token prefix | 16.56 t/s | **31.25 t/s** |
+| serial decode, 300,000-token prefix | 13.95 t/s | **28.27 t/s** |
+| cold prefill, 62,000-token prompt | 736.8 t/s | **813.5 t/s** |
+| time to first token, 23,446-token agent system prompt, cold | 35.8 s | **31.1 s** |
+| the same prompt restored from the disk KV store | — | **229 ms** |
+| restored, then a 111-token append | — | **869 ms** |
+| DSpark on a 512-token code fixture, serial → controller | — | 32.09 → **40.53 t/s** |
+| DSpark on held-out real agent turns, answer phase | — | 31.32 → **41.29 t/s** |
+
+Weights: nothing is redistributed. The target is upstream's published calibrated
+Q4 GGUF, fetched with upstream's own `./download_model.sh ds41f-q4`
+(518,596,067,328 bytes, 483 GiB on disk); every number above was measured on
+that file. DSpark needs a second GGUF, 7.8 GiB, built from the `mtp.*` tensors of
+the official `deepseek-ai/DeepSeek-V4.1-Flash` checkpoint with
+`gguf-tools/deepseek41_dspark_quantize.py`; those tensors live in three of the
+48 safetensors shards, so the conversion downloads 7.4 GiB, not the checkpoint.
+The [DSpark guide](docs/DSPARK-V41.md) is the complete recipe. The admission controller is a port of the GLM-5.3-Flash
+branch's windowed controller: it prices drafting from the wall time of the request
+it is serving and declines what the drafter is not sure of. On the fixture set
+code gains 26% and the worst prose fixture loses 1.2%; on Spec-Bench, where short
+answers make drafting lose, the controller holds 0.99x of serial while a fixed
+block falls to 0.74x. The disk KV store checkpoints at every prefill chunk
+boundary and keeps a ladder of waypoints under disk pressure, which is what turns
+the 31 s prompt above into 229 ms.
+
+**Accuracy of the changes.** None of the changes alters what the model computes.
+Each kernel performs the same arithmetic in the same order as the upstream code it
+replaces, so a stock build with default settings is exactly the configuration
+measured above, and there is nothing to switch on or off to get upstream's
+numerics back. Under greedy decode this branch emits, byte for byte, what
+upstream emits on the same prompt, checked on serial decode at
+four depths, every DSpark arm including the controller, both TTFT arms, the
+restored-from-disk arm, the held-out agent screen and all 252 Spec-Bench
+requests; reference, fixture and binary digests are bound in
+[bench/v41-manifest.json](bench/v41-manifest.json) and checked by
+[bench/verify-v41-manifest.py](bench/verify-v41-manifest.py). At temperature
+above zero DSpark is exact speculative sampling: the same seed gives the same
+bytes, and the shipped acceptance rule passes a chi-square test against the
+target's filtered distribution over 200,000 draws per drafted index
+(`tests/test_sampling.c`). A drafter failure that cannot be recovered latches the
+session off and refuses further requests on it rather than answering from a state
+serial decode could not reach. Byte identity is claimed for greedy decode only.
+The original targets of 80% of DRAM bandwidth in decode and 70% of the matmul
+ideal in prefill were not reached: decode sits at 61% at 8k and cold 62k prefill
+at 54%, and the guide's limits section says why.
 
 ## Logo
 

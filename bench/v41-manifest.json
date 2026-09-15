@@ -1,0 +1,1165 @@
+{
+ "schema": "ds4-v41-m3ultra-manifest/1",
+ "generated_utc": "2026-09-15T09:30:00Z",
+ "about": "Hash-bound identities and provenance for the V4.1 Flash M3 Ultra release. docs/V41_M3ULTRA.md states results and names no commit or date; this file and bench/RELEASE-EVIDENCE-V41.md say where every one of them came from.",
+ "binaries": {
+  "upstream": {
+   "repository": "https://github.com/antirez/ds4",
+   "commit": "bd66c402070042bf0a79ad6ece8242de4c93680c",
+   "note": "stock upstream, clean-rebuilt for the release matrix",
+   "ds4-bench": {
+    "sha256": "f956d4245e674abcb20c3d27c27b4f64a811891f8845ea8888909462d5f9bc8b"
+   },
+   "ds4-server": {
+    "sha256": "0c9b9a944d86058a29b5e0d330fca7fae2d98dff8c6457b4cba9e3159427348b"
+   }
+  },
+  "release": {
+   "commit": "b977a33f062e98808373369e718a66b134e1f6ab",
+   "note": "the build behind the kernel matrix, the TTFT arms and the memory measurements. Every arm on it named its levers explicitly rather than relying on a default.",
+   "ds4-bench": {
+    "sha256_prefix": "9a938e5319d0c4c5"
+   },
+   "ds4-server": {
+    "sha256_prefix": "88a14ce25f41aa7e"
+   }
+  },
+  "depth_defaults": {
+   "commit": "9f432d87b9942b1e0069b2751b1a77636436c63e",
+   "note": "the selection-chain defaults as shipped: the compact index scorer and the bounded radix top-k selector on. The build behind the depth rows of docs/V41_M3ULTRA.md, and behind their control arm with both mechanisms off.",
+   "ds4-server": {
+    "sha256": "86da6c8fcd95ced20e794483337d8800bd3f919e4bee73a3807d633fb47232a1"
+   }
+  },
+  "release_head": {
+   "commit": "f9dc5f981474fb283b503813771357836472c119",
+   "parent": "cda2b9f875367aadf407aa8b4bd12bf71d438433",
+   "note": "the build behind the first admission and sampled-decode sweeps and the first Spec-Bench run: the five MTP decode levers as defaults, the ported windowed admission controller before confidence admission, exact speculative sampling at temperature above zero, and --default-top-p / --default-min-p.",
+   "ds4-server": {
+    "sha256": "463b186a2b96a7813fb0391e370fd1ad6b28ac348579a4dd71bbada8b80504ad"
+   },
+   "ds4-bench": {
+    "note": "not built at this head"
+   }
+  },
+  "admission_screen": {
+   "commit": "afe84d1770a126b5784a615f3534f2b610831778",
+   "note": "the build behind every DSpark number in docs/V41_M3ULTRA.md: confidence admission in, declines priced inside the three-call window. The fixture screen, the release gates, the held-out real-agent screen and the shipped Spec-Bench run are all this binary, one boot each.",
+   "ds4-server": {
+    "sha256": "cfeb2c4d186d6000e2687de88df228272eaff7d86a28ef16405a9480f3f188b6"
+   }
+  },
+  "production_head": {
+   "commit": "03eb93182d0755fe22580b0165808caa89bd1739",
+   "parent": "e389ddd1512ee14b1882c46cd33089dab778ef34",
+   "note": "the release head. Ten commits past f9dc5f9: two that make a long prefill leave continuable checkpoints behind (0f0a367, 9402d39), three that complete the admission port with GLM's confidence gate and drafter fault latch (35ed0f0, afe84d1, f1ba77e), and five that port the GLM-5.3-Flash branch's disk-KV eviction ladder with two test corrections and a store-layer reproducer (e26d830, bdbe6cf, 16e979b, e389ddd, 03eb931). The tree of this manifest's branch is this commit's tree plus documentation, reproducers and comment wording; the comment-stripped hash of every source file the branch touches is identical to this commit's.",
+   "ds4-server": {
+    "sha256": "a671b6eff9c147faf0413bd36a4955e47fdd8f7f2235a6d5815c49486c11a28c",
+    "gates": "8k/512 and 32k/256 decoded text byte-identical to their references on this build, machine quiet, run 2026-09-14"
+   },
+   "ds4-bench": {
+    "note": "not built at this head"
+   }
+  }
+ },
+ "weights": {
+  "target": {
+   "source": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash",
+   "quantization": "Q4",
+   "bytes": 518596067328,
+   "note": "not redistributed; build it with the V4.1 conversion tooling in gguf-tools/"
+  },
+  "dspark_drafter": {
+   "source": "the mtp.* tensors of the same checkpoint, shards 44-46 of 48",
+   "converter": "gguf-tools/deepseek41_dspark_quantize.py --quant q4",
+   "source_revision": "df42c109f1defefcbfcedbe7d905718a12266e40",
+   "bytes": 8328937472,
+   "note": "not redistributed"
+  }
+ },
+ "fixtures": {
+  "code.txt": {
+   "bytes": 30480,
+   "sha256": "2df8394d464b8fff0a0050dc67826ecd96267437113f30f8574916bc071772b1",
+   "redistributed": false,
+   "reconstructible": true,
+   "description": "this repository's C sources plus its GGUF Python tooling, held at an 8,192-token prefix"
+  },
+  "code-32k.txt": {
+   "bytes": 143287,
+   "sha256": "f7bff4f433bdd07ed485cd2c3b5ee64b4ba1f168cab6618dc01be9a1a86bf200",
+   "redistributed": false,
+   "reconstructible": true,
+   "description": "the same, extended to a 32,768-token prefix"
+  },
+  "code-62k.txt": {
+   "bytes": 300002,
+   "sha256": "73ecc0e82eab2f7d80741529f8fa644be1e03595dbfaaa424c0cc280ccdeeffb",
+   "redistributed": false,
+   "reconstructible": true,
+   "description": "the same, extended to a 62,000-token prefix"
+  },
+  "agent.txt": {
+   "bytes": 37064,
+   "sha256": "70961a7ead99cb9c8b4e2875dd0547fca41fe253ab44428eb9d7f54ed3752a64",
+   "redistributed": false,
+   "reconstructible": false,
+   "description": "a coding-agent transcript: a real agent system-prompt capture followed by a synthetic tool-call / tool-result exchange in the model's own DSML format. Real transcript, not redistributed"
+  },
+  "agent2.txt": {
+   "bytes": 162902,
+   "sha256": "57865c96a3138ce4278aa6d5caca466e34074105f81ab12b830a035906adc76f",
+   "redistributed": false,
+   "reconstructible": false,
+   "description": "a different real agent transcript from another project. Held out of every fit. Not redistributed"
+  },
+  "sql.txt": {
+   "bytes": 98309,
+   "sha256": "d993b7eea0268447d518b7adc529809dd161a36bacd332651836d89c82c3fa14",
+   "redistributed": false,
+   "reconstructible": true,
+   "description": "a SQL-generation instruction extended into the natural continuation of the same task, 2,000 INSERT tuples"
+  },
+  "prose-en.txt": {
+   "bytes": 32616,
+   "sha256": "045ecfa557821764dacc1370443ac16e9fe75daf07aa6d03b9db8cce1f12327d",
+   "redistributed": false,
+   "reconstructible": true,
+   "description": "this repository's README plus twelve files from docs/"
+  },
+  "sys23k.txt": {
+   "bytes": 102640,
+   "sha256": "66a0dedf3774c749cb9d135acccf9bc321bd5dd4253e3f8a3c0428d2d30860d9",
+   "redistributed": false,
+   "reconstructible": false,
+   "description": "the agent system prompt for the TTFT arms; the server renders it to 23,446 tokens (23,441 cached anchor plus 5 trailing turn markers)"
+  },
+  "append111.txt": {
+   "bytes": 416,
+   "sha256": "3b0457778d745912472bf24b17ce61b909aaa931778cf155f2268903ea61169d",
+   "redistributed": false,
+   "reconstructible": false,
+   "description": "the 111-token user turn appended in the restored+append TTFT arm"
+  },
+  "depth-mix.txt": {
+   "bytes": 1731960,
+   "sha256": "7f71336c946a8a30fe8d0daaf20a77fd3e25f879624b3bf7bd36f8409db83e6a",
+   "tokens": 451346,
+   "redistributed": false,
+   "reconstructible": false,
+   "description": "the 131k and 300k depth prefix: five repetitions of five existing campaign fixtures (an agent system prompt, code-32k, code, agent, prose-en), each repetition separated by a distinct marker line. Nothing generated. Because it repeats, DSpark acceptance at 131k and 300k is a property of the fixture and NOT a workload number; those arms are quoted for verify cost only. Serial decode is corpus-insensitive, so the serial depth curve stands"
+  },
+  "code-deep.txt": {
+   "bytes": 1737938,
+   "sha256": "b3a3ece9d785e37b77d41b2491506606621a5c4ce7126161a758aff905f79118",
+   "redistributed": false,
+   "reconstructible": true,
+   "description": "pure C source from this repository; the independent deep corpus that reproduces the serial depth curve to 0.5 % on a different fixture"
+  }
+ },
+ "references": {
+  "note": "decoded text produced by the UPSTREAM bd66c40 binary at each gate shape. Every release arm is compared against the reference for its fixture, byte for byte. The reference files are not redistributed; their digests are the binding.",
+  "gate8k512-code": {
+   "fixture": "code.txt",
+   "ctx": 8192,
+   "gen_tokens": 512,
+   "bytes": 1693,
+   "sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481"
+  },
+  "gate8k512-agent": {
+   "fixture": "agent.txt",
+   "ctx": 8192,
+   "gen_tokens": 512,
+   "bytes": 1748,
+   "sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4"
+  },
+  "gate8k512-agent2": {
+   "fixture": "agent2.txt",
+   "ctx": 8192,
+   "gen_tokens": 512,
+   "sha256": "0a6e445dc10b7d0b38dde44382d48d7947ce45a4ec6b8ac318e36657db55b2d3"
+  },
+  "gate8k512-sql": {
+   "fixture": "sql.txt",
+   "ctx": 8192,
+   "gen_tokens": 512,
+   "sha256": "59a45b0bda38f31cea17dd05755ffb44697f1a8ec5ec0cfc135ce717d41593b4"
+  },
+  "gate32k256-code": {
+   "fixture": "code-32k.txt",
+   "ctx": 32768,
+   "gen_tokens": 256,
+   "bytes": 1085,
+   "sha256": "10478f18ddba97e73d480c1ff8bc2f737d36d042842fe5206cbb1378f14a389b"
+  },
+  "gate62k128-code-62k": {
+   "fixture": "code-62k.txt",
+   "ctx": 62000,
+   "gen_tokens": 128,
+   "bytes": 381,
+   "sha256": "75447f865974c8e484edc414a6937b739c1d6a1ff51cc54bf312f6ba6688b36e",
+   "note": "no stored reference file: both binaries produced these bytes in the release matrix and the digest is the binding"
+  },
+  "ttft-cold-23k": {
+   "fixture": "sys23k.txt",
+   "bytes": 56,
+   "sha256": "cf844123db6f6692199fed8baa97ca20117a501a7160de885210104075a6cc32",
+   "note": "emitted identically by upstream cold, release cold AND release restored-from-disk. The restored arm matching is the check that the KV snapshot reproduces the cold computation rather than approximating it"
+  },
+  "ttft-restored-append": {
+   "fixture": "sys23k.txt + append111.txt",
+   "bytes": 151,
+   "sha256": "961e4f2e93b7a68f17971072bd850d5605fa81b2f7b3246a434b0bc2a0e837d5"
+  },
+  "frontier-logits-62k": {
+   "fixture": "62,000-token prefill, --gen-tokens 0",
+   "file_sha256": "a1efdcbe1fbf79629ecfb6fdeb2552170a4e0038773a4b37bb792dde8ad4191a",
+   "body_sha256_prefix": "e1ab24747662a6aa",
+   "note": "compare the 129,280-float body, not the file: --gen-tokens 0 allocates eight fewer context slots and the ctx header records it"
+  },
+  "depth-8k": {
+   "fixture": "code.txt",
+   "ctx": 8192,
+   "gen_tokens": 512,
+   "bytes": 1693,
+   "sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+   "note": "identical bytes to gate8k512-code: same fixture, same shape"
+  },
+  "depth-32k": {
+   "fixture": "code-32k.txt",
+   "ctx": 32768,
+   "gen_tokens": 512,
+   "bytes": 1869,
+   "sha256": "2189679827ad51f3d6002f6c67f0aa6cb4b1d835eef87d92b72e5f28d6289583",
+   "note": "NOT gate32k256-code-32k: 512 generated tokens here, 256 there"
+  },
+  "depth-62k": {
+   "fixture": "code-62k.txt",
+   "ctx": 62000,
+   "gen_tokens": 512,
+   "bytes": 1761,
+   "sha256": "bd7d961f0ebaf12b3fec267de339e99d9f201c159e1aaf36cf926f27d296f2c1",
+   "note": "NOT gate62k128-code-62k: 512 generated tokens here, 128 there"
+  },
+  "depth-131k": {
+   "fixture": "depth-mix.txt",
+   "ctx": 131072,
+   "gen_tokens": 512,
+   "bytes": 2138,
+   "sha256": "17ee0ea03f4126b03cb1f8088015adb36cdbd07411568368348f9ea0c6e39de4"
+  },
+  "depth-300k": {
+   "fixture": "depth-mix.txt",
+   "ctx": 300000,
+   "gen_tokens": 512,
+   "bytes": 1673,
+   "sha256": "3a49c1348e83595dcf21ff4216eea8decd1b50683c7e53338246dd2eff257e5e"
+  }
+ },
+ "measurement_conventions": {
+  "decode_utilisation": "13.77 GB / (ms per token * 705 GB/s)",
+  "prefill_utilisation": "t/s / 1500.2, the 27.4 TFLOPS arithmetic ideal",
+  "harness_offset": "the resident /debug/bench harness reads about 1 t/s above ds4-bench on the same binary; the two are never mixed in one table",
+  "depths": {
+   "8k": {
+    "ctx": 8192,
+    "gen": 512
+   },
+   "32k": {
+    "ctx": 32768,
+    "gen": 256
+   },
+   "62k": {
+    "ctx": 62000,
+    "gen": 128
+   }
+  },
+  "ctx_alloc": "ctx + 768"
+ },
+ "depth_sweep": {
+  "about": "Serial decode against upstream at four depths, plus cold prefill and restore at five. docs/V41_M3ULTRA.md section 5 (Evidence) and docs/REPRODUCE-V41.md section 4a.",
+  "arms_record": "arms.jsonl, 44 arms, one row per arm with its commit, binary digest, fixture, ctx, levers and output digest",
+  "metric": "gen_steady_tps: tokens 2..N over the sum of their individual eval spans",
+  "caveat_131k_300k": "the 131k and 300k prefix repeats its content, so any acceptance-dependent figure at those depths is a property of that fixture rather than of depth. Serial decode is corpus-insensitive - a 0.4 % spread across corpora on both binaries - and stands at every depth.",
+  "controller_note": "the admission column of the original sweep measured the calibrated-window controller, which is deleted rather than defaulted off. It is not carried here. The shipped controller has no position gate; it is in the admission block of this manifest.",
+  "identity": "all 24 measured decode arms byte-identical to their depth's upstream reference",
+  "depth_attribution": {
+   "instrument": "paged kernel ledger, mode 2, BY_TG, 192 pages, dumped after the decode loop; every arm certified 100.000 % coverage, complete=YES",
+   "instrumented_step_growth_8k_to_300k_ms": 12.198,
+   "indexer_scoring_ms": 7.162,
+   "sort_merge_ms": 4.362,
+   "candidate_mask_ms": 0.458,
+   "selection_chain_share_of_growth": "98.2 % at 300k, 93.8 % at 131k, 92.2 % at 62k",
+   "flat_families": "flash attention 1.813 -> 1.810 ms/token, gather+KV stage, routed GU/down, shared+Q8 projections, HC/norm, Engram \u2014 all within 1 % across a 36x context range",
+   "caveat": "ledger mode 2 is not the production shape; its base step reads 33.065 ms against production's 31.760 at 8k. Relative structure transfers, absolute milliseconds do not. It tracks the depth increment to within ~0.6 ms at every depth"
+  },
+  "status": "depth remediation is in measurement; this block will be updated with its result. No recoverable-millisecond figure is claimed here",
+  "arms": [
+   {
+    "ctx": 8192,
+    "fixture": "code.txt",
+    "gen_tokens": 512,
+    "reference": "depth-8k",
+    "upstream_serial_tps": 16.56,
+    "prod_serial_tps": 31.434,
+    "prod_controller_d_tps": 35.175,
+    "prod_six_tps": 36.605,
+    "six_cycle_ms": 119.32,
+    "six_propose_ms": 9.72,
+    "six_verify_ms": 108.44,
+    "cold_prefill_upstream_tps": 626.94,
+    "cold_prefill_upstream_s": 13.07,
+    "cold_prefill_prod_tps": 711.46,
+    "cold_prefill_prod_s": 11.51,
+    "kv_restore_ms": 5.9,
+    "acceptance_representative": true,
+    "reps_serial_and_controller_d": 2
+   },
+   {
+    "ctx": 32768,
+    "fixture": "code-32k.txt",
+    "gen_tokens": 512,
+    "reference": "depth-32k",
+    "upstream_serial_tps": 16.31,
+    "prod_serial_tps": 30.347,
+    "prod_controller_d_tps": 38.771,
+    "prod_six_tps": 36.341,
+    "six_cycle_ms": 126.68,
+    "six_propose_ms": 9.76,
+    "six_verify_ms": 115.73,
+    "cold_prefill_upstream_tps": 740.59,
+    "cold_prefill_upstream_s": 44.25,
+    "cold_prefill_prod_tps": 835.72,
+    "cold_prefill_prod_s": 39.21,
+    "kv_restore_ms": 15.2,
+    "acceptance_representative": true,
+    "reps_serial_and_controller_d": 1
+   },
+   {
+    "ctx": 62000,
+    "fixture": "code-62k.txt",
+    "gen_tokens": 512,
+    "reference": "depth-62k",
+    "upstream_serial_tps": 16.23,
+    "prod_serial_tps": 29.901,
+    "prod_controller_d_tps": 29.852,
+    "prod_six_tps": 37.051,
+    "six_cycle_ms": 131.35,
+    "six_propose_ms": 9.8,
+    "six_verify_ms": 120.34,
+    "cold_prefill_upstream_tps": 736.75,
+    "cold_prefill_upstream_s": 84.15,
+    "cold_prefill_prod_tps": 813.47,
+    "cold_prefill_prod_s": 76.22,
+    "kv_restore_ms": 16.1,
+    "acceptance_representative": true,
+    "reps_serial_and_controller_d": 2
+   },
+   {
+    "ctx": 131072,
+    "fixture": "depth-mix.txt",
+    "gen_tokens": 512,
+    "reference": "depth-131k",
+    "upstream_serial_tps": 15.29,
+    "prod_serial_tps": 27.228,
+    "prod_controller_d_tps": 27.145,
+    "prod_six_tps": 37.985,
+    "six_cycle_ms": 151.15,
+    "six_propose_ms": 9.82,
+    "six_verify_ms": 140.11,
+    "cold_prefill_upstream_tps": 692.06,
+    "cold_prefill_upstream_s": 189.39,
+    "cold_prefill_prod_tps": 781.9,
+    "cold_prefill_prod_s": 167.63,
+    "kv_restore_ms": 46.6,
+    "acceptance_representative": false,
+    "reps_serial_and_controller_d": 1
+   },
+   {
+    "ctx": 300000,
+    "fixture": "depth-mix.txt",
+    "gen_tokens": 512,
+    "reference": "depth-300k",
+    "upstream_serial_tps": 13.95,
+    "prod_serial_tps": 23.047,
+    "prod_controller_d_tps": 23.073,
+    "prod_six_tps": 29.832,
+    "six_cycle_ms": 190.33,
+    "six_propose_ms": 9.79,
+    "six_verify_ms": 178.8,
+    "cold_prefill_upstream_tps": 570.3,
+    "cold_prefill_upstream_s": 526.04,
+    "cold_prefill_prod_tps": 632.62,
+    "cold_prefill_prod_s": 474.22,
+    "kv_restore_ms": 104.0,
+    "acceptance_representative": false,
+    "reps_serial_and_controller_d": 1
+   }
+  ],
+  "shipped_defaults": {
+   "about": "the decode rows of docs/V41_M3ULTRA.md: the compact index scorer and the bounded radix selector on, which is what a stock build does",
+   "commit": "9f432d87b9942b1e0069b2751b1a77636436c63e",
+   "server_sha256": "86da6c8fcd95ced20e794483337d8800bd3f919e4bee73a3807d633fb47232a1",
+   "receipts": "harness/runs/depth/W.log, W-server.log, per-arm quiet checks",
+   "serial_tps": {
+    "8192": 31.25,
+    "62000": 30.683,
+    "131072": 29.898,
+    "300000": 28.274
+   },
+   "serial_ms_per_token": {
+    "8192": 32.001,
+    "62000": 32.591,
+    "131072": 33.448,
+    "300000": 35.368
+   },
+   "control_arm_off": {
+    "300000_serial_tps": 23.101,
+    "note": "both mechanisms disabled in the same boot; reproduces the earlier sweep's 23.047 and anchors the two runs to each other"
+   },
+   "identity": "every arm byte-identical to its depth's upstream reference, every arm GPU-idle-checked"
+  },
+  "upstream_reference_arms": {
+   "commit": "bd66c402070042bf0a79ad6ece8242de4c93680c",
+   "bench_sha256": "f956d4245e674abcb20c3d27c27b4f64a811891f8845ea8888909462d5f9bc8b",
+   "receipts": "baseline/references/depth-{8k,32k,62k,131k,300k}-upstream-bd66c40.{csv,text,log}",
+   "serial_tps": {
+    "8192": 16.56,
+    "32768": 16.31,
+    "62000": 16.23,
+    "131072": 15.29,
+    "300000": 13.95
+   },
+   "cold_prefill_tps": {
+    "8192": 626.94,
+    "32768": 740.59,
+    "62000": 736.75,
+    "131072": 692.06,
+    "300000": 570.3
+   }
+  },
+  "cold_prefill_release": {
+   "commit": "c050b75c324fc6f1f6907d240cd8c8a65495aae0",
+   "server_sha256": "5323ade0bdf1abeba925e0e98b4d3e86c98a4030721ce6163c7a26bc35214c20",
+   "tps": {
+    "8192": 711.46,
+    "32768": 835.72,
+    "62000": 813.47,
+    "131072": 781.9,
+    "300000": 632.62
+   },
+   "restore_ms": {
+    "8192": 5.9,
+    "32768": 15.2,
+    "62000": 16.1,
+    "131072": 46.6,
+    "300000": 104.0
+   },
+   "standing_check": "the prefill and matmul path is unchanged between this commit and the release head: metal/dense.metal, metal/moe.metal and metal/dsv41.metal differ only in comment text, and the two files that changed compute are reached only from the single-token decode path"
+  },
+  "superseded_serial_column": {
+   "about": "the production serial column of the original sweep, on the selection path before the compact scorer and radix selector shipped. NOT the shipped figures; retained because the depth attribution below was taken on it",
+   "serial_tps": {
+    "8192": 31.434,
+    "32768": 30.347,
+    "62000": 29.901,
+    "131072": 27.228,
+    "300000": 23.047
+   }
+  }
+ },
+ "deleted_artifacts": {
+  "about": "Named so a reader upgrading from an earlier draft of this branch knows these are gone rather than moved.",
+  "dspark/calib-ds41-code.txt": "the calibrated-window controller's acceptance bins and cost records, sha256 ad48c4122dff404bc9c7056433b046a03b328fbd0d60d9314b53cdd0c7bd35ee. Deleted with the controller it served, at commit cda2b9f. There is no calibration file on this branch and none is needed.",
+  "DS4_DS41_DSPARK_CALIBRATION": "the override for the above. Deleted; the binary ignores it.",
+  "levers": "dspark_controller, dspark_controller_confidence, dspark_controller_widths and dspark_admit_generalize. Deleted. A request naming one is refused rather than ignored."
+ },
+ "admission": {
+  "about": "the shipped windowed cost-feedback admission controller with confidence admission. docs/V41_M3ULTRA.md sections 2 (Why it is useful), 3 (How to use it) and 5 (Evidence).",
+  "commit": "afe84d1770a126b5784a615f3534f2b610831778",
+  "server_sha256": "cfeb2c4d186d6000e2687de88df228272eaff7d86a28ef16405a9480f3f188b6",
+  "design_origin": "ds4_ds41_dspark_adaptive.h is a port of ds4_dflash_adaptive.h from this project's GLM-5.3-Flash / DFlash2 branch. The width search and the ACK guard are not ported: V4.1 verifies one trained block width, and its step commits inside itself so the guard could never fire.",
+  "policy": "propose the full trained block at every eligible greedy position; admit the longest run from the anchor at or above p_min and decline a run shorter than min_draft without verifying; 16-token serial entry wait; a window is three chosen calls, declines included, judged against the median of the last nine measured serial tokens; a losing window backs off 16, 32, 64 then 128 consumed serial tokens; reasoning spans decode serially and leaving one clears the cooldown",
+  "arm_levers": {
+   "serial": {
+    "dspark_serve": 0
+   },
+   "controller": "the binary's own defaults",
+   "fixed_block": {
+    "dspark_adaptive": 0,
+    "dspark_verify_rows": 0
+   }
+  },
+  "server_flags": "-c 393216 --kv-cache-cold-max-tokens 393216 --kv-cache-continued-interval-tokens 4096 --prefill-chunk 8192 --default-top-p 0.95 --default-min-p 0",
+  "held_out_agent_screen": {
+   "about": "226 archived agent sessions, every real assistant turn reconstructed as the request that produced it, 32 drawn at random with a fixed seed and held out; 14 measurable within the screen's cost cap, 6.7k-107k rendered tokens, 3 arms each, 4,096-token cap with natural EOS, phases separated on the stream",
+   "pooled_token_weighted_tps": {
+    "whole_turn": {
+     "serial": 30.96,
+     "controller": 32.68,
+     "controller_ratio": 1.0556,
+     "gate_lifted": 31.7,
+     "gate_lifted_ratio": 1.024
+    },
+    "reasoning": {
+     "serial": 30.85,
+     "controller": 30.72,
+     "controller_ratio": 0.9958,
+     "gate_lifted": 29.64,
+     "gate_lifted_ratio": 0.9607
+    },
+    "answer": {
+     "serial": 31.32,
+     "controller": 41.29,
+     "controller_ratio": 1.3183,
+     "gate_lifted": 41.06,
+     "gate_lifted_ratio": 1.3108
+    }
+   },
+   "per_request_whole_turn_range": [
+    0.995,
+    1.27
+   ],
+   "per_request_answer_phase_range": [
+    1.132,
+    1.463
+   ],
+   "requests_without_an_answer_phase": 2,
+   "gate_lifted_wins_reasoning_phase": "2 of 13 requests; worst request 0.820",
+   "byte_identical_arms": "14 / 14 in both controller arms",
+   "understates": "the cost cap excluded the long draws, where the controller does best; nine further draws exceeded a 393,216-token context and were not measurable",
+   "not_redistributed": true
+  },
+  "standing_gates": {
+   "about": "restore-only through /debug/bench on the shipped controller's boot, every one byte-identical to its upstream bd66c40 reference",
+   "code_8k": {
+    "serial_tps": 31.465,
+    "six_tps": 36.254,
+    "controller_tps": 32.779,
+    "identity": "IDENTICAL"
+   },
+   "sql_8k": {
+    "serial_tps": 31.25,
+    "six_tps": 49.373,
+    "controller_tps": 48.385,
+    "identity": "IDENTICAL"
+   },
+   "agent2_8k": {
+    "serial_tps": 31.378,
+    "controller_tps": 34.281,
+    "identity": "IDENTICAL",
+    "note": "the held-out real agent transcript a fixed block used to lose 19 % on"
+   },
+   "depth_mix_300k": {
+    "serial_tps": 28.123,
+    "note": "the 24-token DSpark arms on this prefix price the 16-token serial entry wait rather than the controller and are not quoted"
+   }
+  },
+  "confidence_gate": {
+   "about": "GLM's dflash_adaptive_prefix, ported. docs/V41_M3ULTRA.md section 3, How admission decides.",
+   "commits": [
+    "35ed0f00af4d80d447c59cd10b82833f612e8ce1",
+    "afe84d1770a126b5784a615f3534f2b610831778",
+    "f1ba77e378d11d4f8d01647a67108301801e66eb"
+   ],
+   "signal": "normalised top probability of the post-Markov proposal row, already on the host after the Markov pass",
+   "p_min": {
+    "default": 0.75,
+    "env": "DS4_DS41_DSPARK_P_MIN",
+    "note": "GLM's value verbatim; not fitted on V4.1 traffic"
+   },
+   "min_draft": {
+    "default": 3,
+    "env": "DS4_DS41_DSPARK_MIN_DRAFT",
+    "note": "GLM declines below 4 of its 7 draft positions (0.57); V4.1 has 5, so 3 of 5 (0.60) carries it across"
+   },
+   "decline_accounting": "a decline takes a window slot at its drafter cost and three of them close a losing window; losing_cycles counts verified calls only",
+   "decline_pricing_arms": [
+    {
+     "fixture": "prose512",
+     "declines_outside_window": 0.816,
+     "shipped": 0.988,
+     "origin_branch": 0.98
+    },
+    {
+     "fixture": "middle-chat512",
+     "declines_outside_window": 0.893,
+     "shipped": 0.988,
+     "origin_branch": 0.97
+    },
+    {
+     "fixture": "middle-code512",
+     "declines_outside_window": 1.369,
+     "shipped": 1.263
+    },
+    {
+     "fixture": "middle-math512",
+     "declines_outside_window": 1.208,
+     "shipped": 1.115
+    },
+    {
+     "fixture": "json512",
+     "declines_outside_window": 1.375,
+     "shipped": 1.328
+    },
+    {
+     "fixture": "sql512",
+     "declines_outside_window": 1.576,
+     "shipped": 1.576
+    }
+   ],
+   "decline_pricing_metric": "controller over serial, one boot, on the nine DFlash fixtures of the branch this was ported from; 218 declines become 18 on prose",
+   "chat_arms_vs_fixed_six": [
+    {
+     "rendered_prompt": 8745,
+     "controller_over_six": 0.982,
+     "restored_from_disk": true,
+     "byte_identical": true
+    },
+    {
+     "rendered_prompt": 57976,
+     "controller_over_six": 1.053,
+     "restored_from_disk": true,
+     "byte_identical": true
+    },
+    {
+     "rendered_prompt": 62537,
+     "controller_over_six": 0.971,
+     "restored_from_disk": true,
+     "byte_identical": true
+    }
+   ],
+   "fixture_arms": [
+    {
+     "fixture": "code",
+     "ctx": 8192,
+     "controller_tps": 37.32,
+     "fixed_six_tps": 36.23
+    },
+    {
+     "fixture": "agent2",
+     "ctx": 8192,
+     "controller_tps": 32.65,
+     "serial_tps": 31.37,
+     "ratio": 1.041
+    }
+   ],
+   "identity": "8k code, 8k sql and the 8k agent fixture identical to the bd66c40 references across serial, fixed six and the controller; all ten content fixtures byte-identical across their three arms",
+   "fault_latch": {
+    "header": "ds4_ds41_dspark_fault.h",
+    "origin": "ported from the GLM-5.3-Flash branch's ds4_dflash_fault.h",
+    "drained": "falls back to serial for the life of the session; the faulted request and the next are byte-identical to serial",
+    "undrained": "refused: 'dspark: unsafe drafter failure requires a new session'",
+    "injection": "DS4_DS41_DSPARK_FAIL=drafter_once|state_save|after_verify, read at process start",
+    "note": "unreachable without a drafter fault, so it touches no measured arm",
+    "receipts": "harness/runs/faultlatch/ (fault.sh, fault.py, result-drafter_once.json, result-after_verify.json, per-point server logs)",
+    "injection_results": {
+     "drafter_once": "safe: the faulted request runs 192 tokens, finish=length, byte-identical to serial; the next request on the session is byte-identical to serial with disabled=1 safe=1",
+     "after_verify": "unsafe: the faulted request stops at 17 tokens with finish=error and the next request on the session is refused, HTTP 500"
+    }
+   }
+  },
+  "receipts": "harness/runs/glmctl/ (arms.jsonl, counters.json, content.v3.log, predictions3.json, screen3.jsonl, screen3-analysis.txt, per-arm server-log slices and quiet checks)",
+  "fixture_screen": {
+   "about": "ten content fixtures, three arms each, one boot; every arm byte-identical to its serial arm. docs/V41_M3ULTRA.md section 5, Evidence. t/s is the server's own final avg decode line",
+   "rows": [
+    {
+     "fixture": "sql512",
+     "generated": 512,
+     "serial": 31.78,
+     "six": 50.75,
+     "controller": 50.1
+    },
+    {
+     "fixture": "mixed-sql512",
+     "generated": 512,
+     "serial": 31.74,
+     "six": 50.52,
+     "controller": 49.97,
+     "note": "a reconstruction: the prose fixture followed by the SQL fixture in one message"
+    },
+    {
+     "fixture": "json512",
+     "generated": 512,
+     "serial": 31.78,
+     "six": 44.46,
+     "controller": 42.21
+    },
+    {
+     "fixture": "middle-code512",
+     "generated": 132,
+     "serial": 32.09,
+     "six": 47.17,
+     "controller": 40.53
+    },
+    {
+     "fixture": "middle-math512",
+     "generated": 263,
+     "serial": 31.88,
+     "six": 36.66,
+     "controller": 35.54
+    },
+    {
+     "fixture": "middle-rag512",
+     "generated": 174,
+     "serial": 31.8,
+     "six": 28.68,
+     "controller": 31.92
+    },
+    {
+     "fixture": "prose512",
+     "generated": 512,
+     "serial": 31.77,
+     "six": 18.67,
+     "controller": 31.38
+    },
+    {
+     "fixture": "middle-chat512",
+     "generated": 512,
+     "serial": 31.76,
+     "six": 21.47,
+     "controller": 31.38
+    },
+    {
+     "fixture": "middle-summary512",
+     "generated": 276,
+     "serial": 31.65,
+     "six": 23.33,
+     "controller": 30.97
+    },
+    {
+     "fixture": "middle-factual512",
+     "generated": 2,
+     "serial": 31.48,
+     "six": 17.1,
+     "controller": 31.18,
+     "note": "2 generated tokens; not a measurement, and not in docs/V41_M3ULTRA.md"
+    }
+   ],
+   "k1_non_regression": "the serial arms carry the drafter loaded and unserved and read 31.65-32.09 t/s across the nine measurable fixtures"
+  },
+  "long_served_turn": {
+   "about": "one real turn on the deployed stack through the ordinary serving path",
+   "commit": "f1ba77e378d11d4f8d01647a67108301801e66eb",
+   "server_sha256_prefix": "b9064f69",
+   "receipts": "deploy/runs/uat/final/",
+   "prompt_tokens": 86961,
+   "cached_prompt_tokens": 86793,
+   "prefilled_now": 168,
+   "generated_tokens": 56497,
+   "finish": "stop",
+   "decode_s": 2018.4,
+   "whole_turn_tps": 28.0,
+   "reasoning_run": {
+    "tokens": 48700,
+    "samples": 974,
+    "median_tps": 27.2
+   },
+   "answer_run": {
+    "tokens": 7797,
+    "samples": 156,
+    "median_tps": 36.75,
+    "vs_reasoning": 1.35
+   }
+  },
+  "superseded_measurements": {
+   "about": "taken on the controller before confidence admission and before declines were priced into the window. Recorded for provenance; none of it appears in docs/V41_M3ULTRA.md",
+   "commit": "f9dc5f981474fb283b503813771357836472c119",
+   "server_sha256": "463b186a2b96a7813fb0391e370fd1ad6b28ac348579a4dd71bbada8b80504ad",
+   "greedy_length_sweep": [
+    {
+     "rendered_prompt_tokens": 8745,
+     "controller_tps": 39.88,
+     "six_tps": 41.1,
+     "serial_tps": 31.26,
+     "tokens_per_cycle": 5.07,
+     "windows": 28,
+     "backoffs": 4,
+     "byte_identical": true
+    },
+    {
+     "rendered_prompt_tokens": 23457,
+     "controller_tps": 38.74,
+     "six_tps": 39.52,
+     "serial_tps": 31.11,
+     "tokens_per_cycle": 5.22,
+     "windows": 3,
+     "backoffs": 0,
+     "byte_identical": true
+    },
+    {
+     "rendered_prompt_tokens": 57976,
+     "controller_tps": 37.48,
+     "six_tps": 35.9,
+     "serial_tps": 30.66,
+     "tokens_per_cycle": 4.99,
+     "windows": 26,
+     "backoffs": 6,
+     "byte_identical": true
+    },
+    {
+     "rendered_prompt_tokens": 62537,
+     "controller_tps": 42.66,
+     "six_tps": 42.85,
+     "serial_tps": 30.68,
+     "tokens_per_cycle": 5.45,
+     "windows": 29,
+     "backoffs": 1,
+     "byte_identical": true
+    },
+    {
+     "rendered_prompt_tokens": 128679,
+     "controller_tps": 42.91,
+     "six_tps": 43.46,
+     "serial_tps": 29.96,
+     "tokens_per_cycle": 5.64,
+     "windows": 29,
+     "backoffs": 0,
+     "byte_identical": true
+    }
+   ],
+   "greedy_length_sweep_note": "real chat completions, greedy, 512 generated tokens, GPU sampled idle before every timed arm, one prefill per length with the rest restored from the disk cache; the controller column is the mean of two runs. The fixtures are real agent requests and are not redistributed, so these rows are bound by commit and binary rather than by fixture digest.",
+   "sampled_decode_length_sweep": {
+    "settings": "temperature 1.0, top_p 0.95, min_p 0, fixed seed, two runs per arm",
+    "rows": [
+     {
+      "rendered_prompt_tokens": 8745,
+      "controller_tps": 34.01,
+      "serial_tps": 30.47,
+      "ratio": 1.116,
+      "tokens_per_cycle": 4.49
+     },
+     {
+      "rendered_prompt_tokens": 23457,
+      "controller_tps": 26.62,
+      "serial_tps": 29.82,
+      "ratio": 0.893,
+      "tokens_per_cycle": 2.5
+     },
+     {
+      "rendered_prompt_tokens": 57976,
+      "controller_tps": 37.64,
+      "serial_tps": 29.94,
+      "ratio": 1.257,
+      "tokens_per_cycle": 5.08
+     },
+     {
+      "rendered_prompt_tokens": 62537,
+      "controller_tps": 33.73,
+      "serial_tps": 29.85,
+      "ratio": 1.13,
+      "tokens_per_cycle": 4.69
+     },
+     {
+      "rendered_prompt_tokens": 128679,
+      "controller_tps": 33.51,
+      "serial_tps": 29.16,
+      "ratio": 1.149,
+      "tokens_per_cycle": 4.82
+     }
+    ],
+    "claim": "determinism at a fixed seed, verified twice at every length, plus distribution correctness by chi-square over 200,000 draws per configuration in tests/test_sampling.c driving the shipped ds41_accept_or_residual(). BYTE IDENTITY IS NOT CLAIMED HERE and is not expected: byte identity is a greedy claim only.",
+    "23457_note": "a loss, reported as one: that fixture stops at a tool call after 64 generated tokens, sixteen of which are the serial entry wait"
+   },
+   "agent_screen_512_cap": {
+    "serial_pooled_decode_tps": 30.76,
+    "controller_pooled_decode_tps": 33.95,
+    "controller_vs_serial": 1.104,
+    "controller_leave_one_out": [
+     1.093,
+     1.117
+    ],
+    "reasoning_gate_lifted_vs_serial": 1.028,
+    "byte_identical_arms": "42 / 42",
+    "note": "the same 14 requests at a 512-token cap, whole-turn only. The 4,096-token phase-separated screen above supersedes it"
+   },
+   "standing_gates": {
+    "code_8k": {
+     "serial_tps": 31.327,
+     "six_tps": 36.21,
+     "controller_tps": 34.779
+    },
+    "sql_8k": {
+     "controller_tps": 48.419
+    },
+    "agent2_8k": {
+     "serial_tps": 31.236,
+     "six_tps": 31.327,
+     "controller_tps": 31.857
+    },
+    "depth_mix_300k": {
+     "serial_tps": 28.167,
+     "vs_upstream": 2.03
+    },
+    "identity": "IDENTICAL on all"
+   },
+   "deleted_controller_depth_column": "the calibrated-window controller made zero attempts at 62000, 131072 and 300000 because its cost records covered [8192,8704) and [32768,33280) only. That controller and its calibration file are deleted from the tree and from the build"
+  },
+  "sampled_decode_claim": "determinism at a fixed seed and distribution correctness by chi-square over 200,000 draws per configuration in tests/test_sampling.c, driving the shipped ds41_accept_or_residual(). BYTE IDENTITY IS NOT CLAIMED at temperature above zero and is not expected: byte identity is a greedy claim only."
+ },
+ "spec_bench": {
+  "about": "a frozen public subset on the shipped admission controller. Method and every table: bench/SPEC-BENCH-V41.md",
+  "commit": "afe84d1770a126b5784a615f3534f2b610831778",
+  "server_sha256": "cfeb2c4d186d6000e2687de88df228272eaff7d86a28ef16405a9480f3f188b6",
+  "upstream_repository_commit": "fd2c1cd7d2201ef71db4c5f4e455008f017967bf",
+  "question_file_sha256": "4b6d33e79484f9841c487ee87d1cf6aa8c6066f61d5d482ff09e5a007fafdf04",
+  "shape": "72 questions, 84 turn requests per mode, 252 requests, greedy, natural EOS, 256-token cap, reasoning off, one resident server",
+  "pooled_tps": {
+   "server_end_to_end": {
+    "serial": 29.43,
+    "six": 22.32,
+    "controller": 29.32,
+    "six_ratio": 0.758,
+    "controller_ratio": 0.996
+   },
+   "decode_only": {
+    "serial": 31.89,
+    "six": 23.55,
+    "controller": 31.65,
+    "six_ratio": 0.739,
+    "controller_ratio": 0.993
+   },
+   "client_wall": {
+    "serial": 29.34,
+    "six": 22.26,
+    "controller": 29.23,
+    "six_ratio": 0.759,
+    "controller_ratio": 0.996
+   }
+  },
+  "decode_only_by_category": {
+   "mt_bench": {
+    "six": 0.628,
+    "controller": 0.979
+   },
+   "qa": {
+    "six": 0.729,
+    "controller": 0.973
+   },
+   "summarization": {
+    "six": 0.756,
+    "controller": 0.968
+   },
+   "rag": {
+    "six": 0.839,
+    "controller": 0.982
+   },
+   "translation": {
+    "six": 0.864,
+    "controller": 0.95
+   },
+   "math_reasoning": {
+    "six": 1.192,
+    "controller": 1.13
+   }
+  },
+  "committed_per_verify": {
+   "six": 2.714,
+   "controller": 4.362
+  },
+  "controller_ledger": {
+   "cycles": 439,
+   "attempts": 439,
+   "committed": 1915,
+   "serial_rows": 2691,
+   "skipped_steps": 8311,
+   "windows": 362,
+   "backoffs": 238,
+   "losing_cycles": 140,
+   "requests_with_backoff": 75
+  },
+  "six_ledger": {
+   "cycles": 4503,
+   "attempts": 4503,
+   "committed": 12222,
+   "serial_rows": 5
+  },
+  "byte_identity": "252 / 252 answers byte-identical across the three modes",
+  "receipts": "bench/receipts/spec-bench-v41/2026-09-14-glmctl/, hashed by receipt-hashes.json",
+  "superseded_run": {
+   "commit": "f9dc5f981474fb283b503813771357836472c119",
+   "server_sha256": "463b186a2b96a7813fb0391e370fd1ad6b28ac348579a4dd71bbada8b80504ad",
+   "decode_only": {
+    "serial": 31.9,
+    "six": 23.63,
+    "controller": 30.58,
+    "six_ratio": 0.741,
+    "controller_ratio": 0.959
+   },
+   "note": "the same subset before confidence declines were priced into the admission window. Not shipped in bench/receipts/ and not quoted in docs/V41_M3ULTRA.md"
+  },
+  "dataset_text": "not redistributed; a request is identified by the SHA-256 of its body"
+ },
+ "prefill_checkpoints": {
+  "about": "Continuable checkpoints at prefill chunk boundaries, and a continued-store schedule that can land on the boundaries V4.1 actually offers. docs/V41_M3ULTRA.md sections 3 and 5. Restore timings and store lines from the gating boots for each commit; no receipt directory is claimed for them.",
+  "commits": [
+   "0f0a367663f4881023ffaa525f5b79e89dfbbe01",
+   "9402d398e68efeff6f69ee4c17e2cef41cb86cd2"
+  ],
+  "mid_prefill_store": "tokens=94208 trimmed=0 reason=continued size=593.70 MiB save=101.9 ms",
+  "restore_96591_prefix": {
+   "restored_tokens": 94208,
+   "load_ms": 50.9,
+   "prefilled_tokens": 2383,
+   "total_s": 10.3,
+   "cold_reference_s": 140,
+   "note": "cold reference is approximate and is recorded as such"
+  },
+  "restore_38690_prefix": {
+   "restored_tokens": 37728,
+   "load_ms": 32.5,
+   "prefilled_tokens": 962,
+   "total_s": 4.11,
+   "from_anchor_reference_s": 50,
+   "note": "from-anchor reference is approximate and is recorded as such"
+  },
+  "agent_chat_schedule": "cold anchor at 2912, then reason=continued at 35680 and 37728, zero skips; before 9402d39 a 278169-token prefill that resumed at 2778 and offered 35546/68314/101082 wrote nothing",
+  "prefill_throughput_gate": {
+   "metric": "cold 62,537-token prefill t/s",
+   "receipts": [
+    798.25,
+    791.7
+   ],
+   "measured": [
+    790.79,
+    792.68,
+    791.99
+   ],
+   "verdict": "-0.82 % on the mean against 798.25 and +0.04 % against 791.7; both inside the 1 % gate"
+  },
+  "identity": "8k code and 8k sql over serial / fixed six / controller, and the 62k code controller arm, identical to the bd66c40 references"
+ },
+ "kv_eviction": {
+  "about": "Disk-KV eviction: a decaying score baseline, store-time waypoint-ladder retention and deepest-first shedding under pressure. docs/V41_M3ULTRA.md section 3, The disk KV store. Disk-cache-only: it decides which KV snapshots survive, never what decode computes from one.",
+  "design_origin": "ported from this project's GLM-5.3-Flash branch (three eviction commits). Design credit is that branch's; the port, the store-layer reproducer and the two test corrections are this branch's, and the corrections are owed back.",
+  "commits": [
+   "e26d830f0bfb4be9dbe86de5cc9425c4f2cf44ab",
+   "bdbe6cfad830757aa704cc2a413e71279c703187",
+   "16e979bd75bfaaf436d6df62262c854463b33a7a",
+   "e389ddd1512ee14b1882c46cd33089dab778ef34",
+   "03eb93182d0755fe22580b0165808caa89bd1739"
+  ],
+  "levers": {
+   "DS4_KVSTORE_BASE_HALF_LIFE_SECONDS": {
+    "default": 86400,
+    "what": "half-life of the eviction score's baseline term; floored at 1e-6 so relative factors stay meaningful"
+   },
+   "KV_CACHE_LADDER_DENSE_WINDOW": {
+    "default": 32768,
+    "what": "compile-time: every rung within this many tokens of the frontier is kept"
+   },
+   "ladder_ratio": {
+    "value": "5/7",
+    "what": "compile-time: each deeper kept rung sits at or below this fraction of the previous kept depth"
+   },
+   "DS4_KV_LADDER": {
+    "default": 1,
+    "what": "0 restores the pre-ladder cheap-victim policy"
+   }
+  },
+  "motivating_numbers": {
+   "unthinned_300k_chain_gib": 67,
+   "bytes_per_token_kib": 6.3,
+   "disk_budget_mb": 98304,
+   "note": "an un-thinned 300k-token chain stores about 67 GiB of full-prefix snapshots at about 6.3 KB per token; under a 98,304 MB budget the pre-ladder policy let one conversation evict its own shallow waypoints and compaction then re-prefilled from token zero"
+  },
+  "ladder_budget": {
+   "kept_multiple_of_frontier": 4.6,
+   "unthinned_multiple_of_frontier": 14.5,
+   "dense_rungs_alone_multiple": 2.8,
+   "note": "the ported test asserted a bound of under 3x the frontier, which the three dense rungs alone violate; corrected to under 5x plus twice the kept total below the un-thinned total, checked against a standalone copy of ds4_kvstore_ladder_select"
+  },
+  "reproducer": "test_kv_ladder_survives_compaction_pressure in the ./ds4_test --server suite: no model, no GPU, real wall-clock timestamps",
+  "decode_impact": "none. The production 8k/512 and 32k/256 byte gates were re-run on the release head's build and passed"
+ },
+ "fidelity": {
+  "tier": "every change that ships on this branch is Tier 1: an exact reformulation performing the same arithmetic in the same order as the code it replaces",
+  "tier2_register": "empty since b977a33f062e98808373369e718a66b134e1f6ab, which deleted every order-changing lever and its kernels rather than defaulting them off (2,152 lines)",
+  "criterion": "for a Tier-1-only branch, byte identity under greedy decode on the published gates is the complete fidelity criterion, not a sample of one. The reference digests are in this manifest's references block",
+  "sampled_decode": "certified separately: determinism at a fixed seed, and a chi-square test over 200,000 draws driving the shipped ds41_accept_or_residual(). docs/V41_M3ULTRA.md section 4",
+  "scope": "a statement about the gates and fixtures that were run, under greedy decode. No claim is made about an unmeasured prompt, and none at temperature above zero"
+ },
+ "readme_tables": {
+  "about": "one entry per table in docs/V41_M3ULTRA.md: receipt directory, server digest, commit. The prose form, with the checks made before each table was carried forward, is in bench/RELEASE-EVIDENCE-V41.md",
+  "section_2_headline_decode": {
+   "receipts": "harness/runs/depth/W.log + baseline/references/depth-*-upstream-bd66c40.csv",
+   "server_sha256": "86da6c8fcd95ced20e794483337d8800bd3f919e4bee73a3807d633fb47232a1",
+   "commit": "9f432d87b9942b1e0069b2751b1a77636436c63e"
+  },
+  "section_2_headline_prefill": {
+   "receipts": "harness/runs/depth/ (A.log, per-arm json)",
+   "server_sha256": "5323ade0bdf1abeba925e0e98b4d3e86c98a4030721ce6163c7a26bc35214c20",
+   "commit": "c050b75c324fc6f1f6907d240cd8c8a65495aae0"
+  },
+  "section_2_headline_ttft": {
+   "receipts": "release/runs/ (ttft-*.text, ttft-*-server.log, ttft-*.quiet)",
+   "server_sha256_prefix": "88a14ce25f41aa7e",
+   "commit": "b977a33f062e98808373369e718a66b134e1f6ab"
+  },
+  "section_2_headline_dspark": {
+   "receipts": "harness/runs/glmctl/ (arms.jsonl, counters.json, content.v3.log, screen3.jsonl)",
+   "server_sha256": "cfeb2c4d186d6000e2687de88df228272eaff7d86a28ef16405a9480f3f188b6",
+   "commit": "afe84d1770a126b5784a615f3534f2b610831778"
+  },
+  "section_3_memory": {
+   "receipts": "release/runs/ (mem-mtp-*.txt, mem-ttft-*.txt)",
+   "server_sha256_prefix": "88a14ce25f41aa7e",
+   "commit": "b977a33f062e98808373369e718a66b134e1f6ab"
+  },
+  "section_4_fault_latch": {
+   "receipts": "harness/runs/faultlatch/",
+   "server_sha256": "not recorded",
+   "commit": "f1ba77e378d11d4f8d01647a67108301801e66eb"
+  },
+  "section_4_sampled_certification": {
+   "receipts": "tests/test_sampling.c in this repository",
+   "commit": "release head"
+  },
+  "section_5_serial_decode_depth": {
+   "receipts": "harness/runs/depth/W.log",
+   "server_sha256": "86da6c8fcd95ced20e794483337d8800bd3f919e4bee73a3807d633fb47232a1",
+   "commit": "9f432d87b9942b1e0069b2751b1a77636436c63e"
+  },
+  "section_5_cold_prefill_and_restore": {
+   "receipts": "harness/runs/depth/",
+   "server_sha256": "5323ade0bdf1abeba925e0e98b4d3e86c98a4030721ce6163c7a26bc35214c20",
+   "commit": "c050b75c324fc6f1f6907d240cd8c8a65495aae0"
+  },
+  "section_5_ttft": {
+   "receipts": "release/runs/",
+   "server_sha256_prefix": "88a14ce25f41aa7e",
+   "commit": "b977a33f062e98808373369e718a66b134e1f6ab"
+  },
+  "section_5_disk_store_checkpoints": {
+   "receipts": "harness/runs/ckfix/, harness/runs/ckfix2/, deploy/runs/uat/final/",
+   "commit": "0f0a3670 9402d39 f1ba77e 03eb931",
+   "note": "row 4 is the deployed stack's own compaction turn"
+  },
+  "section_5_dspark_fixtures_and_gates": {
+   "receipts": "harness/runs/glmctl/ (arms.jsonl, counters.json, content.v3.log)",
+   "server_sha256": "cfeb2c4d186d6000e2687de88df228272eaff7d86a28ef16405a9480f3f188b6",
+   "commit": "afe84d1770a126b5784a615f3534f2b610831778"
+  },
+  "section_5_agent_screen": {
+   "receipts": "harness/runs/glmctl/ (screen3.jsonl, screen3-analysis.txt, analyze-screen3.py)",
+   "server_sha256": "cfeb2c4d186d6000e2687de88df228272eaff7d86a28ef16405a9480f3f188b6",
+   "commit": "afe84d1770a126b5784a615f3534f2b610831778"
+  },
+  "section_5_long_served_turn": {
+   "receipts": "deploy/runs/uat/final/",
+   "server_sha256_prefix": "b9064f69",
+   "commit": "f1ba77e378d11d4f8d01647a67108301801e66eb"
+  },
+  "section_5_spec_bench": {
+   "receipts": "bench/receipts/spec-bench-v41/2026-09-14-glmctl/",
+   "server_sha256": "cfeb2c4d186d6000e2687de88df228272eaff7d86a28ef16405a9480f3f188b6",
+   "commit": "afe84d1770a126b5784a615f3534f2b610831778"
+  },
+  "section_4_byte_gates_on_the_deployed_build": {
+   "receipts": "deploy/runs/uat/",
+   "server_sha256": "a671b6eff9c147faf0413bd36a4955e47fdd8f7f2235a6d5815c49486c11a28c",
+   "commit": "03eb93182d0755fe22580b0165808caa89bd1739",
+   "note": "8k/512 and 32k/256 decoded text byte-identical to their references, machine quiet"
+  }
+ }
+}
