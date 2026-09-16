@@ -1,5 +1,7 @@
 # Release evidence: what stands behind each table
 
+This is the original release evidence record. The [September 16 evidence](v41-20260916/README.md) covers subsequent UAT decode improvements and their public integration.
+
 [docs/V41_M3ULTRA.md](../docs/V41_M3ULTRA.md) states results and says nothing about where they
 came from, deliberately: a product document should not be a history lesson. This
 file is the other half. For every table in that document it names the receipt

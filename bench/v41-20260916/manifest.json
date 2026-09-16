@@ -1,0 +1,80 @@
+{
+  "schema": "ds4-v41-release-update/1",
+  "generated_utc": "2026-09-16T11:18:17.267093+00:00",
+  "public_parent": "1599cde43cfd076a2e542a77ea67832cf4cece66",
+  "public_implementation_commit": "6d854bdbcadc48c126e5579958fbfb92b074b3ba",
+  "validated_uat_commit": "bbaebc167ba1534f6addae6f1d8c1385d983652b",
+  "validated_uat_binary_sha256": "f166eeda8022be2c43673ebf11cf51693b57f2d8d6b806484cf2938a967a17f6",
+  "public_built_server_sha256": "bec36cb3dcff1a1625f77509461904fa41793ac9d36781103bd8ac8dd1659ca5",
+  "new_public_binary_timed": false,
+  "integration_checks": {
+    "initial_transplant_129_source_files_token_identical_to_uat": true,
+    "subsequent_changes": "six validated flags default on; rejected compact F16/split collapse/non-selected HC variants removed; control/default tests added",
+    "metal_source_audit": {
+      "metal/dense.metal": {
+        "uat_tokens": 85928,
+        "public_tokens": 84280,
+        "only_deletions": true
+      },
+      "metal/dsv41.metal": {
+        "uat_tokens": 62664,
+        "public_tokens": 57707,
+        "only_deletions": true
+      },
+      "metal/dsv4_misc.metal": {
+        "uat_tokens": 187493,
+        "public_tokens": 187493,
+        "only_deletions": true
+      },
+      "metal/glu.metal": {
+        "uat_tokens": 1978,
+        "public_tokens": 1978,
+        "only_deletions": true
+      },
+      "metal/moe.metal": {
+        "uat_tokens": 303498,
+        "public_tokens": 303498,
+        "only_deletions": true
+      }
+    },
+    "build_all": "pass",
+    "production_path_suite": "pass",
+    "controller_admission_markov": "pass",
+    "large_model_reloaded": false
+  },
+  "source_sha256": {
+    ".gitignore": "c82001ff9a15fdb0ae08615fcede69e7d91bb595e6bf93fb3284e2512a4dce31",
+    "Makefile": "913a6d6a59ef1ece6e287c46a9a9423a4865e3abc11575a4a20be78c6905940a",
+    "ds4.c": "478fa0599a95929422aee77c1280a2dd1c103b10aed09750a3b8b271a0d837f4",
+    "ds4.h": "5381c9936b0d1b06c557e27411f25b2a96b1ff0d33d11e668a190247f9b94ebc",
+    "ds4_ds41_dspark_adaptive.h": "0f4f1367c15aae54f75c10e3d7f93ed339cac8d5e8eed86b89397d7c376b95e7",
+    "ds4_gpu.h": "15b4e712ec42e19b85c5ded7a6686db1fdb04e4b1603b9ad260ba70d97002b57",
+    "ds4_metal.m": "4cdb71950759f9edf4a425fdf3a292ec1412b732c206eb42891056cb83ee6997",
+    "ds4_server.c": "a3ae7fee50ea47c94abc899cf657b7512f86161835c4ccd6de4163029d127a4f",
+    "metal/dense.metal": "2289d4572c843a84db1e592469f82b3c2c7d04ca9b31fc0dd775d5365b6a42b5",
+    "metal/dsv41.metal": "2f6454e7dda40142cc9eb454b7b05192f649b4d048f7c1dcdfe03a36821ee3f1",
+    "metal/dsv4_misc.metal": "134574a4fb438008589dfb60d48e446a25b06c573fe4f034e73c4df4b1f3d3df",
+    "metal/glu.metal": "20dfdbd12f77a3ed407233f108d3b9f6d48e6ed9b0addd73a42722cea3721250",
+    "metal/moe.metal": "51c06d1b65512033704902a726051b43e58bd7a024f5bbf53b533caa206abf5c",
+    "tests/test_ds41_batch_round.c": "7d802f74a9c485fa13938b0f812bf93a413427b596499e994de78eeb2c31d6d8",
+    "tests/test_ds41_dspark_adaptive.c": "92e0d1c209bb5e54a45f88bdb8410dee527ec9e2acfad58348794a0d2bf825e5",
+    "tests/test_ds41_f16_trio.c": "5b4cb4c940d9cad34dd8c54b6c0c01ef18ec9d9178920a282e2f98fe28c84499",
+    "tests/test_ds41_f32_rows.c": "dfe342cc60e7d5eeedb747af813472395fd09d8fba941589549130e044c6f73e",
+    "tests/test_ds41_ffn_expand.c": "e6585ca1bbed4270fd3938b853383d742983b72775706452a9ced2cd3206672b",
+    "tests/test_ds41_hc_layout.c": "a1292a722b6a18b8477e99e351024af4ae31f7674a19f273edaea34b11f474ae",
+    "tests/test_ds41_markov_cache.c": "a3bf26e9218c5a97897734796bade3ddbf23f3275d311e46b121bde3651ce3f4",
+    "tests/test_ds41_material_paths.c": "37f3dfc69dad52f3c163da3303bf693ecce952060cff03950c2d4edc50a4a12f",
+    "tests/test_ds41_moe_order.c": "d6babb94afb43ce1f60f7a9f6824b031bc77d0d148faa43e2a27c998c6cbf3d2",
+    "tests/test_ds41_pointwise_batch.c": "5274294183367404f1bb1b73fa728cabb532cf1f3b678dca22841716bbe7091e",
+    "tests/test_ds41_q8_order.c": "e9dfd652b19c5f66ca7bca5d650f1036ead4ffe4e4e555f58197da5b870d1ed7",
+    "tests/test_ds41_q8_trio.c": "f257e6ec7d2d165a2673b60dfa4520f4ad21b7e1437188be6e0bc2cdba9f4c45",
+    "tests/test_ds41_release_defaults.c": "682c96faf186bdf454ef42dbf566ec332d77a765b714e967ba1ee828550a42b1",
+    "tests/test_ds41_score_layout.c": "d586c0fa365007f9e04610ef9c06e244585b528d5262c22c8c298f9efea87b65"
+  },
+  "historical_experiments": "../../docs/experiments/v41-20260915/README.md",
+  "notes": [
+    "Public defaults equal the explicitly enabled UAT configuration for retained paths.",
+    "Private prompt bodies, conversation outputs and machine-control artifacts are not redistributed.",
+    "Original release manifest stays separate and unchanged."
+  ]
+}

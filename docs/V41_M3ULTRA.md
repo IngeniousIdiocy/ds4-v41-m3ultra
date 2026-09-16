@@ -12,7 +12,7 @@ commit `bd66c402070042bf0a79ad6ece8242de4c93680c`, "DeepSeek v4.1 Flash support
 for Metal". This is a standalone repository carrying upstream's full history to
 that commit plus this branch's work, not a GitHub fork object, so nothing above
 the file list will tell you where it came from. `LICENSE` is upstream's,
-unchanged (MIT). `README.md` is upstream's own README.
+unchanged (MIT). `README.md` retains upstream's introduction with a fork-specific navigation note.
 
 What the branch adds:
 
@@ -39,6 +39,29 @@ byte for byte, what upstream emits on the same prompt — see section 4.
 * [THIRD_PARTY-V41.md](../THIRD_PARTY-V41.md) — upstream, DeepSeek's reference stack, weights licences.
 
 ## 2. Why it is useful
+
+### Current decode results
+
+All validated post-launch optimizations are included and enabled by default.
+
+| Workload | Original public release | September 16 update |
+| --- | ---: | ---: |
+| Serial decode, 8k context | 31.3 t/s | **33.3 t/s** |
+| Serial decode, 300k context | 28.3 t/s | **31.7 t/s** |
+| DSpark on code | 40.5 t/s | **46.4 t/s** |
+| DSpark on agent turns, answer phase | 41.3 t/s | **50.0 t/s** |
+
+Six-row verification improved from 112 to **90.8 ms/block**; the same normalized
+weight-traffic calculation improved from 337 to **415 GB/s**. The answer-phase
+calculation is unchanged. These are the validated UAT measurements of the paths
+now shipped here; see [the update](RELEASE-V41-20260916.md) for exact scope,
+controller changes, controls, validation, and pruned experiments.
+
+### Original release measurements
+
+The table and discussion below preserve the original launch comparisons,
+including prefill/TTFT/cache results that were not retimed for the decode update.
+
 
 One machine, one weights file, one quiet GPU, the same fixtures on both sides.
 The baseline is a clean build of stock upstream except on the DSpark rows, where
@@ -308,7 +331,9 @@ it.
 | `drafter_once` | safe | 192 tokens, `finish=length`, byte-identical to serial | byte-identical to serial, drafting disabled |
 | `after_verify` | unsafe | 17 tokens, `finish=error` | refused — HTTP 500, `dspark: unsafe drafter failure requires a new session` |
 
-## 5. Evidence
+## 5. Original release evidence
+
+For the subsequent decode campaigns, see [September 16 evidence](../bench/v41-20260916/README.md) and the [full experiment history](experiments/v41-20260915/README.md).
 
 Everything below is one 512 GB M3 Ultra Mac Studio, one model process at a time,
 the GPU sampled idle before every timed arm. Nothing is projected, averaged
@@ -498,7 +523,9 @@ have found the 1.13x on `math_reasoning` or the 1.32x on real agent answers.
 This is the clearest answer to whether a fixed block is safe as a production
 default: on a workload nobody here chose, it costs a quarter of the throughput.
 
-## 6. Limits
+## 6. Original release limits
+
+The later update's additional validation and remaining limits are documented in [the release update](RELEASE-V41-20260916.md).
 
 * **Both of the original targets — 80 % of the DRAM wall in decode, 70 % of the
   matmul roof in prefill — were missed, and are recorded as missed.** Decode

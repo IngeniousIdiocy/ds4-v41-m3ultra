@@ -1,5 +1,13 @@
 # Optimizations on the V4.1 Flash M3 Ultra branch
 
+## September 16 update
+
+The [current release log](docs/RELEASE-V41-20260916.md) covers all validated gains since launch, enabled by default. The [chronological experiment records](docs/experiments/v41-20260915/README.md) include adopted, rejected, invalid and unrun experiments. Rejected implementations were culled from the source; their evidence is retained.
+
+## Original launch record
+
+The sections below describe the original release and preserve its measurements.
+
 Adopted changes only, one line each. Every entry is on by default on the release
 head `03eb931` unless the line says otherwise, and every entry keeps an `=0` kill
 switch so any arm can be reproduced from one binary. Rows M1-M16 were measured on

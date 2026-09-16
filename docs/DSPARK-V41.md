@@ -17,6 +17,12 @@ for exactly that case.
 
 ---
 
+The [September 16 update](RELEASE-V41-20260916.md) adds exact verifier
+optimizations, Markov correction memoization, faster serial decode, and bounded
+loss accounting. Adopted optimizations default on. The performance tables later
+in this document are the original launch measurements; current code/answer
+rates are 46.4/50.0 t/s on the established fixtures.
+
 ## 1. Build the support GGUF
 
 No drafter weights are redistributed here. Build one from your own copy of the
@@ -177,7 +183,7 @@ tokens.
 - **A decline is a chosen call.** It takes a slot in the three-attempt window:
   its wall is the drafter plus the serial token it still has to take, its
   consumed rows are 1, so its net is a straight loss of the drafter cost, and
-  three of them close a losing window and arm the cooldown. What a decline is not
+  three of them close a losing window; the bounded cumulative loss policy below decides when to arm the cooldown. What a decline is not
   is a rejection — it never asked the target to check anything — so
   `losing_cycles` counts verified calls only. That asymmetry is the whole of the
   accounting, and getting it wrong is expensive in both directions: an earlier
@@ -193,17 +199,21 @@ tokens.
   The full cycle also carries an EMA, but only for reporting.
 - **A window is three complete attempts.** Each contributes
   `net = wall_ms - consumed * serial_ms`; negative is a win.
-- **Judgement.** A window whose summed net is below zero engages and clears any
-  cooldown. A window that is not backs off.
+- **Judgement.** By default, carry measured net loss across completed windows.
+  Wins repay debt without banking credit. Back off when unrepaid loss exceeds
+  half a measured median serial step. `DS4_DS41_DSPARK_LOSS_BUDGET=0` restores
+  the original policy: back off after each non-winning window. This bounded
+  policy was validated with the faster serial kernels, including agent/prose
+  regression gates; see the update for the kernel-only regression that led to it.
 - **Backoff ladder.** 16, then 32, 64, 128 consumed serial tokens
   (`16 << (bad_run-1)`, `bad_run` capped at 4). The cooldown is spent in consumed
   serial tokens, so a losing request spends at most 128 serial tokens before it
   tries again. **It never latches off.**
 - **Reasoning.** Reasoning spans decode serially by default; leaving one clears
-  the cooldown, because evidence gathered inside a reasoning span does not price
+  the cooldown and loss debt, because evidence gathered inside a reasoning span does not price
   the span after it.
 - **Evidence reset.** When the session's prefix stops being an extension of what
-  it was, the serial window, the cycle EMA and the open window are dropped. The
+  it was, the serial window, the cycle EMA and the open window are dropped. The loss debt resets too. The
   cooldown survives: it is request policy, not measured evidence.
 
 ### What was not ported from GLM, and why

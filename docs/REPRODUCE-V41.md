@@ -1,5 +1,9 @@
 # Reproducing the V4.1 Flash M3 Ultra numbers
 
+> This guide preserves the original release protocols. For the September 16
+> code, default-on optimizations, new production-path tests, numerical results,
+> and experiment records, start with [the update](RELEASE-V41-20260916.md).
+
 Everything in [V41_M3ULTRA.md](V41_M3ULTRA.md) comes from one measurement session
 on one machine. This file gives the bound identities, the fixtures, and the exact
 invocations, so a reader can tell what was measured and run it again.

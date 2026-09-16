@@ -3,6 +3,8 @@
 </p>
 
 
+**V4.1 on M3 Ultra:** this branch includes the [September 16 decode update](docs/RELEASE-V41-20260916.md), with all validated optimizations enabled by default. See the [setup and results](docs/V41_M3ULTRA.md), [experiment records](docs/experiments/v41-20260915/README.md), and [coding-agent prompting guide](docs/PROMPTING-V41.md).
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
