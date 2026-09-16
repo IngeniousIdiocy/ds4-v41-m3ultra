@@ -34,6 +34,7 @@ byte for byte, what upstream emits on the same prompt — see section 4.
 * [CHANGES-V41.md](../CHANGES-V41.md) — the engineering log: every adopted change, and everything tried and rejected, with receipts.
 * [REPRODUCE-V41.md](REPRODUCE-V41.md) — the benchmark invocations, the fixtures, the bound identities.
 * [DSPARK-V41.md](DSPARK-V41.md) — the support GGUF, the drafter, the admission controller, exact sampled decode, the width guard, EOS.
+* [PROMPTING-V41.md](PROMPTING-V41.md) — coding-agent guidance: draft in real files, test, and revise; includes a copyable prompt and observations from two game-building runs.
 * [bench/RELEASE-EVIDENCE-V41.md](../bench/RELEASE-EVIDENCE-V41.md) — which receipt directory and which binary stands behind each table below.
 * [THIRD_PARTY-V41.md](../THIRD_PARTY-V41.md) — upstream, DeepSeek's reference stack, weights licences.
 
@@ -237,6 +238,14 @@ and a fully cached Engram table do not both fit; one of them wins, and the cost
 of losing the page cache is prefill latency, not a memory alarm. Do not respond
 to memory pressure by dropping the Engram cache — that converts a memory alarm
 into a prefill regression.
+
+### Coding-agent prompting: draft in files
+
+For tool-using coding tasks, explicitly ask V4.1 to write a small runnable
+draft to a real file, test it, and revise from observed results. Settle the
+design choices up front. This can reduce the time spent drafting and
+reconsidering the implementation in reasoning before writing it.
+See [the copyable instruction block and observed results](PROMPTING-V41.md).
 
 ## 4. What is guaranteed
 
