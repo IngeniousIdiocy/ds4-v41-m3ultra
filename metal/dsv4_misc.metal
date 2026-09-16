@@ -7648,3 +7648,148 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+// Same lane dot, SIMD reduction, rounded product and head order as the
+// original scorer. Stage the query once for 32 keys, retain four keys per SIMD
+// group in registers, and avoid every per-head threadgroup rendezvous.
+// Derived from the independently validated GLM stream scorer in ds4's GLM fork.
+template<bool MASKED, bool COMPACT>
+inline void dsv41_indexer_stream_body(
+        constant ds4_metal_args_glm_indexer_score_one &args,
+        device const char *q, device const float *weights,
+        device const char *indexer_key_cache, device float *scores,
+        device const float *block_mask, device const uint *plan,
+        threadgroup float *qtg, uint tgid, ushort tid, ushort ntg,
+        ushort lane, ushort sg) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    const uint jobs = COMPACT ? (plan[0]>2048u ? args.n_rows : plan[0]*8u) : args.n_rows;
+    if (tgid*32u >= jobs) return;
+    threadgroup float4 *q4tg = (threadgroup float4 *)qtg;
+    {
+        device const float4 *q4src = (device const float4 *)q;
+        for (uint i = tid; i < 32u * 32u; i += ntg) q4tg[i] = q4src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n = args.n_rows;
+    const uint n_sg = (uint)ntg / 32u;
+    const uint job = ((uint)tgid * n_sg + (uint)sg)*4u;
+    if (job >= jobs) return;
+    const uint row0 = COMPACT && plan[0]<=2048u ? plan[4u+job/8u]*8u+job%8u : job;
+    if (row0 >= n) return;
+    // Four consecutive rows share one eight-row block; no mixed-mask SIMD group.
+    if (MASKED && !(block_mask[row0/8u] == 0.0f)) {
+        if (!lane) for (uint j=0; j<4u && row0+j<n; ++j) scores[row0+j]=-INFINITY;
+        return;
+    }
+
+    /* Clamp the tail rows onto the last valid row so the inner loop stays
+     * branch-free; their accumulators are simply never stored. */
+    const uint last = n - 1u;
+    const uint r1 = min(row0 + 1u, last);
+    const uint r2 = min(row0 + 2u, last);
+    const uint r3 = min(row0 + 3u, last);
+
+    float4 k0, k1, k2, k3;
+    if (args.cache_f16 != 0u) {
+        device const half4 *kh = (device const half4 *)indexer_key_cache;
+        k0 = float4(kh[(uint64_t)row0 * 32u + lane]);
+        k1 = float4(kh[(uint64_t)r1   * 32u + lane]);
+        k2 = float4(kh[(uint64_t)r2   * 32u + lane]);
+        k3 = float4(kh[(uint64_t)r3   * 32u + lane]);
+    } else {
+        device const float4 *kf = (device const float4 *)indexer_key_cache;
+        k0 = kf[(uint64_t)row0 * 32u + lane];
+        k1 = kf[(uint64_t)r1   * 32u + lane];
+        k2 = kf[(uint64_t)r2   * 32u + lane];
+        k3 = kf[(uint64_t)r3   * 32u + lane];
+    }
+
+    /* The direct kernel routes max(...)*weights[head] through threadgroup
+     * memory before accumulating, which forces the product to be rounded to
+     * f32 first.  Written as `acc += x * w` the fast-math compiler contracts
+     * the pair into one FMA and the score drifts by 1 ULP - enough to flip
+     * selection at the top-k cut.  fma(x, w, 0.0f) is the correctly rounded
+     * product and pins the multiply out of the accumulator. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint h = 0; h < 32u; h++) {
+        const float4 qv = q4tg[h * 32u + lane];
+        const float w = weights[h];
+        a0 = a0 + fma(max(simd_sum(dot(qv, k0)) * args.scale, 0.0f), w, 0.0f);
+        a1 = a1 + fma(max(simd_sum(dot(qv, k1)) * args.scale, 0.0f), w, 0.0f);
+        a2 = a2 + fma(max(simd_sum(dot(qv, k2)) * args.scale, 0.0f), w, 0.0f);
+        a3 = a3 + fma(max(simd_sum(dot(qv, k3)) * args.scale, 0.0f), w, 0.0f);
+    }
+
+    if (lane == 0) {
+        scores[row0] = a0;
+        if (row0 + 1u < n) scores[row0 + 1u] = a1;
+        if (row0 + 2u < n) scores[row0 + 2u] = a2;
+        if (row0 + 3u < n) scores[row0 + 3u] = a3;
+    }
+}
+
+kernel void kernel_dsv41_indexer_stream_direct(
+        constant ds4_metal_args_glm_indexer_score_one &args,
+        device const char *q, device const float *weights,
+        device const char *keys, device float *scores,
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]], ushort ntg [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    dsv41_indexer_stream_body<false,false>(
+        args,q,weights,keys,scores,weights,(device const uint *)weights,
+        qtg,tgid,tid,ntg,lane,sg);
+}
+
+kernel void kernel_dsv41_indexer_stream_masked(
+        constant ds4_metal_args_glm_indexer_score_one &args,
+        device const char *q, device const float *weights,
+        device const char *keys, device float *scores,
+        device const float *block_mask [[buffer(5)]],
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]], ushort ntg [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    dsv41_indexer_stream_body<true,false>(
+        args,q,weights,keys,scores,block_mask,(device const uint *)weights,
+        qtg,tgid,tid,ntg,lane,sg);
+}
+
+kernel void kernel_dsv41_indexer_stream_compact(
+        constant ds4_metal_args_glm_indexer_score_one &args,
+        device const char *q, device const float *weights,
+        device const char *keys, device float *scores,
+        device const float *block_mask [[buffer(5)]],
+        device const uint *plan [[buffer(6)]],
+        threadgroup float *qtg [[threadgroup(0)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]], ushort ntg [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    dsv41_indexer_stream_body<true,true>(
+        args,q,weights,keys,scores,block_mask,plan,
+        qtg,tgid,tid,ntg,lane,sg);
+}
+
+kernel void kernel_dsv41_index_mask_plan_stream(
+        constant uint &width [[buffer(0)]], device const float *mask [[buffer(1)]],
+        device uint *plan [[buffer(2)]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint count;
+    if (!tid) atomic_store_explicit(&count, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint block = tid; block < (width + 7u) / 8u; block += 256u) {
+        if (mask[block] == 0.0f) {
+            const uint slot = atomic_fetch_add_explicit(&count, 1u, memory_order_relaxed);
+            if (slot < 2048u) plan[4u + slot] = block;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!tid) {
+        const uint n = atomic_load_explicit(&count, memory_order_relaxed);
+        plan[0] = n;
+        plan[1] = n > 2048u ? (width+31u)/32u : (n+3u)/4u;
+        plan[2] = 1u;
+        plan[3] = 1u;
+    }
+}

@@ -870,6 +870,15 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+int ds4_gpu_matmul_q8_0_decode_rows_exact_round_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -1732,6 +1741,21 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         uint32_t              head_dim,
         float                 scale,
         bool                  cache_f16);
+
+#ifdef __APPLE__
+int ds4_gpu_dsv41_indexer_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16);
+#else
+#define ds4_gpu_dsv41_indexer_score_one_tensor ds4_gpu_glm_indexer_score_one_tensor
+#endif
 
 int ds4_gpu_glm_indexer_scores_batch_tensor(
         ds4_gpu_tensor       *scores,
@@ -2694,6 +2718,13 @@ int ds4_gpu_attention_output_q8_tp_tensor(
  */
 
 int ds4_gpu_swiglu_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t                n,
+        float                   clamp,
+        float                   weight);
+int ds4_gpu_dsv41_swiglu_round_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *up,

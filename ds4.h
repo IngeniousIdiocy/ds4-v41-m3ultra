@@ -209,6 +209,7 @@ typedef struct {
  *   hc_expand_fold DS4_DS41_HC_EXPAND_FOLD=0 disables                 (L3/R1b)
  *   mv_round     DS4_DS41_MV_ROUND=0 disables                         (L3/R2)
  *   producer_round DS4_DS41_PRODUCER_ROUND=0 disables                  (L3/R8')
+ *   ffn_producer DS4_DS41_FFN_PRODUCER=0 restores separate expansion
  *   ffn_add_fold DS4_DS41_FFN_ADD_FOLD=0 disables                      (L3/R8')
  *   kv_stage_f16 DS4_DS41_KV_STAGE_F16=0 disables                      (L3/R3a)
  *
@@ -242,6 +243,7 @@ typedef struct {
     int hc_norm_mix;
     int ffn_producer; /* DS4_DS41_FFN_PRODUCER=0 restores separate HC expansion */
     int qa_kv_flat; /* DS4_DS41_QA_KV_FLAT=0 restores separate projections */
+    int hc_stream_layout; /* 0=original, 2=validated four-channel query cohorts */
     int hc_stream; /* DS4_DS41_HC_STREAM=0 restores pre-wave-A sequence */
     int hc_tail;
     int hc_expand_fold;
@@ -269,6 +271,22 @@ typedef struct {
     int stage_gather;
     int index_topk_radix; /* Selector stage 3: exact conditional token selector. */
     int index_compact_score; /* Selector stage 2, independent of stage 1. */
+    int mtp_q8_trio_mask; /* Exact three-row Q8 reuse; default mask80 (outB/shared down). */
+    int markov_cache; /* Exact 64-entry per-drafter bias memoization. */
+    int markov_profile; /* Diagnostic timing only; default off. */
+    int router_simd; /* Exact batch top-six selection with bitonic tie fallback. */
+    int router_hier; /* Exact hierarchical serial-router selection. */
+    int mtp_down_wide; /* Validated exact scheduling/load variant; default on, =0 restores parent. */
+    int mtp_gu_sort_simd; /* Validated exact scheduling/load variant; default on, =0 restores parent. */
+    int mtp_swiglu_round; /* Exact shared activation store fold; default on. */
+    int mtp_q8_round; /* Exact BF16 store for decode batches; default on. */
+    int mtp_f32_rows; /* Exact router matvec rows in one launch; default on. */
+    int mtp_pointwise_batch; /* Batch independent verifier RoPE/KV quantization only. */
+    int mtp_f16_trio; /* Exact three-row reuse for six-row Engram projections. */
+    int mtp_gu_expert_sort; /* Group independent verifier GU jobs by expert ID. */
+    int mtp_q8_swizzle; /* Exact pair6 Q8 job ordering; default on, =0 restores parent. */
+    int mtp_gu_swizzle; /* Exact six-row Q4 GU job ordering; default on, =0 restores parent. */
+    int index_score_stream; /* Exact decode scorer; default on, =0 restores direct scorer. */
     int index_mask_score; /* Exact masked scorer, candidate default off. */
     /* Decode pass 2, D1: routed DOWN leg at NR0 = 1 (2,560 threadgroups).
      * DS4_DS41_Q4_DN_NR1=0 restores the two-rows-per-simdgroup grid. */
@@ -372,6 +390,7 @@ typedef struct {
      * widths are invalid; use serial generation for the one-row control.
      * dspark_expert_union = 1 reads the routed selection back per layer. */
     int dspark_verify_rows;
+    int dspark_loss_budget; /* DS4_DS41_DSPARK_LOSS_BUDGET=0 restores zero-tolerance windows */
     /* Windowed cost-feedback admission, ported from GLM DFlash2.  ADOPTED:
      * default 1; DS4_DS41_DSPARK_ADAPTIVE=0 proposes at every eligible
      * position and never backs off, which is the fixed-width control. */

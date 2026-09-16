@@ -18,7 +18,7 @@ static void decline(ds41_dspark_adaptive *a, double ms) {
 }
 
 int main(void) {
-    const ds41_adapt_config c = {16u, true, true, 0.75f, 3u};
+    const ds41_adapt_config c = {16u, true, true, 0.75f, 3u, false};
     ds41_dspark_adaptive a;
     ds41_adapt_begin(&a, c);
     assert(a.active && !a.invalid && !a.engaged);
@@ -132,6 +132,38 @@ int main(void) {
     a.skip_remaining = 64;
     ds41_adapt_reset_evidence(&a);
     assert(a.skip_remaining == 64 && a.serial_ms == 0.0 && !a.serial_count);
+
+    /* Marginal losses accumulate: four +4 ms windows exhaust a 16 ms budget
+     * only on the fifth window. A clear loss still backs off immediately. */
+    ds41_adapt_config tolerant = c; tolerant.loss_budget = true;
+    ds41_dspark_adaptive h;
+    ds41_adapt_begin(&h, tolerant);
+    for (unsigned i = 0; i < 16; i++) serial(&h, 32.0);
+    for (unsigned window = 0; window < 4; window++) {
+        cycle(&h, 128.0, 4); cycle(&h, 128.0, 4); cycle(&h, 132.0, 4);
+        assert(!h.skip_remaining && h.loss_debt_ms == 4.0 * (window + 1));
+    }
+    cycle(&h, 128.0, 4); cycle(&h, 128.0, 4); cycle(&h, 132.0, 4);
+    assert(h.skip_remaining == 16 && h.backoffs == 1 && h.loss_debt_ms == 0.0);
+    assert(h.net_ms == 20.0); /* accounting never hides the tolerated losses */
+    h.skip_remaining = 0;
+    decline(&h, 40.0); decline(&h, 40.0); decline(&h, 40.0);
+    assert(h.skip_remaining == 32 && h.backoffs == 2);
+
+    /* A profitable follow-up repays a near-break-even window; large earlier
+     * gains cannot subsidize an unlimited run of future losses. */
+    ds41_adapt_begin(&h, tolerant);
+    for (unsigned i = 0; i < 16; i++) serial(&h, 32.0);
+    cycle(&h, 129.0, 4); cycle(&h, 129.0, 4); cycle(&h, 129.0, 4);
+    assert(h.loss_debt_ms == 3.0 && !h.skip_remaining);
+    cycle(&h, 120.0, 4); cycle(&h, 120.0, 4); cycle(&h, 120.0, 4);
+    assert(h.loss_debt_ms == 0.0 && !h.skip_remaining);
+    h.loss_debt_ms = 10.0;
+    ds41_adapt_reset_evidence(&h);
+    assert(h.loss_debt_ms == 0.0);
+    h.loss_debt_ms = 10.0; h.reasoning = true;
+    ds41_adapt_reasoning(&h, false);
+    assert(h.loss_debt_ms == 0.0);
 
     puts("V4.1 DSpark windowed admission: PASS");
     return 0;

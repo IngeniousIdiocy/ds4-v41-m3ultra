@@ -39311,7 +39311,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(residual, DS4_N_HC * DS4_N_EMBD) \
     X(after_attn, DS4_N_HC * DS4_N_EMBD) \
     X(flat_norm, DS4_N_HC * DS4_N_EMBD) \
-    X(hc_counter, 1) X(mix, 24) X(attn_split, 24) X(ffn_split, 24) X(pre, 4) \
+    X(hc_counter, 33) X(mix, 24) X(attn_split, 24) X(ffn_split, 24) X(pre, 4) \
     X(x, DS4_N_EMBD) X(norm, DS4_N_EMBD) X(block, DS4_N_EMBD) \
     X(qr, DS4_N_LORA_Q) X(q, DS4_N_HEAD * DS4_N_HEAD_DIM) \
     X(kv, DS4_N_HEAD_DIM) X(latent, DS4_N_HEAD_DIM) \
@@ -39659,9 +39659,10 @@ ds41_levers g_ds41_levers = {
     .router_fused_w = 1,
     .shared_swiglu = 1,
     .hc_norm_mix = 1,
-    .ffn_producer = 0, /* wave 4: opt-in, epilogue diverges (WAVE4.md S3) */
+    .ffn_producer = 1, /* exact ordered-FMA producer epilogue */
     .qa_kv_flat = 1,
     .hc_stream = 1,
+    .hc_stream_layout = 2,
     .mtp_capture_warmup = 1,
     .mtp_state_fix = 1,
     .hc_tail = 1,
@@ -39728,7 +39729,7 @@ static int ds41_env_optin_form(const char *enable, const char *disable) {
 /* A counted lever carries a quantity, not a switch, so /debug/levers stores it
  * as given (inside its own range) instead of coercing it to 0/1. */
 static int ds41_lever_counted(const char *name) {
-    return !strcmp(name, "engram_readers") || !strcmp(name, "attn_diag") ||
+    return !strcmp(name, "mtp_q8_trio_mask") || !strcmp(name, "hc_stream_layout") || !strcmp(name, "engram_readers") || !strcmp(name, "attn_diag") ||
            !strcmp(name, "attn_geom") || !strcmp(name, "gather_wide") ||
            !strcmp(name, "hc_expand_nth") || !strcmp(name, "mtp_q8_stream6_mask") ||
            !strcmp(name, "dspark_verify_rows");
@@ -39753,6 +39754,7 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "hc_norm_mix",        offsetof(ds41_levers, hc_norm_mix),        "DS4_DS41_HC_NORM_MIX" },
     { "ffn_producer", offsetof(ds41_levers, ffn_producer), "DS4_DS41_FFN_PRODUCER" },
     { "qa_kv_flat", offsetof(ds41_levers, qa_kv_flat), "DS4_DS41_QA_KV_FLAT" },
+    { "hc_stream_layout", offsetof(ds41_levers, hc_stream_layout), "DS4_DS41_HC_STREAM_LAYOUT" },
     { "hc_stream", offsetof(ds41_levers, hc_stream), "DS4_DS41_HC_STREAM" },
     { "hc_tail",            offsetof(ds41_levers, hc_tail),            "DS4_DS41_HC_TAIL" },
     { "hc_expand_fold",     offsetof(ds41_levers, hc_expand_fold),     "DS4_DS41_HC_EXPAND_FOLD" },
@@ -39769,6 +39771,22 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "gather_wide",        offsetof(ds41_levers, gather_wide),        "DS4_DS41_GATHER_WIDE" },
     { "index_topk_radix", offsetof(ds41_levers, index_topk_radix), "DS4_DS41_INDEX_TOPK_RADIX" },
     { "index_compact_score", offsetof(ds41_levers, index_compact_score), "DS4_DS41_INDEX_COMPACT_SCORE" },
+    { "mtp_q8_trio_mask", offsetof(ds41_levers, mtp_q8_trio_mask), "DS4_DS41_MTP_Q8_TRIO_MASK" },
+    { "markov_cache", offsetof(ds41_levers, markov_cache), "DS4_DS41_MARKOV_CACHE" },
+    { "markov_profile", offsetof(ds41_levers, markov_profile), "DS4_DS41_MARKOV_PROFILE" },
+    { "router_simd", offsetof(ds41_levers, router_simd), "DS4_DS41_ROUTER_SIMD" },
+    { "router_hier", offsetof(ds41_levers, router_hier), "DS4_DS41_ROUTER_HIER" },
+    { "mtp_down_wide", offsetof(ds41_levers, mtp_down_wide), "DS4_DS41_MTP_DOWN_WIDE" },
+    { "mtp_gu_sort_simd", offsetof(ds41_levers, mtp_gu_sort_simd), "DS4_DS41_MTP_GU_SORT_SIMD" },
+    { "mtp_swiglu_round", offsetof(ds41_levers, mtp_swiglu_round), "DS4_DS41_MTP_SWIGLU_ROUND" },
+    { "mtp_q8_round", offsetof(ds41_levers, mtp_q8_round), "DS4_DS41_MTP_Q8_ROUND" },
+    { "mtp_f32_rows", offsetof(ds41_levers, mtp_f32_rows), "DS4_DS41_MTP_F32_ROWS" },
+    { "mtp_pointwise_batch", offsetof(ds41_levers, mtp_pointwise_batch), "DS4_DS41_MTP_POINTWISE_BATCH" },
+    { "mtp_f16_trio", offsetof(ds41_levers, mtp_f16_trio), "DS4_DS41_MTP_F16_TRIO" },
+    { "mtp_gu_expert_sort", offsetof(ds41_levers, mtp_gu_expert_sort), "DS4_DS41_MTP_GU_EXPERT_SORT" },
+    { "mtp_q8_swizzle", offsetof(ds41_levers, mtp_q8_swizzle), "DS4_DS41_MTP_Q8_SWIZZLE" },
+    { "mtp_gu_swizzle", offsetof(ds41_levers, mtp_gu_swizzle), "DS4_DS41_MTP_GU_SWIZZLE" },
+    { "index_score_stream", offsetof(ds41_levers, index_score_stream), "DS4_DS41_INDEX_SCORE_STREAM" },
     { "index_mask_score", offsetof(ds41_levers, index_mask_score), "DS4_DS41_INDEX_MASK_SCORE" },
     { "stage_gather",       offsetof(ds41_levers, stage_gather),       "DS4_DS41_STAGE_GATHER" },
     { "q4_dn_nr1",          offsetof(ds41_levers, q4_dn_nr1),          "DS4_DS41_Q4_DN_NR1" },
@@ -39798,6 +39816,7 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "dspark_capture",     offsetof(ds41_levers, dspark_capture),     "DS4_DS41_DSPARK_CAPTURE" },
     { "verify_wide_prefill", offsetof(ds41_levers, verify_wide_prefill), "DS4_DS41_VERIFY_WIDE_PREFILL" },
     { "dspark_verify_rows", offsetof(ds41_levers, dspark_verify_rows), "DS4_V41_DSPARK_VERIFY_ROWS" },
+    { "dspark_loss_budget", offsetof(ds41_levers, dspark_loss_budget), "DS4_DS41_DSPARK_LOSS_BUDGET" },
     { "dspark_adaptive",   offsetof(ds41_levers, dspark_adaptive),   "DS4_DS41_DSPARK_ADAPTIVE" },
     { "dspark_serve",      offsetof(ds41_levers, dspark_serve),      "DS4_DS41_DSPARK_SERVE" },
     { "dspark_reasoning_serial", offsetof(ds41_levers, dspark_reasoning_serial), "DS4_DS41_DSPARK_REASONING_SERIAL" },
@@ -39821,6 +39840,7 @@ void ds41_levers_init_from_env(void) {
      * off for 16/32/64/128 serial tokens.  DS4_DS41_DSPARK_ADAPTIVE=0 proposes
      * everywhere and never backs off, which is the fixed-six control. */
     g_ds41_levers.dspark_adaptive = ds41_env_enable_form("DS4_DS41_DSPARK_ADAPTIVE");
+    g_ds41_levers.dspark_loss_budget = ds41_env_enable_form("DS4_DS41_DSPARK_LOSS_BUDGET");
     /* Reasoning spans decode serially by default, as they do on GLM.
      * DS4_DS41_DSPARK_REASONING_SERIAL=0 lets the controller propose inside
      * <think>; measured acceptance there is 3.46 rows/cycle (THINK-ACCEPTANCE.md). */
@@ -39855,11 +39875,13 @@ void ds41_levers_init_from_env(void) {
     g_ds41_levers.router_fused_w     = ds41_env_enable_form("DS4_DS41_ROUTER_FUSED_W");
     g_ds41_levers.shared_swiglu      = ds41_env_enable_form("DS4_DS41_SHARED_SWIGLU");
     g_ds41_levers.hc_norm_mix        = ds41_env_enable_form("DS4_DS41_HC_NORM_MIX");
-    /* Wave 4: opt-in.  The copied epilogue is not byte-exact (WAVE4.md S3);
-     * setting DS4_DS41_FFN_PRODUCER=1 arms it for diagnosis only. */
-    g_ds41_levers.ffn_producer       = getenv("DS4_DS41_FFN_PRODUCER") != NULL &&
-                                       ds41_env_enable_form("DS4_DS41_FFN_PRODUCER");
+    /* The producer pins the standalone expansion's ordered FMAs.  Setting
+     * DS4_DS41_FFN_PRODUCER=0 restores the separate expansion for A/B checks. */
+    g_ds41_levers.ffn_producer       = ds41_env_enable_form("DS4_DS41_FFN_PRODUCER");
     g_ds41_levers.qa_kv_flat         = ds41_env_enable_form("DS4_DS41_QA_KV_FLAT");
+    { const char *v = getenv("DS4_DS41_HC_STREAM_LAYOUT");
+      const int layout = v ? atoi(v) : 2;
+      g_ds41_levers.hc_stream_layout = (layout == 0 || layout == 2) ? layout : 2; }
     g_ds41_levers.hc_stream          = ds41_env_enable_form("DS4_DS41_HC_STREAM");
     g_ds41_levers.hc_tail            = ds41_env_enable_form("DS4_DS41_HC_TAIL");
     g_ds41_levers.hc_expand_fold     = ds41_env_enable_form("DS4_DS41_HC_EXPAND_FOLD");
@@ -39953,6 +39975,24 @@ void ds41_levers_init_from_env(void) {
      * once the compact scorer, which supersedes it, is enabled. */
     g_ds41_levers.index_topk_radix = ds41_env_enable_form("DS4_DS41_INDEX_TOPK_RADIX");
     g_ds41_levers.index_compact_score = ds41_env_enable_form("DS4_DS41_INDEX_COMPACT_SCORE");
+    g_ds41_levers.index_score_stream = ds41_env_enable_form("DS4_DS41_INDEX_SCORE_STREAM");
+    g_ds41_levers.mtp_gu_swizzle = ds41_env_enable_form("DS4_DS41_MTP_GU_SWIZZLE");
+    { const char *v = getenv("DS4_DS41_MTP_Q8_TRIO_MASK");
+      const int mask = v ? atoi(v) : 80;
+      g_ds41_levers.mtp_q8_trio_mask = mask >= 0 && mask <= 127 ? mask : 0; }
+    g_ds41_levers.markov_cache = ds41_env_enable_form("DS4_DS41_MARKOV_CACHE");
+    g_ds41_levers.markov_profile = getenv("DS4_DS41_MARKOV_PROFILE") && atoi(getenv("DS4_DS41_MARKOV_PROFILE")) != 0;
+    g_ds41_levers.router_simd = ds41_env_enable_form("DS4_DS41_ROUTER_SIMD");
+    g_ds41_levers.router_hier = ds41_env_enable_form("DS4_DS41_ROUTER_HIER");
+    g_ds41_levers.mtp_down_wide = !getenv("DS4_DS41_MTP_DOWN_WIDE") || atoi(getenv("DS4_DS41_MTP_DOWN_WIDE")) != 0;
+    g_ds41_levers.mtp_gu_sort_simd = !getenv("DS4_DS41_MTP_GU_SORT_SIMD") || atoi(getenv("DS4_DS41_MTP_GU_SORT_SIMD")) != 0;
+    g_ds41_levers.mtp_swiglu_round = !getenv("DS4_DS41_MTP_SWIGLU_ROUND") || atoi(getenv("DS4_DS41_MTP_SWIGLU_ROUND")) != 0;
+    g_ds41_levers.mtp_q8_round = !getenv("DS4_DS41_MTP_Q8_ROUND") || atoi(getenv("DS4_DS41_MTP_Q8_ROUND")) != 0;
+    g_ds41_levers.mtp_f32_rows = !getenv("DS4_DS41_MTP_F32_ROWS") || atoi(getenv("DS4_DS41_MTP_F32_ROWS")) != 0;
+    g_ds41_levers.mtp_pointwise_batch = !getenv("DS4_DS41_MTP_POINTWISE_BATCH") || atoi(getenv("DS4_DS41_MTP_POINTWISE_BATCH")) != 0;
+    g_ds41_levers.mtp_f16_trio = ds41_env_enable_form("DS4_DS41_MTP_F16_TRIO");
+    g_ds41_levers.mtp_gu_expert_sort = ds41_env_enable_form("DS4_DS41_MTP_GU_EXPERT_SORT");
+    g_ds41_levers.mtp_q8_swizzle = ds41_env_enable_form("DS4_DS41_MTP_Q8_SWIZZLE");
     g_ds41_levers.index_mask_score = getenv("DS4_DS41_INDEX_MASK_SCORE") &&
         ds41_env_enable_form("DS4_DS41_INDEX_MASK_SCORE");
     g_ds41_levers.stage_gather = ds41_env_enable_form("DS4_DS41_STAGE_GATHER");
@@ -40002,14 +40042,16 @@ int ds41_levers_set(const char *name, int value) {
     for (size_t i = 0; i < ds41_levers_count(); i++) {
         if (!strcmp(name, g_ds41_lever_map[i].name)) {
             if (ds41_lever_counted(name)) {
-                const int lo = !strcmp(name, "attn_diag") ||
+                const int lo = !strcmp(name, "mtp_q8_trio_mask") || !strcmp(name, "hc_stream_layout") || !strcmp(name, "attn_diag") ||
                                !strcmp(name, "gather_wide") ||
                                !strcmp(name, "dspark_verify_rows") ||
                                !strcmp(name, "mtp_q8_stream6_mask") ? 0 : 1;
-                const int hi = !strcmp(name, "mtp_q8_stream6_mask") ? 127 :
+                const int hi = !strcmp(name, "mtp_q8_trio_mask") ? 127 : !strcmp(name, "hc_stream_layout") ? 3 :
+                               !strcmp(name, "mtp_q8_stream6_mask") ? 127 :
                                !strcmp(name, "attn_diag") ? 9 :
                                !strcmp(name, "dspark_verify_rows") ? 6 : 256;
                 if (value < lo || value > hi ||
+                    (!strcmp(name, "hc_stream_layout") && value != 0 && value != 2) ||
                     (!strcmp(name, "dspark_verify_rows") && value == 1)) return 0;
                 *(int *)((char *)&g_ds41_levers + g_ds41_lever_map[i].off) = value;
             } else {
@@ -40146,11 +40188,19 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * routing boundaries. The vocabulary head does not feed back into them. */
     if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && outputs != DS4_N_VOCAB &&
         weight->type == DS4_TENSOR_Q8_0) {
+        if (round && g_ds41_levers.mtp_q8_round)
+            return ds4_gpu_matmul_q8_0_decode_rows_exact_round_tensor(out, m->map, m->size,
+                weight->abs_offset, width, outputs, in, count);
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
+    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32 &&
+               g_ds41_levers.mtp_f32_rows && width == 5120u && outputs == 384u) {
+        /* Same scalar kernel and reduction tree; independent rows in grid.y. */
+        ok = ds4_gpu_matmul_f32_tensor(out, m->map, m->size, weight->abs_offset,
+                                      width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
         ok = true;
         for (uint32_t i = 0; ok && i < count; i++) {
@@ -40530,7 +40580,7 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             !(il > 20u && (g_ds41_levers.index_mask_score || g_ds41_levers.index_compact_score) && DS4_N_INDEXER_HEAD == 32u ?
                 ds4_gpu_dsv41_indexer_score_masked(g->index_scores, g->index_q, g->index_weights,
                     g->index_cache[owner], g->block_mask, n_comp, g_ds41_levers.index_compact_score) :
-                ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+                ds4_gpu_dsv41_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                     g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false))) return false;
     }
     return ds41_attention_pick(g, il);
@@ -40543,7 +40593,7 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
-                           const ds4_layer_weights *l, uint32_t il, bool projected) {
+                           const ds4_layer_weights *l, uint32_t il, bool projected, bool batch_pointwise) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -40569,9 +40619,10 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_matmul(g->kv, m, l->attn_kv, g->norm, true) ||
         !ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm))) return false;
     }
-    if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
+    if ((!batch_pointwise &&
+        (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
+         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
+         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0))) ||
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il)) return false;
@@ -40615,7 +40666,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_set_dsv41_stage_gather(NULL, NULL);
     if (!heads_ok ||
         (!heads_rounded && !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM)) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+        (!batch_pointwise && !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true))) return false;
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -40841,7 +40892,7 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
-    return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
+    return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false, false) &&
         ds41_graph_after_attention(g, m, l);
 }
 
@@ -41486,9 +41537,12 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ((shared_owner && g->tp_rank != (il & 1u)) ||
         ((ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
           ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true)) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+        ((g_ds41_levers.mtp_swiglu_round && count >= 2u && count <= DS4_TP_BATCH_MAX_ROWS) ?
+            ds4_gpu_dsv41_swiglu_round_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+                count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) :
+            (ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+                count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+             ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16))) &&
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
         ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
@@ -42261,7 +42315,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_USE_ATTN_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_ATTN_ROW)
 #undef DS41_USE_ATTN_ROW
-                    ok = ds41_attention(&row, m, l, il, true);
+                    ok = ds41_attention(&row, m, l, il, true, false);
                 }
                 DS41_STAGE("attention core/index");
                 if (ok && g->tp_world == 2) {
@@ -42522,6 +42576,16 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
             !g->quality && !g->streaming &&
             vc && rows == 6u && (g_ds41_levers.mtp_q8_pair6 || g_ds41_levers.mtp_q8_stream6) &&
             l->attn_output_a->type == DS4_TENSOR_Q8_0 && l->attn_output_b->type == DS4_TENSOR_Q8_0;
+        const bool batch_pointwise = output_rows2 && contiguous &&
+            g_ds41_levers.mtp_pointwise_batch;
+        /* Projections and row storage are already independent. Publish each
+         * KV row to its ring in the original chronological loop below. */
+        if (ok && batch_pointwise)
+            ok = ds4_gpu_dsv41_rope(active.q, DS4_N_HEAD_DIM, DS4_N_HEAD, rows,
+                                   positions[0], ds4_layer_compress_ratio(il) != 0u, false) &&
+                ds4_gpu_dsv41_rope(active.kv, DS4_N_HEAD_DIM, 1, rows,
+                                   positions[0], ds4_layer_compress_ratio(il) != 0u, false) &&
+                ds4_gpu_dsv41_quantize(active.kv, DS4_N_HEAD_DIM, rows, DS4_V41_FP8_E8M0);
         for (int i = 0; ok && !batch_core && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
@@ -42530,11 +42594,14 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
-            ok = ds41_attention(&row, model, l, il, true) &&
+            ok = ds41_attention(&row, model, l, il, true, batch_pointwise) &&
                 (output_rows2 || ds41_attention_output(&row, model, l));
             if (ok && vc && ds41_kv_source(il) && ds4_layer_compress_ratio(il) == 2u)
                 ok = ds41_verify_save_prev(vc, graphs[0], owner, (uint32_t)i);
         }
+        if (ok && batch_pointwise)
+            ok = ds4_gpu_dsv41_rope(active.heads, DS4_N_HEAD_DIM, DS4_N_HEAD, rows,
+                                   positions[0], ds4_layer_compress_ratio(il) != 0u, true);
         if (ok && output_rows2) {
             const int fold = g_ds41_levers.producer_round ? 1 : 0;
             ok = ds4_gpu_dsv41_attention_low_paired_tensor(active.low, model->map, model->size,
@@ -42661,6 +42728,11 @@ typedef struct {
     uint32_t stages, block, rows;      /* rows = block + 1: main_kv plus drafts */
     uint32_t n_expert, n_expert_used, n_ff_exp, markov_rank, vocab;
     bool     ready;
+    /* Bias depends only on predecessor and immutable support weights. Scope to
+     * this drafter, never share between models/sessions. Entries contain the
+     * literal CPU matvec output, preserving all proposal/confidence arithmetic. */
+    float *markov_bias_cache;
+    uint32_t markov_cache_keys[64], markov_cache_count, markov_cache_next;
     ds4_gpu_tensor *ring[DS4_DSPARK_MAX_STAGES];
     /* Shared scratch.  Sized for `rows`, viewed down to `block` where the
      * draft rows are the only ones that carry an hc stream. */
@@ -42724,6 +42796,8 @@ static DS4_MAYBE_UNUSED void ds41_dspark_free(ds41_dspark *d) {
     DS41_DSPARK_DROP(tokens); DS41_DSPARK_DROP(head_x); DS41_DSPARK_DROP(head_norm);
     DS41_DSPARK_DROP(logits); DS41_DSPARK_DROP(draft_token);
 #undef DS41_DSPARK_DROP
+    free(d->markov_bias_cache); d->markov_bias_cache = NULL;
+    d->markov_cache_count = d->markov_cache_next = 0;
     d->ready = false;
 }
 
@@ -43100,19 +43174,54 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov_greedy(
         ds41_dspark *d, int first_prev_token, float *logits_rows,
         int32_t proposal[DS4_DSPARK_MAX_BLOCK_SIZE]) {
     if (!d || !d->ready || !logits_rows || !proposal) return false;
-    /* Metal has no fused markov-argmax kernel (ds4_gpu_dspark_markov_argmax_tensor
-     * is CUDA-only), and it would buy little: the chain is five serial rank-256
-     * lookups plus five 129,280-wide argmaxes against a 22-23 GB verify pass.
-     * Read the base logits once and run the released chain on the CPU, which is
-     * the same routine the V4 Metal path uses. */
+    const bool profile = g_ds41_levers.markov_profile != 0;
+    const double t0 = profile ? ds41_now_us() : 0.0;
     float *state = malloc((size_t)d->markov_rank * sizeof(float));
     float *bias = malloc((size_t)d->vocab * sizeof(float));
-    uint32_t len = 0;
+    uint32_t len = 0, hits = 0;
     bool ok = state && bias &&
         ds4_gpu_tensor_read(d->logits, 0, logits_rows,
-                            (uint64_t)d->block * d->vocab * sizeof(float)) != 0 &&
-        dspark_apply_markov_greedy_probe(logits_rows, d->model, d->dw,
-            first_prev_token, 0, state, bias, proposal, &len) && len == d->block;
+                            (uint64_t)d->block * d->vocab * sizeof(float)) != 0;
+    const double t1 = profile ? ds41_now_us() : 0.0;
+    const bool cache = g_ds41_levers.markov_cache && !dspark_markov_bias_disabled();
+    if (ok && cache && !d->markov_bias_cache)
+        d->markov_bias_cache = malloc((size_t)64 * d->vocab * sizeof(float));
+    if (ok && cache && d->markov_bias_cache && dspark_markov_probe_ready(d->dw) &&
+        first_prev_token >= 0 && (uint32_t)first_prev_token < d->vocab) {
+        const ds4_dspark_stage_weights *final = &d->dw->stage[d->dw->n_stages-1u];
+        uint32_t prev = (uint32_t)first_prev_token;
+        for (uint32_t j = 0; j < d->block && ok; ++j) {
+            uint32_t slot = 0;
+            while (slot < d->markov_cache_count && d->markov_cache_keys[slot] != prev) ++slot;
+            const float *correction;
+            if (slot < d->markov_cache_count) {
+                correction = d->markov_bias_cache + (size_t)slot*d->vocab;
+                ++hits;
+            } else {
+                ok = dspark_dense_row_to_f32(state, d->model, final->markov_w1, prev);
+                if (!ok) break;
+                matvec_any(bias, d->model, final->markov_w2, state);
+                slot = d->markov_cache_count < 64 ? d->markov_cache_count++ : d->markov_cache_next;
+                d->markov_cache_next = (slot + 1u) % 64u;
+                float *entry = d->markov_bias_cache + (size_t)slot*d->vocab;
+                memcpy(entry, bias, (size_t)d->vocab*sizeof(float));
+                d->markov_cache_keys[slot] = prev;
+                correction = entry;
+            }
+            float *row = logits_rows + (size_t)j*d->vocab;
+            for (uint32_t i = 0; i < d->vocab; ++i) row[i] += correction[i];
+            prev = dspark_argmax_f32(row, d->vocab);
+            proposal[j] = (int32_t)prev;
+            ++len;
+        }
+    } else if (ok) {
+        ok = dspark_apply_markov_greedy_probe(logits_rows, d->model, d->dw,
+            first_prev_token, 0, state, bias, proposal, &len);
+    }
+    ok = ok && len == d->block;
+    const double t2 = profile ? ds41_now_us() : 0.0;
+    if (profile) fprintf(stderr, "ds41-markov cache=%d hits=%u/%u read_us=%.3f chain_us=%.3f\n",
+        cache, hits, d->block, t1-t0, t2-t1);
     free(state);
     free(bias);
     return ok;
@@ -43192,7 +43301,7 @@ static ds41_adapt_config ds41_adapt_config_read(void) {
      * same fraction of the trained block -- GLM declines below 4 of 7 (0.57),
      * V4.1 below 3 of 5 (0.60).  Documented `=` knobs, not levers: they change
      * which cycles are worth verifying, never what a verified cycle emits. */
-    ds41_adapt_config c = {16u, true, true, 0.75f, 3u};
+    ds41_adapt_config c = {16u, true, true, 0.75f, 3u, true};
     const char *entry = getenv("DS4_DS41_DSPARK_MIN_SERIAL_TOKENS");
     if (entry && entry[0]) {
         const long n = strtol(entry, NULL, 10);
@@ -43208,6 +43317,7 @@ static ds41_adapt_config ds41_adapt_config_read(void) {
         const long n = strtol(mind, NULL, 10);
         if (n >= 0 && n <= (long)DS4_DSPARK_MAX_BLOCK_SIZE) c.min_draft = (uint32_t)n;
     }
+    c.loss_budget = g_ds41_levers.dspark_loss_budget != 0;
     c.enabled = g_ds41_levers.dspark_adaptive != 0;
     c.reasoning_serial = g_ds41_levers.dspark_reasoning_serial != 0;
     return c;

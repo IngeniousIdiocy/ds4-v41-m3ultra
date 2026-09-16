@@ -8,10 +8,11 @@
  *
  * The policy, in one paragraph: PROPOSE BY DEFAULT at every eligible greedy
  * position.  Three complete attempts are judged together against the measured
- * serial step: a window whose net wall time is below serial engages and clears
- * any cooldown, a window that is not backs off for 16, then 32, 64 and 128
- * consumed serial tokens before proposing again.  The serial step cost is the
- * median of the last nine measured serial tokens, so one jittery token cannot
+ * serial step: a winning window engages and clears any cooldown. Small losses
+ * accumulate without banking earlier wins; exceeding half one serial step
+ * backs off for 16, then 32, 64 and 128 consumed serial tokens. The diagnostic
+ * loss_budget=0 arm restores immediate backoff on a non-winning window. The
+ * serial step cost is the median of the last nine measured serial tokens, so one jittery token cannot
  * move the decision; the full cycle carries an EMA for reporting.  A request
  * starts serial for sixteen tokens so the first window is judged against a
  * measured cost rather than a guess.  `<think>` spans decode serially by
@@ -56,6 +57,7 @@ typedef struct {
     bool enabled;                /* false: propose everywhere, never back off */
     float p_min;                 /* per-position confidence floor (GLM's 0.75) */
     uint32_t min_draft;          /* admitted prefix below this declines the cycle */
+    bool loss_budget;            /* bounded cumulative loss before backoff */
 } ds41_adapt_config;
 
 typedef struct {
@@ -63,6 +65,7 @@ typedef struct {
     bool active, invalid, engaged, reasoning;
     uint32_t bad_run, skip_remaining, window_calls;
     double window_net_ms;
+    double loss_debt_ms;         /* unrepaid window losses; wins repay, never bank credit */
     double serial_ms;            /* median of the last nine serial tokens */
     double serial_samples[DS41_ADAPT_SERIAL_WINDOW];
     uint32_t serial_count, serial_next;
@@ -105,6 +108,7 @@ static inline void ds41_adapt_reset_evidence(ds41_dspark_adaptive *a) {
     memset(a->serial_samples, 0, sizeof(a->serial_samples));
     a->window_calls = 0;
     a->window_net_ms = 0.0;
+    a->loss_debt_ms = 0.0;
     a->engaged = false;
 }
 
@@ -139,6 +143,7 @@ static inline void ds41_adapt_reasoning(ds41_dspark_adaptive *a, bool inside) {
     if (a->reasoning && !inside) {
         a->window_calls = a->bad_run = a->skip_remaining = 0u;
         a->window_net_ms = 0.0;
+        a->loss_debt_ms = 0.0;
         a->engaged = false;
     }
     a->reasoning = inside;
@@ -177,7 +182,8 @@ static inline void ds41_adapt_serial_sample(ds41_dspark_adaptive *a, double ms) 
  * `verified` separates the two kinds of chosen call.  Both are priced -- a
  * declined probe really did cost the drafter and really should discourage the
  * next one -- but only a call that asked the target to check something can be
- * counted as a losing cycle. */
+ * counted as a losing cycle. The bounded loss budget extends the GLM decision
+ * rule without changing this accounting. */
 static inline void ds41_adapt_window_feedback(ds41_dspark_adaptive *a, uint32_t consumed,
                                               double wall_ms, bool verified) {
     if (a->serial_ms <= 0.0) return;
@@ -188,14 +194,26 @@ static inline void ds41_adapt_window_feedback(ds41_dspark_adaptive *a, uint32_t 
     a->losing_cycles += verified && net >= 0.0;
     if (a->window_calls < DS41_ADAPT_WINDOW) return;
     a->windows++;
-    if (a->window_net_ms < 0.0) {
+    /* A tiny measured loss must not immediately discard the next MTP window.
+     * Carry losses until they exceed half one serial step. Wins repay this
+     * debt without banking credit, so repeated marginal losses still back off.
+     * The extra exploration cost before a losing window is bounded by that
+     * half-step budget; net_ms continues to report the actual measured cost. */
+    if (a->config.loss_budget) {
+        a->loss_debt_ms += a->window_net_ms;
+        if (a->loss_debt_ms < 0.0) a->loss_debt_ms = 0.0;
+    }
+    const bool within_budget = a->config.loss_budget &&
+                               a->loss_debt_ms <= 0.5 * a->serial_ms;
+    if (a->window_net_ms < 0.0 || within_budget) {
         a->engaged = true;
-        a->bad_run = a->skip_remaining = 0u;
+        if (a->window_net_ms < 0.0) a->bad_run = a->skip_remaining = 0u;
     } else {
         a->engaged = false;
         if (a->bad_run < DS41_ADAPT_BACKOFF_MAX) a->bad_run++;
         a->skip_remaining = DS41_ADAPT_BACKOFF_BASE << (a->bad_run - 1u);
         a->backoffs++;
+        a->loss_debt_ms = 0.0;
     }
     a->window_calls = 0u;
     a->window_net_ms = 0.0;

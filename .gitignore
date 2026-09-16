@@ -72,3 +72,24 @@ __pycache__/
 /tests/test_ds41_controller
 /tests/test_ds41_dspark_adaptive
 /tests/test_ds41_prefix
+
+# V4.1 decode schedule tests
+/tests/test_ds41_score_layout
+/tests/test_ds41_moe_order
+/tests/test_ds41_q8_order
+/tests/test_ds41_ffn_expand
+
+/tests/test_ds41_hc_layout
+
+# Decode materiality campaign synthetic tests
+/tests/test_ds41_material_paths
+/tests/test_ds41_q8_trio
+/tests/test_ds41_markov_cache
+/tests/test_ds41_f16_trio
+
+# Second decode campaign test executables
+tests/test_ds41_f32_rows
+tests/test_ds41_pointwise_batch
+/tests/test_ds41_batch_round
+
+/tests/test_ds41_release_defaults

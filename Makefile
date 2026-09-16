@@ -857,6 +857,7 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f $(DS41_BANDWIDTH_TESTS)
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
@@ -889,3 +890,33 @@ tests/test_ds41_prefix.o: tests/test_ds41_prefix.c ds4.c ds4.h ds4_gpu.h ds4_eng
 
 tests/test_ds41_prefix: tests/test_ds41_prefix.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
+# Exact V4.1 decode schedules; synthetic operands, no large model load.
+ifeq ($(UNAME_S),Darwin)
+.PHONY: test-ds41-decode-bandwidth
+DS41_BANDWIDTH_TESTS = tests/test_ds41_release_defaults tests/test_ds41_batch_round tests/test_ds41_pointwise_batch tests/test_ds41_f32_rows tests/test_ds41_f16_trio tests/test_ds41_material_paths tests/test_ds41_q8_trio tests/test_ds41_score_layout tests/test_ds41_moe_order tests/test_ds41_q8_order tests/test_ds41_ffn_expand tests/test_ds41_hc_layout
+$(DS41_BANDWIDTH_TESTS): %: %.c ds4.h ds4_gpu.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+test-ds41-decode-bandwidth: $(DS41_BANDWIDTH_TESTS)
+	./tests/test_ds41_release_defaults
+	DS4_DS41_MTP_DOWN_WIDE=0 DS4_DS41_MTP_GU_SORT_SIMD=0 DS4_DS41_MTP_SWIGLU_ROUND=0 DS4_DS41_MTP_Q8_ROUND=0 DS4_DS41_MTP_F32_ROWS=0 DS4_DS41_MTP_POINTWISE_BATCH=0 ./tests/test_ds41_release_defaults 0
+	./tests/test_ds41_batch_round
+	./tests/test_ds41_pointwise_batch
+	./tests/test_ds41_f32_rows
+	./tests/test_ds41_f16_trio
+	./tests/test_ds41_material_paths
+	./tests/test_ds41_q8_trio
+	./tests/test_ds41_score_layout
+	./tests/test_ds41_moe_order
+	DS4_DS41_MTP_GU_EXPERT_SORT=1 ./tests/test_ds41_moe_order
+	./tests/test_ds41_q8_order
+	./tests/test_ds41_ffn_expand
+	./tests/test_ds41_hc_layout
+endif
+
+ifeq ($(UNAME_S),Darwin)
+tests/test_ds41_markov_cache.o: tests/test_ds41_markov_cache.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
+tests/test_ds41_markov_cache: tests/test_ds41_markov_cache.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+endif

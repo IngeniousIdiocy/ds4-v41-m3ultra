@@ -15003,6 +15003,15 @@ static void wait_for_job_or_disconnect(server *s, job *j) {
     pthread_mutex_unlock(&j->mu);
 }
 
+/* An optional local marker lets an exclusive resident A/B session end without
+ * reloading weights. It never enables diagnostics by itself. Normal serving
+ * routes do not read it; removing it closes all diagnostic endpoints. */
+static bool server_debug_levers_enabled(const server *s) {
+    if (!s->debug_levers) return false;
+    const char *marker = getenv("DS4_DEBUG_LEVERS_FILE");
+    return !marker || !marker[0] || access(marker, F_OK) == 0;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -15023,7 +15032,7 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/bench")) {
         char lever_reject[192] = {0};
-        if (!s->debug_levers) {
+        if (!server_debug_levers_enabled(s)) {
             http_error(fd, s->enable_cors, 404, "unknown endpoint");
             http_request_free(&hr);
             goto done;
@@ -15131,7 +15140,7 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/prefill")) {
         char lever_reject[192] = {0};
-        if (!s->debug_levers) {
+        if (!server_debug_levers_enabled(s)) {
             http_error(fd, s->enable_cors, 404, "unknown endpoint");
             http_request_free(&hr);
             goto done;
@@ -15246,7 +15255,7 @@ static void *client_main(void *arg) {
      * load plus a prefill.  Only reachable with --debug-levers. */
     if (!strcmp(hr.path, "/debug/levers") &&
         (!strcmp(hr.method, "GET") || !strcmp(hr.method, "POST"))) {
-        if (!s->debug_levers) {
+        if (!server_debug_levers_enabled(s)) {
             http_error(fd, s->enable_cors, 404, "unknown endpoint");
             http_request_free(&hr);
             goto done;
