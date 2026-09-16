@@ -1,0 +1,27 @@
+PASS overlap0 complete outputs exact
+overlap0 arm0 us=375.043
+overlap0 arm1 us=363.942
+overlap0 arm1 us=366.625
+overlap0 arm0 us=375.221
+overlap0 arm0 us=375.746
+overlap0 arm1 us=364.872
+overlap0 arm1 us=364.889
+overlap0 arm0 us=375.450
+PASS overlap3 complete outputs exact
+overlap3 arm0 us=338.288
+overlap3 arm1 us=317.614
+overlap3 arm1 us=318.197
+overlap3 arm0 us=338.104
+overlap3 arm0 us=339.797
+overlap3 arm1 us=317.761
+overlap3 arm1 us=318.062
+overlap3 arm0 us=337.594
+PASS overlap6 complete outputs exact
+overlap6 arm0 us=313.411
+overlap6 arm1 us=285.806
+overlap6 arm1 us=285.379
+overlap6 arm0 us=313.453
+overlap6 arm0 us=313.821
+overlap6 arm1 us=285.490
+overlap6 arm1 us=286.104
+overlap6 arm0 us=311.146

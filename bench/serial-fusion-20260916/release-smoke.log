@@ -1,0 +1,13 @@
+PASS long API cache guard
+smoke-code-warm-A A tokens 132 decode 2.796 answer 2.796 cycles 17 declines 6 hash 9659a5ed0c5d
+smoke-code-warm-B B tokens 132 decode 2.679 answer 2.679 cycles 17 declines 6 hash 9659a5ed0c5d
+smoke-code-0-A A tokens 132 decode 2.772 answer 2.772 cycles 17 declines 6 hash 9659a5ed0c5d
+smoke-code-1-B B tokens 132 decode 2.68 answer 2.68 cycles 17 declines 6 hash 9659a5ed0c5d
+smoke-code-2-B B tokens 132 decode 2.681 answer 2.681 cycles 17 declines 6 hash 9659a5ed0c5d
+smoke-code-3-A A tokens 132 decode 2.771 answer 2.771 cycles 17 declines 6 hash 9659a5ed0c5d
+smoke-agent-A10-0-A A tokens 438 decode 10.322 answer 4.815 cycles 47 declines 12 hash 0a64bb6f4347
+smoke-agent-A10-1-B B tokens 438 decode 9.935 answer 4.738 cycles 47 declines 12 hash 0a64bb6f4347
+smoke-agent-A10-2-A A tokens 438 decode 10.306 answer 4.822 cycles 47 declines 12 hash 0a64bb6f4347
+smoke-prose-A A tokens 512 decode 15.163 answer 15.163 cycles 0 declines 18 hash e98f676ff1b0
+smoke-prose-B B tokens 512 decode 14.224 answer 14.224 cycles 0 declines 18 hash e98f676ff1b0
+PASS bounded normal-controller serving check

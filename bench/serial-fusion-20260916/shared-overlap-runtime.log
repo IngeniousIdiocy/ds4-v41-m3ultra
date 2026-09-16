@@ -1,0 +1,9 @@
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+q4_wide=1
+ds4: Metal model views created in 0.612 ms, residency requested in 50.251 ms, warmup 7.104 ms (mapped 7301.95 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+[shared-down-overlap] joined shared Q8 down and group6 routed GU
+controls 64/64
+PASS 2294016 exact producer-chain words

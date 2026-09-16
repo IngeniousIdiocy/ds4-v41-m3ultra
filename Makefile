@@ -92,8 +92,8 @@ help:
 ds4: ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-server: ds4_server.o ds4_score.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_score.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -225,9 +225,9 @@ tests/test_metal_dense_mpp: tests/test_metal_dense_mpp.o $(CORE_OBJS)
 test-metal-dense-mpp: tests/test_metal_dense_mpp
 	./tests/test_metal_dense_mpp
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_score.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_score.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -300,7 +300,7 @@ test-rocm:
 ds4: ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
+ds4-server: ds4_server.o ds4_score.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS)
@@ -338,9 +338,9 @@ tests/test_cuda_dspark_moe: tests/test_cuda_dspark_moe.o $(CORE_OBJS)
 test-cuda-dspark-moe: tests/test_cuda_dspark_moe
 	./tests/test_cuda_dspark_moe
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
+cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_score.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_score.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -765,11 +765,11 @@ test-cuda-mixed-batch: tests/test_cuda_mixed_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_mixed_batch
 endif
 
-ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
+ds4_test: ds4_test.o ds4_score.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
-	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_score.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(DS4_LINK) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(DS4_LINK_LIBS)
+	$(DS4_LINK) -o $@ ds4_test.o ds4_score.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(DS4_LINK_LIBS)
 endif
 
 ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
@@ -899,7 +899,7 @@ $(DS41_BANDWIDTH_TESTS): %: %.c ds4.h ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 test-ds41-decode-bandwidth: $(DS41_BANDWIDTH_TESTS)
 	./tests/test_ds41_release_defaults
-	DS4_DS41_MTP_DOWN_WIDE=0 DS4_DS41_MTP_GU_SORT_SIMD=0 DS4_DS41_MTP_SWIGLU_ROUND=0 DS4_DS41_MTP_Q8_ROUND=0 DS4_DS41_MTP_F32_ROWS=0 DS4_DS41_MTP_POINTWISE_BATCH=0 ./tests/test_ds41_release_defaults 0
+	DS4_DS41_MTP_DOWN_WIDE=0 DS4_DS41_MTP_GU_SORT_SIMD=0 DS4_DS41_MTP_SWIGLU_ROUND=0 DS4_DS41_MTP_Q8_ROUND=0 DS4_DS41_MTP_F32_ROWS=0 DS4_DS41_MTP_POINTWISE_BATCH=0 DS4_DS41_ATTN_OUT_HC=0 DS4_DS41_ROUTER_SHARED_HC=0 DS4_DS41_DOWN_TAIL_PACK=0 DS4_DS41_MTP_HC_EPILOGUE=0 DS4_DS41_MTP_DOWN_TAIL_PACK=0 DS4_DS41_Q8_VIRTUAL_DOWN=0 DS4_DS41_Q8_VIRTUAL_QUERY=0 DS4_DS41_KV_PREPARE=0 DS4_DS41_KV_QUERY_MIX=0 ./tests/test_ds41_release_defaults 0
 	./tests/test_ds41_batch_round
 	./tests/test_ds41_pointwise_batch
 	./tests/test_ds41_f32_rows
@@ -920,3 +920,9 @@ tests/test_ds41_markov_cache.o: tests/test_ds41_markov_cache.c ds4.c ds4.h ds4_g
 tests/test_ds41_markov_cache: tests/test_ds41_markov_cache.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 endif
+
+# Quality metrics must use the same strict arithmetic as score_official.
+ds4_score.o: ds4_score.c ds4_score.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -c -o $@ $<
+
+ds4_server.o ds4_server_cpu.o ds4_test.o: ds4_score.h

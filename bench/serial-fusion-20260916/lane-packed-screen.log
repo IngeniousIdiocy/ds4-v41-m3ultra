@@ -1,0 +1,2 @@
+CHECKER SELFTEST PASS first/middle/last mismatches, NaN, infinity, guards, control
+FAIL draws0..50 mismatch3463098 poison0 guard0 controls50

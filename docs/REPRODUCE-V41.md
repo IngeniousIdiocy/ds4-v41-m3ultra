@@ -1,5 +1,7 @@
 # Reproducing the V4.1 Flash M3 Ultra numbers
 
+For the latest nine-path consolidation, see the [current controls and results](DECODE-CONSOLIDATION-20260916.md) and [integration checks/evidence](../bench/serial-fusion-20260916/README.md). Earlier commands and release identities below remain historical reproductions.
+
 > This guide preserves the original release protocols. For the September 16
 > code, default-on optimizations, new production-path tests, numerical results,
 > and experiment records, start with [the update](RELEASE-V41-20260916.md).

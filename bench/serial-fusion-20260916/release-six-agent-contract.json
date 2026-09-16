@@ -1,0 +1,87 @@
+{
+  "passed": true,
+  "tag": "release-six-agent",
+  "cases": [
+    {
+      "file": "release-six-agent-8192-0-control.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.0427,
+      "warmup": true
+    },
+    {
+      "file": "release-six-agent-8192-0-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.7178,
+      "warmup": true
+    },
+    {
+      "file": "release-six-agent-8192-1-control.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.1493,
+      "warmup": false
+    },
+    {
+      "file": "release-six-agent-8192-1-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.8127,
+      "warmup": false
+    },
+    {
+      "file": "release-six-agent-8192-2-control.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.1272,
+      "warmup": false
+    },
+    {
+      "file": "release-six-agent-8192-2-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.7547,
+      "warmup": false
+    },
+    {
+      "file": "release-six-agent-8192-3-control.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.1465,
+      "warmup": false
+    },
+    {
+      "file": "release-six-agent-8192-3-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.7249,
+      "warmup": false
+    },
+    {
+      "file": "release-six-agent-8192-4-control.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.1854,
+      "warmup": false
+    },
+    {
+      "file": "release-six-agent-8192-4-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "37499efba41f6bca24a464968b9f2bc41b207376eff65f23277d8f103fc299a4",
+      "steady_tps": 38.7601,
+      "warmup": false
+    }
+  ],
+  "mtp_work_fields": [
+    "dspark_cycles",
+    "dspark_committed",
+    "dspark_verified_rows",
+    "dspark_processed_rows",
+    "dspark_serial_rows",
+    "dspark_attempts",
+    "dspark_skipped_steps",
+    "dspark_declines",
+    "dspark_accept_hist"
+  ]
+}

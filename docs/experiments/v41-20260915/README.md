@@ -20,3 +20,9 @@ These records retain preliminary screens, superseded measurements, failed builds
 - [DECODE-ANSWER50-20260915.md](DECODE-ANSWER50-20260915.md)
 - [DECODE-ANSWER50-EXPERIMENTS-20260915.md](DECODE-ANSWER50-EXPERIMENTS-20260915.md)
 - [OMLX-DSPARK-REVIEW-20260915.md](OMLX-DSPARK-REVIEW-20260915.md)
+
+## Later serial/MTP consolidation
+
+- [Complete September 16 experiment ledger](../../../bench/serial-fusion-20260916/EXPERIMENTS.md): accepted fusions, tail packing, Q8 mapping, KV preparation, failed expert splits and all corrected tests.
+- [Current release and verdict summary](../../DECODE-CONSOLIDATION-20260916.md).
+- [Numerical evidence](../../../bench/serial-fusion-20260916/README.md).

@@ -241,6 +241,15 @@ typedef struct {
     int router_fused_w;
     int shared_swiglu;
     int hc_norm_mix;
+    int mtp_down_tail_pack; /* exact six-row ninth-block packing */
+    int mtp_hc_epilogue; /* exact two/six-row residual epilogue */
+    int down_tail_pack; /* exact four-row ninth-block packing */
+    int router_shared_hc; /* independent producer mixed grid */
+    int q8_virtual_down; /* four logical K groups per physical SIMD */
+    int q8_virtual_query; /* same mapping inside query/HC grid */
+    int kv_prepare; /* exact scalar KV norm/rope/quantize/ring fusion */
+    int kv_query_mix; /* independent KV task inside query/HC grid */
+    int attn_out_hc; /* serial attention producer fusion */
     int ffn_producer; /* DS4_DS41_FFN_PRODUCER=0 restores separate HC expansion */
     int qa_kv_flat; /* DS4_DS41_QA_KV_FLAT=0 restores separate projections */
     int hc_stream_layout; /* 0=original, 2=validated four-channel query cohorts */
@@ -251,7 +260,6 @@ typedef struct {
     int producer_round;
     int ffn_add_fold;
     int kv_stage_f16;
-    int routed_down_split; /* DS4_DS41_ROUTED_DOWN_SPLIT=1 arms R4 (opt-in) */
     /* Prefill cost map.  prefill_8k_chunk moves the ENCODER CHUNK only: the
      * graph's batch buffers are sized from the startup value of the same
      * switch, so flipping it at runtime shrinks the chunk without shrinking

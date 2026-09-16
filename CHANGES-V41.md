@@ -1,5 +1,8 @@
 # Optimizations on the V4.1 Flash M3 Ultra branch
 
+> **Latest update:** [September 16 decode consolidation](docs/DECODE-CONSOLIDATION-20260916.md).
+> The measurements and release identity below describe the earlier release stage.
+
 ## September 16 update
 
 The [current release log](docs/RELEASE-V41-20260916.md) covers all validated gains since launch, enabled by default. The [chronological experiment records](docs/experiments/v41-20260915/README.md) include adopted, rejected, invalid and unrun experiments. Rejected implementations were culled from the source; their evidence is retained.

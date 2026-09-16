@@ -1,0 +1,72 @@
+program_source:25:9: warning: 'M_PI_F' macro redefined [-Wmacro-redefined]
+#define M_PI_F 3.14159265358979323846f
+        ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_types:294:9: note: previous definition is here
+#define M_PI_F __FLT_M_PI__
+        ^
+program_source:18285:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+program_source:18464:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+program_source:18476:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+program_source:22361:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+program_source:32558:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+program_source:32573:36: warning: 'mem_device_and_threadgroup' is deprecated: use mem_device or mem_threadgroup instead [-Wdeprecated-declarations]
+    threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
+                                   ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_compute:27:30: note: 'mem_device_and_threadgroup' has been explicitly marked deprecated here
+  mem_device_and_threadgroup METAL_DEPRECATED("use mem_device or mem_threadgroup instead") = mem_device | mem_threadgroup
+                             ^
+/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.886/include/metal/metal_types:17:47: note: expanded from macro 'METAL_DEPRECATED'
+#define METAL_DEPRECATED(M...) __attribute__((deprecated(M)))
+                                              ^
+program_source:32922:32: error: use of undeclared identifier 'QK_K'
+    const int nb = args.ne00 / QK_K;
+                               ^
+program_source:32947:43: error: use of undeclared identifier 'QK_K'
+        device const float *y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+                                          ^
+program_source:33016:23: error: use of undeclared identifier 'QK_K'
+            y4 += 4 * QK_K;
+                      ^
+program_source:33021:26: error: use of undeclared identifier 'QK_K'
+            y4 = y + 8 * QK_K + 64 * iq + 8 * ir;
+                         ^

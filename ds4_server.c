@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_tool_text.h"
+#include "ds4_score.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
@@ -5582,6 +5583,11 @@ static bench_fixture *bench_fixture_get(ds4_engine *e, const char *path,
         }
     }
 
+    if (!f->have_snap && getenv("DS4_BENCH_REQUIRE_DISK_KV")) {
+        snprintf(err, errlen, "required disk KV fixture missing or incompatible: %s", snap_path);
+        bench_fixture_reset(f);
+        return NULL;
+    }
     if (!f->have_snap) {
         ds4_tokens prefix = { .v = f->prompt.v, .len = ctx_start, .cap = ctx_start };
         const double t0 = bench_now_sec_srv();
@@ -5613,10 +5619,35 @@ static bench_fixture *bench_fixture_get(ds4_engine *e, const char *path,
 /* Returns a malloc'd JSON body, or NULL with err set. */
 static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
                        int ctx_alloc, int gen_tokens, bool fresh, bool dspark,
-                       const char *bench_ledger_dump,
+                       const char *bench_ledger_dump, const char *replay_path,
                        char *err, size_t errlen) {
     pthread_mutex_lock(&g_bench_mu);
     char *out = NULL;
+    int *replay = NULL;
+    if (replay_path) {
+        if (dspark || gen_tokens < 1 || gen_tokens > 8192) {
+            snprintf(err, errlen, "replay requires serial decode and 1..8192 tokens");
+            goto out;
+        }
+        char *data = bench_read_file(replay_path, NULL);
+        replay = calloc((size_t)gen_tokens, sizeof(int));
+        if (!data || !replay) {
+            free(data); snprintf(err, errlen, "cannot load replay tokens"); goto out;
+        }
+        const char *cursor = data;
+        bool valid = true;
+        const int vocab = ds4_engine_vocab_size(e);
+        for (int i = 0; i < gen_tokens; ++i) {
+            while (isspace((unsigned char)*cursor)) ++cursor;
+            char *end = NULL; errno = 0;
+            long value = strtol(cursor, &end, 10);
+            if (end == cursor || errno || value < 0 || value >= vocab ||
+                (*end && !isspace((unsigned char)*end))) { valid = false; break; }
+            replay[i] = (int)value; cursor = end;
+        }
+        free(data);
+        if (!valid) { snprintf(err, errlen, "invalid or short replay token file"); goto out; }
+    }
     bool created = false;
     bench_fixture *f = bench_fixture_get(e, path, ctx_start, ctx_alloc, fresh,
                                          &created, err, errlen);
@@ -5654,7 +5685,7 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     int *toks = calloc((size_t)(gen_tokens > 0 ? gen_tokens : 1), sizeof(int));
     if (!toks) { snprintf(err, errlen, "oom"); goto out; }
     double first_sec = 0.0, steady_sec = 0.0;
-    int done = 0;
+    int done = 0, replay_matches = 0;
     /* The DSpark arm runs the same fixture, the same restored prefix and the
      * same greedy rule; only the number of target rows per pass differs, so
      * the text must match the serial arm token for token. */
@@ -5673,7 +5704,9 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     }
     const double gen_t0 = bench_now_sec_srv();
     while (!dspark && done < gen_tokens) {
-        const int token = ds4_session_argmax_excluding(f->session, eos);
+        const int predicted = ds4_session_argmax_excluding(f->session, eos);
+        const int token = replay ? replay[done] : predicted;
+        if (replay && token == predicted) ++replay_matches;
         if (token < 0) { snprintf(err, errlen, "argmax failed"); free(toks); goto out; }
         const double t0 = bench_now_sec_srv();
         if (ds4_session_eval(f->session, token, serr, sizeof(serr)) != 0) {
@@ -5726,6 +5759,11 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
             buf_printf(&b, "%s%u", i > 8 ? "," : "", radix1[i]-radix0[i]);
         buf_puts(&b, "]");
     }
+    buf_printf(&b, ",\"forced_replay\":%s", replay ? "true" : "false");
+    if (replay) buf_printf(&b, ",\"replay_top1_matches\":%d", replay_matches);
+    buf_puts(&b, ",\"token_ids\":[");
+    for (int i = 0; i < done; ++i) buf_printf(&b, "%s%d", i ? "," : "", toks[i]);
+    buf_puts(&b, "]");
     buf_printf(&b, ",\"dspark\":%s", dspark ? "true" : "false");
     if (dspark) {
         buf_printf(&b, ",\"dspark_cycles\":%u,\"dspark_committed\":%u"
@@ -5778,6 +5816,120 @@ static char *bench_run(ds4_engine *e, const char *path, int ctx_start,
     out = buf_take(&b);
     buf_free(&b);
 out:
+    free(replay);
+    pthread_mutex_unlock(&g_bench_mu);
+    return out;
+}
+
+/* Resident counterpart of score_official's single-session teacher forcing.
+ * Cache creation is explicit and belongs to the control arm. Later arms
+ * restore that exact prefix; no model reload or repeated prompt prefill.
+ * This is a quality instrument, not a decode throughput measurement. */
+static char *bench_score(ds4_engine *e, const char *prompt_path,
+                         const char *target_path, int ctx_alloc, bool cache_create,
+                         char *err, size_t errlen) {
+    pthread_mutex_lock(&g_bench_mu);
+    char *out = NULL, *prompt_text = NULL, *target_text = NULL;
+    ds4_tokens prompt = {0}, target = {0};
+    ds4_session *session = NULL;
+    ds4_session_snapshot snap = {0};
+    float *logits = NULL;
+    bool from_disk = false, prefilled = false;
+    if (!target_path || !g_bench_snap_dir) {
+        snprintf(err, errlen, "score needs continuation_path and a KV directory");
+        goto done;
+    }
+    prompt_text = bench_read_file(prompt_path, NULL);
+    target_text = bench_read_file(target_path, NULL);
+    if (!prompt_text || !target_text) {
+        snprintf(err, errlen, "cannot read score prompt or continuation"); goto done;
+    }
+    ds4_encode_chat_prompt(e, NULL, prompt_text, DS4_THINK_NONE, &prompt);
+    ds4_tokenize_text(e, target_text, &target);
+    if (prompt.len < 1 || target.len < 1 || prompt.len + target.len + 1 >= ctx_alloc) {
+        snprintf(err, errlen, "invalid score lengths or insufficient context"); goto done;
+    }
+    /* The token sequence is checked again after restore, so even a hash
+     * collision cannot silently substitute another prompt. Snapshot loading
+     * retains the engine's model/payload compatibility checks. */
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int i = 0; i < prompt.len; ++i) {
+        uint32_t token = (uint32_t)prompt.v[i];
+        for (int j = 0; j < 4; ++j) {
+            hash = (hash ^ ((token >> (j * 8)) & 255u)) * UINT64_C(1099511628211);
+        }
+    }
+    char cache_path[1024];
+    int cn = snprintf(cache_path, sizeof(cache_path), "%s/ds41-score-v1-%016llx-%d.snap",
+                      g_bench_snap_dir, (unsigned long long)hash, ctx_alloc);
+    if (cn < 0 || (size_t)cn >= sizeof(cache_path) ||
+        ds4_session_create(&session, e, ctx_alloc) != 0) {
+        snprintf(err, errlen, "score session/cache path failed"); goto done;
+    }
+    size_t disk_len = 0;
+    char *disk = bench_read_file(cache_path, &disk_len);
+    if (disk) {
+        snap.ptr = (uint8_t *)disk; snap.len = disk_len; snap.cap = disk_len + 1;
+        if (ds4_session_load_snapshot(session, &snap, err, errlen) != 0) goto done;
+        from_disk = true;
+    } else {
+        if (!cache_create) {
+            snprintf(err, errlen, "score prefix cache absent; create it with the control arm");
+            goto done;
+        }
+        if (ds4_session_sync(session, &prompt, err, errlen) != 0 ||
+            ds4_session_save_snapshot(session, &snap, err, errlen) != 0) goto done;
+        char temp_path[1100];
+        snprintf(temp_path, sizeof(temp_path), "%s.tmp", cache_path);
+        FILE *fp = fopen(temp_path, "wb");
+        if (!fp) { snprintf(err, errlen, "cannot create score prefix cache"); goto done; }
+        bool saved = fwrite(snap.ptr, 1, (size_t)snap.len, fp) == (size_t)snap.len;
+        if (fclose(fp) != 0) saved = false;
+        if (!saved || rename(temp_path, cache_path) != 0) {
+            unlink(temp_path); snprintf(err, errlen, "score prefix cache write failed"); goto done;
+        }
+        prefilled = true;
+        /* Both arms score from the snapshot-restored state. */
+        if (ds4_session_load_snapshot(session, &snap, err, errlen) != 0) goto done;
+    }
+    const ds4_tokens *restored = ds4_session_tokens(session);
+    if (!restored || restored->len != prompt.len ||
+        memcmp(restored->v, prompt.v, (size_t)prompt.len * sizeof(int)) != 0) {
+        snprintf(err, errlen, "score prefix token identity mismatch"); goto done;
+    }
+    int vocab = ds4_engine_vocab_size(e), lcp = 0, first_match = 0;
+    double nll = 0.0;
+    bool matching = true;
+    logits = malloc((size_t)vocab * sizeof(float));
+    if (!logits) { snprintf(err, errlen, "score logits allocation failed"); goto done; }
+    for (int i = 0; i < target.len; ++i) {
+        if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+            snprintf(err, errlen, "score logits copy failed"); goto done;
+        }
+        int greedy = -1;
+        if (!ds4_score_logits(logits, vocab, target.v[i], &nll, &greedy)) {
+            snprintf(err, errlen, "invalid/nonfinite score logits or target"); goto done;
+        }
+        if (i == 0) first_match = greedy == target.v[i];
+        if (matching && greedy == target.v[i]) ++lcp; else matching = false;
+        if (ds4_session_eval(session, target.v[i], err, errlen) != 0) goto done;
+    }
+    buf b = {0};
+    buf_printf(&b, "{\"prompt_tokens\":%d,\"target_tokens\":%d,\"nll\":%.17g,"
+                  "\"avg_nll\":%.17g,\"first_match\":%d,\"greedy_lcp\":%d,"
+                  "\"prefix_from_disk\":%s,\"prefilled_now\":%s,\"levers\":{",
+               prompt.len, target.len, nll, nll / target.len, first_match, lcp,
+               from_disk ? "true" : "false", prefilled ? "true" : "false");
+    for (size_t i = 0; i < ds41_levers_count(); ++i) {
+        int value = 0; ds41_levers_get(ds41_levers_name(i), &value);
+        buf_printf(&b, "%s\"%s\":%d", i ? "," : "", ds41_levers_name(i), value);
+    }
+    buf_puts(&b, "}}"); out = buf_take(&b); buf_free(&b);
+done:
+    free(logits); free(prompt_text); free(target_text);
+    ds4_tokens_free(&prompt); ds4_tokens_free(&target);
+    ds4_session_snapshot_free(&snap);
+    if (session) ds4_session_free(session);
     pthread_mutex_unlock(&g_bench_mu);
     return out;
 }
@@ -13408,6 +13560,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
     const int prompt_tokens = prompt_for_sync->len;
+    /* Decode campaign guard: long API replays must restore their whole prefix.
+     * Small ordinary API prompts still exercise the real serving path. This is
+     * disabled outside an explicitly enabled diagnostic server. */
+    if (s->debug_levers && getenv("DS4_BENCH_REQUIRE_CACHED_API") &&
+        prompt_tokens >= 512 && cached != prompt_tokens) {
+        snprintf(err, sizeof(err),
+                 "decode benchmark requires a fully cached API prefix: cached=%d prompt=%d",
+                 cached, prompt_tokens);
+        ds4_tokens_free(&effective_prompt);
+        free(disk_cache_path);
+        http_error(j->fd, s->enable_cors, 409, err);
+        return;
+    }
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
      * the live KV cache and can be reused by the next request. */
@@ -15030,16 +15195,18 @@ static void *client_main(void *arg) {
         goto done;
     }
 
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/bench")) {
+    if (!strcmp(hr.method, "POST") &&
+        (!strcmp(hr.path, "/debug/bench") || !strcmp(hr.path, "/debug/score"))) {
+        const bool score = !strcmp(hr.path, "/debug/score");
         char lever_reject[192] = {0};
         if (!server_debug_levers_enabled(s)) {
             http_error(fd, s->enable_cors, 404, "unknown endpoint");
             http_request_free(&hr);
             goto done;
         }
-        char *bpath = NULL, *bledger = NULL;
+        char *bpath = NULL, *bledger = NULL, *breplay = NULL, *btarget = NULL;
         int ctx_start = 8192, ctx_alloc = 0, gen = 512;
-        bool fresh = false, dspark = false;
+        bool fresh = false, dspark = false, cache_create = false;
         if (hr.body) {
             const char *p = hr.body;
             json_ws(&p);
@@ -15055,6 +15222,12 @@ static void *client_main(void *arg) {
                     json_ws(&p);
                     if (!strcmp(key, "path")) {
                         if (!json_string(&p, &bpath)) { free(key); break; }
+                    } else if (!strcmp(key, "continuation_path")) {
+                        if (!json_string(&p, &btarget)) { free(key); break; }
+                    } else if (!strcmp(key, "cache_create")) {
+                        if (!json_bool(&p, &cache_create)) { free(key); break; }
+                    } else if (!strcmp(key, "replay_path")) {
+                        if (!json_string(&p, &breplay)) { free(key); break; }
                     } else if (!strcmp(key, "ledger_dump")) {
                         if (!json_string(&p, &bledger)) { free(key); break; }
                     } else if (!strcmp(key, "ctx_start")) {
@@ -15111,6 +15284,7 @@ static void *client_main(void *arg) {
             }
         }
         if (!bpath) {
+            free(breplay); free(btarget); free(bledger);
             http_error(fd, s->enable_cors, 400, "missing \"path\"");
             http_request_free(&hr);
             goto done;
@@ -15119,15 +15293,20 @@ static void *client_main(void *arg) {
             http_error(fd, s->enable_cors, 400, lever_reject);
             free(bpath);
             free(bledger);
+            free(breplay); free(btarget);
             http_request_free(&hr);
             goto done;
         }
         if (ctx_alloc <= 0) ctx_alloc = s->ctx_size;
         char berr[256] = {0};
-        char *body = bench_run(s->engine, bpath, ctx_start, ctx_alloc, gen, fresh,
-                               dspark, bledger, berr, sizeof(berr));
+        char *body = score
+            ? bench_score(s->engine, bpath, btarget, ctx_alloc, cache_create, berr, sizeof(berr))
+            : bench_run(s->engine, bpath, ctx_start, ctx_alloc, gen, fresh,
+                        dspark, bledger, breplay, berr, sizeof(berr));
         free(bpath);
         free(bledger);
+        free(breplay);
+        free(btarget);
         if (!body) {
             http_error(fd, s->enable_cors, 500, berr[0] ? berr : "bench failed");
         } else {

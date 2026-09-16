@@ -1,0 +1,9 @@
+START release-six-code
+PASS release-six-code: 30 full-output, cache and quiet contracts
+DONE release-six-code
+START release-two-code
+PASS release-two-code: 18 full-output, cache and quiet contracts
+DONE release-two-code
+START release-six-agent
+PASS release-six-agent: 10 full-output, cache and quiet contracts
+DONE release-six-agent

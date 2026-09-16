@@ -1,0 +1,15 @@
+reference_layout=2
+draws64/64 exact finite1.000000 controls64/64 control_moved_fraction1.000000
+PASS draws64 words2100288 finite1.000000 controls64 control_moved_fraction1.000000 determinism1000/1000
+screen cache-hot rep0 arm0 us47.141
+screen cache-hot rep0 arm1 us44.576
+screen cache-hot rep1 arm1 us44.531
+screen cache-hot rep1 arm0 us47.029
+screen cache-hot rep2 arm0 us47.100
+screen cache-hot rep2 arm1 us44.553
+screen cache-hot rep3 arm1 us44.552
+screen cache-hot rep3 arm0 us47.084
+screen cache-hot rep4 arm0 us47.087
+screen cache-hot rep4 arm1 us44.597
+screen cache-hot rep5 arm1 us44.576
+screen cache-hot rep5 arm0 us47.050

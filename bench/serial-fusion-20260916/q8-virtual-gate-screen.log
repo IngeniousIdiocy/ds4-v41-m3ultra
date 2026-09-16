@@ -1,0 +1,12 @@
+comparator selftest shape0 round0 PASS
+shape0 round0 draws64/64 exact finite1.000000 controls64
+PASS shape0 round0 draws64 words327680 finite1.000000 controls64 determinism1000/1000
+comparator selftest shape0 round1 PASS
+shape0 round1 draws64/64 exact finite1.000000 controls64
+PASS shape0 round1 draws64 words327680 finite1.000000 controls64 determinism1000/1000
+comparator selftest shape1 round0 PASS
+shape1 round0 draws64/64 exact finite1.000000 controls64
+PASS shape1 round0 draws64 words2097152 finite1.000000 controls64 determinism1000/1000
+comparator selftest shape1 round1 PASS
+shape1 round1 draws64/64 exact finite1.000000 controls64
+PASS shape1 round1 draws64 words2097152 finite1.000000 controls64 determinism1000/1000

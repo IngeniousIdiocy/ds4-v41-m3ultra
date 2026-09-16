@@ -1,0 +1,52 @@
+[
+  {
+    "pair": 0,
+    "warmup": true,
+    "tokens": 512,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256"
+    ],
+    "all_disk": true
+  },
+  {
+    "pair": 1,
+    "warmup": false,
+    "tokens": 512,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256"
+    ],
+    "all_disk": true
+  },
+  {
+    "pair": 2,
+    "warmup": false,
+    "tokens": 512,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256"
+    ],
+    "all_disk": true
+  },
+  {
+    "pair": 3,
+    "warmup": false,
+    "tokens": 512,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256"
+    ],
+    "all_disk": true
+  },
+  {
+    "pair": 4,
+    "warmup": false,
+    "tokens": 512,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256"
+    ],
+    "all_disk": true
+  }
+]

@@ -1,0 +1,1 @@
+-[MTLComputePipelineDescriptorInternal setComputeFunction:withType:]:866: failed assertion `computeFunction must not be nil.'

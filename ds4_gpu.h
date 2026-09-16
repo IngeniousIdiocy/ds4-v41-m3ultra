@@ -925,6 +925,27 @@ int ds4_gpu_dsv41_matmul_round_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x);
 
+int ds4_gpu_dsv41_router_shared_hc_available(void);
+int ds4_gpu_dsv41_router_shared_hc_tensor(ds4_gpu_tensor *output,
+        ds4_gpu_tensor *mix, ds4_gpu_tensor *split, ds4_gpu_tensor *counter,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *input,
+        const void *model_map, uint64_t model_size, uint64_t hc_offset,
+        uint64_t scale_offset, uint64_t base_offset, uint64_t weight_offset,
+        uint64_t up_offset, uint32_t sinkhorn_iters,
+        float hc_eps, float norm_eps, float clamp,
+        ds4_gpu_tensor *router_logits, uint64_t router_offset);
+
+int ds4_gpu_dsv41_attn_out_hc_available(void);
+int ds4_gpu_dsv41_attn_out_hc_tensor(ds4_gpu_tensor *out_hc,
+    ds4_gpu_tensor *block, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, const ds4_gpu_tensor *x,
+    const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split);
+
+int ds4_gpu_dsv41_verify_epilogue_tensor(ds4_gpu_tensor *out_hc,
+        ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_in,
+        const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t rows);
+
 int ds4_gpu_dsv41_hc_round_expand4_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
@@ -945,15 +966,23 @@ int ds4_gpu_dsv41_arch_ffn_begin(ds4_gpu_tensor *routed, ds4_gpu_tensor *shared,
     ds4_gpu_tensor *residual, ds4_gpu_tensor *split, ds4_gpu_tensor *block,
     ds4_gpu_tensor *hc, ds4_gpu_tensor *pre);
 int ds4_gpu_dsv41_arch_ffn_end(void);
+int ds4_gpu_dsv41_q8_virtual_down_tensor(ds4_gpu_tensor *out,
+    const void *model_map, uint64_t model_size, uint64_t weight_offset,
+    const ds4_gpu_tensor *input);
+int ds4_gpu_dsv41_kv_prepare_tensor(ds4_gpu_tensor *kv, ds4_gpu_tensor *window,
+    const void *model_map, uint64_t model_size, uint64_t norm_offset,
+    uint32_t position, bool compressed, float eps);
+int ds4_gpu_dsv41_query_hc_kv_tensor(ds4_gpu_tensor *output,
+    ds4_gpu_tensor *mix, ds4_gpu_tensor *split, ds4_gpu_tensor *counter,
+    const ds4_gpu_tensor *residual, const ds4_gpu_tensor *input,
+    const void *model_map, uint64_t model_size, uint64_t hc_offset,
+    uint64_t scale_offset, uint64_t base_offset, uint64_t weight_offset,
+    uint32_t sinkhorn_iters, float hc_eps, float norm_eps,
+    ds4_gpu_tensor *kv, ds4_gpu_tensor *window, uint64_t kv_norm_offset,
+    uint32_t position, bool compressed);
 /* Scoped target GU selection: 0=parent, 1=scalar oracle, 6=verifier.
  * Returns the previous scope; the caller restores it after synchronous encode. */
 
-/* R4: arm the expert-parallel routed-down geometry for one synchronous encode.
- * `slots` holds 6 F32 partials per output row, packed slot-minor.  Returns 1 if
- * the hint was accepted; ds4_gpu_dsv41_routed_split_end() reports whether the
- * routed-down encoder actually consumed it. */
-int ds4_gpu_dsv41_routed_split_begin(ds4_gpu_tensor *slots);
-int ds4_gpu_dsv41_routed_split_end(void);
 int ds4_gpu_dsv41_arch_hc_available(void);
 int ds4_gpu_dsv41_arch_collapse_tensor(ds4_gpu_tensor *collapsed, ds4_gpu_tensor *norm,
     ds4_gpu_tensor *counter, const ds4_gpu_tensor *residual, const ds4_gpu_tensor *pre,

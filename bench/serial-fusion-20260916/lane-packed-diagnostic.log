@@ -1,0 +1,46 @@
+CHECKER SELFTEST PASS first/middle/last mismatches, NaN, infinity, guards, control
+FAIL draws0..50 mismatch3463098 poison0 guard0 controls50
+DIFF word0 row0 slot0 lane0 ref3e78f678 cand3e78f677
+DIFF word6 row0 slot0 lane6 ref3dcc18af cand3dcc18ae
+DIFF word65 row0 slot2 lane1 ref3ce217e4 cand3ce217e3
+DIFF word96 row0 slot3 lane0 refbef5d3ce candbef5d3cf
+DIFF word97 row0 slot3 lane1 ref3f35e206 cand3f35e205
+DIFF word98 row0 slot3 lane2 refbee0b80e candbee0b80d
+DIFF word100 row0 slot3 lane4 ref3f4dd69f cand3f4dd69e
+DIFF word101 row0 slot3 lane5 refbec4a7b2 candbec4a7b3
+DIFF word103 row0 slot3 lane7 ref3e943b52 cand3e943b51
+DIFF word128 row0 slot4 lane0 refbf91eb3a candbf91eb39
+DIFF word129 row0 slot4 lane1 ref3fa12345 cand3fa12344
+DIFF word133 row0 slot4 lane5 refbf9aa0dd candbf9aa0de
+LANE 0 mismatch9102
+LANE 1 mismatch8399
+LANE 2 mismatch8726
+LANE 3 mismatch8573
+LANE 4 mismatch8353
+LANE 5 mismatch9663
+LANE 6 mismatch8918
+LANE 7 mismatch7056
+LANE 8 mismatch0
+LANE 9 mismatch0
+LANE 10 mismatch0
+LANE 11 mismatch0
+LANE 12 mismatch0
+LANE 13 mismatch0
+LANE 14 mismatch0
+LANE 15 mismatch0
+LANE 16 mismatch0
+LANE 17 mismatch0
+LANE 18 mismatch0
+LANE 19 mismatch0
+LANE 20 mismatch0
+LANE 21 mismatch0
+LANE 22 mismatch0
+LANE 23 mismatch0
+LANE 24 mismatch0
+LANE 25 mismatch0
+LANE 26 mismatch0
+LANE 27 mismatch0
+LANE 28 mismatch0
+LANE 29 mismatch0
+LANE 30 mismatch0
+LANE 31 mismatch0

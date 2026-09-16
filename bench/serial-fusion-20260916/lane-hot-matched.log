@@ -1,0 +1,17 @@
+draws64/64 untouched_exact finite1.000000 controls64/64 moved_fraction0.996968
+DIFFERENCE routed_f32 mismatch_fraction0.796817017 mean_abs7.47137983e-07 max_abs5.7220459e-06 ulp_bins_0_1_2to4_5to16_over16 66579 72017 112987 55912 20185
+DIFFERENCE block_bf16 mismatch_fraction0.000097656 mean_abs1.97975169e-07 max_abs0.015625 ulp_bins_0_1_2to4_5to16_over16 327648 27 3 1 1
+DIFFERENCE hc_bf16 mismatch_fraction0.000023651 mean_abs1.6214326e-07 max_abs0.015625 ulp_bins_0_1_2to4_5to16_over16 1310689 20 10 1 0
+PASS draws64 untouched_words327936 finite1.000000 controls64 determinism1000/1000
+TIMING rotate2 run0 arm0 us80.221880
+TIMING rotate2 run1 arm1 us71.710406
+TIMING rotate2 run2 arm1 us71.165618
+TIMING rotate2 run3 arm0 us78.907295
+TIMING rotate2 run4 arm0 us79.081242
+TIMING rotate2 run5 arm1 us71.257295
+TIMING rotate2 run6 arm1 us71.070832
+TIMING rotate2 run7 arm0 us80.084370
+TIMING rotate2 run8 arm0 us80.367713
+TIMING rotate2 run9 arm1 us71.481254
+TIMING rotate2 run10 arm1 us72.093750
+TIMING rotate2 run11 arm0 us80.471882

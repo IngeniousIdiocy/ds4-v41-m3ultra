@@ -46,16 +46,17 @@ All validated post-launch optimizations are included and enabled by default.
 
 | Workload | Original public release | September 16 update |
 | --- | ---: | ---: |
-| Serial decode, 8k context | 31.3 t/s | **33.3 t/s** |
-| Serial decode, 300k context | 28.3 t/s | **31.7 t/s** |
-| DSpark on code | 40.5 t/s | **46.4 t/s** |
-| DSpark on agent turns, answer phase | 41.3 t/s | **50.0 t/s** |
+| Serial decode, 8k context | 31.3 t/s | **35.9 t/s** |
+| Serial decode, 300k context | 28.3 t/s | **34.4 t/s** |
+| DSpark on code | 40.5 t/s | **48.7 t/s** |
 
-Six-row verification improved from 112 to **90.8 ms/block**; the same normalized
-weight-traffic calculation improved from 337 to **415 GB/s**. The answer-phase
-calculation is unchanged. These are the validated UAT measurements of the paths
-now shipped here; see [the update](RELEASE-V41-20260916.md) for exact scope,
-controller changes, controls, validation, and pruned experiments.
+Six-row verification improved from 112 to **87.0 ms/block**; the same normalized
+weight-traffic calculation improved from 337 to **433 GB/s**. The last full agent-answer result remains **41.3 → 50.0 t/s**, from the
+earlier update; the full suite was not rerun for this bundle. Serial rates are
+best valid runs and code is a normal-serving ABBA mean (132 output tokens;
+the launch code fixture used a 512-token budget). These are the validated UAT measurements of the paths
+now shipped here; see [the consolidation](DECODE-CONSOLIDATION-20260916.md) for exact scope,
+controller behavior, controls, validation, and pruned experiments.
 
 ### Original release measurements
 

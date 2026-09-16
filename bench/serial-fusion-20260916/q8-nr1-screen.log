@@ -1,0 +1,36 @@
+PASS shape0 64draws NR1 initial screen exact
+shape0 rep0 arm0 us66.697
+shape0 rep0 arm1 us66.678
+shape0 rep1 arm1 us66.847
+shape0 rep1 arm0 us67.286
+shape0 rep2 arm0 us67.097
+shape0 rep2 arm1 us66.303
+shape0 rep3 arm1 us66.242
+shape0 rep3 arm0 us67.156
+PASS shape1 64draws NR1 initial screen exact
+shape1 rep0 arm0 us22.014
+shape1 rep0 arm1 us21.136
+shape1 rep1 arm1 us21.388
+shape1 rep1 arm0 us21.009
+shape1 rep2 arm0 us21.372
+shape1 rep2 arm1 us21.375
+shape1 rep3 arm1 us21.527
+shape1 rep3 arm0 us21.505
+PASS shape2 64draws NR1 initial screen exact
+shape2 rep0 arm0 us64.456
+shape2 rep0 arm1 us77.161
+shape2 rep1 arm1 us76.278
+shape2 rep1 arm0 us64.472
+shape2 rep2 arm0 us64.517
+shape2 rep2 arm1 us77.199
+shape2 rep3 arm1 us76.973
+shape2 rep3 arm0 us64.432
+PASS shape3 64draws NR1 initial screen exact
+shape3 rep0 arm0 us20.959
+shape3 rep0 arm1 us20.760
+shape3 rep1 arm1 us20.580
+shape3 rep1 arm0 us20.742
+shape3 rep2 arm0 us20.747
+shape3 rep2 arm1 us20.906
+shape3 rep3 arm1 us20.844
+shape3 rep3 arm0 us20.717

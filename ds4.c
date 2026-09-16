@@ -39330,7 +39330,6 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(up, DS4_N_EXPERT_USED * DS4_N_FF_EXP) X(mid, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(experts, DS4_N_EXPERT_USED * DS4_N_EMBD) X(routed, DS4_N_EMBD) \
-    X(routed_slots, DS4_N_EXPERT_USED * DS4_N_EMBD) \
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
     X(shared_mid, DS4_N_FF_EXP) X(shared, DS4_N_EMBD) \
     X(engram_rows, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
@@ -39387,6 +39386,7 @@ typedef struct {
      * expansion that follows it, cleared by that expansion. */
     int arch_scalar_step; /* never inherited as enabled by prefill row views */
     int hc_attn_deferred, hc_ffn_deferred;
+    int attn_out_expanded; /* set only by the scalar attention producer */
     int ffn_expand_done;
     int ffn_add_pending;
     /* Stage 5 target-hidden capture.  A 128-slot ring, indexed by absolute
@@ -39659,6 +39659,15 @@ ds41_levers g_ds41_levers = {
     .router_fused_w = 1,
     .shared_swiglu = 1,
     .hc_norm_mix = 1,
+    .mtp_down_tail_pack = 1,
+    .mtp_hc_epilogue = 1,
+    .down_tail_pack = 1,
+    .router_shared_hc = 1,
+    .q8_virtual_down = 1,
+    .q8_virtual_query = 1,
+    .kv_prepare = 1,
+    .kv_query_mix = 1,
+    .attn_out_hc = 1, /* exact attention-output/HC producer fusion */
     .ffn_producer = 1, /* exact ordered-FMA producer epilogue */
     .qa_kv_flat = 1,
     .hc_stream = 1,
@@ -39671,7 +39680,6 @@ ds41_levers g_ds41_levers = {
     .producer_round = 1,
     .ffn_add_fold = 1,
     .kv_stage_f16 = 1,
-    .routed_down_split = 0, /* R4: opt-in until the four-manifest gate passes */
     .prefill_8k_chunk = 1,
     .prefill_decoder_suffix = 1,
     .prefill_stage_profile = 0,
@@ -39752,6 +39760,15 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "router_fused_w",     offsetof(ds41_levers, router_fused_w),     "DS4_DS41_ROUTER_FUSED_W" },
     { "shared_swiglu",      offsetof(ds41_levers, shared_swiglu),      "DS4_DS41_SHARED_SWIGLU" },
     { "hc_norm_mix",        offsetof(ds41_levers, hc_norm_mix),        "DS4_DS41_HC_NORM_MIX" },
+    { "mtp_down_tail_pack", offsetof(ds41_levers, mtp_down_tail_pack), "DS4_DS41_MTP_DOWN_TAIL_PACK" },
+    { "mtp_hc_epilogue", offsetof(ds41_levers, mtp_hc_epilogue), "DS4_DS41_MTP_HC_EPILOGUE" },
+    { "down_tail_pack", offsetof(ds41_levers, down_tail_pack), "DS4_DS41_DOWN_TAIL_PACK" },
+    { "router_shared_hc", offsetof(ds41_levers, router_shared_hc), "DS4_DS41_ROUTER_SHARED_HC" },
+    { "q8_virtual_down", offsetof(ds41_levers, q8_virtual_down), "DS4_DS41_Q8_VIRTUAL_DOWN" },
+    { "q8_virtual_query", offsetof(ds41_levers, q8_virtual_query), "DS4_DS41_Q8_VIRTUAL_QUERY" },
+    { "kv_prepare", offsetof(ds41_levers, kv_prepare), "DS4_DS41_KV_PREPARE" },
+    { "kv_query_mix", offsetof(ds41_levers, kv_query_mix), "DS4_DS41_KV_QUERY_MIX" },
+    { "attn_out_hc", offsetof(ds41_levers, attn_out_hc), "DS4_DS41_ATTN_OUT_HC" },
     { "ffn_producer", offsetof(ds41_levers, ffn_producer), "DS4_DS41_FFN_PRODUCER" },
     { "qa_kv_flat", offsetof(ds41_levers, qa_kv_flat), "DS4_DS41_QA_KV_FLAT" },
     { "hc_stream_layout", offsetof(ds41_levers, hc_stream_layout), "DS4_DS41_HC_STREAM_LAYOUT" },
@@ -39762,7 +39779,6 @@ static const struct { const char *name; size_t off; const char *env; } g_ds41_le
     { "producer_round",     offsetof(ds41_levers, producer_round),     "DS4_DS41_PRODUCER_ROUND" },
     { "ffn_add_fold",       offsetof(ds41_levers, ffn_add_fold),       "DS4_DS41_FFN_ADD_FOLD" },
     { "kv_stage_f16",       offsetof(ds41_levers, kv_stage_f16),       "DS4_DS41_KV_STAGE_F16" },
-    { "routed_down_split",  offsetof(ds41_levers, routed_down_split),  "DS4_DS41_ROUTED_DOWN_SPLIT" },
     { "prefill_8k_chunk",   offsetof(ds41_levers, prefill_8k_chunk),   "DS4_METAL_DISABLE_V41_8K_CHUNK" },
     { "prefill_decoder_suffix", offsetof(ds41_levers, prefill_decoder_suffix), "DS4_METAL_DISABLE_V41_DECODER_SUFFIX" },
     { "prefill_stage_profile",  offsetof(ds41_levers, prefill_stage_profile),  "DS4_METAL_V41_STAGE_PROFILE" },
@@ -39877,6 +39893,15 @@ void ds41_levers_init_from_env(void) {
     g_ds41_levers.hc_norm_mix        = ds41_env_enable_form("DS4_DS41_HC_NORM_MIX");
     /* The producer pins the standalone expansion's ordered FMAs.  Setting
      * DS4_DS41_FFN_PRODUCER=0 restores the separate expansion for A/B checks. */
+    g_ds41_levers.router_shared_hc = ds41_env_enable_form("DS4_DS41_ROUTER_SHARED_HC");
+    g_ds41_levers.q8_virtual_down = ds41_env_enable_form("DS4_DS41_Q8_VIRTUAL_DOWN");
+    g_ds41_levers.q8_virtual_query = ds41_env_enable_form("DS4_DS41_Q8_VIRTUAL_QUERY");
+    g_ds41_levers.kv_prepare = ds41_env_enable_form("DS4_DS41_KV_PREPARE");
+    g_ds41_levers.kv_query_mix = ds41_env_enable_form("DS4_DS41_KV_QUERY_MIX");
+    g_ds41_levers.mtp_down_tail_pack = ds41_env_enable_form("DS4_DS41_MTP_DOWN_TAIL_PACK");
+    g_ds41_levers.mtp_hc_epilogue = ds41_env_enable_form("DS4_DS41_MTP_HC_EPILOGUE");
+    g_ds41_levers.down_tail_pack = ds41_env_enable_form("DS4_DS41_DOWN_TAIL_PACK");
+    g_ds41_levers.attn_out_hc = ds41_env_enable_form("DS4_DS41_ATTN_OUT_HC");
     g_ds41_levers.ffn_producer       = ds41_env_enable_form("DS4_DS41_FFN_PRODUCER");
     g_ds41_levers.qa_kv_flat         = ds41_env_enable_form("DS4_DS41_QA_KV_FLAT");
     { const char *v = getenv("DS4_DS41_HC_STREAM_LAYOUT");
@@ -39889,8 +39914,6 @@ void ds41_levers_init_from_env(void) {
     g_ds41_levers.producer_round     = ds41_env_enable_form("DS4_DS41_PRODUCER_ROUND");
     g_ds41_levers.ffn_add_fold       = ds41_env_enable_form("DS4_DS41_FFN_ADD_FOLD");
     g_ds41_levers.kv_stage_f16       = ds41_env_enable_form("DS4_DS41_KV_STAGE_F16");
-    g_ds41_levers.routed_down_split  = getenv("DS4_DS41_ROUTED_DOWN_SPLIT") != NULL &&
-                                       ds41_env_enable_form("DS4_DS41_ROUTED_DOWN_SPLIT");
     g_ds41_levers.q4_gu_nr1          = getenv("DS4_DS41_Q4_GU_NR1") != NULL &&
                                        getenv("DS4_DS41_Q4_GU_NR1")[0] != '0';
     /* Prefill cost map.  The two DISABLE_ variables keep their historical
@@ -40460,6 +40483,17 @@ static bool ds41_hc_stream(ds41_gpu_graph *g, const ds4_model *m,
         DS4_HC_EPS, DS4_RMS_EPS, DS4_SWIGLU_CLAMP_EXP) != 0;
 }
 
+static bool ds41_hc_query_kv(ds41_gpu_graph *g, const ds4_model *m,
+                           const ds4_layer_weights *l, uint32_t il) {
+    return ds4_gpu_dsv41_query_hc_kv_tensor(g->q, g->mix, g->attn_split,
+        g->hc_counter, g->residual, g->qr, m->map, m->size,
+        l->hc_attn_fn->abs_offset, l->hc_attn_scale->abs_offset,
+        l->hc_attn_base->abs_offset, l->attn_q_b->abs_offset,
+        DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS,
+        g->kv, g->window[il], l->attn_kv_a_norm->abs_offset,
+        g->pos, ds4_layer_compress_ratio(il) != 0) != 0;
+}
+
 static bool ds41_hc_pre(ds41_gpu_graph *g, const ds4_model *m,
                         const ds4_layer_weights *l, bool ffn,
                         const ds4_gpu_tensor *residual,
@@ -40504,7 +40538,19 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
+    g->attn_out_expanded = 0;
     if (!ds41_attention_low(g, m, l)) return false;
+    if (g_ds41_levers.attn_out_hc && g->arch_scalar_step && g->tp_world == 1 &&
+        !g->streaming && !g->quality && !g->imatrix && ds41_hc_expand_fold(g) &&
+        l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        l->attn_output_b->dim[0] == 8192 && l->attn_output_b->dim[1] == 5120 &&
+        ds4_gpu_dsv41_attn_out_hc_available()) {
+        if (!ds4_gpu_dsv41_attn_out_hc_tensor(g->after_attn, g->block, m->map,
+            m->size, l->attn_output_b->abs_offset, g->low, g->residual, g->attn_split))
+            return false;
+        g->attn_out_expanded = 1;
+        return true;
+    }
     return g->tp_world == 2 ?
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
@@ -40604,13 +40650,21 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         l->attn_q_a->type == DS4_TENSOR_Q8_0 && l->attn_kv->type == DS4_TENSOR_Q8_0 &&
         l->attn_q_a->dim[0] == 5120u && l->attn_q_a->dim[1] == 1280u &&
         l->attn_kv->dim[0] == 5120u && l->attn_kv->dim[1] == 512u;
+    const bool prepare_kv = flat && !batch_pointwise && g_ds41_levers.kv_prepare &&
+        g->tp_world == 1 && !g->streaming && !g->quality && !g->imatrix &&
+        ds41_round_fuse_norm() && DS4_N_HEAD_DIM == 512u &&
+        l->attn_kv_a_norm->type == DS4_TENSOR_F32 && l->attn_kv_a_norm->dim[0] == 512u;
+    const bool query_kv = prepare_kv && g->hc_attn_deferred &&
+        g_ds41_levers.kv_query_mix && g_ds41_levers.q8_virtual_query &&
+        (g_ds41_levers.hc_stream_layout == 0 || g_ds41_levers.hc_stream_layout == 2);
     if (flat) {
         if (!ds4_gpu_dsv41_arch_qa_kv_tensor(g->qr, g->kv, g->norm, m->map, m->size,
                 l->attn_q_a->abs_offset, l->attn_kv->abs_offset) ||
             !ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) ||
-            !(g->hc_attn_deferred ? ds41_hc_stream(g, m, l, false) :
+            !(query_kv ? ds41_hc_query_kv(g, m, l, il) :
+              g->hc_attn_deferred ? ds41_hc_stream(g, m, l, false) :
                 ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, head0*512u, heads*512u)) ||
-            !ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm)) return false;
+            (!prepare_kv && !ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm))) return false;
     } else {
     if (!projected && (!ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) ||
         !ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) ||
@@ -40621,10 +40675,13 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     }
     if ((!batch_pointwise &&
         (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
-         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
-         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0))) ||
-        !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                             g->kv, 0, 512u * 4u) ||
+         (prepare_kv ?
+          (!query_kv && !ds4_gpu_dsv41_kv_prepare_tensor(g->kv, g->window[il], m->map, m->size,
+              l->attn_kv_a_norm->abs_offset, pos, ratio != 0, DS4_RMS_EPS)) :
+          (!ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
+           !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0))))) ||
+        (!prepare_kv && !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+                             g->kv, 0, 512u * 4u)) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     /* R3a: gather the selected compressed rows straight to F16.  The attention
@@ -40708,23 +40765,40 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
-    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
+    const bool router_shared = g_ds41_levers.router_shared_hc &&
+        g->arch_scalar_step && g->tp_world == 1 && !g->streaming && !g->quality &&
+        !g->imatrix && g->hc_ffn_deferred &&
+        l->ffn_gate_inp->type == DS4_TENSOR_F32 &&
+        l->ffn_gate_inp->dim[0] == 5120 && l->ffn_gate_inp->dim[1] == 384 &&
+        ds4_gpu_dsv41_router_shared_hc_available();
+    if (router_shared && !ds4_gpu_dsv41_router_shared_hc_tensor(g->shared_mid,
+        g->mix, g->ffn_split, g->hc_counter, g->after_attn, g->norm,
+        m->map, m->size, l->hc_ffn_fn->abs_offset, l->hc_ffn_scale->abs_offset,
+        l->hc_ffn_base->abs_offset, l->ffn_gate_shexp->abs_offset,
+        l->ffn_up_shexp->abs_offset, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS,
+        DS4_RMS_EPS, DS4_SWIGLU_CLAMP_EXP, g->route_logits, l->ffn_gate_inp->abs_offset))
+        return false;
+    if ((!router_shared && !ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) ||
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
     if ((!shared_owner || g->tp_rank == (il & 1u)) &&
-        (!ds41_shared_mid(g, m, l) ||
-        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+        !router_shared && !ds41_shared_mid(g, m, l)) return false;
+    const bool virtual_down = g_ds41_levers.q8_virtual_down &&
+        g->arch_scalar_step && g->tp_world == 1 && !g->streaming && !g->quality &&
+        !g->imatrix && g_ds41_levers.mv_round &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->dim[0] == 2304 && l->ffn_down_shexp->dim[1] == 5120 &&
+        ds4_gpu_dsv41_q8_virtual_down_tensor(g->shared, m->map, m->size,
+            l->ffn_down_shexp->abs_offset, g->shared_mid);
+    if (!virtual_down && (!shared_owner || g->tp_rank == (il & 1u)) &&
+        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true)) return false;
     g->ffn_expand_done = 0;
     const bool fold = g->arch_scalar_step && g->tp_world != 2 && !g->streaming &&
         g_ds41_levers.ffn_producer && g_ds41_levers.ffn_add_fold && ds41_hc_expand_fold(g);
     if (fold) (void)ds4_gpu_dsv41_arch_ffn_begin(routed, g->shared, g->after_attn,
         g->ffn_split, g->block, g->residual, g->pre);
-    /* R4: same scalar-step/non-TP/non-streaming scope as the folded epilogue. */
-    const bool split_down = g->arch_scalar_step && g->tp_world != 2 && !g->streaming &&
-        g_ds41_levers.routed_down_split && g_ds41_levers.q4_group6 &&
-        ds4_gpu_dsv41_routed_split_begin(g->routed_slots);
     bool routed_ok;
     routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
@@ -40734,7 +40808,6 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
             !g->streaming) != 0;
     const bool expanded = fold && ds4_gpu_dsv41_arch_ffn_end();
-    (void)split_down; (void)ds4_gpu_dsv41_routed_split_end();
     if (!routed_ok) return false;
     if (expanded) {
         g->ffn_expand_done = 1;
@@ -40883,10 +40956,12 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return (ds41_hc_expand_fold(g) ?
+    const bool expanded = g->attn_out_expanded != 0;
+    g->attn_out_expanded = 0;
+    return (expanded || (ds41_hc_expand_fold(g) ?
             ds41_hc_round_expand(g->after_attn, g->block, g->block, NULL,
                                  g->residual, g->attn_split) :
-            ds41_hc_expand_split_bf16(g->after_attn, g->block, g->residual, g->attn_split)) &&
+            ds41_hc_expand_split_bf16(g->after_attn, g->block, g->residual, g->attn_split))) &&
         ds41_hc_pre(g, m, l, true, g->after_attn, g->attn_split, l->ffn_norm);
 }
 
@@ -42482,6 +42557,7 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         malloc(prefill_rows * sizeof(*engram)) : NULL;
     const bool mtp_shape = vc && (rows == 2u || rows == 6u) && g->tp_world == 1 &&
         !g->quality && !g->streaming && !g->imatrix && DS4_N_EMBD == 5120u && DS4_N_HC == 4u;
+    const bool hc_epilogue = mtp_shape && g_ds41_levers.mtp_hc_epilogue;
     const bool engram_async = mtp_shape && rows == 6u && g_ds41_levers.mtp_engram_rows6;
     const uint64_t engram_row_bytes = DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float);
     if (engram_async && !vc->mtp_engram_late)
@@ -42611,9 +42687,21 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
                 ds41_matmul_batch(active.block, model, l->attn_output_b, active.low, rows, false);
         }
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(&active, model, l, rows) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
+        if (ok && hc_epilogue) {
+            ok = ds4_gpu_dsv41_verify_epilogue_tensor(active.after_attn, active.block,
+                active.block, NULL, active.residual, active.attn_split, rows) &&
+                ds41_hc_mix_batch(&active, model, l, true, rows) &&
+                ds41_hc_sum_batch(active.x, active.after_attn, active.attn_split, true, rows) &&
+                ds41_hc_norm_batch(active.norm, active.x, model, l->ffn_norm, rows);
+        } else if (ok) {
+            ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+                ds41_after_attention_batch(&active, model, l, rows);
+        }
+        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner);
+        if (ok && hc_epilogue) {
+            ok = ds4_gpu_dsv41_verify_epilogue_tensor(active.residual, active.block,
+                active.routed, active.shared, active.after_attn, active.ffn_split, rows);
+        } else if (ok) ok =
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
