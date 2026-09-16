@@ -5,6 +5,30 @@
 
 **V4.1 on M3 Ultra:** this branch includes the [September 16 decode update](docs/RELEASE-V41-20260916.md), with all validated optimizations enabled by default. See the [setup and results](docs/V41_M3ULTRA.md), [experiment records](docs/experiments/v41-20260915/README.md), and [coding-agent prompting guide](docs/PROMPTING-V41.md).
 
+## DeepSeek V4.1 Flash: current performance
+
+Same 512 GB M3 Ultra Mac Studio, Q4 weights, and established decode fixtures:
+
+| Workload | Original public release | Current release |
+| --- | ---: | ---: |
+| Serial decode, 8k context | 31.3 t/s | **33.3 t/s** |
+| Serial decode, 300k context | 28.3 t/s | **31.7 t/s** |
+| DSpark on code | 40.5 t/s | **46.4 t/s** |
+| DSpark on agent turns, answer phase | 41.3 t/s | **50.0 t/s** |
+| Six-row verifier block | 112 ms | **90.8 ms** |
+| Normalized verifier weight traffic | 337 GB/s | **415 GB/s** |
+
+These results were measured on the validated UAT paths now shipped and enabled
+by default here. Reasoning stays serial; the agent-answer rate uses the same
+estimated answer-token calculation throughout. Weight traffic uses the same
+37.657 GB/block ledger, rather than physical DRAM counters. See the
+[release notes and evidence](docs/RELEASE-V41-20260916.md) for the measurements,
+controller changes, exactness checks, and rejected experiments.
+
+Previously measured prefill and cache results: **813 t/s** for a 62k prompt,
+**31.1 s** TTFT for a cold 23k system prompt, and **0.23 s** with that prompt
+restored from disk KV cache. These were not retimed in the decode update.
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
