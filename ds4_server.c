@@ -981,6 +981,10 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
+/* Private UAT serving defaults; explicit request sampling values still win. */
+static float g_default_top_p = DS4_DEFAULT_TOP_P;
+static float g_default_min_p = DS4_DEFAULT_MIN_P;
+
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
@@ -990,8 +994,8 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->max_tokens = max_tokens;
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
-    r->top_p = DS4_DEFAULT_TOP_P;
-    r->min_p = DS4_DEFAULT_MIN_P;
+    r->top_p = g_default_top_p;
+    r->min_p = g_default_min_p;
     r->think_mode = DS4_THINK_HIGH;
 }
 
@@ -13800,8 +13804,8 @@ decode_again:
              * same greedy request returns different text on every call. */
             if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
             if (!j->req.top_k_set) top_k = 0;
-            if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
-            if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
+            if (!j->req.top_p_set) top_p = g_default_top_p;
+            if (!j->req.min_p_set) min_p = g_default_min_p;
         }
         const bool greedy_tool_syntax = !thinking.inside && in_tool_call &&
             !dsml_decode_state_uses_payload_sampling(dsml_state);
@@ -15456,6 +15460,12 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--default-top-p")) {
+            g_default_top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            if (!(g_default_top_p > 0.0f && g_default_top_p <= 1.0f)) die("--default-top-p must be in (0,1]");
+        } else if (!strcmp(arg, "--default-min-p")) {
+            g_default_min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            if (!(g_default_min_p >= 0.0f && g_default_min_p < 1.0f)) die("--default-min-p must be in [0,1)");
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
             c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -17311,6 +17321,17 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
     TEST_ASSERT(!r.ignore_eos);
     request_free(&r);
+
+    char *uat_argv[] = {"ds4-server", "--default-top-p", "0.95",
+                        "--default-min-p", "0", "--mtp-exact-sampling"};
+    server_config cfg = parse_options(6, uat_argv);
+    TEST_ASSERT(cfg.engine.dspark_exact_sampling);
+    request_init(&r, REQ_CHAT, 128);
+    TEST_ASSERT(r.top_p == 0.95f && r.min_p == 0.0f);
+    TEST_ASSERT(!r.top_p_set && !r.min_p_set);
+    request_free(&r);
+    g_default_top_p = DS4_DEFAULT_TOP_P;
+    g_default_min_p = DS4_DEFAULT_MIN_P;
 }
 
 static void test_chat_ignore_eos_contract(void) {
