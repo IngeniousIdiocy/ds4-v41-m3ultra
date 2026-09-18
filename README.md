@@ -1,3 +1,33 @@
+## DeepSeek V4.1 Flash on M3 Ultra — September 18 update
+
+This branch now includes the UAT-accepted MXFP4 combination of scalar decode,
+prefill and native DSpark improvements, based on [kernelpool's V4.1 work](https://github.com/antirez/ds4/pull/1073).
+Accepted optimizations and the cost-aware controller are enabled by default on
+supported local Metal paths. Reasoning stays serial; DSpark handles eligible answers and tool output.
+
+Same 512 GB M3 Ultra, same native MXFP4 weights and matching prompts; best valid runs:
+
+| Workload | Previous public implementation | Current release |
+|---|---:|---:|
+| Serial decode, 8k, DSpark loaded | 34.43 | **35.80 t/s** |
+| Serial decode, 62k, DSpark loaded | 34.17 | **34.91 t/s** |
+| DSpark, directed code | 41.58 | **45.11 t/s** |
+| DSpark, final answer A30 | 39.13 | **42.19 t/s** |
+| Prefill, 63,488 tokens | 840.58 | **846.05 t/s** |
+
+The earlier Q4 release used different weights, prompts and generation budgets;
+its 35.9/48.7 t/s headlines are historical and are not an apples-to-apples baseline
+for this table. Both implementations here use native MXFP4. See the
+[release notes](docs/RELEASE-MXFP4-20260918.md) for means, best runs, methodology,
+setup, controller selection and validation limits.
+
+Implementation and failed experiments: [decode](docs/METAL-V41-DECODE.md),
+[prefill](docs/METAL-V41-PREFILL.md), [DSpark](docs/METAL-V41-DSPARK.md).
+The [coding-agent prompting guide](docs/PROMPTING-V41.md) still applies: draft
+code in real files, then inspect and iterate, rather than writing the implementation in reasoning.
+
+---
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
@@ -83,8 +113,8 @@ So, while this project attempts to be usable for the featured models and the mos
 ## Start Here
 
 ```sh
-git clone https://github.com/antirez/ds4.git
-cd ds4
+git clone https://github.com/IngeniousIdiocy/ds4-v41-m3ultra.git
+cd ds4-v41-m3ultra
 ```
 
 Choose your build. The platform guides cover prerequisites, memory sizing,

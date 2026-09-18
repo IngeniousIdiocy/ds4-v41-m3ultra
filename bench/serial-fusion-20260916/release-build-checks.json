@@ -1,0 +1,29 @@
+{
+  "passed": true,
+  "checks": {
+    "release-build": {
+      "passed": true,
+      "seconds": 15.042655944824219
+    },
+    "release-bandwidth-tests": {
+      "passed": true,
+      "seconds": 19.382606029510498
+    },
+    "test_ds41_controller": {
+      "passed": true,
+      "seconds": 0.16561007499694824
+    },
+    "test_ds41_dspark_adaptive": {
+      "passed": true,
+      "seconds": 0.12525582313537598
+    },
+    "test_ds41_markov_cache": {
+      "passed": true,
+      "seconds": 1.0570921897888184
+    },
+    "release-diff-check": {
+      "passed": true,
+      "seconds": 0.049275875091552734
+    }
+  }
+}

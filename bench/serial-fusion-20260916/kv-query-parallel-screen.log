@@ -1,0 +1,4 @@
+reference_layout=2
+COMPARATOR SELFTEST PASS exact/nonfinite/poison/guard/control counts
+draws64/64 exact finite1.000000 controls64/64 control_moved_fraction0.499276
+PASS draws64 words2165824 finite1.000000 controls64 control_moved_fraction0.499276 determinism1000/1000

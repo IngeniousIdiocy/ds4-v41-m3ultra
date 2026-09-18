@@ -1,0 +1,36 @@
+{
+  "cases": 100,
+  "paired_mean": -0.0008284493888900184,
+  "se": 0.0020081804313212847,
+  "ratio": 0.41253732780621666,
+  "wins": 56,
+  "losses": 42,
+  "ties": 2,
+  "binomial_p": 0.18884671980890244,
+  "first_match": {
+    "control": 88,
+    "p1": 88
+  },
+  "avg_lcp": {
+    "control": 12.14,
+    "p1": 12.28
+  },
+  "per_prompt_upstream_drift": {
+    "control": 1.0791750382045001e-11,
+    "p1": -0.000828449378098268
+  },
+  "gates": {
+    "S1": true,
+    "S2": false,
+    "S3": true,
+    "S4": false,
+    "S5": false
+  },
+  "complete_100": true,
+  "control_reference_rows_at_tsv_precision": 100,
+  "token_weighted_avg_nll": {
+    "control": 0.25240916142198605,
+    "p1": 0.2511616256940071
+  },
+  "candidate_cache_restores": 100
+}

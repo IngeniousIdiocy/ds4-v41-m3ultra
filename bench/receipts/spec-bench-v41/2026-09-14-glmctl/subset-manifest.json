@@ -1,0 +1,1189 @@
+{
+  "spec_bench_commit": "fd2c1cd7d2201ef71db4c5f4e455008f017967bf",
+  "question_file": "data/spec_bench/question.jsonl",
+  "question_file_sha256": "4b6d33e79484f9841c487ee87d1cf6aa8c6066f61d5d482ff09e5a007fafdf04",
+  "rows_per_category": 12,
+  "categories": [
+    "mt_bench",
+    "translation",
+    "summarization",
+    "qa",
+    "math_reasoning",
+    "rag"
+  ],
+  "questions": 72,
+  "turn_requests_per_mode": 84,
+  "modes": [
+    "serial",
+    "six",
+    "controller"
+  ],
+  "total_requests": 252,
+  "max_generated_tokens": 256,
+  "sampling": "greedy, temperature 0, natural EOS",
+  "note": "turns execute sequentially; a second turn includes that mode's own first answer, so later prompts can differ across modes and their rendered identities are retained per request",
+  "rows": [
+    {
+      "global_index": 0,
+      "question_id": 81,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 0,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 127,
+          "sha256": "ae0703a93d5816aaeadc9bb86cf60a81a2f6b4b7ae3474a4969ee2829b7f3e98"
+        },
+        {
+          "index": 1,
+          "bytes": 71,
+          "sha256": "5c5f7fd95b412332b6a19375b942014232ba20ab10decd35cf3d904ba4f9f2df"
+        }
+      ]
+    },
+    {
+      "global_index": 1,
+      "question_id": 82,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 1,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 250,
+          "sha256": "3a10cad88c0e1c791b33ee9b50c35a5e024f0e1a9d9e361ea77bab32d47f0e25"
+        },
+        {
+          "index": 1,
+          "bytes": 57,
+          "sha256": "823f4eb112959815dcace10704090fca0e9f991f15af138e02d5f4424815643e"
+        }
+      ]
+    },
+    {
+      "global_index": 2,
+      "question_id": 83,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 2,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 292,
+          "sha256": "bfa9789b68b0ecf4f4d7f62de614e225099783f93c4eaada4111add69343026a"
+        },
+        {
+          "index": 1,
+          "bytes": 58,
+          "sha256": "eae58ce3d59d4d05f1e8c1d2eebccad0a617bb7cfccec5c24f366948b34df2b7"
+        }
+      ]
+    },
+    {
+      "global_index": 3,
+      "question_id": 84,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 3,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 219,
+          "sha256": "322151bfe92f766689fd1a34be08917c03fab69c4cbd87753f517f945e013108"
+        },
+        {
+          "index": 1,
+          "bytes": 92,
+          "sha256": "03e318bdd71e1fd2b30c1e434d1877e23062fb82e21a2ded7fd002985e22eaea"
+        }
+      ]
+    },
+    {
+      "global_index": 4,
+      "question_id": 85,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 4,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 126,
+          "sha256": "5b9ed9f841805e93141991fcf2a2f178fe64f39ecfa390fcb8ec01507dc1d04a"
+        },
+        {
+          "index": 1,
+          "bytes": 126,
+          "sha256": "c105a0b9dec6ae58aff414ea423348873e74c805d7261c195d481fb99a07239f"
+        }
+      ]
+    },
+    {
+      "global_index": 5,
+      "question_id": 86,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 5,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 183,
+          "sha256": "dbb8fbd4c10e8892a8848c79417e1f732009a11f154eb9be0234a96bc67a7cf9"
+        },
+        {
+          "index": 1,
+          "bytes": 113,
+          "sha256": "7b4b917609ba7c64bec9f2bf600ee86329d5979b18e716cc93a3d1ed5a1a6504"
+        }
+      ]
+    },
+    {
+      "global_index": 6,
+      "question_id": 87,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 6,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 166,
+          "sha256": "54fc87a58642b969fe0d49f1055c441b29413abca2431a9f550a631b2e11520f"
+        },
+        {
+          "index": 1,
+          "bytes": 61,
+          "sha256": "f64743aecb8d2013a4b729fb10a869bb8db698f912ccf7740ac9cd5ce641473b"
+        }
+      ]
+    },
+    {
+      "global_index": 7,
+      "question_id": 88,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 7,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 163,
+          "sha256": "2b4f2c7b895c7d3fe1707ffec5e5dcb2982394a8be564ab35539884c605aaf8b"
+        },
+        {
+          "index": 1,
+          "bytes": 92,
+          "sha256": "b2208a82c4e4dad933d7c8abfcf16cbefa8ff4aea614d03126004e699189231b"
+        }
+      ]
+    },
+    {
+      "global_index": 8,
+      "question_id": 89,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 8,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 226,
+          "sha256": "daf4cfe33393c0e3d2abeb9152ea4d8d54572571ba109beab2403c160a69816a"
+        },
+        {
+          "index": 1,
+          "bytes": 192,
+          "sha256": "ba38b72662e9c7f205b7858c5e5c02ae700600b3722b11bf27c925eb79a7892f"
+        }
+      ]
+    },
+    {
+      "global_index": 9,
+      "question_id": 90,
+      "category": "writing",
+      "logical_category": "mt_bench",
+      "category_index": 9,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 365,
+          "sha256": "c7efbb034f245ac19156813827ff8e0ff175c444d41676a37682563ecb5383f3"
+        },
+        {
+          "index": 1,
+          "bytes": 69,
+          "sha256": "9b69131bcfdd23824e7726204414469e2c8cbdd2d7653264393e925e450f6167"
+        }
+      ]
+    },
+    {
+      "global_index": 10,
+      "question_id": 91,
+      "category": "roleplay",
+      "logical_category": "mt_bench",
+      "category_index": 10,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 140,
+          "sha256": "2168c49b9e1ac6df386c54cb9aab2c8c66ef2b644fa8e4e988805d7d0febf8e4"
+        },
+        {
+          "index": 1,
+          "bytes": 42,
+          "sha256": "69354cf628874c92290312c901a5e70ca420c8ff0319afa07ba71def88e951b6"
+        }
+      ]
+    },
+    {
+      "global_index": 11,
+      "question_id": 92,
+      "category": "roleplay",
+      "logical_category": "mt_bench",
+      "category_index": 11,
+      "turn_count": 2,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 225,
+          "sha256": "c1e6ffe9df2fd711013bb418ca1756e7c34be165a40c5727b1f6022122868cea"
+        },
+        {
+          "index": 1,
+          "bytes": 64,
+          "sha256": "9fd62799bb41b929811f3b570092ac9be35a4de8c6f2fb455b9aec8ad724c7a6"
+        }
+      ]
+    },
+    {
+      "global_index": 80,
+      "question_id": 161,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 0,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 111,
+          "sha256": "8a87a2dc4ac12a9044cee747a80ec552351d7a0200e9f5dece377ae766f62d61"
+        }
+      ]
+    },
+    {
+      "global_index": 81,
+      "question_id": 162,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 1,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 178,
+          "sha256": "d432cbf5f20241b5aff40fb5ff67c9f931973487643a7c5767727b1ad42cf617"
+        }
+      ]
+    },
+    {
+      "global_index": 82,
+      "question_id": 163,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 2,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 190,
+          "sha256": "444dd5492bbb7638d1619603b034c8e630432686331491fb9c294abd7fc3a2d7"
+        }
+      ]
+    },
+    {
+      "global_index": 83,
+      "question_id": 164,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 3,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 81,
+          "sha256": "5ba57e4a0d36bea2ae0d1a04221dd08e43176e0c14dd50e589e235775bd98f3c"
+        }
+      ]
+    },
+    {
+      "global_index": 84,
+      "question_id": 165,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 4,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 87,
+          "sha256": "3c9a97c9b44c743d639010425028057e20de997aee70ec1978c471c4c142c7d2"
+        }
+      ]
+    },
+    {
+      "global_index": 85,
+      "question_id": 166,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 5,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 289,
+          "sha256": "2a7f5462e4b8fd0cdbee2ec7355b508de8d823f6d45a27c1ecfd89dba255791b"
+        }
+      ]
+    },
+    {
+      "global_index": 86,
+      "question_id": 167,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 6,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 174,
+          "sha256": "5c881696c9d34f26aede8b2c7f93d1c2aafdfcaea03702b8b89330e31142a7bd"
+        }
+      ]
+    },
+    {
+      "global_index": 87,
+      "question_id": 168,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 7,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 134,
+          "sha256": "8afd62baa1454bf56134d27881a1d58246007382de68e95c456f44479a21bb86"
+        }
+      ]
+    },
+    {
+      "global_index": 88,
+      "question_id": 169,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 8,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 175,
+          "sha256": "b17aafcadfd02d06c7d70f31da12b472b247ae4687ce03899463131d57114778"
+        }
+      ]
+    },
+    {
+      "global_index": 89,
+      "question_id": 170,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 9,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 117,
+          "sha256": "7ffa0e1ca2092e0185d837c9510eae152c78adfdd1a7bd7bc25271e7eb1a0783"
+        }
+      ]
+    },
+    {
+      "global_index": 90,
+      "question_id": 171,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 10,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 194,
+          "sha256": "fed9b6e20c8544694a5a92d31962c94cbd7448bf3400d0de1ad73ae3d9447f7e"
+        }
+      ]
+    },
+    {
+      "global_index": 91,
+      "question_id": 172,
+      "category": "translation",
+      "logical_category": "translation",
+      "category_index": 11,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 119,
+          "sha256": "7f347584b3236d66e47c9ea9a0eb19738e6395cf06c3bd5f364d601d95b205d5"
+        }
+      ]
+    },
+    {
+      "global_index": 160,
+      "question_id": 241,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 0,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3279,
+          "sha256": "6a0fb44e7d07da349e34e131c8fd5717a095cd58a5ce17f2fe527efe5f84e2ab"
+        }
+      ]
+    },
+    {
+      "global_index": 161,
+      "question_id": 242,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 1,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 2910,
+          "sha256": "c4bb6a3f576afaaef208bea10b7a8b07f66230b8d14cd64f0e50016c7b2c9b37"
+        }
+      ]
+    },
+    {
+      "global_index": 162,
+      "question_id": 243,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 2,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 2955,
+          "sha256": "846ce1bd9fe826799b0aae122ec1d18e0c57cef2117660c1297e44a538e8b488"
+        }
+      ]
+    },
+    {
+      "global_index": 163,
+      "question_id": 244,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 3,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3914,
+          "sha256": "a3a80f1a4c195e8a0d8075863a503bac33f4cf07a62f546f49b245d666df464c"
+        }
+      ]
+    },
+    {
+      "global_index": 164,
+      "question_id": 245,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 4,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 1787,
+          "sha256": "03df2fba88fa0db48390ec00df1534b749b4a3712e131e93c706a5f4652df80b"
+        }
+      ]
+    },
+    {
+      "global_index": 165,
+      "question_id": 246,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 5,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3480,
+          "sha256": "4f2e3989a9e6d16f64d1cea0ff9a5aaf13f502e0715a883988c88147f0859c26"
+        }
+      ]
+    },
+    {
+      "global_index": 166,
+      "question_id": 247,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 6,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3386,
+          "sha256": "a349a3e039f553d81a2453fd537867dbaa6a7162478d1c1984a4ba1f5431dddf"
+        }
+      ]
+    },
+    {
+      "global_index": 167,
+      "question_id": 248,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 7,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 5165,
+          "sha256": "c475d155c7f791a8cf4d2a346f77e7fcce2bdb1753a71dd4ac0d0ad501017f45"
+        }
+      ]
+    },
+    {
+      "global_index": 168,
+      "question_id": 249,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 8,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 2625,
+          "sha256": "b94ef545394e1fe900792aae9987973605e0211f59862b4379ad56ba192008ee"
+        }
+      ]
+    },
+    {
+      "global_index": 169,
+      "question_id": 250,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 9,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 1991,
+          "sha256": "c73fa057c8a237307b53a871b71ef28ac4c07b099460afc8bff727be2dd29d73"
+        }
+      ]
+    },
+    {
+      "global_index": 170,
+      "question_id": 251,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 10,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 1402,
+          "sha256": "70025225d72c28e34ccefe08afbfc34814ebf35783d544ab11bbd119369bc452"
+        }
+      ]
+    },
+    {
+      "global_index": 171,
+      "question_id": 252,
+      "category": "summarization",
+      "logical_category": "summarization",
+      "category_index": 11,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 2924,
+          "sha256": "febdfddb5183c5fd0f8ebb6b3847308bcb0d69f18e86674544cb0748594e68c9"
+        }
+      ]
+    },
+    {
+      "global_index": 240,
+      "question_id": 321,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 0,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 36,
+          "sha256": "28342f18eec5a305fc8d23060330ed1825c707ce2aeba37b213bd4343425a5a2"
+        }
+      ]
+    },
+    {
+      "global_index": 241,
+      "question_id": 322,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 1,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 46,
+          "sha256": "ac5fd0f910a4a36d44dbcf123082dc2e98b7dfa9ecfd3c06a1ce9d124b03ed49"
+        }
+      ]
+    },
+    {
+      "global_index": 242,
+      "question_id": 323,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 2,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 45,
+          "sha256": "efa49c20170fa288f7df06387345192fe7febe1f61e0a297ae9a78a29b92f3bd"
+        }
+      ]
+    },
+    {
+      "global_index": 243,
+      "question_id": 324,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 3,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 38,
+          "sha256": "ff7eaf15eb9cfec1aa2ad6ddef9aaafe94426eb0cb7685b8a1cc931597ca0ee9"
+        }
+      ]
+    },
+    {
+      "global_index": 244,
+      "question_id": 325,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 4,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 39,
+          "sha256": "ba79332a44d56a28c256f0cc782a5ba4aca174552481609a73ca118e6806707d"
+        }
+      ]
+    },
+    {
+      "global_index": 245,
+      "question_id": 326,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 5,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 51,
+          "sha256": "7faf1e458214f0e454f1ab077ba075e317f23ff72ec6879c57ba6d3998181ed0"
+        }
+      ]
+    },
+    {
+      "global_index": 246,
+      "question_id": 327,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 6,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 46,
+          "sha256": "54cf15adfe7f1a9d8451fa4835ccb041fd4599e0a2ae7ee4b64988b3c1926d30"
+        }
+      ]
+    },
+    {
+      "global_index": 247,
+      "question_id": 328,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 7,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 46,
+          "sha256": "1bc7e8db0b23f5a35223bc5d079491357a64a03c5d6623018bcb1c485b63c8ec"
+        }
+      ]
+    },
+    {
+      "global_index": 248,
+      "question_id": 329,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 8,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 39,
+          "sha256": "6cb08a6b54895d7ee83e8914cc0e45f506df08ac2769045873b5f13b415a270b"
+        }
+      ]
+    },
+    {
+      "global_index": 249,
+      "question_id": 330,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 9,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 48,
+          "sha256": "f99f46365b9a80dbe64b5573fcd67330d026422a8247e3b852f1cbc6101c719e"
+        }
+      ]
+    },
+    {
+      "global_index": 250,
+      "question_id": 331,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 10,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 48,
+          "sha256": "8617ee45e56a6da62ca033ad7b499780b88c467acc3ff320ec8ba7762af74df9"
+        }
+      ]
+    },
+    {
+      "global_index": 251,
+      "question_id": 332,
+      "category": "qa",
+      "logical_category": "qa",
+      "category_index": 11,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 48,
+          "sha256": "82859b2c00ee7257104e5182ee8272657f370dc10c022961fb632487906dc83b"
+        }
+      ]
+    },
+    {
+      "global_index": 320,
+      "question_id": 401,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 0,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 200,
+          "sha256": "adda018a8588695c0d5e17c88d8941960587b5002bc0466912e97d1e02fe4e43"
+        }
+      ]
+    },
+    {
+      "global_index": 321,
+      "question_id": 402,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 1,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 216,
+          "sha256": "7810cb6f7d1e2ec732197a85f05988002b179c41adfcc03895d287e4568c53b5"
+        }
+      ]
+    },
+    {
+      "global_index": 322,
+      "question_id": 403,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 2,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 146,
+          "sha256": "1a93ae062315cbef8cdf8609209ee78e97d81bd56078fbd3c48c44c078eb182e"
+        }
+      ]
+    },
+    {
+      "global_index": 323,
+      "question_id": 404,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 3,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 359,
+          "sha256": "30fd5e0ab26ce8922ae3a3cfe03d6ae224796c94a8efc59527c48ec729bcc1d8"
+        }
+      ]
+    },
+    {
+      "global_index": 324,
+      "question_id": 405,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 4,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 332,
+          "sha256": "3af5503ad498c930a6d12fd65ee426d9aa42ce206a7ef125733660a33aa7372a"
+        }
+      ]
+    },
+    {
+      "global_index": 325,
+      "question_id": 406,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 5,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 149,
+          "sha256": "d00fb9b486684a27912fb8328ab124e39923bace0d34b2c7cb013d8d764ae291"
+        }
+      ]
+    },
+    {
+      "global_index": 326,
+      "question_id": 407,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 6,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 150,
+          "sha256": "dd298e40caaedd1081e6a05ad3b4a6338f132b613c4da97170c859977f4e971d"
+        }
+      ]
+    },
+    {
+      "global_index": 327,
+      "question_id": 408,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 7,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 154,
+          "sha256": "941d3e9751cc05b912cad9365761f12ff60d9fecf5fee721480e377b2ad0e25c"
+        }
+      ]
+    },
+    {
+      "global_index": 328,
+      "question_id": 409,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 8,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 282,
+          "sha256": "6b3e7528587eb18acc2d2f6e4e768524741feeea14f96b0e2a02ba1ed92ef593"
+        }
+      ]
+    },
+    {
+      "global_index": 329,
+      "question_id": 410,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 9,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 269,
+          "sha256": "0d5bf73514e9adcf4e6cc6ccbc29b3fb52d5962d510d029781a3efa0cc68ca05"
+        }
+      ]
+    },
+    {
+      "global_index": 330,
+      "question_id": 411,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 10,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 174,
+          "sha256": "8cae947b581d6be24ea0d1a2bd867b715a54e880ccff5fd798f4fd073c7bd4bc"
+        }
+      ]
+    },
+    {
+      "global_index": 331,
+      "question_id": 412,
+      "category": "math_reasoning",
+      "logical_category": "math_reasoning",
+      "category_index": 11,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 184,
+          "sha256": "a5ba7162a998aef7dba9e3112d1b62ad1e088f42228c3647ef377baa95ec3fba"
+        }
+      ]
+    },
+    {
+      "global_index": 400,
+      "question_id": 481,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 0,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3381,
+          "sha256": "f390bf101216319298fea8fb078a1935c386de9f07d3ff727a2e477e77e3a754"
+        }
+      ]
+    },
+    {
+      "global_index": 401,
+      "question_id": 482,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 1,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 2661,
+          "sha256": "57f149c0b2e3af3a713fee051eb7ea4d894974366e0dcfe5c1202e6471322ecc"
+        }
+      ]
+    },
+    {
+      "global_index": 402,
+      "question_id": 483,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 2,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3396,
+          "sha256": "a804e74366927868f40b6f0f98f7db3fa5c1a7ff695e04bc624ff2154baa639c"
+        }
+      ]
+    },
+    {
+      "global_index": 403,
+      "question_id": 484,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 3,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3199,
+          "sha256": "074f86a20468d73b79a29c68cf5e96c46be9ea231a49806918a8824a6ab5e4c4"
+        }
+      ]
+    },
+    {
+      "global_index": 404,
+      "question_id": 485,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 4,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3046,
+          "sha256": "74af2bd9883352e7cfce5c51f38845ee2ba0c44ba2b84fbc1dd7ebcf794c5d98"
+        }
+      ]
+    },
+    {
+      "global_index": 405,
+      "question_id": 486,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 5,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3183,
+          "sha256": "cbd55cae5d22abdf382ad775bdb9107e6da22bb699c1dae187db311b64960656"
+        }
+      ]
+    },
+    {
+      "global_index": 406,
+      "question_id": 487,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 6,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3097,
+          "sha256": "0b48e355a02a022352888008c46a57ac114bb4627ceef3a1551d1b75c0fae52b"
+        }
+      ]
+    },
+    {
+      "global_index": 407,
+      "question_id": 488,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 7,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3055,
+          "sha256": "21ce5a43c4d8d553ab287f2c2d09a60b1d49b912916e660e9c2d1d8ec924cb4e"
+        }
+      ]
+    },
+    {
+      "global_index": 408,
+      "question_id": 489,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 8,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3333,
+          "sha256": "d56192ab7a9f394df7e08490f6f380d4c548be2e1f2ddbaefb1840ba19f6cdde"
+        }
+      ]
+    },
+    {
+      "global_index": 409,
+      "question_id": 490,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 9,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3289,
+          "sha256": "ff86461bbbaf1983b74b61b30970ba25f94e80c97384efb0b6a811b90c4a5c9b"
+        }
+      ]
+    },
+    {
+      "global_index": 410,
+      "question_id": 491,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 10,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3073,
+          "sha256": "da10b94b6bb71bf944e72829313a49f985365c5155ff272e30ee0758a6b96b35"
+        }
+      ]
+    },
+    {
+      "global_index": 411,
+      "question_id": 492,
+      "category": "rag",
+      "logical_category": "rag",
+      "category_index": 11,
+      "turn_count": 1,
+      "turns": [
+        {
+          "index": 0,
+          "bytes": 3031,
+          "sha256": "7f6906af98e733342706bc73c312f30867bba9bd2d03984450f790fb335b8e05"
+        }
+      ]
+    }
+  ],
+  "resident_server": true,
+  "resident_server_note": "one resident server switched per request set through /debug/levers instead of one server per mode: model-load economy. The lever map read back after each switch is kept in <mode>-levers.json.",
+  "mode_levers": {
+    "serial": {
+      "dspark_serve": 0,
+      "dspark_adaptive": 1,
+      "dspark_verify_rows": 0,
+      "dspark_reasoning_serial": 1
+    },
+    "six": {
+      "dspark_serve": 1,
+      "dspark_adaptive": 0,
+      "dspark_verify_rows": 0,
+      "dspark_reasoning_serial": 1
+    },
+    "controller": {
+      "dspark_serve": 1,
+      "dspark_adaptive": 1,
+      "dspark_verify_rows": 0,
+      "dspark_reasoning_serial": 1
+    }
+  }
+}

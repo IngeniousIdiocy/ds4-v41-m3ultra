@@ -1,0 +1,12 @@
+[
+  {
+    "test": "missing-replay",
+    "status": 500,
+    "body": "{\"error\":{\"message\":\"cannot load replay tokens\",\"type\":\"invalid_request_error\"}}\n"
+  },
+  {
+    "test": "retired-tail-lever",
+    "status": 400,
+    "body": "{\"error\":{\"message\":\"lever \\\"down_tail9\\\" rejected value 0\",\"type\":\"invalid_request_error\"}}\n"
+  }
+]

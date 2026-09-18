@@ -1,0 +1,13 @@
+PASS draws64 words2981888 exact finite
+latency arm0 us=136.681
+latency arm1 us=132.304
+latency arm1 us=131.936
+latency arm0 us=132.425
+latency arm0 us=131.815
+latency arm1 us=130.612
+latency arm1 us=131.021
+latency arm0 us=134.759
+latency arm0 us=133.323
+latency arm1 us=129.827
+latency arm1 us=129.820
+latency arm0 us=135.252

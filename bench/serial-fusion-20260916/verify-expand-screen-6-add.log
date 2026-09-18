@@ -1,0 +1,14 @@
+draws64/64 rows6 add1 exact finite1.000000 controls64
+PASS draws64 rows6 add1 words9830400 finite1.000000 controls64 determinism1000/1000
+TIMING run0 arm0 us15.244167
+TIMING run1 arm1 us6.754999
+TIMING run2 arm1 us6.745416
+TIMING run3 arm0 us14.980831
+TIMING run4 arm0 us15.256251
+TIMING run5 arm1 us6.741248
+TIMING run6 arm1 us6.245002
+TIMING run7 arm0 us15.053754
+TIMING run8 arm0 us15.107915
+TIMING run9 arm1 us6.791251
+TIMING run10 arm1 us6.771665
+TIMING run11 arm0 us15.268330

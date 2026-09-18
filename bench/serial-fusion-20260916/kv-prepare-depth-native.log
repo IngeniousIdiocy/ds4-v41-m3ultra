@@ -1,0 +1,32 @@
+62000 0 control 33.6026 quiet 98.11 hash bd7d961f0eba
+62000 0 arp_qboth_kv 35.3197 quiet 98.31 hash bd7d961f0eba
+PAIR EXACT 62000 0
+62000 1 arp_qboth_kv 35.2867 quiet 98.2 hash bd7d961f0eba
+62000 1 control 33.53 quiet 98.15 hash bd7d961f0eba
+PAIR EXACT 62000 1
+62000 2 control 33.4915 quiet 98.11 hash bd7d961f0eba
+62000 2 arp_qboth_kv 35.3562 quiet 95.59 hash bd7d961f0eba
+PAIR EXACT 62000 2
+62000 3 arp_qboth_kv 35.3468 quiet 95.98 hash bd7d961f0eba
+62000 3 control 33.6073 quiet 97.93 hash bd7d961f0eba
+PAIR EXACT 62000 3
+62000 4 control 33.6646 quiet 98.8 hash bd7d961f0eba
+62000 4 arp_qboth_kv 35.4128 quiet 98.18 hash bd7d961f0eba
+PAIR EXACT 62000 4
+SUMMARY 62000 {'control': {'values': [33.53, 33.4915, 33.6073, 33.6646], 'best': 33.6646, 'mean': 33.573350000000005, 'delta': 0.0, 'se': 0.0}, 'arp_qboth_kv': {'values': [35.2867, 35.3562, 35.3468, 35.4128], 'best': 35.4128, 'mean': 35.350625, 'delta': 1.7772749999999995, 'se': 0.029352409753431317}}
+300000 0 control 32.2171 quiet 97.59 hash 3a49c1348e83
+300000 0 arp_qboth_kv 33.8759 quiet 98.23 hash 3a49c1348e83
+PAIR EXACT 300000 0
+300000 1 arp_qboth_kv 33.867 quiet 98.14 hash 3a49c1348e83
+300000 1 control 32.121 quiet 94.43 hash 3a49c1348e83
+PAIR EXACT 300000 1
+300000 2 control 32.1201 quiet 98.21 hash 3a49c1348e83
+300000 2 arp_qboth_kv 33.8639 quiet 98.15 hash 3a49c1348e83
+PAIR EXACT 300000 2
+300000 3 arp_qboth_kv 33.786 quiet 98.9 hash 3a49c1348e83
+300000 3 control 32.2513 quiet 98.4 hash 3a49c1348e83
+PAIR EXACT 300000 3
+300000 4 control 32.0931 quiet 97.89 hash 3a49c1348e83
+300000 4 arp_qboth_kv 33.7623 quiet 95.55 hash 3a49c1348e83
+PAIR EXACT 300000 4
+SUMMARY 300000 {'control': {'values': [32.121, 32.1201, 32.2513, 32.0931], 'best': 32.2513, 'mean': 32.146375, 'delta': 0.0, 'se': 0.0}, 'arp_qboth_kv': {'values': [33.867, 33.8639, 33.786, 33.7623], 'best': 33.867, 'mean': 33.8198, 'delta': 1.673425, 'se': 0.04956666176305658}}

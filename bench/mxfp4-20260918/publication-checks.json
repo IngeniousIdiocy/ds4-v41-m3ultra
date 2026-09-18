@@ -1,0 +1,30 @@
+{
+  "metal_library": {
+    "decode": "METAL_LIBRARY_PASS functions=510",
+    "prefill": "METAL_LIBRARY_PASS functions=504",
+    "dspark": "METAL_LIBRARY_PASS functions=501",
+    "release": "METAL_LIBRARY_PASS functions=515"
+  },
+  "branches": {
+    "decode": {
+      "url": "https://github.com/kernelpool/ds4/pull/1",
+      "head": "ebe8389a910c909cacf3966f8583ba7263101bb6",
+      "branch": "perf/v41-decode-review"
+    },
+    "prefill": {
+      "url": "https://github.com/kernelpool/ds4/pull/2",
+      "head": "6cd58261f272f80869d77042f9249693f200bafb",
+      "branch": "perf/v41-prefill-review"
+    },
+    "dspark": {
+      "url": "https://github.com/kernelpool/ds4/pull/3",
+      "head": "768560c722aa246f97deb84c318d2f5f474f83ee",
+      "branch": "perf/v41-dspark-review"
+    }
+  },
+  "server_units": "pass on three independent PR branches and combined release",
+  "controller_units": "pass on DSpark branch and combined release",
+  "builds": "all binaries, qualification executables, and CPU engine objects; forced fresh rebuild after incremental build reused an object with a same-second timestamp",
+  "native_requalification": "not rerun during publication; inference engine and shaders match the accepted qualification source, see source-identity.json",
+  "live_deployment": "not restarted or modified"
+}

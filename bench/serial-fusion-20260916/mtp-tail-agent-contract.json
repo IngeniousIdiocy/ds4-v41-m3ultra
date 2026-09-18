@@ -1,0 +1,62 @@
+[
+  {
+    "pair": 1,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256",
+      "dspark_cycles",
+      "dspark_committed",
+      "dspark_verified_rows",
+      "dspark_accept_hist",
+      "dspark_serial_rows"
+    ],
+    "cycles": 135,
+    "committed": 511,
+    "verified": 810
+  },
+  {
+    "pair": 2,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256",
+      "dspark_cycles",
+      "dspark_committed",
+      "dspark_verified_rows",
+      "dspark_accept_hist",
+      "dspark_serial_rows"
+    ],
+    "cycles": 135,
+    "committed": 511,
+    "verified": 810
+  },
+  {
+    "pair": 3,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256",
+      "dspark_cycles",
+      "dspark_committed",
+      "dspark_verified_rows",
+      "dspark_accept_hist",
+      "dspark_serial_rows"
+    ],
+    "cycles": 135,
+    "committed": 511,
+    "verified": 810
+  },
+  {
+    "pair": 4,
+    "exact_fields": [
+      "token_ids",
+      "text_sha256",
+      "dspark_cycles",
+      "dspark_committed",
+      "dspark_verified_rows",
+      "dspark_accept_hist",
+      "dspark_serial_rows"
+    ],
+    "cycles": 135,
+    "committed": 511,
+    "verified": 810
+  }
+]

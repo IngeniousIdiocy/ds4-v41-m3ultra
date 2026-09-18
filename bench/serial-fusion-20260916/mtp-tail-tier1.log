@@ -1,0 +1,15 @@
+progress overlap0 draw5000
+progress overlap0 draw10000
+progress overlap0 draw15000
+PASS overlap0 draws16667 complete outputs exact finite_fraction1.000000
+PASS determinism1000 controls16667 overlap0 finite_words512010240
+progress overlap3 draw5000
+progress overlap3 draw10000
+progress overlap3 draw15000
+PASS overlap3 draws16667 complete outputs exact finite_fraction1.000000
+PASS determinism1000 controls16667 overlap3 finite_words512010240
+progress overlap6 draw5000
+progress overlap6 draw10000
+progress overlap6 draw15000
+PASS overlap6 draws16667 complete outputs exact finite_fraction1.000000
+PASS determinism1000 controls16667 overlap6 finite_words512010240

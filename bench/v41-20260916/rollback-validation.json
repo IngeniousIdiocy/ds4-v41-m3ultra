@@ -1,0 +1,53 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "fixture": "code.txt",
+      "ctx": 8192,
+      "rows": 2,
+      "hash": "6c94b6192e99f7cdd4421162c961d08a5803109c14f18540ee0bbbdd292bc639",
+      "cycles": 126,
+      "prefilled_now": false
+    },
+    {
+      "fixture": "code.txt",
+      "ctx": 8192,
+      "rows": 6,
+      "hash": "6c94b6192e99f7cdd4421162c961d08a5803109c14f18540ee0bbbdd292bc639",
+      "cycles": 126,
+      "prefilled_now": false
+    },
+    {
+      "fixture": "code-62k.txt",
+      "ctx": 62000,
+      "rows": 2,
+      "hash": "75447f865974c8e484edc414a6937b739c1d6a1ff51cc54bf312f6ba6688b36e",
+      "cycles": 126,
+      "prefilled_now": false
+    },
+    {
+      "fixture": "code-62k.txt",
+      "ctx": 62000,
+      "rows": 6,
+      "hash": "75447f865974c8e484edc414a6937b739c1d6a1ff51cc54bf312f6ba6688b36e",
+      "cycles": 126,
+      "prefilled_now": false
+    },
+    {
+      "fixture": "depth-mix.txt",
+      "ctx": 300000,
+      "rows": 2,
+      "hash": "b7680002de8a9b9c033694a4b024c9e39e6ad490759b846f604a6886a0014a0a",
+      "cycles": 126,
+      "prefilled_now": false
+    },
+    {
+      "fixture": "depth-mix.txt",
+      "ctx": 300000,
+      "rows": 6,
+      "hash": "b7680002de8a9b9c033694a4b024c9e39e6ad490759b846f604a6886a0014a0a",
+      "cycles": 126,
+      "prefilled_now": false
+    }
+  ]
+}
