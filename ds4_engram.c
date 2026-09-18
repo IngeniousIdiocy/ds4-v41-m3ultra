@@ -190,7 +190,11 @@ static int request_order(const void *a, const void *b) {
     return (x->row > y->row) - (x->row < y->row);
 }
 
+#ifdef __APPLE__
+enum { ENGRAM_READERS = 32 };
+#else
 enum { ENGRAM_READERS = 16 };
+#endif
 
 typedef struct {
     const ds4_engram_table *table;
@@ -270,7 +274,10 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= 2) {
-            batch.readers = count < ENGRAM_READERS ? count : ENGRAM_READERS;
+            /* The public fork's 32 readers versus the parent 16. Capture
+             * per batch; output ownership and join ordering are unchanged. */
+            const size_t limit = getenv("DS4_DISABLE_V41_ENGRAM_READERS32") ? 16u : ENGRAM_READERS;
+            batch.readers = count < limit ? count : limit;
 #ifdef __APPLE__
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);

@@ -40229,6 +40229,15 @@ static void ds41_draft_free(ds41_draft *d) {
 }
 
 typedef struct {
+    pthread_t thread;
+    const ds4_engram_table *table;
+    const uint32_t *ids;
+    float *out;
+    uint32_t count, ready;
+    bool active, ok, cancel, done;
+} ds41_engram_prefetch;
+
+typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
@@ -40245,6 +40254,13 @@ typedef struct {
     ds4_engram_history history;
     uint32_t *token_map;
     uint32_t (*prefill_ids)[2][DS4_ENGRAM_COLS];
+    /* Own both reader descriptors and IDs until join, including cancellation. */
+    struct {
+        ds41_engram_prefetch pf[2];
+        uint32_t (*ids)[2][DS4_ENGRAM_COLS];
+        uint32_t count, row_off[2];
+        bool armed[2];
+    } engram_carry;
     ds4_engram_table table[2];
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     ds4_gpu_tensor *window[40];
@@ -40268,8 +40284,12 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
     return cursor_read(&c, out, bytes);
 }
 
+static void ds41_engram_carry_drop(ds41_gpu_graph *g);
+
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+    ds41_engram_carry_drop(g);
+    free(g->engram_carry.ids);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     ds4_gpu_decode_graphs_invalidate();
 #endif
@@ -40357,6 +40377,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 }
 
 static void ds41_graph_reset(ds41_gpu_graph *g) {
+    ds41_engram_carry_drop(g);
     g->pos = 0;
     g->valid = true;
     if (g->draft) g->draft->mh_rows = 0;
@@ -41274,8 +41295,56 @@ static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
         (g->tp_world == 2 ? ds41_graph_after_attention(g, m, l, il) : ds41_hc_mix(g, m, l, true, g->attn_split));
 }
 
+/* Diagnostic switches compare public large-prefill folds with the parent.
+ * Keep small-row kernelpool fusions and non-Metal scheduling unchanged. */
+static bool ds41_prefill_fold(uint32_t count, const char *disable) {
+#ifdef __APPLE__
+    return count > DS4_TP_BATCH_MAX_ROWS && ds4_gpu_dsv41_prefill_folds_available() && !getenv(disable);
+#else
+    (void)count; (void)disable;
+    return false;
+#endif
+}
+
+static bool ds41_hc_sum_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+        const ds4_gpu_tensor *pre, uint32_t count, bool split) {
+#ifdef __APPLE__
+    if (ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_SUM"))
+        return split ? ds4_gpu_hc_weighted_sum_split_bf16_tensor(out, in, pre, DS4_N_EMBD, DS4_N_HC) :
+            ds4_gpu_hc_weighted_sum_bf16_tensor(out, in, pre, DS4_N_EMBD, DS4_N_HC);
+#endif
+    return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, pre, DS4_N_EMBD, DS4_N_HC) :
+        ds4_gpu_hc_weighted_sum_tensor(out, in, pre, DS4_N_EMBD, DS4_N_HC)) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, count, DS4_V41_BF16);
+}
+
+static bool ds41_hc_expand_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split, uint32_t count) {
+#ifdef __APPLE__
+    if (ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_EXPAND"))
+        return ds4_gpu_hc_expand_split_bf16_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC);
+#endif
+    return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+}
+
+static bool ds41_ffn_add_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b, uint32_t count) {
+#ifdef __APPLE__
+    if (ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_ADD"))
+        return ds4_gpu_dsv41_add_bf16_rows(out, a, b, DS4_N_EMBD, count);
+#endif
+    return ds4_gpu_add_tensor(out, a, b, count * DS4_N_EMBD) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, count, DS4_V41_BF16);
+}
+
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                             const ds4_model *m, const ds4_tensor *weight, uint32_t count) {
+#ifdef __APPLE__
+    if (ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_NORM"))
+        return ds4_gpu_dsv41_norm_bf16_rows(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS);
+#endif
     return ds4_gpu_rms_norm_weight_rows_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS) &&
         ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[0], count, DS4_V41_BF16);
@@ -41335,10 +41404,7 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     if (ds41_hc_block_input_rows(b, m, l, false, il ? b->ffn_split : b->pre,
                                  il ? 2u * DS4_N_HC + DS4_N_HC * DS4_N_HC : DS4_N_HC, count)) return true;
     if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
-    const bool mixed = il ?
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC);
-    return mixed && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+    return ds41_hc_sum_batch(b->x, b->residual, il ? b->ffn_split : b->pre, count, il != 0) &&
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
 }
 
@@ -41356,13 +41422,10 @@ static bool ds41_attention_expand_rows(ds41_prefill_row *b, const ds4_model *m,
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count, bool expanded) {
     return (expanded ||
-            (ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
-                 b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-             ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16))) &&
+            ds41_hc_expand_batch(b->after_attn, b->block, b->residual, b->attn_split, count)) &&
         (ds41_hc_block_input_rows(b, m, l, true, b->attn_split, 2u * DS4_N_HC + DS4_N_HC * DS4_N_HC, count) ||
          (ds41_hc_mix_batch(b, m, l, true, count) &&
-          ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-          ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+          ds41_hc_sum_batch(b->x, b->after_attn, b->attn_split, count, true) &&
           ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count)));
 }
 
@@ -41376,18 +41439,20 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
     if (!(count <= DS4_TP_BATCH_MAX_ROWS &&
           ds4_gpu_dsv41_norm_pair_rows(b->qr, b->qr, l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q,
               b->kv, b->kv, l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, m->map, m->size, DS4_RMS_EPS, count)) &&
-        !(ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
-              l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
-          ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
-          ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
-              l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
-          ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16))) return false;
+        !(ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, count) &&
+          ds41_norm_batch(b->kv, b->kv, m, l->attn_kv_a_norm, count))) return false;
     return ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr, g->tp_rank * q_dim, q_dim, count);
 }
 
 static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool bf16) {
+#ifdef __APPLE__
+    if (weight->type == DS4_TENSOR_F16 && ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_F16_ROWS2"))
+        return ds4_gpu_dsv41_projection_rows2(out, m->map, m->size, weight->abs_offset,
+            (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) &&
+            (!bf16 || ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[1], count, DS4_V41_BF16));
+#endif
     if (weight->type == DS4_TENSOR_F16)
         return ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], count, in) &&
@@ -42502,14 +42567,7 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
     return ok;
 }
 
-typedef struct {
-    pthread_t thread;
-    const ds4_engram_table *table;
-    const uint32_t *ids;
-    float *out;
-    uint32_t count, ready;
-    bool active, ok, cancel, done;
-} ds41_engram_prefetch;
+
 
 static void *ds41_engram_prefetch_read(void *arg) {
     ds41_engram_prefetch *p = arg;
@@ -42552,13 +42610,62 @@ static bool ds41_engram_prefetch_join(ds41_engram_prefetch *p, bool cancel) {
 }
 
 static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *g,
-                                      uint32_t table, uint32_t count) {
+                                      uint32_t table, uint32_t count,
+                                      const uint32_t (*ids)[2][DS4_ENGRAM_COLS],
+                                      uint32_t row_off) {
+    float *slab = ds4_gpu_tensor_contents(g->engram_prefetch);
     *p = (ds41_engram_prefetch){.table = &g->table[table], .count = count,
-        .ids = g->prefill_ids[0][table], .out = ds4_gpu_tensor_contents(g->engram_prefetch)};
+        .ids = ids[0][table],
+        .out = slab ? slab + (size_t)row_off * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM : NULL};
     if (!p->out || pthread_create(&p->thread, NULL, ds41_engram_prefetch_read, p))
         return false;
     p->active = true;
     return true;
+}
+
+/* Wave 4 lever 1.  Join and forget any carried delivery.  Called whenever the
+ * graph's history is reset or the graph is freed, and whenever a sweep's own
+ * hashed ids do not match the ones the carried reader used: the reader owns
+ * part of the prefetch slab, so it must be joined before anything else writes
+ * there. */
+static void ds41_engram_carry_drop(ds41_gpu_graph *g) {
+    for (int t = 0; t < 2; t++) {
+        if (g->engram_carry.pf[t].active)
+            (void)ds41_engram_prefetch_join(&g->engram_carry.pf[t], true);
+        g->engram_carry.armed[t] = false;
+    }
+    g->engram_carry.count = 0;
+}
+
+/* Start the NEXT sweep's Engram delivery from the tail of the current one.
+ * `seed` is the history AFTER the current sweep's tokens, which the current
+ * sweep has computed but not yet committed to g->history -- so this hashes
+ * from a PRIVATE copy and the live history is never advanced early.  Module 1
+ * is carried only when both deliveries fit the slab side by side, which is the
+ * short final sweep: the only place wave 3 measured an exposed layer-14 wait.
+ * No extra slab is allocated. */
+static bool ds41_engram_carry_arm(ds41_gpu_graph *g, const int *tokens, uint32_t count,
+                                  const ds4_engram_history *seed) {
+    const uint32_t cap = g->carry_cap ? g->carry_cap : g->prefill_cap;
+    ds41_engram_carry_drop(g);
+    if (!tokens || !count || count > cap) return false;
+    if (!g->engram_carry.ids) {
+        g->engram_carry.ids = malloc((size_t)cap * sizeof(*g->engram_carry.ids));
+        if (!g->engram_carry.ids) return false;
+    }
+    ds4_engram_history history = *seed;
+    if (!ds41_hash_tokens(g, &history, tokens, count, &g->engram_carry.ids[0][0][0]))
+        return false;
+    g->engram_carry.count = count;
+    g->engram_carry.row_off[0] = 0;
+    g->engram_carry.row_off[1] = count;
+    g->engram_carry.armed[0] = ds41_engram_prefetch_start(&g->engram_carry.pf[0], g,
+        0, count, g->engram_carry.ids, 0);
+    g->engram_carry.armed[1] = g->engram_carry.armed[0] && 2u * count <= cap &&
+        ds41_engram_prefetch_start(&g->engram_carry.pf[1], g,
+            1, count, g->engram_carry.ids, count);
+    if (!g->engram_carry.armed[0]) g->engram_carry.count = 0;
+    return g->engram_carry.armed[0];
 }
 
 static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) {
@@ -42576,7 +42683,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t total_count,
                               ds4_session_progress_fn progress, void *progress_ud,
                               int total, ds4_session_cancel_fn cancel, void *cancel_ud,
-                              bool encoder_only, bool resume_encoder) {
+                              bool encoder_only, bool resume_encoder,
+                              const int *next_tokens, uint32_t next_count) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
     const bool wide = total_count > encoder_chunk;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
@@ -42600,6 +42708,19 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, tokens, total_count, &ids[0][0][0]))
         return false;
+    const bool xsweep = !getenv("DS4_METAL_DISABLE_V41_ENGRAM_XSWEEP") && g->tp_world == 1 && !g->streaming && !g->image_count &&
+        !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PREFETCH") &&
+        !getenv("DS4_METAL_DISABLE_V41_BATCH_ENGRAM");
+    bool carry_ok[2] = {false, false};
+    if (g->engram_carry.armed[0]) {
+        if (xsweep && g->engram_carry.ids && g->engram_carry.count == total_count &&
+            !memcmp(g->engram_carry.ids, ids, (size_t)total_count * sizeof(*ids))) {
+            carry_ok[0] = true;
+            carry_ok[1] = g->engram_carry.armed[1];
+        } else {
+            ds41_engram_carry_drop(g);
+        }
+    }
     const uint32_t initial_start = g->pos;
     if (g->draft) {
         g->draft->mh_rows = total_count < DS41_DRAFT_WINDOW ? total_count : DS41_DRAFT_WINDOW;
@@ -42610,14 +42731,25 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     /* The complete current layer is mapped for prefill. Refresh the bounded
      * decode cache from it before advancing to the next layer. */
     row.streaming = false;
-    ds41_engram_prefetch engram_prefetch = {0};
+    ds41_engram_prefetch engram_local = {0};
+    /* The reader whose rows the current Engram layer consumes, and its base row
+     * in the slab: either this sweep's own reader (row 0) or a carried one. */
+    ds41_engram_prefetch *engram_pf = &engram_local;
+    uint32_t engram_src_row = 0;
     const bool overlap_engram = total_count >= 1024u &&
         !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PREFETCH") &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_ENGRAM");
-    const bool pipeline_engram = overlap_engram &&
+    const bool pipeline_engram = (overlap_engram || carry_ok[0]) &&
         !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PIPELINE");
-    bool engram_prefetched = overlap_engram &&
-        ds41_engram_prefetch_start(&engram_prefetch, g, 0, total_count);
+    bool engram_prefetched = false;
+    if (carry_ok[0]) {
+        engram_pf = &g->engram_carry.pf[0];
+        engram_src_row = g->engram_carry.row_off[0];
+        engram_prefetched = true;
+    } else {
+        engram_prefetched = overlap_engram &&
+            ds41_engram_prefetch_start(&engram_local, g, 0, total_count, ids, 0);
+    }
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
     metal_graph_stream_prepare_slot prepare = {0};
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -42632,8 +42764,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         }
         /* Layer 1 no longer reads the prefix buffer. Fill it for layer 14
          * while the intervening encoder layers run. The table stays on disk. */
-        if (il == 2u) engram_prefetched = overlap_engram &&
-            ds41_engram_prefetch_start(&engram_prefetch, g, 1, total_count);
+        if (il == 2u) {
+            if (carry_ok[1]) {
+                engram_pf = &g->engram_carry.pf[1];
+                engram_src_row = g->engram_carry.row_off[1];
+                engram_prefetched = true;
+            } else {
+                engram_src_row = 0;
+                engram_prefetched = overlap_engram &&
+                    ds41_engram_prefetch_start(&engram_local, g, 1, total_count, ids, 0);
+            }
+        }
         const double t0 = profile ? now_sec() : 0;
         if (g->streaming) {
 #ifdef __APPLE__
@@ -42713,7 +42854,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok) ok = ds4_gpu_begin_commands() != 0;
             if (!il) {
-#ifndef __APPLE__
+#ifdef __APPLE__
+                if (ok && batch_hc && g->tp_world == 1 && !g->image_count &&
+                    w->token_embd->type == DS4_TENSOR_F16 &&
+                    ds41_prefill_fold(count, "DS4_METAL_DISABLE_V41_PREFILL_EMBED")) {
+                    for (uint32_t t = 0; ok && t < count; t++)
+                        ok = tokens[off + t] >= 0 && (uint32_t)tokens[off + t] < DS4_N_VOCAB;
+                    if (ok) ok = ds4_gpu_dsv41_embed_init_rows(active.residual, active.pre, active.x,
+                        g->prefill_tokens, m->map, m->size, w->token_embd->abs_offset,
+                        DS4_N_VOCAB, count, DS4_N_EMBD);
+                } else
+#else
                 if (ok && !g->image_count) {
                     float *pre = calloc((size_t)count * DS4_N_HC, sizeof(float));
                     if (!pre) ok = false;
@@ -42745,8 +42896,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 const uint32_t engram = il == 1 ? 0 : 1;
                 if (engram_prefetched) {
                     ok = pipeline_engram ?
-                        ds41_engram_prefetch_wait(&engram_prefetch, off + count, cancel, cancel_ud) :
-                        ds41_engram_prefetch_join(&engram_prefetch, false);
+                        ds41_engram_prefetch_wait(engram_pf, off + count, cancel, cancel_ud) :
+                        ds41_engram_prefetch_join(engram_pf, false);
                 } else if (getenv("DS4_METAL_DISABLE_V41_BATCH_ENGRAM")) {
                     for (uint32_t t = 0; ok && t < count; t++)
                         ok = ds4_engram_read(&g->table[engram], ids[off + t][engram], DS4_ENGRAM_COLS,
@@ -42772,7 +42923,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ok && engram_prefetched && ds41_engram_layer(il)) {
                 const uint64_t bytes = (uint64_t)DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float);
                 ok = ds4_gpu_tensor_copy(g->batch.engram_rows, 0, g->engram_prefetch,
-                                         off * bytes, count * bytes) != 0;
+                                         (engram_src_row + off) * bytes, count * bytes) != 0;
             }
             if (ok && g->draft) ok = ds41_draft_capture(g, il, g->batch.residual, start, count);
             if (ok && batch_hc)
@@ -42838,11 +42989,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, true);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
-                    ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
-                        ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
-                        ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                            active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+                    ok = ds41_ffn_add_batch(active.block, active.routed, active.shared, count) &&
+                        ds41_hc_expand_batch(active.residual, active.block, active.after_attn, active.ffn_split, count);
                 }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
@@ -42863,8 +43011,15 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             const double t_done = profile ? now_sec() : 0;
             if (ok && !encoder_only && off + count == total_count)
                 ok = ds41_prefill_seed(g, m, &w->layer[il], il, count);
-            if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
-                !ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
+            if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count) {
+                if (!ds41_engram_prefetch_join(engram_pf, !ok)) ok = false;
+                engram_pf = &engram_local;
+                engram_src_row = 0;
+            }
+            /* Layer 14 has consumed the last slab rows. Read the next sweep
+             * while the remaining layers run; never advance live history. */
+            if (ok && xsweep && il == 14u && off + count == total_count)
+                (void)ds41_engram_carry_arm(g, next_tokens, next_count, &next_history);
             if (profile)
                 fprintf(stderr, "ds4: V4.1 prefill layer=%u pos=%u rows=%u encoder_resident=%u "
                         "map=%.3f engram=%.3f encode=%.3f drain=%.3f seed=%.3f ms\n",
@@ -42888,7 +43043,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
         }
     }
-    if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
+    if (!ds41_engram_prefetch_join(engram_pf, !ok)) ok = false;
+    if (!ok) ds41_engram_carry_drop(g);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (g->streaming) ds4_gpu_stream_expert_cache_prefetch_finish(true);
 #endif
@@ -42903,15 +43059,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     }
     g->pos = initial_start;
     if (ok) { g->pos += total_count; g->history = next_history; g->valid = !encoder_only; }
+    if (!ok) ds41_engram_carry_drop(g);
     return ok;
 }
 
 static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                               const ds4_weights *w, const int *tokens, uint32_t count,
                               ds4_session_progress_fn progress, void *progress_ud,
-                              int total, ds4_session_cancel_fn cancel, void *cancel_ud) {
+                              int total, ds4_session_cancel_fn cancel, void *cancel_ud,
+                              const int *next_tokens, uint32_t next_count) {
     return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
-                                   total, cancel, cancel_ud, false, false);
+                                   total, cancel, cancel_ud, false, false, next_tokens, next_count);
 }
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
     if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
@@ -76473,15 +76631,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* Never add an encoder sweep just to defer the decoder. A short
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
+            const uint32_t after = remaining - count;
+            const uint32_t next_count = (after && !g->encoder_resident) ?
+                ds41_prefill_count(g, after) : 0u;
+            const int *next_tokens = next_count > 1u ? prompt->v + i + (int)count : NULL;
+            if (short_count || count == 1u) ds41_engram_carry_drop(g);
             const bool ok = short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
                 layer_major ?
                 (defer_decoder || decoder_pending ?
                  ds41_graph_prefill_sweep(g, &e->model, &e->weights, prompt->v + i, count,
                     s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud,
-                    defer_decoder, decoder_pending) :
+                    defer_decoder, decoder_pending, next_tokens, next_count) :
                  ds41_graph_prefill(g, &e->model, &e->weights, prompt->v + i, count,
-                    s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud)) :
+                    s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud,
+                    next_tokens, next_count)) :
                 ds41_graph_step(g, &e->model, &e->weights, prompt->v[i], NULL);
             if (!ok) {
                 ds41_encoder_release(g, &e->model, &encoder);

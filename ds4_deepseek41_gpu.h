@@ -279,6 +279,22 @@ int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);
 
+/* Large-prefill producers. Short-row fused paths remain unchanged. */
+int ds4_gpu_dsv41_prefill_folds_available(void);
+int ds4_gpu_dsv41_add_bf16_rows(ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t width, uint32_t rows);
+int ds4_gpu_dsv41_embed_init_rows(ds4_gpu_tensor *out_hc, ds4_gpu_tensor *pre,
+        ds4_gpu_tensor *scratch, const ds4_gpu_tensor *tokens,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_vocab, uint32_t rows, uint32_t width);
+int ds4_gpu_dsv41_projection_rows2(ds4_gpu_tensor *out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t width, uint32_t outputs, uint32_t rows, const ds4_gpu_tensor *in);
+int ds4_gpu_dsv41_norm_bf16_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset, uint32_t width,
+        uint32_t rows, float eps);
+
+
 #ifdef __cplusplus
 }
 #endif

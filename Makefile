@@ -1116,4 +1116,12 @@ tests/test_v41_router_hier: tests/test_v41_router_hier.c ds4_gpu_args.o $(CORE_O
 	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_v41_index_masked: tests/test_v41_index_masked.c ds4_gpu_args.o $(CORE_OBJS)
+
+tests/test_v41_embed_batch: tests/test_v41_embed_batch.c ds4_gpu_args.o $(CORE_OBJS)
+	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_v41_prefill_folds: tests/test_v41_prefill_folds.c ds4_gpu_args.o $(CORE_OBJS)
+	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)
+
+tests/test_v41_prefill_attention: tests/test_v41_prefill_attention.c ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) -O2 -g -mcpu=native -Wall -Wextra -std=c99 -I. -o $@ $^ $(METAL_LDLIBS)

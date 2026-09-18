@@ -943,3 +943,100 @@ kernel void kernel_dsv41_query_deferred_hc(
         } else { q[row] = re; q[row + 1u] = im; }
     }
 }
+
+// Two token rows share each lane's half4 weight staging. Each virtual
+// row retains NSG, NR0, ib0/stride, four dot accumulation steps, then the exact
+// existing two-level SIMD reduction. Inputs remain float4, never narrowed.
+// Eligibility requires K divisible by 32 and output rows divisible by NR0.
+template<short NR0>
+static void dsv41_project_f16_rows2_impl(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *weights, device const char *input, device char *output,
+        threadgroup char *scratch, uint2 group, ushort lane, ushort sg) {
+    constexpr short NW = 32, NB = 32, NF = 16, NF4 = 4;
+    const short NSG = FC_mul_mv_nsg;
+    const int r0 = group.x * NR0;
+    const int token0 = group.y * 2;
+    const int nb = args.ne00 / NB;
+    const short ix = lane / (NW / NF), il = lane % (NW / NF);
+    const int ib0 = sg * NF + ix;
+    float sums[2][NR0] = {};
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        float4 y[2][NF4];
+        for (short t = 0; t < 2; ++t) {
+            if (token0 + t < args.ne1) {
+                device const float4 *p = (device const float4 *)(input +
+                    (ulong)(token0 + t) * args.nb11) + (ib * NB + il * NF) / 4;
+                for (short i = 0; i < NF4; ++i) y[t][i] = p[i];
+            }
+        }
+        for (short row = 0; row < NR0; ++row) {
+            device const half4 *p = (device const half4 *)(weights +
+                (ulong)(r0 + row) * args.nb01) + (ib * NB + il * NF) / 4;
+            half4 staged[NF4];
+            FOR_UNROLL (short i = 0; i < NF4; ++i) staged[i] = p[i];
+            for (short t = 0; t < 2; ++t) {
+                if (token0 + t < args.ne1) {
+                    float sumq = 0.f;
+                    FOR_UNROLL (short i = 0; i < NF4; ++i)
+                        sumq += dot(float4(staged[i]), float4(y[t][i]));
+                    sums[t][row] += sumq;
+                }
+            }
+        }
+    }
+    // Disjoint scratch for the two reductions: the original helper has no
+    // trailing barrier, so reusing token0's scratch immediately would race.
+    for (short t = 0; t < 2; ++t) {
+        if (token0 + t < args.ne1) {
+            device float *dst = (device float *)output + (ulong)(token0 + t) * args.ne0;
+            helper_mv_reduce_and_write<NR0>(dst, sums[t], r0, args.ne01,
+                lane, sg, scratch + t * NW * NR0 * sizeof(float));
+        }
+    }
+}
+
+kernel void kernel_dsv41_project_f16_rows2(
+        constant ds4_metal_args_mul_mv &args,
+        device const char *weights, device const char *input, device char *output,
+        threadgroup char *scratch [[threadgroup(0)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.nr0 == 2)
+        dsv41_project_f16_rows2_impl<2>(args, weights, input, output, scratch, group, lane, sg);
+    else if (args.nr0 == 4)
+        dsv41_project_f16_rows2_impl<4>(args, weights, input, output, scratch, group, lane, sg);
+}
+
+
+// Copy bits from the unchanged F16 gather, repeat four HC streams, and seed
+// each token's preceding mixer. No arithmetic or new quantization boundary.
+kernel void kernel_dsv41_repeat_init4(
+        constant uint2 &args,
+        device const uint4 *rows,
+        device uint4 *residual,
+        device uint4 *pre,
+        uint gid [[thread_position_in_grid]]) {
+    const uint vectors = args.x / 4u;
+    if (gid >= args.y * vectors) return;
+    const uint token = gid / vectors, d = gid % vectors;
+    const uint4 value = rows[gid];
+    for (uint h = 0; h < 4u; ++h)
+        residual[((ulong)token * 4u + h) * vectors + d] = value;
+    if (d == 0u) pre[token] = uint4(0x3f800000u, 0u, 0u, 0u);
+}
+
+
+// One F32 componentwise add, then exactly the standalone BF16 bit mapping.
+// In particular b is not independently rounded; preserve the parent's words.
+kernel void kernel_dsv41_add_bf16_rows4(
+        constant uint &vectors,
+        device const float4 *a, device const float4 *b, device uint4 *out,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= vectors) return;
+    uint4 bits = as_type<uint4>(a[gid] + b[gid]);
+    const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+    bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+    out[gid] = bits & 0xffff0000u;
+}
