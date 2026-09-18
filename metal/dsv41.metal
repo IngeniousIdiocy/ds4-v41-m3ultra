@@ -1040,3 +1040,72 @@ kernel void kernel_dsv41_add_bf16_rows4(
     bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
     out[gid] = bits & 0xffff0000u;
 }
+
+/* Preserve the original Markov reduction and additionally publish each full
+ * vocabulary row for the public controller's normalized confidence. */
+kernel void kernel_dsv41_markov_post_part(
+        constant ds4_metal_args_dsv41_markov &a,
+        device const float *logits,   // [block, vocab]
+        device const void *embed,
+        device const void *head,
+        device const int *tokens,     // [block + 1]
+        device float *part_val,       // [n_parts]
+        device int *part_idx,
+        device float *post_logits,    // complete rows for public admission
+        threadgroup float *e [[threadgroup(0)]],  // [rank]
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort ntg   [[threads_per_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]],
+        ushort nsg   [[simdgroups_per_threadgroup]]) {
+    threadgroup float sv[32];
+    threadgroup int si[32];
+    const uint per = a.rank / 32u;
+    if (per == 0u || per > DSV41_MARKOV_MAX_PER_LANE) return;
+    const int prev = tokens[a.step];
+    for (uint r = tid; r < a.rank; r += ntg) e[r] = dsv41_markov_tab(embed, (ulong)prev * a.rank + r, a.f16);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // a lane owns `per` consecutive ranks, so a row is one contiguous load per lane; four
+    // rows go per step so their loads overlap
+    float ev[DSV41_MARKOV_MAX_PER_LANE];
+    for (uint i = 0; i < DSV41_MARKOV_MAX_PER_LANE; i++) ev[i] = i < per ? e[lane * per + i] : 0.0f;
+    device const float *lg = logits + (ulong)a.step * a.vocab;
+    float best = -INFINITY;
+    int bi = -1;
+    const uint stride = a.n_parts * nsg;
+    for (uint v0 = tgpig * nsg + sg; v0 < a.vocab; v0 += 4u * stride) {
+        float p4[4];
+        for (ushort j = 0; j < 4; j++) {
+            const uint v = min(v0 + j * stride, a.vocab - 1u);
+            const ulong base = (ulong)v * a.rank + lane * per;
+            float p = 0.0f;
+            if (a.f16 && per == 8u) {
+                device const half4 *hp = (device const half4 *)((device const half *)head + base);
+                const float4 h0 = float4(hp[0]), h1 = float4(hp[1]);
+                p = dot(h0, float4(ev[0], ev[1], ev[2], ev[3])) + dot(h1, float4(ev[4], ev[5], ev[6], ev[7]));
+            } else {
+                for (uint i = 0; i < DSV41_MARKOV_MAX_PER_LANE; i++) {
+                    if (i < per) p = fma(dsv41_markov_tab(head, base + i, a.f16), ev[i], p);
+                }
+            }
+            p4[j] = p;
+        }
+        for (ushort j = 0; j < 4; j++) {
+            const uint v = v0 + j * stride;
+            if (v >= a.vocab) break;
+            const float p = simd_sum(p4[j]) + lg[v];
+            if (lane == 0) post_logits[(ulong)a.step * a.vocab + v] = p;
+            if (p > best || (p == best && (int)v < bi)) { best = p; bi = (int)v; }
+        }
+    }
+    if (lane == 0) { sv[sg] = best; si[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < nsg; k++) {
+            if (si[k] >= 0 && (sv[k] > best || (sv[k] == best && si[k] < bi))) { best = sv[k]; bi = si[k]; }
+        }
+        part_val[tgpig] = best;
+        part_idx[tgpig] = bi;
+    }
+}

@@ -294,6 +294,14 @@ int ds4_gpu_dsv41_norm_bf16_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t offset, uint32_t width,
         uint32_t rows, float eps);
 
+/* Complete post-Markov rows for public admission; arithmetic is unchanged. */
+int ds4_gpu_dsv41_markov_chain_post(uint32_t block, uint32_t vocab, uint32_t rank, uint32_t dim,
+                              const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
+                              const void *model_map, uint64_t model_size,
+                              uint64_t embed_offset, uint64_t head_offset, int f16,
+                              const ds4_gpu_tensor *conf_proj, ds4_gpu_tensor *tokens,
+                              ds4_gpu_tensor *conf, ds4_gpu_tensor *parts, uint32_t n_parts,
+                              ds4_gpu_tensor *post_logits);
 
 #ifdef __cplusplus
 }
