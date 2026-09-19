@@ -1,6 +1,6 @@
 ## DeepSeek V4.1 Flash on M3 Ultra — September 18 update
 
-This branch now includes the UAT-accepted MXFP4 combination of scalar decode,
+This branch now blends its prior optimizations with a MXFP4 combination of scalar decode,
 prefill and native DSpark improvements, based on [kernelpool's V4.1 work](https://github.com/antirez/ds4/pull/1073).
 Accepted optimizations and the cost-aware controller are enabled by default on
 supported local Metal paths. Reasoning stays serial; DSpark handles eligible answers and tool output.
