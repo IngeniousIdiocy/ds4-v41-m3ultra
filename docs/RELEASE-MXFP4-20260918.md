@@ -12,10 +12,13 @@ make -j4
 
 Use matching native DeepSeek V4.1 Flash MXFP4 target and DSpark GGUF files. The included converter accepts the original Hugging Face safetensors checkpoint; `--quant mxfp4` preserves the released expert codes/scales and packs them into GGUF. It does not convert Q4_K back to MXFP4. See [conversion instructions](../gguf-tools/README.md).
 
+Install the converter dependencies (`numpy`, `tokenizers`, and `sympy`). Set `SOURCE_REVISION` to the full 40-character Hugging Face commit used to download the checkpoint; the converter requires it for source provenance.
+
 ```sh
 make -C gguf-tools libds4quants.dylib
 python3 gguf-tools/deepseek41_quantize.py \
   --hf models/DeepSeek-V4.1-Flash --quant mxfp4 \
+  --source-revision "$SOURCE_REVISION" \
   --out gguf/DeepSeek-V4.1-Flash-MXFP4.gguf \
   --dspark-out gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
 
