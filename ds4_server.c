@@ -3,6 +3,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_image.h"
 #include "ds4_kvstore.h"
 #include "ds4_tp.h"
 #include "rax.h"
@@ -502,7 +503,8 @@ static bool server_image_media_type(const char *media_type) {
     return media_type &&
            (!strcasecmp(media_type, "image/png") ||
             !strcasecmp(media_type, "image/jpeg") ||
-            !strcasecmp(media_type, "image/jpg"));
+            !strcasecmp(media_type, "image/jpg") ||
+            !strcasecmp(media_type, "image/webp"));
 }
 
 static bool server_image_inputs_push_base64(server_image_inputs *images,
@@ -546,6 +548,7 @@ static bool server_image_inputs_push_data_uri(
     static const char png[] = "data:image/png;base64,";
     static const char jpeg[] = "data:image/jpeg;base64,";
     static const char jpg[] = "data:image/jpg;base64,";
+    static const char webp[] = "data:image/webp;base64,";
     if (!uri) return false;
     if (!strncmp(uri, png, sizeof(png) - 1))
         return server_image_inputs_push_base64(
@@ -556,6 +559,9 @@ static bool server_image_inputs_push_data_uri(
     if (!strncmp(uri, jpg, sizeof(jpg) - 1))
         return server_image_inputs_push_base64(
             images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    if (!strncmp(uri, webp, sizeof(webp) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/webp", uri + sizeof(webp) - 1, marker);
     return false;
 }
 
@@ -24045,6 +24051,41 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+/* A 4x4 lossless WebP, small enough to keep inline like the PNG fixture. */
+static const char test_inline_webp_base64[] =
+    "UklGRiAAAABXRUJQVlA4TBQAAAAvA8AAABALJvOX7oth/ue//6FgPQ==";
+
+static void test_openai_inline_webp_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"describe \"},"
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/webp;base64,");
+    buf_puts(&json, test_inline_webp_base64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "describe ") == msgs.v[0].content);
+    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 12);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "RIFF", 4));
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded + 8, "WEBP", 4));
+#ifdef __APPLE__
+    /* The ImageIO decoder must turn the fixture into the RGB pixels that the
+     * vision encoder consumes. */
+    ds4_image img = {0};
+    char err[128] = {0};
+    TEST_ASSERT(ds4_image_decode_memory(&img, msgs.v[0].images.v[0].encoded,
+                                        msgs.v[0].images.v[0].encoded_len,
+                                        err, sizeof(err)));
+    TEST_ASSERT(img.width == 4 && img.height == 4);
+    ds4_image_free(&img);
+#endif
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
 static void test_visible_image_key(void) {
     char markers[2][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A", "nonce_B"};
     request req = {.image_count = 1, .image_markers = markers};
@@ -24498,6 +24539,7 @@ static void ds4_server_unit_tests_run(void) {
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
+    test_openai_inline_webp_image_content();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();
