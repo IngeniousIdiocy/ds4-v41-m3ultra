@@ -24051,9 +24051,10 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
-/* A 4x4 lossless WebP, small enough to keep inline like the PNG fixture. */
+/* A 32x32 lossless WebP gradient, red on the top row and blue on the bottom
+ * row: inline like the PNG fixture, and sensitive to a vertical inversion. */
 static const char test_inline_webp_base64[] =
-    "UklGRiAAAABXRUJQVlA4TBQAAAAvA8AAABALJvOX7oth/ue//6FgPQ==";
+    "UklGRjIAAABXRUJQVlA4TCUAAAAvH8AHAM1VIKL/sYuI/geEBITo/2tZOf6/kCAh+n+tMZJ0RXsDAA==";
 
 static void test_openai_inline_webp_image_content(void) {
     buf json = {0};
@@ -24073,13 +24074,18 @@ static void test_openai_inline_webp_image_content(void) {
     TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded + 8, "WEBP", 4));
 #ifdef __APPLE__
     /* The ImageIO decoder must turn the fixture into the RGB pixels that the
-     * vision encoder consumes. */
+     * vision encoder consumes, in the right orientation: buffer row 0 is the
+     * gradient's red top, the last row is its blue bottom. */
     ds4_image img = {0};
     char err[128] = {0};
     TEST_ASSERT(ds4_image_decode_memory(&img, msgs.v[0].images.v[0].encoded,
                                         msgs.v[0].images.v[0].encoded_len,
                                         err, sizeof(err)));
-    TEST_ASSERT(img.width == 4 && img.height == 4);
+    TEST_ASSERT(img.width == 32 && img.height == 32);
+    const unsigned char *top = img.rgb;
+    const unsigned char *bottom = img.rgb + (size_t)(img.height - 1) * img.width * 3;
+    TEST_ASSERT(top[0] > 200 && top[2] < 60);
+    TEST_ASSERT(bottom[2] > 200 && bottom[0] < 60);
     ds4_image_free(&img);
 #endif
     chat_msgs_free(&msgs);

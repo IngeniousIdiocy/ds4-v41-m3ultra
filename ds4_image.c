@@ -278,11 +278,10 @@ static int ds4_decode_webp_imageio(
     }
     CGContextSetRGBFillColor(context, 1.0, 1.0, 1.0, 1.0);
     CGContextFillRect(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height));
-    CGContextSaveGState(context);
-    CGContextTranslateCTM(context, 0.0, (CGFloat)height);
-    CGContextScaleCTM(context, 1.0, -1.0);
+    /* A plain draw already lands the image top row in buffer row 0: the
+     * context stores top-down memory, so the classic Cocoa flip idiom here
+     * would invert the picture. Verified pixel-exact against the PNG path. */
     CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
-    CGContextRestoreGState(context);
     const uint8_t *pixels = (const uint8_t *)CGBitmapContextGetData(context);
     if (!pixels) {
         ds4_image_error(error, error_cap, "unable to read decoded WebP pixels");
