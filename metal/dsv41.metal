@@ -550,6 +550,55 @@ kernel void kernel_dsv41_candidate_filter(
         ? scores[offset] : -INFINITY;
 }
 
+/* The 2048 candidate blocks of a 0/-inf mask in ascending order; one
+ * threadgroup of 1024 threads, four mask entries per thread and step. */
+kernel void kernel_dsv41_candidate_list(
+        constant uint &blocks,
+        device const float *mask,
+        device uint *list,
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint part[33];
+    uint base = 0u;
+    for (uint b0 = 0u; b0 < blocks; b0 += 4096u) {
+        const uint b = b0 + tid * 4u;
+        bool keep[4];
+        uint count = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            keep[j] = b + j < blocks && mask[b + j] == 0.0f;
+            count += keep[j] ? 1u : 0u;
+        }
+        const uint before = simd_prefix_exclusive_sum(count);
+        if (lane == 31u) part[simd] = before + count;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u) {
+            const uint c = part[lane], c_before = simd_prefix_exclusive_sum(c);
+            part[lane] = c_before;
+            if (lane == 31u) part[32] = c_before + c;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint at = base + part[simd] + before;
+        for (uint j = 0u; j < 4u; j++) {
+            if (keep[j] && at < 2048u) list[at] = b + j;
+            at += keep[j] ? 1u : 0u;
+        }
+        base += part[32];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+/* Positions in the candidate list back to key ids, in place and in order. */
+kernel void kernel_dsv41_candidate_ids(
+        constant uint &count,
+        device const uint *list,
+        device int *selected,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= count) return;
+    const uint p = (uint)selected[i];
+    selected[i] = (int)(list[p >> 3] * 8u + (p & 7u));
+}
+
 struct ds4_metal_args_dsv41_carry {
     uint width, rows, words, format, pack;
 };

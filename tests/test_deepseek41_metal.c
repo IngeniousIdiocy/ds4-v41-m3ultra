@@ -1332,8 +1332,101 @@ static int check_index_score_wide(void) {
     fprintf(stderr, "V4.1 wide index score: double-precision oracle PASS\n");
     return 1;
 }
+
+/* Candidate-only index rows against the wide row they replace (wide scores,
+ * candidate filter, radix top-512): the same ids in the same order, with
+ * realistic and wide FP4 block scales, partial newest blocks and ties. */
+static int check_index_candidates(void) {
+    enum { HEADS = 32, DIM = 128, TOP = 512, ROUNDS = 6 };
+    const uint32_t widths[] = {16385, 16391, 20007, 65536, 131072, 131075, 262147};
+    const uint32_t max_keys = 262147, max_blocks = (max_keys + 7) / 8;
+    ds4_gpu_tensor *qt = upload(NULL, (size_t)HEADS * DIM * 4), *wt = upload(NULL, HEADS * 4);
+    ds4_gpu_tensor *kt = upload(NULL, (size_t)max_keys * DIM * 4);
+    ds4_gpu_tensor *full = upload(NULL, (size_t)max_keys * 4), *plain = upload(NULL, (size_t)max_keys * 4);
+    ds4_gpu_tensor *source = upload(NULL, (size_t)max_keys * 4), *cand = upload(NULL, 16384 * 4);
+    ds4_gpu_tensor *list = upload(NULL, 2048 * 4), *blocks_t = upload(NULL, (size_t)max_blocks * 4);
+    ds4_gpu_tensor *picked = upload(NULL, 2048 * 4), *mask = upload(NULL, (size_t)max_blocks * 4);
+    ds4_gpu_tensor *old_sel = upload(NULL, TOP * 4), *new_sel = upload(NULL, TOP * 4);
+    CHECK(qt && wt && kt && full && plain && source && cand && list && blocks_t && picked && mask &&
+          old_sel && new_sel);
+    float *q = ds4_gpu_tensor_contents(qt), *w = ds4_gpu_tensor_contents(wt);
+    float *k = ds4_gpu_tensor_contents(kt), *s = ds4_gpu_tensor_contents(source);
+    const float *p = ds4_gpu_tensor_contents(plain), *c = ds4_gpu_tensor_contents(cand);
+    const float *m = ds4_gpu_tensor_contents(mask);
+    const uint32_t *l = ds4_gpu_tensor_contents(list);
+    const int32_t *a = ds4_gpu_tensor_contents(old_sel), *b = ds4_gpu_tensor_contents(new_sel);
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        const uint32_t n = widths[wi], blocks = (n + 7) / 8, count = 16384 - (blocks * 8 - n);
+        double seconds[2] = {0, 0};
+        uint32_t ties = 0;
+        for (int mode = 0; mode < 4; mode++) {
+            /* bit 0: block exponents over +-20 instead of +-2; bit 1: ties */
+            const int range = mode & 1 ? 20 : 2;
+            for (size_t i = 0; i < (size_t)HEADS * DIM; i++)
+                q[i] = ldexpf(random_value(), (int)((i / 32) % (2 * range + 1)) - range);
+            for (size_t i = 0; i < (size_t)n * DIM; i++)
+                k[i] = ldexpf(random_value(), (int)((i / 32 + n) % (2 * range + 1)) - range);
+            for (size_t i = 0; i < HEADS; i++) w[i] = random_value() * 0.37139f;
+            for (uint32_t i = 0; i < n; i++) s[i] = (float)((i * 7919u + mode) % 1048573u);
+            CHECK(ds4_gpu_dsv41_quantize(qt, DIM, HEADS, DS4_V41_FP4_E8M0));
+            CHECK(ds4_gpu_dsv41_quantize(kt, DIM, n, DS4_V41_FP4_E8M0));
+            CHECK(ds4_gpu_synchronize());
+            if (mode & 2) {
+                /* copy the best key over 1/16 of all keys: the 512th score ties */
+                CHECK(ds4_gpu_glm_indexer_score_one_tensor(plain, qt, wt, kt, n, HEADS, DIM,
+                    1.0f / 64.0f, false) && ds4_gpu_synchronize());
+                uint32_t best = 0;
+                for (uint32_t i = 1; i < n; i++) if (p[i] > p[best]) best = i;
+                for (uint32_t i = 0; i < n; i += 16)
+                    memcpy(k + (size_t)(i ^ 5) % n * DIM, k + (size_t)best * DIM, DIM * 4);
+            }
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_candidate_blocks(blocks_t, source, n, 1, n - 1, 1));
+            CHECK(ds4_gpu_indexer_topk_tensor(picked, blocks_t, blocks, 1, 2048));
+            CHECK(ds4_gpu_dsv4_topk_mask_tensor(mask, picked, blocks, 1, 2048));
+            CHECK(ds4_gpu_glm_indexer_score_one_tensor(plain, qt, wt, kt, n, HEADS, DIM, 1.0f / 64.0f, false));
+            CHECK(ds4_gpu_end_commands());
+            for (int round = 0; round < ROUNDS; round++) {
+                for (int path = 0; path < 2; path++) {
+                    const double t0 = monotonic_seconds();
+                    CHECK(ds4_gpu_begin_commands());
+                    if (path) {
+                        CHECK(ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt, mask,
+                            n, 1.0f / 64.0f, TOP));
+                    } else {
+                        CHECK(ds4_gpu_dsv41_indexer_score_masked(full, qt, wt, kt, mask, n));
+                        CHECK(ds4_gpu_dsv41_candidate_filter(full, mask, n, 1, n - 1, 1, 0));
+                        CHECK(ds4_gpu_indexer_topk_tensor(old_sel, full, n, 1, TOP));
+                    }
+                    CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+                    if (round) seconds[path] += monotonic_seconds() - t0;
+                }
+                CHECK(!memcmp(a, b, TOP * sizeof(*a)));
+            }
+            /* the list is the mask's candidates in order; each score is the wide one */
+            uint32_t at = 0;
+            for (uint32_t j = 0; j < blocks; j++) if (m[j] == 0.0f) CHECK(at < 2048 && l[at++] == j);
+            CHECK(at == 2048 && l[2047] == blocks - 1);
+            for (uint32_t i = 0; i < count; i++) {
+                const uint32_t key = l[i / 8] * 8 + i % 8;
+                CHECK(key < n && !memcmp(c + i, p + key, sizeof(*c)));
+            }
+            for (uint32_t i = 0; i < TOP; i++) ties += i && p[a[i]] == p[a[i - 1]];
+        }
+        fprintf(stderr, "V4.1 candidate index rows keys=%u candidates=%u: ids, order and scores "
+                "identical (%u tied neighbours) us per row full=%.0f candidates=%.0f\n",
+                n, count, ties, seconds[0] / (4 * (ROUNDS - 1)) * 1e6, seconds[1] / (4 * (ROUNDS - 1)) * 1e6);
+    }
+    CHECK(!ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt, mask,
+        16384, 1.0f / 64.0f, TOP));
+    ds4_gpu_tensor *tensors[] = {qt, wt, kt, full, plain, source, cand, list, blocks_t, picked, mask,
+                                 old_sel, new_sel};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    return 1;
+}
 #else
 static int check_index_score_wide(void) { return 1; }
+static int check_index_candidates(void) { return 1; }
 #endif
 
 static int check_compact_carry(void) {
@@ -1546,6 +1639,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--index-candidates")) {
+        const int ok = ds4_gpu_init() && check_index_candidates();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-topk")) {
         const int ok = ds4_gpu_init() && check_causal_topk();
         ds4_gpu_cleanup();
@@ -1570,6 +1668,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() &&
+             check_index_candidates() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();
