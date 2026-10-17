@@ -824,6 +824,9 @@ typedef struct {
     bool stream;
     bool stream_include_usage;
     bool ignore_eos;
+    /* "ds4_utility": a one-shot side request served by the --utility-ctx
+     * session; it never touches the main session or the disk KV cache. */
+    bool utility;
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
@@ -4215,6 +4218,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ds4_utility")) {
+            if (!json_bool(&p, &r->utility)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -4268,6 +4276,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (r->utility) thinking_enabled = false;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
@@ -4434,6 +4443,11 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ds4_utility")) {
+            if (!json_bool(&p, &r->utility)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -4484,6 +4498,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (r->utility) thinking_enabled = false;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!anthropic_validate_tool_results(s, &msgs,
@@ -5691,6 +5706,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ds4_utility")) {
+            if (!json_bool(&p, &r->utility)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "think")) {
             if (!json_bool(&p, &thinking_enabled)) {
                 free(key);
@@ -5719,6 +5739,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (r->utility) thinking_enabled = false;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     chat_msgs msgs = {0};
@@ -6952,6 +6973,13 @@ static bool request_exceeds_context(const request *r, int ctx_size) {
      * needs at least one free context slot.  Catch the same boundary here so
      * clients get a normal protocol error instead of a later backend failure. */
     return r && r->prompt.len >= ctx_size;
+}
+
+static bool request_exceeds_utility_context(const request *r, int ctx_size) {
+    /* A utility job never falls back to the main session, so its whole output
+     * budget must fit up front rather than stopping at the context limit. */
+    return r && (r->prompt.len >= ctx_size ||
+                 r->max_tokens > ctx_size - r->prompt.len);
 }
 
 static bool http_error_context_length_exceeded(int fd, bool enable_cors,
@@ -10013,6 +10041,7 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    bool utility;   /* the --utility-ctx side session, never in slots[] */
 
     job *assigned;
     job *running;
@@ -10134,6 +10163,8 @@ struct server {
     server_slot *slots;
     int slot_count;
     int ctx_size;
+    server_slot *utility_slot;   /* NULL unless --utility-ctx; non-batched only */
+    int utility_ctx;
     bool batched_mode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
@@ -11248,7 +11279,9 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
-    if (!s || !slot) return false;
+    /* The utility session is one-shot scratch: every store reason (cold,
+     * continued, evict, shutdown) funnels through here and stops. */
+    if (!s || !slot || slot->utility) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -11272,6 +11305,10 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
+}
+
+static bool kv_cache_slot_enabled(const server *s, const server_slot *slot) {
+    return s->kv.enabled && !slot->utility;
 }
 
 static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
@@ -11417,6 +11454,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (slot->utility) return 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -13304,6 +13342,9 @@ static void *decode_worker_main(void *arg) {
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
+    /* Utility jobs are one-shot: drop whatever protocol state the previous
+     * utility job remembered, so nothing below can continue from it. */
+    if (slot->utility) request_live_state_clear(s, slot);
     const bool multimodal = j->req.image_count != 0;
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
@@ -13450,7 +13491,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && s->kv.enabled && cached == 0 &&
+    if (!multimodal && kv_cache_slot_enabled(s, slot) && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
@@ -13554,7 +13595,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     int cold_store_len = 0;
     if (!multimodal && cached == 0 &&
-        s->kv.enabled &&
+        kv_cache_slot_enabled(s, slot) &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
@@ -13837,7 +13878,7 @@ decode_again:
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
         /* The alternative admission policy keeps reasoning serial. */
-        if (!s->batched_mode &&
+        if (!s->batched_mode && !slot->utility &&
             !(thinking.inside &&
               ds4_session_ds41_dspark_adaptive_stats(slot->session, NULL, NULL)) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
@@ -14766,12 +14807,19 @@ static job *dequeue(server *s) {
     return j;
 }
 
+/* Non-batched mode has one worker and one main session.  Utility jobs take the
+ * side session when --utility-ctx created one; everything else keeps slots[0],
+ * so the main session never sees them. */
+static server_slot *worker_slot_for_job(server *s, const job *j) {
+    return j->req.utility && s->utility_slot ? s->utility_slot : &s->slots[0];
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, &s->slots[0], j);
+        generate_job(s, worker_slot_for_job(s, j), j);
         job_complete(j);
     }
     return NULL;
@@ -15151,6 +15199,16 @@ static void *client_main(void *arg) {
         request_free(&req);
         goto done;
     }
+    if (req.utility && s->utility_slot &&
+        request_exceeds_utility_context(&req, s->utility_ctx)) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "Utility request needs %d prompt + %d output tokens, but --utility-ctx is %d tokens",
+                 req.prompt.len, req.max_tokens, s->utility_ctx);
+        http_error(fd, s->enable_cors, 400, msg);
+        request_free(&req);
+        goto done;
+    }
 
     set_client_socket_nonblocking(fd);
     job j;
@@ -15240,6 +15298,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    int utility_ctx;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15325,6 +15384,15 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
+    }
+    if (s->utility_slot) {
+        server_slot *slot = s->utility_slot;
+        live_tool_state_free(&slot->responses_live);
+        live_tool_state_free(&slot->anthropic_live);
+        visible_live_free(&slot->thinking_live);
+        if (slot->session) ds4_session_free(slot->session);
+        free(slot);
+        s->utility_slot = NULL;
     }
     free(s->slot_threads);
     free(s->slots);
@@ -15486,6 +15554,8 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--utility-ctx")) {
+            c.utility_ctx = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -15599,6 +15669,11 @@ static server_config parse_options(int argc, char **argv) {
     {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
+        exit(2);
+    }
+    if (c.utility_ctx > 0 && c.batched_sessions > 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --utility-ctx requires non-batched mode; drop --batched-session");
         exit(2);
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
@@ -15796,6 +15871,31 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+    }
+    if (cfg.utility_ctx > 0) {
+        /* A separate small session for one-shot side requests (titles, tags),
+         * kept outside slots[] so no main-session loop ever visits it. */
+        server_slot *slot = xmalloc(sizeof(*slot));
+        memset(slot, 0, sizeof(*slot));
+        slot->srv = &s;
+        slot->id = slot_count;
+        slot->utility = true;
+        s.utility_slot = slot;
+        s.utility_ctx = cfg.utility_ctx;
+        if (ds4_session_create(&slot->session, engine, cfg.utility_ctx) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create %s utility session ctx=%d",
+                       ds4_backend_name(cfg.engine.backend), cfg.utility_ctx);
+            server_close_resources(&s);
+            return 1;
+        }
+        ds4_context_memory um = ds4_context_memory_estimate_with_prefill_mode(
+            cfg.engine.backend, cfg.utility_ctx, ds4_engine_prefill_chunk(engine),
+            cfg.engine.ssd_streaming);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: utility session ctx=%d context buffers %.2f MiB (prefill_chunk=%u); thinking, MTP/DSpark, and disk KV cache off",
+                   cfg.utility_ctx, (double)um.total_bytes / (1024.0 * 1024.0),
+                   um.prefill_cap);
     }
 
     if (cfg.kv_disk_dir) {
@@ -16037,6 +16137,107 @@ static void test_batched_live_continuation_slot_binding(void) {
     request_free(&j.req);
     live_tool_state_free(&slots[1].responses_live);
     live_tool_state_free(&slots[2].anthropic_live);
+}
+
+static void test_utility_request_parse(void) {
+    char *default_argv[] = {"ds4-server"};
+    TEST_ASSERT(parse_options(1, default_argv).utility_ctx == 0);
+    char *utility_argv[] = {"ds4-server", "--utility-ctx", "32768"};
+    TEST_ASSERT(parse_options(3, utility_argv).utility_ctx == 32768);
+
+    /* A recognized key is type-checked; an unknown one would be skipped and
+     * the parse would fail later on the missing messages instead. */
+    char err[128];
+    request r;
+    TEST_ASSERT(!parse_chat_request(NULL, NULL, "{\"ds4_utility\":\"yes\"}",
+                                    1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+    TEST_ASSERT(!parse_chat_request(NULL, NULL, "{\"ds4_utility\":true}",
+                                    1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(err, "missing messages"));
+    TEST_ASSERT(!parse_anthropic_request(NULL, NULL, "{\"ds4_utility\":1}",
+                                         1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+    TEST_ASSERT(!parse_anthropic_request(NULL, NULL, "{\"ds4_utility\":true}",
+                                         1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(err, "missing messages"));
+    TEST_ASSERT(!parse_completion_request(NULL, "{\"ds4_utility\":null}",
+                                          1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+    TEST_ASSERT(!parse_completion_request(NULL, "{\"ds4_utility\":false}",
+                                          1, 100, &r, err, sizeof(err)));
+    TEST_ASSERT(!strcmp(err, "missing prompt"));
+
+    request fit = {0};
+    fit.prompt.len = 3000;
+    fit.max_tokens = 800;
+    TEST_ASSERT(!request_exceeds_utility_context(&fit, 3800));
+    TEST_ASSERT(request_exceeds_utility_context(&fit, 3799));
+    fit.max_tokens = INT_MAX;
+    TEST_ASSERT(request_exceeds_utility_context(&fit, 32768));
+    fit.max_tokens = 0;
+    TEST_ASSERT(request_exceeds_utility_context(&fit, 3000));
+}
+
+static void test_utility_worker_routing(void) {
+    server s = {0};
+    server_slot main_slot = {0};
+    server_slot utility = {.utility = true};
+    s.slots = &main_slot;
+    s.slot_count = 1;
+
+    job j = {0};
+    TEST_ASSERT(worker_slot_for_job(&s, &j) == &main_slot);
+    j.req.utility = true;
+    /* Feature off: a utility job runs exactly where it ran before. */
+    TEST_ASSERT(worker_slot_for_job(&s, &j) == &main_slot);
+    s.utility_slot = &utility;
+    TEST_ASSERT(worker_slot_for_job(&s, &j) == &utility);
+    j.req.utility = false;
+    TEST_ASSERT(worker_slot_for_job(&s, &j) == &main_slot);
+}
+
+static void test_utility_slot_excluded_from_cache_and_live_state(void) {
+    server s = {0};
+    server_slot main_slot = {0};
+    server_slot utility = {.utility = true};
+    s.slots = &main_slot;
+    s.slot_count = 1;
+    s.utility_slot = &utility;
+    s.kv.enabled = true;
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    TEST_ASSERT(kv_cache_slot_enabled(&s, &main_slot));
+    TEST_ASSERT(!kv_cache_slot_enabled(&s, &utility));
+    s.kv.enabled = false;
+    TEST_ASSERT(!kv_cache_slot_enabled(&s, &main_slot));
+    s.kv.enabled = true;
+
+    /* Stores and loads return before taking any lock or reaching the store. */
+    ds4_tokens tokens = {0};
+    TEST_ASSERT(!kv_cache_store_live_prefix(&s, &utility, &tokens, 0, "evict"));
+    char *path = (char *)"stale";
+    uint8_t ext = 7;
+    TEST_ASSERT(kv_cache_try_load_text(&s, &utility, "prompt", &tokens,
+                                       &path, &ext, false) == 0);
+    TEST_ASSERT(path == NULL && ext == 0);
+
+    /* Live tool state on the utility slot never binds a continuation. */
+    job j = {0};
+    j.req.anthropic_requires_live_tool_state = true;
+    id_list_push_unique(&j.req.anthropic_live_call_ids, "toolu-utility");
+    utility.anthropic_live.valid = true;
+    id_list_push_unique(&utility.anthropic_live.call_ids, "toolu-utility");
+    utility.responses_live.valid = true;
+    id_list_push_unique(&utility.responses_live.call_ids, "call-utility");
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu-utility"));
+    TEST_ASSERT(!responses_live_has_call_id(&s, "call-utility"));
+
+    request_free(&j.req);
+    live_tool_state_free(&utility.anthropic_live);
+    live_tool_state_free(&utility.responses_live);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
@@ -22065,6 +22266,9 @@ static void ds4_server_unit_tests_run(void) {
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
+    test_utility_request_parse();
+    test_utility_worker_routing();
+    test_utility_slot_excluded_from_cache_and_live_state();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
