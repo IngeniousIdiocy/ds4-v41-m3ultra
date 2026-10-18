@@ -9393,6 +9393,35 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (bytes == 0) return 1;
     if (!g_batch_cb) return 0;
 
+    /* A 16-byte aligned copy inside a serial compute section stays in the
+     * open compute encoder: a blit closes it, and DSpark verify and rollback
+     * issue hundreds of small copies per cycle.  The bytes moved are the same. */
+    static int compute_copy_off = -1;
+    if (compute_copy_off < 0) compute_copy_off = getenv("DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY") != NULL;
+    const uint64_t src_at = s.offset + src_offset, dst_at = d.offset + dst_offset;
+    if (!compute_copy_off && !g_batch_encoder_concurrent &&
+        ((src_at | dst_at | bytes) & 15u) == 0 && bytes / 16u <= UINT32_MAX &&
+        (s.buffer != d.buffer || src_at + bytes <= dst_at || dst_at + bytes <= src_at)) {
+        static id<MTLComputePipelineState> copy_pipeline;
+        if (!copy_pipeline) copy_pipeline = ds4_gpu_get_pipeline("kernel_ds4_copy_u4");
+        if (copy_pipeline) {
+            @autoreleasepool {
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+                if (!enc) return 0;
+                const uint32_t n = (uint32_t)(bytes / 16u);
+                [enc setComputePipelineState:copy_pipeline];
+                [enc setBytes:&n length:sizeof(n) atIndex:0];
+                [enc setBuffer:s.buffer offset:(NSUInteger)src_at atIndex:1];
+                [enc setBuffer:d.buffer offset:(NSUInteger)dst_at atIndex:2];
+                const NSUInteger nth = 256u;
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + nth - 1u) / nth, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+            }
+            return 1;
+        }
+    }
+
     /* C inference callers have no surrounding autorelease pool. In particular,
      * validation-layer blit bookkeeping otherwise accumulates across tokens. */
     @autoreleasepool {
