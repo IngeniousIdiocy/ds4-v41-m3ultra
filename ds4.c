@@ -42747,7 +42747,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               bool encoder_only, bool resume_encoder,
                               const int *next_tokens, uint32_t next_count) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
-    const bool wide = total_count > encoder_chunk;
+    /* DS4_V41_SUFFIX_ALL: the exact dependency suffix for short sweeps too, without
+     * tile rounding; same math, other kernels for the smaller row counts. */
+    const bool suffix_all = getenv("DS4_V41_SUFFIX_ALL") && g->tp_world == 1 && !g->streaming &&
+        !g->image_count && total_count >= 384u && total_count <= g->carry_cap;
+    const bool wide = total_count > encoder_chunk || suffix_all;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
@@ -42762,8 +42766,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     /* Drafting needs the last window of every layer's stream. */
     const uint32_t kept = g->draft ? DS41_DRAFT_WINDOW : 1u;
     const uint32_t suffix_rows = kept + (DS4_N_LAYER - 20u) * 127u;
-    const bool decoder_suffix = wide && total_count >= suffix_rows &&
-        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+    const bool decoder_suffix = suffix_all || (wide && total_count >= suffix_rows &&
+        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX"));
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
     ds4_engram_history next_history = g->history;
@@ -42875,12 +42879,14 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
             const uint32_t needed = kept + (DS4_N_LAYER - 1u - il) * 127u;
-            first = total_count - needed;
+            first = needed < total_count ? total_count - needed : 0u;
             /* short sweeps prune whole tiles and warm a complete one, keeping
              * the partitions the plain schedule would have used */
-            const bool short_sweep = total_count < 8192u && !ds41_short_sweep_off();
+            const bool short_sweep = total_count < 8192u && !ds41_short_sweep_off() && !suffix_all;
             if (short_sweep) first -= first % 2048u;
-            const uint32_t warm = short_sweep ? 128u : 127u;
+            uint32_t warm = short_sweep ? 128u : 127u;
+            /* rows before the sweep are already in the window ring */
+            if (warm > first) warm = first;
             if (ok && first) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                 first - warm, warm, false, batch_hc, batch_attention, cancel, cancel_ud);
         }
