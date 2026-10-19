@@ -19774,7 +19774,9 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         /* Amortize dequantization across token tiles with identical half
          * operands. Default is scoped by the Qwen entry point to M3 Ultra. */
         const int unpack_override = ds4_gpu_env_bool("DS4_QWEN4_Q8_PREFILL_UNPACK");
-        const bool prefill_unpack = generic_rows >= 32u &&
+        /* The unpacked weights share one scratch buffer: a concurrent section
+         * could overlap the unpack and its GEMM, so it keeps the tiled kernel. */
+        const bool prefill_unpack = generic_rows >= 32u && !g_batch_encoder_concurrent &&
             (unpack_override >= 0 ? unpack_override == 1 : prefill_default);
         const char *fn = "kernel_mul_mm_q8_0_f32";
         id<MTLBuffer> mat_weights = wbuf;
@@ -19938,7 +19940,10 @@ int ds4_gpu_matmul_q8_0_bf16_tensor(
     if (n_tok >= 2 && n_tok <= 8 &&
         ds4_gpu_matmul_q8_0_rows_tensor_impl(out, model_map, model_size, weight_offset,
                                              in_dim, out_dim, x, (uint32_t)n_tok, 1)) return 1;
-    if (!ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, false, 1, &fused)) return 0;
+    /* V4.1 prefill on M3 Ultra: the half weights of the unpack path are the
+     * tiled kernel's own, so wide batches gain with bit-identical outputs. */
+    if (!ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok,
+            ds4_gpu_device_name_contains("M3 Ultra"), 1, &fused)) return 0;
     return fused ? 1 : ds4_gpu_dsv41_quantize(out, (uint32_t)out_dim, (uint32_t)n_tok, DS4_V41_BF16);
 }
 
@@ -36954,7 +36959,11 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         if (verify_tiled < 0) verify_tiled = getenv("DS4_METAL_DISABLE_V41_VERIFY_TILED_INDEX") == NULL;
         const bool use_tiled = !force_scalar && n_head == 32u && head_dim == 128u &&
             (n_tokens >= 8u || (n_tokens >= 2u && g_v41_verify_rows && verify_tiled));
+        /* V4.1's f32 tiles on simdgroup matrices, K^T held in registers */
+        const bool use_mma = use_tiled && use_tiled_f32 && n_tokens >= 8u &&
+            !getenv("DS4_METAL_DISABLE_V41_INDEX_MMA");
         id<MTLComputePipelineState> pipeline =
+            use_mma ? ds4_gpu_get_pipeline("kernel_dsv41_indexer_scores_mma") :
             use_tiled
                 ? ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
                                                      : g_glm_indexer_scores_tiled_pipeline,
@@ -36992,7 +37001,12 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
         [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
         [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-        if (use_tiled) {
+        if (use_mma) {
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u,
+                                                  ((NSUInteger)n_tokens + 7u) / 8u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        } else if (use_tiled) {
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 32u * 128u;
             const NSUInteger dot_shared = 8u * 32u;
