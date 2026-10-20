@@ -17701,6 +17701,8 @@ static void test_chat_ignore_eos_contract(void) {
     TEST_ASSERT(!strcmp(err, "invalid JSON request"));
 }
 
+ds4_think_mode ds4_test_think_mode_for_context_as(bool deepseek41, ds4_think_mode mode, int ctx_size);
+
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
     TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_LOW);
@@ -17717,9 +17719,12 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(!strncmp(ds4_deepseek41_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: 50 ", 21));
     TEST_ASSERT(!strncmp(ds4_deepseek41_reasoning_effort_text(DS4_THINK_HIGH), "Reasoning Effort: 75 ", 21));
     TEST_ASSERT(!strncmp(ds4_deepseek41_reasoning_effort_text(DS4_THINK_MAX), "Reasoning Effort: 100 ", 22));
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
-    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
-                                           (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
+    /* Both families, whatever model this process loaded earlier: below the
+     * max-thinking context V4 falls back to high, while V4.1 keeps max. */
+    TEST_ASSERT(ds4_test_think_mode_for_context_as(false, DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
+    TEST_ASSERT(ds4_test_think_mode_for_context_as(false, DS4_THINK_MAX,
+                                                   (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
+    TEST_ASSERT(ds4_test_think_mode_for_context_as(true, DS4_THINK_MAX, 32768) == DS4_THINK_MAX);
 }
 
 static void test_model_alias_thinking_controls(void) {

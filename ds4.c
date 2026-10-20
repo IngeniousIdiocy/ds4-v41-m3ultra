@@ -62364,6 +62364,17 @@ ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
     return mode;
 }
 
+/* Test entry: ds4_think_mode_for_context under the DeepSeek V4 Flash or V4.1
+ * Flash shape, then the process's shape restored, so a test does not depend
+ * on which model the process loaded before it. */
+ds4_think_mode ds4_test_think_mode_for_context_as(bool deepseek41, ds4_think_mode mode, int ctx_size) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = deepseek41 ? DS4_SHAPE_FLASH41 : DS4_SHAPE_FLASH;
+    const ds4_think_mode r = ds4_think_mode_for_context(mode, ctx_size);
+    g_ds4_shape = saved_shape;
+    return r;
+}
+
 static void ds4_release_instance_lock(void) {
     if (g_ds4_lock_fd >= 0) {
         close(g_ds4_lock_fd);
