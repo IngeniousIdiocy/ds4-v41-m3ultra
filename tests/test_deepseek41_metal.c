@@ -1414,8 +1414,33 @@ static int check_topk_select(void) {
                 variants++;
             }
         }
+        /* one row, k <= 512: the gather-and-finish path against the plain radix passes, bit for bit; tied rows,
+         * unique, masked, few finite, all equal (the bin overflows) and 2000 copies of the 400th (too many ties) */
+        uint32_t gathered = 0;
+        for (uint32_t pattern = 0; pattern < 6; pattern++) {
+            for (uint32_t i = 0; i < width; i++) {
+                const float unique = (float)((i * 7919u) % 1048573u) - 500000.0f;
+                s[i] = pattern == 0 ? random_value() : pattern == 1 ? unique : pattern == 2 ? (i / 8 % 8 ? -INFINITY : unique) :
+                       pattern == 3 ? (i % 1361 ? -INFINITY : unique) : pattern == 4 ? 1.0f : unique;
+            }
+            if (pattern == 5) {
+                for (uint32_t i = 0; i < width; i++) reference[i] = (topk_entry){s[i], i};
+                qsort(reference, width, sizeof(*reference), compare_topk_entry);
+                for (uint32_t i = 0; i < 2000u; i++) s[(i * 131u) % width] = reference[399].value;
+            }
+            for (size_t ki = 0; ki < 3; ki++) {
+                const uint32_t k = counts[ki];
+                CHECK(ds4_gpu_indexer_topk_tensor(fast, scores, width, 1, k));
+                CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_GATHER", "1", 1) == 0);
+                const int ok = ds4_gpu_indexer_topk_tensor(slow, scores, width, 1, k);
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_GATHER") == 0 && ok && ds4_gpu_synchronize());
+                CHECK(!memcmp(ds4_gpu_tensor_contents(fast), ds4_gpu_tensor_contents(slow), k * sizeof(int32_t)));
+                gathered++;
+            }
+        }
         fprintf(stderr, "V4.1 radix top-k width=%u: values by rank, unique-ID and tie-order oracle PASS; "
-                "512-wide and 2048-wide winners' sorts identical (%u calls)\n", width, variants);
+                "512-wide and 2048-wide winners' sorts identical (%u calls); one-row gather == radix passes (%u calls)\n",
+                width, variants, gathered);
         ds4_gpu_tensor_free(scores); ds4_gpu_tensor_free(fast); ds4_gpu_tensor_free(slow);
         ds4_gpu_tensor_free(alt);
         free(reference); free(seen);
