@@ -11232,6 +11232,33 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
     return ds4_kvstore_continued_store_target(kc, live_tokens);
 }
 
+/* The prefix a request persists as a "cold" checkpoint (0: none). With nothing
+ * restored it is the chat anchor, or the aligned prompt length. A request that
+ * restored a shorter prefix from disk persists the aligned prompt length (or a
+ * later anchor) too, once that extends the restored prefix by at least one
+ * continued interval: V4.1 prefill cannot stage mid-sync (its chunks have no
+ * logits until the output head runs), so without this the new depth is never
+ * written and every later request re-prefills it from the restored prefix. A
+ * live continuation is not stored here: its state stays in the session. */
+static int kv_cache_cold_store_target(const kv_disk_cache *kc,
+                                      const ds4_tokens *prompt,
+                                      int user_token_id,
+                                      int assistant_token_id,
+                                      int cached,
+                                      bool disk_hit) {
+    if (!kc || !prompt || prompt->len < kc->opt.min_tokens) return 0;
+    if (kc->opt.cold_max_tokens <= 0 || prompt->len > kc->opt.cold_max_tokens) return 0;
+    if (cached > 0 && !disk_hit) return 0;
+    const int anchor = kv_cache_chat_anchor_pos(kc, prompt, user_token_id,
+                                                assistant_token_id);
+    if (cached == 0)
+        return anchor >= kc->opt.min_tokens ? anchor : kv_cache_store_len(kc, prompt->len);
+    const int len = anchor > cached ? anchor : kv_cache_store_len(kc, prompt->len);
+    const int gain = kc->opt.continued_interval_tokens > kc->opt.min_tokens ?
+                     kc->opt.continued_interval_tokens : kc->opt.min_tokens;
+    return len - cached >= gain ? len : 0;
+}
+
 /* A same-text-prefix file can be reused by a larger context, but not by a
  * smaller one: the payload was validated against the context capacity recorded
  * in the file.  If the existing file cannot be used by this server, replace it
@@ -13620,17 +13647,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
-        kv_cache_slot_enabled(s, slot) &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
-    {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
+    if (!multimodal && kv_cache_slot_enabled(s, slot)) {
+        cold_store_len = kv_cache_cold_store_target(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+                                                    ds4_token_assistant(s->engine),
+                                                    cached, disk_cached > 0);
+        if (cached > 0 && cold_store_len > 0)
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache extends restored prefix cached=%d store=%d prompt=%d",
+                       cached, cold_store_len, prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -21175,6 +21200,70 @@ static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(voi
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 }
 
+static void test_kv_cache_extending_a_disk_hit_stores_the_new_depth(void) {
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    kc.opt.cold_max_tokens = 393216;          /* the README server line */
+    kc.opt.continued_interval_tokens = 4096;
+
+    /* One user turn over a long document, as R1 dd sent it: 8K then 64K. */
+    ds4_tokens p8 = {0}, p64 = {0}, p300 = {0};
+    ds4_tokens *ps[] = {&p8, &p64, &p300};
+    const int lens[] = {8242, 67314, 303912};
+    for (int k = 0; k < 3; k++) {
+        ds4_tokens_push(ps[k], 1);
+        ds4_tokens_push(ps[k], user);
+        for (int i = 2; i < lens[k] - 1; i++) ds4_tokens_push(ps[k], 100 + i % 50);
+        ds4_tokens_push(ps[k], assistant);
+        TEST_ASSERT(ps[k]->len == lens[k]);
+    }
+
+    /* Cold: unchanged (the 8K request stores 8192). */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p8, user, assistant, 0, false) == 8192);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 0, false) == 65536);
+
+    /* Restored 8192 from disk, extended to 64K / 300K: the aligned new depth is stored. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 8192, true) == 65536);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p300, user, assistant, 8192, true) == 303104);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p300, user, assistant, 65536, true) == 303104);
+
+    /* The stored entry is what a resend restores: a prefix of the prompt, past the old hit. */
+    const int stored = kv_cache_cold_store_target(&kc, &p64, user, assistant, 8192, true);
+    TEST_ASSERT(stored > 8192 && stored <= p64.len);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, stored, true) == 0);
+
+    /* Nothing new worth a file: a resend of the same prompt, or a short extension. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 65536, true) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 63488, true) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 61440, true) == 65536);
+
+    /* A live continuation keeps its state in the session; past cold_max nothing is stored. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 8192, false) == 0);
+    kc.opt.cold_max_tokens = 65536;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 8192, true) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 0, false) == 0);
+
+    /* A later turn of a restored conversation: its anchor is the first turn, so the aligned length counts. */
+    ds4_tokens conv = {0};
+    ds4_tokens_push(&conv, 1);
+    ds4_tokens_push(&conv, user);
+    for (int i = 2; i < 9000; i++) ds4_tokens_push(&conv, 100 + i % 50);
+    ds4_tokens_push(&conv, assistant);
+    for (int i = 0; i < 20; i++) ds4_tokens_push(&conv, 7);
+    ds4_tokens_push(&conv, user);
+    for (int i = 0; i < 12000; i++) ds4_tokens_push(&conv, 100 + i % 50);
+    ds4_tokens_push(&conv, assistant);
+    kc.opt.cold_max_tokens = 393216;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &conv, user, assistant, 9021, true) ==
+                kv_cache_store_len(&kc, conv.len));
+
+    for (int k = 0; k < 3; k++) ds4_tokens_free(ps[k]);
+    ds4_tokens_free(&conv);
+}
+
 static void test_kv_cache_file_size_must_fit_budget(void) {
     kv_disk_cache kc = {0};
     kc.budget_bytes = 1100 + (KV_CACHE_FIXED_HEADER - 48u);   /* boundaries written for the 48-byte v1 header */
@@ -23065,6 +23154,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
+    test_kv_cache_extending_a_disk_hit_stores_the_new_depth();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
