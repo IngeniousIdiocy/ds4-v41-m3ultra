@@ -40984,15 +40984,207 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
         ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
 }
 
-/* The index-source q projection (BF16-rounded): from the FP8 sidecar while the
- * step reads it (the F16 path's single-token dispatch), else the F16 tensor. */
-static bool ds41_indexer_q(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l) {
+/* Narrow decode copies built at load from the GGUF being loaded (Ivan Fioravanti's builder, 81a25fb2c6, extended
+ * to the indexer q_b): the router as BF16 (the F32 tensor's high halves, every low half zero), and the Engram
+ * projections and the index-source indexer q_b as E4M3 codes with one E8M0 byte per 32x32 block, every F16 weight
+ * re-encoded exactly at its block scale. A family whose tensors do not narrow exactly keeps its wide reads; a
+ * loaded sidecar takes precedence and that family is not built. Model-wide, built once by the first session, freed
+ * with the engine. The decode readers bind these tensors; the accessors below also serve other readers. */
+typedef struct {
+    ds4_gpu_tensor *codes, *e8m0;   /* [rows][cols] codes; [rows/32][cols/32] bytes, e + 127 */
+    bool table_ok;                  /* every byte in 109..119, the Engram value table's range */
+} ds41_fp8_copy;
+
+#define DS41_NARROW_LAYERS 64u   /* >= DS4_N_LAYER (a runtime value) */
+static struct {
+    const ds4_model *owner;
+    ds4_gpu_tensor *router[DS41_NARROW_LAYERS];
+    ds41_fp8_copy engram[2], indexer[DS41_NARROW_LAYERS];
+} g_ds41_narrow;
+
+static void ds41_fp8_copy_free(ds41_fp8_copy *c) {
+    ds4_gpu_tensor_free(c->codes);
+    ds4_gpu_tensor_free(c->e8m0);
+    memset(c, 0, sizeof(*c));
+}
+
+static DS4_MAYBE_UNUSED void ds41_narrow_free(void) {
+    for (uint32_t il = 0; il < DS41_NARROW_LAYERS; il++) {
+        ds4_gpu_tensor_free(g_ds41_narrow.router[il]);
+        ds41_fp8_copy_free(&g_ds41_narrow.indexer[il]);
+    }
+    for (uint32_t i = 0; i < 2u; i++) ds41_fp8_copy_free(&g_ds41_narrow.engram[i]);
+    memset(&g_ds41_narrow, 0, sizeof(g_ds41_narrow));
+}
+
+static const ds4_gpu_tensor *ds41_narrow_router(const ds4_model *m, uint32_t il) {
+    return g_ds41_narrow.owner == m && il < DS41_NARROW_LAYERS ? g_ds41_narrow.router[il] : NULL;
+}
+
+static const ds41_fp8_copy *ds41_narrow_engram(const ds4_model *m, uint32_t table) {
+    return g_ds41_narrow.owner == m && table < 2u && g_ds41_narrow.engram[table].codes ? &g_ds41_narrow.engram[table] : NULL;
+}
+
+static const ds41_fp8_copy *ds41_narrow_indexer(const ds4_model *m, uint32_t il) {
+    return g_ds41_narrow.owner == m && il < DS41_NARROW_LAYERS && g_ds41_narrow.indexer[il].codes ? &g_ds41_narrow.indexer[il] : NULL;
+}
+
+#if defined(__APPLE__) && defined(__aarch64__) && !defined(DS4_NO_GPU)
+/* E4M3 code of q when q is exactly representable (|q| <= 448, three mantissa bits, subnormals in steps of 2^-9). */
+static bool ds41_e4m3_code(float q, uint8_t *code) {
+    const uint8_t sign = signbit(q) ? 0x80u : 0u;
+    const float a = fabsf(q);
+    if (a == 0.0f) { *code = sign; return true; }
+    if (!(a <= 448.0f)) return false;
+    int e;
+    const float f = frexpf(a, &e);   /* a = f * 2^e, f in [0.5, 1) */
+    if (e - 1 >= -6) {
+        const float mm = f * 16.0f - 8.0f;   /* 1.mmm: mm in [0, 8) */
+        if (mm != floorf(mm)) return false;
+        *code = (uint8_t)(sign | (uint8_t)((e - 1 + 7) << 3) | (uint8_t)mm);
+        return true;
+    }
+    const float mm = a * 512.0f;
+    if (mm != floorf(mm) || mm < 1.0f || mm > 7.0f) return false;
+    *code = (uint8_t)(sign | (uint8_t)mm);
+    return true;
+}
+
+typedef struct {
+    const __fp16 *src;
+    uint64_t cols;
+    uint8_t *codes, *e8m0;
+    bool failed;
+} ds41_e4m3_job;
+
+/* One row of 32x32 blocks: the scale that fits the block's largest value, or one step either side, must hold every
+ * weight exactly; its E8M0 byte is e + 127 (never 255). */
+static void ds41_e4m3_block_row(void *context, size_t br) {
+    ds41_e4m3_job *job = context;
+    const uint64_t cols = job->cols, bc = cols / 32u;
+    for (uint64_t bj = 0; bj < bc; bj++) {
+        float amax = 0.0f;
+        for (uint32_t r = 0; r < 32u; r++)
+            for (uint32_t j = 0; j < 32u; j++) {
+                const float v = fabsf((float)job->src[(br * 32u + r) * cols + bj * 32u + j]);
+                if (v > amax) amax = v;
+            }
+        const int e0 = amax > 0.0f ? (int)ceilf(log2f(amax / 448.0f)) : 0;
+        bool fit = false;
+        for (int d = 0; !fit && d < 3; d++) {
+            const int e = e0 + (d == 1 ? 1 : d == 2 ? -1 : 0);
+            if (e < -127 || e > 127) continue;
+            const float inv = ldexpf(1.0f, -e);
+            fit = true;
+            for (uint32_t r = 0; fit && r < 32u; r++)
+                for (uint32_t j = 0; fit && j < 32u; j++) {
+                    const uint64_t i = (br * 32u + r) * cols + bj * 32u + j;
+                    fit = ds41_e4m3_code((float)job->src[i] * inv, &job->codes[i]);
+                }
+            if (fit) job->e8m0[br * bc + bj] = (uint8_t)(e + 127);
+        }
+        if (!fit) { job->failed = true; return; }   /* a benign race: any writer sets true */
+    }
+}
+
+/* The F16 tensor t [rows][cols] as E4M3 codes + E8M0 block bytes, or false (nothing kept) unless every block is exact. */
+static bool ds41_fp8_copy_build(const ds4_model *m, const ds4_tensor *t, ds41_fp8_copy *out) {
+    memset(out, 0, sizeof(*out));
+    if (!t || t->type != DS4_TENSOR_F16 || t->dim[0] % 32u || t->dim[1] % 32u) return false;
+    const uint64_t cols = t->dim[0], rows = t->dim[1], nb = (rows / 32u) * (cols / 32u);
+    ds41_fp8_copy c = {ds4_gpu_tensor_alloc(rows * cols), ds4_gpu_tensor_alloc(nb), true};
+    ds41_e4m3_job job = {(const __fp16 *)(m->map + t->abs_offset), cols,
+        c.codes ? ds4_gpu_tensor_contents(c.codes) : NULL, c.e8m0 ? ds4_gpu_tensor_contents(c.e8m0) : NULL, false};
+    bool ok = job.codes && job.e8m0;
+    if (ok) dispatch_apply_f(rows / 32u, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &job, ds41_e4m3_block_row);
+    ok = ok && !job.failed;
+    for (uint64_t i = 0; ok && i < nb; i++) c.table_ok = c.table_ok && job.e8m0[i] >= 109u && job.e8m0[i] <= 119u;
+    if (!ok) { ds41_fp8_copy_free(&c); return false; }
+    *out = c;
+    return true;
+}
+#endif
+
+/* Build the copies for model m once (single-host, non-streaming sessions); prints one timing line. */
+static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
+#if defined(__APPLE__) && defined(__aarch64__) && !defined(DS4_NO_GPU)
+    if (g_ds41_narrow.owner == m) return;
+    ds41_narrow_free();
+    g_ds41_narrow.owner = m;
+    const bool router = !w->router_bf16_model && !ds41_router_bf16_off();
+    const bool engram = !w->engram_fp8_model && !ds41_engram_fp8_off();
+    const bool indexer = !w->indexer_fp8_model && !ds41_indexer_fp8_off();
+    if ((!router && !engram && !indexer) || DS4_N_LAYER > DS41_NARROW_LAYERS) return;
+    const double t0 = now_sec();
+    const char *rs = router ? "BF16" : w->router_bf16_model ? "sidecar" : "off";
+    const char *es = engram ? "E4M3" : w->engram_fp8_model ? "sidecar" : "off";
+    const char *is = indexer ? "E4M3" : w->indexer_fp8_model ? "sidecar" : "off";
+    for (uint32_t il = 0; router && il < DS4_N_LAYER; il++) {
+        const ds4_tensor *t = w->layer[il].ffn_gate_inp;
+        if (!t) continue;
+        const uint64_t n = t->dim[0] * t->dim[1];
+        const uint32_t *src = (const uint32_t *)(m->map + t->abs_offset);
+        bool exact = t->type == DS4_TENSOR_F32;
+        for (uint64_t i = 0; exact && i < n; i++) exact = (src[i] & 0xffffu) == 0;
+        ds4_gpu_tensor *dst = exact ? ds4_gpu_tensor_alloc(n * sizeof(uint16_t)) : NULL;
+        uint16_t *o = dst ? ds4_gpu_tensor_contents(dst) : NULL;
+        if (!o) {
+            ds4_gpu_tensor_free(dst);
+            for (uint32_t j = 0; j < il; j++) { ds4_gpu_tensor_free(g_ds41_narrow.router[j]); g_ds41_narrow.router[j] = NULL; }
+            rs = exact ? "F32 (allocation failed)" : "F32 (not exact BF16)";
+            break;
+        }
+        for (uint64_t i = 0; i < n; i++) o[i] = (uint16_t)(src[i] >> 16);
+        g_ds41_narrow.router[il] = dst;
+    }
+    for (uint32_t i = 0; engram && i < 2u; i++) {
+        ds41_fp8_copy *c = &g_ds41_narrow.engram[i];
+        if (!ds41_fp8_copy_build(m, w->layer[i == 0 ? 1 : 14].engram_kv, c)) {
+            ds41_fp8_copy_free(&g_ds41_narrow.engram[0]);
+            ds41_fp8_copy_free(&g_ds41_narrow.engram[1]);
+            es = "F16 (not exact E4M3)";
+            break;
+        }
+        if (!c->table_ok) es = "E4M3 (a scale outside 109..119: F16-pattern decode)";
+    }
+    for (uint32_t il = 0; indexer && il < DS4_N_LAYER; il++) {
+        if (!ds41_index_source(il)) continue;
+        ds41_fp8_copy *c = &g_ds41_narrow.indexer[il];
+        if (!ds41_fp8_copy_build(m, w->layer[il].indexer_attn_q_b, c)) {
+            for (uint32_t j = 0; j < DS41_NARROW_LAYERS; j++) ds41_fp8_copy_free(&g_ds41_narrow.indexer[j]);
+            is = "F16 (not exact E4M3)";
+            break;
+        }
+    }
+    uint64_t bytes = 0;
+    for (uint32_t il = 0; il < DS41_NARROW_LAYERS; il++) {
+        if (g_ds41_narrow.router[il]) bytes += ds4_gpu_tensor_bytes(g_ds41_narrow.router[il]);
+        if (g_ds41_narrow.indexer[il].codes)
+            bytes += ds4_gpu_tensor_bytes(g_ds41_narrow.indexer[il].codes) + ds4_gpu_tensor_bytes(g_ds41_narrow.indexer[il].e8m0);
+    }
+    for (uint32_t i = 0; i < 2u; i++)
+        if (g_ds41_narrow.engram[i].codes)
+            bytes += ds4_gpu_tensor_bytes(g_ds41_narrow.engram[i].codes) + ds4_gpu_tensor_bytes(g_ds41_narrow.engram[i].e8m0);
+    fprintf(stderr, "ds4: V4.1 narrow decode copies built at load in %.1f ms (%.1f MiB): router %s, Engram %s, indexer q_b %s\n",
+            (now_sec() - t0) * 1e3, (double)bytes / 1048576.0, rs, es, is);
+#else
+    (void)m; (void)w;
+#endif
+}
+
+/* The index-source q projection (BF16-rounded): from the FP8 sidecar or the copy built at load while the
+ * step reads FP8 (the F16 path's single-token dispatch), else the F16 tensor. */
+static bool ds41_indexer_q(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const uint32_t in_dim = (uint32_t)l->indexer_attn_q_b->dim[0], out_dim = (uint32_t)l->indexer_attn_q_b->dim[1];
     if (g->indexer_fp8 && l->indexer_attn_q_b_fp8)
         return ds4_gpu_dsv41_project_fp8_bf16(g->index_q, g->indexer_model->map, g->indexer_model->size,
                                               l->indexer_attn_q_b_fp8->abs_offset, l->indexer_attn_q_b_e8m0->abs_offset,
-                                              (uint32_t)l->indexer_attn_q_b->dim[0], (uint32_t)l->indexer_attn_q_b->dim[1],
-                                              g->qr) != 0;
+                                              in_dim, out_dim, g->qr) != 0;
+    const ds41_fp8_copy *c = g->indexer_fp8 ? ds41_narrow_indexer(m, il) : NULL;
+    if (c) return ds4_gpu_dsv41_project_fp8_bf16_weights(g->index_q, c->codes, c->e8m0, in_dim, out_dim, g->qr) != 0;
+#else
+    (void)il;
 #endif
     return ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true);
 }
@@ -41003,7 +41195,7 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
-        if (!ds41_indexer_q(g, m, l) ||
+        if (!ds41_indexer_q(g, m, l, il) ||
             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) return false;
@@ -41178,9 +41370,13 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* The same matvec geometry and F32 reduction over the released BF16
      * gates; schedule guards still see the F32 tensor. */
+    const ds4_gpu_tensor *router_copy = g->router_bf16 && !l->ffn_gate_inp_bf16 ? ds41_narrow_router(m, il) : NULL;
     if (g->router_bf16 && l->ffn_gate_inp_bf16) {
         if (!ds4_gpu_matmul_bf16_router_tensor(g->route_logits, g->router_model->map, g->router_model->size,
                 l->ffn_gate_inp_bf16->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, g->norm))
+            return false;
+    } else if (router_copy) {
+        if (!ds4_gpu_matmul_bf16_router_weights(g->route_logits, router_copy, DS4_N_EMBD, DS4_N_EXPERT, g->norm))
             return false;
     } else
 #endif
@@ -41348,10 +41544,14 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
         /* The released E4M3 codes and E8M0 scales in the F16 projection's matvec
          * geometry, with the same BF16 output. */
-        const bool fp8 = g->engram_fp8 && l->engram_kv_fp8;
-        if (fp8 && !ds4_gpu_matmul_engram_fp8_tensor(g->engram_kv, g->engram_model->map, g->engram_model->size,
+        const ds41_fp8_copy *c = g->engram_fp8 && !l->engram_kv_fp8 ? ds41_narrow_engram(m, i) : NULL;
+        const bool fp8 = g->engram_fp8 && (l->engram_kv_fp8 || c);
+        if (fp8 && l->engram_kv_fp8 && !ds4_gpu_matmul_engram_fp8_tensor(g->engram_kv, g->engram_model->map, g->engram_model->size,
                 l->engram_kv_fp8->abs_offset, l->engram_kv_e8m0->abs_offset,
                 (uint32_t)l->engram_kv->dim[0], (uint32_t)l->engram_kv->dim[1], rows))
+            return false;
+        if (c && !ds4_gpu_matmul_engram_fp8_weights(g->engram_kv, c->codes, c->e8m0,
+                (uint32_t)l->engram_kv->dim[0], (uint32_t)l->engram_kv->dim[1], rows, c->table_ok))
             return false;
 #else
         const bool fp8 = false;
@@ -42364,15 +42564,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         g->draft->mh_rows = 1;
     }
     g->scalar_decode = true;
+    /* each family: its sidecar when loaded, else the copy built at load */
     g->router_model = w->router_bf16_model;
-    g->router_bf16 = g->router_model && g->tp_world == 1 && !g->streaming && !g->quality &&
+    g->router_bf16 = (g->router_model || ds41_narrow_router(m, 0)) && g->tp_world == 1 && !g->streaming && !g->quality &&
         !ds41_router_bf16_off();
     g->engram_model = w->engram_fp8_model;
-    g->engram_fp8 = logits && g->engram_model && g->tp_world == 1 && !g->streaming && !g->quality &&
-        !ds41_engram_fp8_off();
+    g->engram_fp8 = logits && (g->engram_model || ds41_narrow_engram(m, 0)) && g->tp_world == 1 && !g->streaming &&
+        !g->quality && !ds41_engram_fp8_off();
     g->indexer_model = w->indexer_fp8_model;
-    g->indexer_fp8 = logits && g->indexer_model && g->tp_world == 1 && !g->streaming && !g->quality &&
-        !ds41_indexer_fp8_off();
+    g->indexer_fp8 = logits && (g->indexer_model || ds41_narrow_indexer(m, 2)) && g->tp_world == 1 && !g->streaming &&
+        !g->quality && !ds41_indexer_fp8_off();
     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     /* With the head queued, the drafter's capture of this token is encoded after
@@ -74608,6 +74809,9 @@ void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     ds4_engine_tp_unbind(e);
     ds4_expert_profile_close();
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    ds41_narrow_free();   /* before ds4_gpu_cleanup below */
+#endif
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -74828,6 +75032,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
+        if (!e->tp.active && !e->ssd_streaming && !e->quality) ds41_narrow_build(&e->model, &e->weights);
         if (e->ds41_dspark &&
             !ds41_draft_init(&s->ds41_graph, &e->dspark_weights,
                              e->mtp_model.map ? &e->mtp_model : &e->model))

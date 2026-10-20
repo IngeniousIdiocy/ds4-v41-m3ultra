@@ -232,6 +232,9 @@ int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *out, const void *model_map, u
 int ds4_gpu_dsv41_project_fp8_bf16(ds4_gpu_tensor *out, const void *fp8_map, uint64_t fp8_size,
                                    uint64_t codes_off, uint64_t scales_off, uint32_t in_dim, uint32_t out_dim,
                                    const ds4_gpu_tensor *x);
+/* The same with the codes and E8M0 bytes in tensors (copies built at load). */
+int ds4_gpu_dsv41_project_fp8_bf16_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
+                                           uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
 /* Decode attention over the raw ring and the compressed rows selected by
  * ids, staged in one pass (0: not available; `selected` is gather scratch). */
 /* The same for `rows` consecutive query rows in one dispatch: row r uses the

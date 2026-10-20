@@ -1447,9 +1447,11 @@ static int check_engram_decode(void) {
     for (int i = 0; i < IN; i++) x[i] = random_value() / 4;
     ds4_gpu_tensor *xt = upload(x, sizeof(x));
     ds4_gpu_tensor *o16 = upload(NULL, OUT * 4), *otab = upload(NULL, OUT * 4), *oshift = upload(NULL, OUT * 4);
-    CHECK(xt && o16 && otab && oshift);
+    ds4_gpu_tensor *owt = upload(NULL, OUT * 4), *ows = upload(NULL, OUT * 4), *oidx = upload(NULL, OUT * 4);
+    CHECK(xt && o16 && otab && oshift && owt && ows && oidx);
     const float *r16 = ds4_gpu_tensor_contents(o16), *rtab = ds4_gpu_tensor_contents(otab);
-    const float *rshift = ds4_gpu_tensor_contents(oshift);
+    const float *rshift = ds4_gpu_tensor_contents(oshift), *rwt = ds4_gpu_tensor_contents(owt);
+    const float *rws = ds4_gpu_tensor_contents(ows), *ridx = ds4_gpu_tensor_contents(oidx);
     for (int pass = 0; pass < 4; pass++) {
         const uint32_t e_lo = pass < 2 ? 112u : 109u, e_n = pass < 2 ? 8u : 11u;
         for (size_t i = 0; i < scale_bytes; i++) { (void)random_value(); scales[i] = (unsigned char)(e_lo + seed % e_n); }
@@ -1469,20 +1471,31 @@ static int check_engram_decode(void) {
                 v *= ldexpf(1.0f, (int)scales[(r / 32) * (IN / 32) + k / 32] - 127);
                 w16[r * IN + k] = (_Float16)v;
             }
+        /* the same codes and bytes as tensors: the copies built at load bind this way */
+        ds4_gpu_tensor *ct = upload(codes, code_bytes), *st = upload(scales, scale_bytes);
+        CHECK(ct && st);
         CHECK(ds4_gpu_begin_commands());
         if (pass < 2) CHECK(ds4_gpu_dsv41_project_f16_bf16(o16, map, map_bytes, 0, IN, OUT, xt));
+        ds4_gpu_set_engram_decode_shift(0);
+        CHECK(ds4_gpu_matmul_engram_fp8_weights(owt, ct, st, IN, OUT, xt, 1));
+        CHECK(ds4_gpu_matmul_engram_fp8_weights(ows, ct, st, IN, OUT, xt, 0));   /* table_ok 0: the F16 pattern */
+        CHECK(ds4_gpu_dsv41_project_fp8_bf16_weights(oidx, ct, st, IN, OUT, xt));
         ds4_gpu_set_engram_decode_shift(0);
         CHECK(ds4_gpu_matmul_engram_fp8_tensor(otab, map, map_bytes, code_off, scale_off, IN, OUT, xt));
         ds4_gpu_set_engram_decode_shift(1);
         CHECK(ds4_gpu_matmul_engram_fp8_tensor(oshift, map, map_bytes, code_off, scale_off, IN, OUT, xt));
         CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+        ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(st);
         CHECK(!memcmp(rtab, rshift, OUT * sizeof(float)));
-        if (pass < 2) CHECK(!memcmp(r16, rtab, OUT * sizeof(float)));
-        fprintf(stderr, "V4.1 Engram FP8 decode pass %d (E8M0 %u..%u%s): table == F16 pattern%s PASS\n",
-                pass, e_lo, e_lo + e_n - 1, pass & 1 ? ", small codes" : "", pass < 2 ? " == F16 projection" : "");
+        CHECK(!memcmp(rtab, rwt, OUT * sizeof(float)) && !memcmp(rtab, rws, OUT * sizeof(float)));
+        if (pass < 2) CHECK(!memcmp(r16, rtab, OUT * sizeof(float)) && !memcmp(r16, ridx, OUT * sizeof(float)));
+        fprintf(stderr, "V4.1 Engram FP8 decode pass %d (E8M0 %u..%u%s): table == F16 pattern == tensor-bound%s PASS\n",
+                pass, e_lo, e_lo + e_n - 1, pass & 1 ? ", small codes" : "",
+                pass < 2 ? " == F16 projection == indexer FP8 (tensor-bound)" : "");
     }
     ds4_gpu_set_engram_decode_shift(0);
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o16); ds4_gpu_tensor_free(otab); ds4_gpu_tensor_free(oshift);
+    ds4_gpu_tensor_free(owt); ds4_gpu_tensor_free(ows); ds4_gpu_tensor_free(oidx);
     return 1;
 }
 #else

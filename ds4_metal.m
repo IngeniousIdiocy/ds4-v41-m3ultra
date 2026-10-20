@@ -21692,31 +21692,21 @@ int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *out, const void *model_map, u
 /* ds4_gpu_dsv41_project_f16_bf16's single-token dispatch (ds4_gpu_matmul_f16_tensor_impl with n_tok 1 and
  * round_bf16: the same args, NSG, NR0 rules, threadgroup memory and grid) with the weight read as E4M3 codes
  * [out_dim][in_dim] and E8M0 32x32 scales. */
-int ds4_gpu_dsv41_project_fp8_bf16(ds4_gpu_tensor *out, const void *fp8_map, uint64_t fp8_size,
-                                   uint64_t codes_off, uint64_t scales_off, uint32_t in_dim, uint32_t out_dim,
-                                   const ds4_gpu_tensor *x) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!fp8_map || !in_dim || !out_dim || (in_dim % 32u) || (out_dim % 32u)) return 0;
-
+/* The FP8 indexer q_b matvec over codes at (cbuf, codes_inner) and E8M0 bytes at (sbuf, scales_inner): a mapped
+ * sidecar range or a copy built at load. */
+static int ds4_gpu_dsv41_project_fp8_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> cbuf, uint64_t codes_inner,
+                                              id<MTLBuffer> sbuf, uint64_t scales_inner,
+                                              uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x) {
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!cbuf || !sbuf) return 0;
         if (!xbuf || !outbuf ||
             ds4_gpu_tensor_bytes(x) < (uint64_t)in_dim * sizeof(float) ||
             ds4_gpu_tensor_bytes(out) < (uint64_t)out_dim * sizeof(float)) {
             fprintf(stderr, "ds4: Metal FP8 indexer matvec received undersized activation buffers\n");
             return 0;
         }
-        const uint64_t codes_bytes = (uint64_t)in_dim * out_dim, scales_bytes = (uint64_t)(in_dim / 32u) * (out_dim / 32u);
-        if (codes_off > fp8_size || codes_bytes > fp8_size - codes_off ||
-            scales_off > fp8_size || scales_bytes > fp8_size - scales_off) {
-            fprintf(stderr, "ds4: Metal FP8 indexer matvec range is outside the mapped sidecar\n");
-            return 0;
-        }
-        uint64_t codes_inner = 0, scales_inner = 0;
-        id<MTLBuffer> cbuf = ds4_gpu_wrap_model_range(fp8_map, fp8_size, codes_off, codes_bytes, &codes_inner);
-        id<MTLBuffer> sbuf = cbuf ? ds4_gpu_wrap_model_range(fp8_map, fp8_size, scales_off, scales_bytes, &scales_inner) : nil;
-        if (!cbuf || !sbuf) return 0;
 
         ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
         mv_args.ne11 = mv_args.ne1 = 1;
@@ -21751,6 +21741,34 @@ int ds4_gpu_dsv41_project_fp8_bf16(ds4_gpu_tensor *out, const void *fp8_map, uin
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "FP8 indexer matvec") ? 1 : 0;
     }
+}
+
+int ds4_gpu_dsv41_project_fp8_bf16(ds4_gpu_tensor *out, const void *fp8_map, uint64_t fp8_size,
+                                   uint64_t codes_off, uint64_t scales_off, uint32_t in_dim, uint32_t out_dim,
+                                   const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!fp8_map || !in_dim || !out_dim || (in_dim % 32u) || (out_dim % 32u)) return 0;
+    const uint64_t codes_bytes = (uint64_t)in_dim * out_dim, scales_bytes = (uint64_t)(in_dim / 32u) * (out_dim / 32u);
+    if (codes_off > fp8_size || codes_bytes > fp8_size - codes_off ||
+        scales_off > fp8_size || scales_bytes > fp8_size - scales_off) {
+        fprintf(stderr, "ds4: Metal FP8 indexer matvec range is outside the mapped sidecar\n");
+        return 0;
+    }
+    uint64_t codes_inner = 0, scales_inner = 0;
+    id<MTLBuffer> cbuf = ds4_gpu_wrap_model_range(fp8_map, fp8_size, codes_off, codes_bytes, &codes_inner);
+    id<MTLBuffer> sbuf = cbuf ? ds4_gpu_wrap_model_range(fp8_map, fp8_size, scales_off, scales_bytes, &scales_inner) : nil;
+    return ds4_gpu_dsv41_project_fp8_dispatch(out, cbuf, codes_inner, sbuf, scales_inner, in_dim, out_dim, x);
+}
+
+int ds4_gpu_dsv41_project_fp8_bf16_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
+                                           uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!codes || !e8m0 || !in_dim || !out_dim || (in_dim % 32u) || (out_dim % 32u) ||
+        ds4_gpu_tensor_bytes(codes) < (uint64_t)in_dim * out_dim ||
+        ds4_gpu_tensor_bytes(e8m0) < (uint64_t)(in_dim / 32u) * (out_dim / 32u)) return 0;
+    return ds4_gpu_dsv41_project_fp8_dispatch(out, ds4_gpu_tensor_buffer(codes), ds4_gpu_tensor_offset(codes),
+                                              ds4_gpu_tensor_buffer(e8m0), ds4_gpu_tensor_offset(e8m0),
+                                              in_dim, out_dim, x);
 }
 
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
@@ -22607,22 +22625,17 @@ int ds4_gpu_matmul_f32_tensor(
     return 1;
 }
 
-int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-                                      uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-                                      const ds4_gpu_tensor *x) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || (in_dim % 4u) != 0) return 0;
+/* The BF16 router matvec over weights at (wbuf, inner_offset): a mapped
+ * sidecar range or a copy built at load. */
+static int ds4_gpu_bf16_router_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> wbuf, uint64_t inner_offset,
+                                        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    const uint64_t row_bytes = in_dim * sizeof(uint16_t);
+    const uint64_t weight_bytes = row_bytes * out_dim;
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
-        if (!xbuf || !outbuf || ds4_gpu_tensor_bytes(x) < in_dim * sizeof(float) ||
+        if (!wbuf || !xbuf || !outbuf || ds4_gpu_tensor_bytes(x) < in_dim * sizeof(float) ||
             ds4_gpu_tensor_bytes(out) < out_dim * sizeof(float)) return 0;
-        const uint64_t row_bytes = in_dim * sizeof(uint16_t);
-        const uint64_t weight_bytes = row_bytes * out_dim;
-        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
-        uint64_t inner_offset = 0;
-        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
-        if (!wbuf) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -22661,6 +22674,27 @@ int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map
     }
 }
 
+int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                      uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                      const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || (in_dim % 4u) != 0) return 0;
+    const uint64_t weight_bytes = in_dim * sizeof(uint16_t) * out_dim;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    uint64_t inner_offset = 0;
+    id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+    return ds4_gpu_bf16_router_dispatch(out, wbuf, inner_offset, in_dim, out_dim, x);
+}
+
+int ds4_gpu_matmul_bf16_router_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights,
+                                       uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!weights || in_dim > UINT32_MAX || out_dim > UINT32_MAX || (in_dim % 4u) != 0 ||
+        ds4_gpu_tensor_bytes(weights) < in_dim * out_dim * sizeof(uint16_t)) return 0;
+    return ds4_gpu_bf16_router_dispatch(out, ds4_gpu_tensor_buffer(weights), ds4_gpu_tensor_offset(weights),
+                                        in_dim, out_dim, x);
+}
+
 /* The Engram reader's value table, index (e - 109) * 256 + code over the E8M0
  * range 109..119 the sidecar audit admits: each E4M3 code times 2^(e - 127),
  * exact in float. NaN codes (0x7f/0xff), which the audit rejects, hold a quiet NaN. */
@@ -22689,30 +22723,23 @@ static void ds4_engram_lut_build(void) {
 static int g_engram_decode_shift = -1;
 void ds4_gpu_set_engram_decode_shift(int on) { g_engram_decode_shift = on != 0; }
 
-int ds4_gpu_matmul_engram_fp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-                                     uint64_t code_offset, uint64_t scale_offset,
-                                     uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
+/* The Engram projection over codes at (cbuf, code_inner) and E8M0 bytes at (sbuf, scale_inner); table_ok: every
+ * scale byte is in the table's range 109..119 (else the F16-pattern decode, exact for any byte, is used). */
+static int ds4_gpu_engram_fp8_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> cbuf, uint64_t code_inner,
+                                       id<MTLBuffer> sbuf, uint64_t scale_inner,
+                                       uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, int table_ok) {
     const uint32_t nr0 = 2;
-    if (!in_dim || (in_dim % 32u) != 0 || (out_dim % 32u) != 0) return 0;
+    const uint64_t code_bytes = (uint64_t)in_dim * out_dim;
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
-        if (!xbuf || !outbuf || ds4_gpu_tensor_bytes(x) < (uint64_t)in_dim * sizeof(float) ||
+        if (!cbuf || !sbuf || !xbuf || !outbuf || ds4_gpu_tensor_bytes(x) < (uint64_t)in_dim * sizeof(float) ||
             ds4_gpu_tensor_bytes(out) < (uint64_t)out_dim * sizeof(float)) return 0;
-        const uint64_t code_bytes = (uint64_t)in_dim * out_dim;
-        const uint64_t scale_bytes = (uint64_t)(in_dim / 32u) * (out_dim / 32u);
-        if (code_offset > model_size || code_bytes > model_size - code_offset ||
-            scale_offset > model_size || scale_bytes > model_size - scale_offset) return 0;
-        uint64_t code_inner = 0, scale_inner = 0;
-        id<MTLBuffer> cbuf = ds4_gpu_wrap_model_range(model_map, model_size, code_offset, code_bytes, &code_inner);
-        id<MTLBuffer> sbuf = ds4_gpu_wrap_model_range(model_map, model_size, scale_offset, scale_bytes, &scale_inner);
-        if (!cbuf || !sbuf) return 0;
         if (g_engram_decode_shift < 0) {
             const char *v = getenv("DS4_V41_ENGRAM_DECODE");
             g_engram_decode_shift = v && !strcmp(v, "shift");
         }
-        const int shift = g_engram_decode_shift;
+        const int shift = g_engram_decode_shift || !table_ok;
         if (!shift && !g_engram_lut_buf) {
             ds4_engram_lut_build();
             g_engram_lut_buf = [g_device newBufferWithBytes:g_engram_lut length:sizeof(g_engram_lut)
@@ -22755,6 +22782,32 @@ int ds4_gpu_matmul_engram_fp8_tensor(ds4_gpu_tensor *out, const void *model_map,
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "Engram FP8 matvec");
     }
+}
+
+int ds4_gpu_matmul_engram_fp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                     uint64_t code_offset, uint64_t scale_offset,
+                                     uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!in_dim || (in_dim % 32u) != 0 || (out_dim % 32u) != 0) return 0;
+    const uint64_t code_bytes = (uint64_t)in_dim * out_dim;
+    const uint64_t scale_bytes = (uint64_t)(in_dim / 32u) * (out_dim / 32u);
+    if (code_offset > model_size || code_bytes > model_size - code_offset ||
+        scale_offset > model_size || scale_bytes > model_size - scale_offset) return 0;
+    uint64_t code_inner = 0, scale_inner = 0;
+    id<MTLBuffer> cbuf = ds4_gpu_wrap_model_range(model_map, model_size, code_offset, code_bytes, &code_inner);
+    id<MTLBuffer> sbuf = ds4_gpu_wrap_model_range(model_map, model_size, scale_offset, scale_bytes, &scale_inner);
+    return ds4_gpu_engram_fp8_dispatch(out, cbuf, code_inner, sbuf, scale_inner, in_dim, out_dim, x, 1);
+}
+
+int ds4_gpu_matmul_engram_fp8_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
+                                      uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, int table_ok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!codes || !e8m0 || !in_dim || (in_dim % 32u) != 0 || (out_dim % 32u) != 0 ||
+        ds4_gpu_tensor_bytes(codes) < (uint64_t)in_dim * out_dim ||
+        ds4_gpu_tensor_bytes(e8m0) < (uint64_t)(in_dim / 32u) * (out_dim / 32u)) return 0;
+    return ds4_gpu_engram_fp8_dispatch(out, ds4_gpu_tensor_buffer(codes), ds4_gpu_tensor_offset(codes),
+                                       ds4_gpu_tensor_buffer(e8m0), ds4_gpu_tensor_offset(e8m0),
+                                       in_dim, out_dim, x, table_ok);
 }
 
 int ds4_gpu_repeat_hc_tensor(

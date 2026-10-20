@@ -1110,6 +1110,9 @@ int ds4_gpu_matmul_f32_tensor(
 int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                       uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
                                       const ds4_gpu_tensor *x);
+/* The same over BF16 weights [out_dim][in_dim] in a tensor (a copy built at load). */
+int ds4_gpu_matmul_bf16_router_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights,
+                                       uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x);
 
 /* One-row Engram projection over E4M3 codes [out_dim][in_dim] and E8M0 32x32
  * block scales [out_dim/32][in_dim/32]: the F16 matvec's geometry and
@@ -1117,6 +1120,10 @@ int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map
 int ds4_gpu_matmul_engram_fp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                      uint64_t code_offset, uint64_t scale_offset,
                                      uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
+/* The same over codes and E8M0 bytes in tensors (copies built at load); table_ok 0 when a scale byte
+ * is outside the value table's 109..119, which selects the F16-bit-pattern decode. */
+int ds4_gpu_matmul_engram_fp8_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
+                                      uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, int table_ok);
 /* Its weight decode: 0 the value table (default), 1 the F16 bit pattern
  * (DS4_V41_ENGRAM_DECODE=shift). For tests; production reads the variable. */
 void ds4_gpu_set_engram_decode_shift(int on);
