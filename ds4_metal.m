@@ -49718,6 +49718,12 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
                 ds4_gpu_get_pipeline("kernel_mul_mv_q8_0_short72_bf16io_hc_expand4");
             if (short_pipeline) { pipeline = short_pipeline; dispatch.nr0 = 4; args.nr0 = 4; }
         }
+        /* The one-row 8192 -> 5120 call without an add (the single-host attention output-B) takes the literal-shape
+         * kernel: the same NSG, NR0, grid, buffers and threadgroup memory (opt-out read per call). */
+        if (rows == 1u && in_dim == 8192u && out_dim == 5120u && !add && dispatch.nr0 == 2 &&
+            getenv("DS4_METAL_DISABLE_V41_HC_CONSUMER_STATIC") == NULL) {
+            pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static", dispatch.nsg);
+        }
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);

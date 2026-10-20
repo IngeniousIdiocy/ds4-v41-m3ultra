@@ -972,6 +972,54 @@ kernel void kernel_mul_mv_q8_0_f32_bf16io_hc_expand4(
         args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, nullptr, &hc, add, residual, post, comb);
 }
 
+/* kernel_mul_mv_q8_0_f32_bf16io_hc_expand4 at its one-row V4.1 decode call, the attention output-B projection
+ * (8192 -> 5120: 256 Q8_0 blocks, 5120 rows, one row, four HC streams, no add), with every args and hc value it reads
+ * a literal. The same NSG (function constant), NR0, lane mapping, K walk, input round and HC rounding; args and hc
+ * stay bound but unread. The HC literal is a program-scope constant, so the impl, the helper and every other
+ * instantiation are untouched. */
+constant ds4_metal_args_mv_hc_expand4 ds4_hc_static_8192_5120 = { /*.n_embd =*/ 5120, /*.has_add =*/ 0, /*.split_stride =*/ 24 };
+
+[[host_name("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_hc_expand4 & hc,
+        device const float * add,
+        device const float * residual,
+        device const float * post,
+        device const float * comb,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)args; (void)hc;
+    ds4_metal_args_mul_mv sa = {
+        /*.ne00 =*/ 8192,
+        /*.ne01 =*/ 5120,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ 34,
+        /*.nb01 =*/ 8704,
+        /*.nb02 =*/ 8704ull*5120ull,
+        /*.nb03 =*/ 8704ull*5120ull,
+        /*.ne10 =*/ 8192,
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ 4,
+        /*.nb11 =*/ 32768,
+        /*.nb12 =*/ 32768,
+        /*.nb13 =*/ 32768,
+        /*.ne0  =*/ 5120,
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ 2,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true, true, false, false, true>(
+        sa, src0, src1, dst, shmem, tgpig, tiisg, sgitg, nullptr, &ds4_hc_static_8192_5120, add, residual, post, comb);
+}
+
 /* Two Q8_0 matrices over one activation row in one dispatch: the leading
  * threadgroups take the first matrix's row groups, the rest the second's. */
 [[host_name("kernel_mul_mv_q8_0_f32_bf16_pair")]]
