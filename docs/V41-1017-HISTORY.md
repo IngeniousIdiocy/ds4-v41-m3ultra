@@ -125,17 +125,24 @@ the work that depends only on the position can be done once per step:
 After this phase the exact basis stood at **39.40 / 39.33 tok/s** (25.38 /
 25.43 ms). No exact lever in hand closed the remaining 0.4 ms.
 
-### 5. EADD, the Engram gate
+### 5. The staged Engram gate
 
-The Engram residual gate ran as 32 lanes per stream and was latency-bound.
-A 256-thread form (EADD) saved −0.24 / −0.33, but its summation order
-differed, changing about 1 BF16 value in 30,000. It was handled as a
-numerical change: on the general set, NLL moved +0.00256 nats/token
-(SE 0.00137), and it was cleared for continued experimental work. With EADD the basis reached 39.81 / 39.83.
+The Engram residual gate ran as 32 lanes per stream. It was latency-bound:
+each of a lane's 160 iterations waited for its own device loads. The staged
+gate keeps the 32-lane kernel's arithmetic and spreads only the loads:
 
-On this branch, EADD has since been replaced by a staged kernel that gives
-the 32-lane kernel's bits exactly. It keeps about 90% of the gain (0 of
-3,072,000 fresh streams differ).
+- all 256 threads stage the inputs into threadgroup memory;
+- one SIMD group runs the 32-lane kernel's reduction chains, in the same
+  order and as the same fused multiply-adds;
+- all threads apply the residual update.
+
+It is bit-identical to the 32-lane kernel: 0 of 3,072,000 fresh streams
+(15.7G values) differ. In a micro at the decode shape, a call takes 18.6 µs
+against 122.5 µs. Its gain in the composed stack at 8K comes from the next
+composed window, and the README will give it.
+
+The campaign first reached 40 with an earlier 256-thread form that summed in
+a different order. That form is under "What did not work".
 
 ### 6. The host chain
 
@@ -149,16 +156,25 @@ The last 0.1 to 0.2 ms came from the time between tokens:
 - **The indexer RoPE and FP4 quantize in one batched dispatch** (IRQ):
   −0.034 / −0.049.
 
-**Result (October 20, 00:08 UTC):** 24.920 / 24.942 ms per token,
-**40.129 / 40.093 tok/s**, every treatment run above 40. Every lever on top
-of the pair + EADD composition was bit-exact against its control. Release
-quality qualification of the whole stack is still open.
+**Campaign result (October 20, 00:08 UTC), on the campaign build:** 24.920 /
+24.942 ms per token, **40.129 / 40.093 tok/s**, every treatment run above
+40. That build used the earlier, inexact Engram gate; every other lever
+in it was bit-exact against its control. This branch ships the staged exact
+gate instead, so the campaign result is not this branch's number. This
+branch's 8K number is in the README, from a composed window still pending.
+Release quality qualification of the whole stack is also still open.
 
 ## What did not work
 
 All of these were measured. Exact ones that did not pay earned zero credit;
 numerical ones that failed a screen were not timed further.
 
+- **The first 256-thread Engram gate (float4 summation):** it summed the
+  gate's three reductions as float4 lanes, then SIMD sums, then an 8-way
+  threadgroup sum. That changed about 1 BF16 value in 30,000 and about 1
+  stream in 10. It measured −0.24 / −0.33 ms/token. On the general set NLL
+  moved +0.00256 nats/token (SE 0.00137), which cleared it for experimental
+  work only. It was not bit-exact, and the staged gate replaced it.
 - **Routed gate/up lookup through `simd_shuffle`:** exact, but +66 µs per
   layer (slower in 48 of 48 batches).
 - **Integer reconstruction of the E2M1 FP4 values** in the gate/up and down
@@ -208,9 +224,8 @@ After the 8K milestone, the work moved to depth, serving and a public build:
   canary and a payload hash. A 300K conversation that took 391.6 s to first
   token cold resumes in 11.2 s after a restart. A restart test found an
   older bug that deleted a checkpoint on shutdown; it is fixed.
-- **Against DwarfStar main as servers** (same GGUF and flags, no DSpark):
-  decode is 2.06 to 2.16 times faster from 2K to 64K, and cold TTFT is 15 to
-  35% lower.
+- **Comparison against Ivan Fioravanti's performance branch:** see the
+  README (pending).
 - **DSpark:** 57.70 tok/s on a code answer, against 52.61 on the production
   build.
 
