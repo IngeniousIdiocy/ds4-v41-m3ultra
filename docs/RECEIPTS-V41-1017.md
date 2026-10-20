@@ -57,8 +57,8 @@ Caveats:
   adjudication and no speed verdict. P25 accepted the d01 default-arm rows on
   their digests.
 
-The same window ran the `DS4_V41_S1TG` arms. Their result is in the
-single-group kernels section below.
+The same window ran the `DS4_V41_S1TG` arms. Their result, and the later
+default for `c` and `k`, are in the single-group kernels section below.
 
 The depth rows of the README (64K, 131K, 300K) are still W5 on the
 state-depth tree. A composed depth run on this branch is pending.
@@ -508,32 +508,53 @@ These were measured and are not in the branch:
 The micros ran with production up, so their absolute times carry
 contention; the A/B order repeated.
 
-## Single-group latency kernels (f45f4e8, 77eea27, 913aa61; opt-in, experimental)
+## Single-group latency kernels (f45f4e8, 77eea27; default since 7f2ba58)
 
-`DS4_V41_S1TG`:
+`DS4_V41_S1TG` letters, read per call:
 
-- `c`: the split HC collapse.
-- `k` and `r`: the fused top-k merge ladder and the ballot router.
-- `h`: eight heads per threadgroup in single-row decode attention.
+- `c`: the split HC collapse, two dispatches over 32 + 10 groups in place of
+  one 1024-thread group (80 calls per token).
+- `k`: the decode top-k merge ladder, staged in threadgroup memory and
+  finished in one 1024-thread group (8 calls per token).
 
-Model-free exactness, counted over distinct inputs. An earlier version of
-these receipts counted repeats of the same inputs: they show determinism, not
-coverage.
+Both are on by default. When `DS4_V41_S1TG` is set, it names exactly the
+letters to use, and `none` (or empty) restores the original kernels.
 
-- `c`: 0 of 20.48M distinct collapsed and 0 of 20.48M distinct normed values
-  differ, on fresh data for every call, with and without the engine's macros.
-  An engine-linked check adds 0 of 819,200. The earlier "0 of 16.4M" was 20
-  repeats of 819,200 values.
-- `k`: 140 crafted rows (seven widths; Gaussian, many-tie, `-inf`-tail, NaN
-  and all-equal rows), plus 71,680 distinct selected indices per fused form.
-  The merge only compares and moves pairs, with no float arithmetic.
-- `r`: 15,840 distinct values (the printed 316,800 is 20 repeats). That is
-  small coverage for its float part.
-- `h`: 6,316,032 distinct partial values per key count (the printed 18.9M is
-  3 repeats), with one key set per shape.
+Exactness of `c` and `k`:
 
-None of the four gets speed credit. Their micro timings are not added to any
-figure on this page or in the README.
+- **Model-free, the opt-in micros.** These were counted over distinct
+  inputs. An earlier version of these receipts counted repeats of the same
+  inputs, which show determinism, not coverage.
+  - `c`: 0 of 20.48M distinct collapsed values and 0 of 20.48M distinct
+    normed values differ, on fresh data for every call, with and without the
+    engine's macros. An engine-linked check adds 0 of 819,200.
+  - `k`: 140 crafted rows (seven widths; Gaussian, many-tie, `-inf`-tail,
+    NaN and all-equal rows), plus 71,680 distinct selected indices per fused
+    form. The merge only compares and moves pairs; it does no float
+    arithmetic.
+- **Model-free, in the test suite.** `tests/test_deepseek41_metal --s1tg`
+  runs each call with and without `DS4_V41_S1TG`.
+  - `c`: 200 fresh calls, 0 of 2,048,000 values differ.
+  - `k`: widths 1024 to 65536, covering one level, fused only, and staged
+    levels first. Random, tied, `-inf`-tailed, signed-zero, NaN and
+    constant rows: 0 of 39,936 selections differ.
+- **On the stack at 8K.**
+  - Window a6, each letter alone against the same stack without it: both
+    bitwise equal. `c` measured −0.069 / −0.061 ms/token and `k` −0.118 /
+    −0.105 (prose / code). The base's digests equal the irqres-a1 T arm.
+  - Window W10-a2, `c` and `k` together: bitwise equal to the base, with
+    logits digests `ed3ca952` (prose) and `c1c571c0` (code).
+- The depth and server evidence comes from the release window R1.
+
+Removed letters:
+
+- `r`, the ballot router: exact (15,840 distinct values in its micro), but
+  slower on the stack in window a6, +0.052 / +0.056 ms/token. Removed in
+  d116f7d.
+- `h`, eight heads per threadgroup in single-row decode attention: exact
+  (6,316,032 distinct partial values per key count), but within noise in a6,
+  +0.018 / −0.036 ms/token. Removed in d116f7d.
+- `n`, the hoisted paired norm: not exact. See below.
 
 On the stack, `cn` is **not exact**. In window fp8pf-a5 (d01) its arm's
 digests differed from the control:
@@ -549,9 +570,7 @@ The cause is letter `n`, the hoisted paired norm, and it is removed from the
 branch (P28). Its micro had reported "0 of 1.4M", but that was 20 repeats of
 the same 71,680 values. Over 71.68M distinct values, 302 differ. Fast math
 reassociates its `(x * scale) * w` into `(x * w) * scale` once the weight
-loads move ahead of the reduction. No exact form of the hoist gained anything. `c`, `k`, `r` and
-`h` stay opt-in and experimental until their per-letter stack results are in.
-None of them enters a measured basis.
+loads move ahead of the reduction. No exact form of the hoist gained anything.
 
 ## Clean-checkout check (25b45ea)
 

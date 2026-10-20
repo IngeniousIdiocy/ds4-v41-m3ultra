@@ -83,8 +83,21 @@ streams (15.7G values) differing. In a micro at the decode shape, a call takes
 18.6 µs, against 122.5 µs for the 32-lane kernel. EADD is on by default, and
 `DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG=1` turns it off.
 
-The rows and digests above were measured before this kernel landed. The
-composed run with it (window W10) is pending.
+**Single-group latency kernels.** Two decode kernels run in single-group
+latency forms by default:
+- the HC collapse, as two dispatches over 32 + 10 groups;
+- the indexer top-k merge ladder, staged in threadgroup memory and finished
+  in one group.
+
+Both give the replaced kernels' bits. Window a6 checked each alone at 8K:
+the collapse saved 0.069 / 0.061 ms/token and the ladder 0.118 / 0.105
+(prose / code). Together they gave the base's digests at 8K (window W10-a2),
+and `tests/test_deepseek41_metal --s1tg` compares both with the originals.
+`DS4_V41_S1TG=none` restores the originals.
+
+The rows and digests above were measured before the staged Engram gate and
+these two kernels became the default. The composed run of this release is
+pending.
 
 The 8K row is a composed run of this branch. A composed run at depth (64K and
 beyond) on this branch is still pending. Windows, arms and per-run numbers are
