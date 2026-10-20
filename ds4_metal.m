@@ -37544,8 +37544,26 @@ int ds4_gpu_dsv41_indexer_score_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tenso
         ds4_gpu_tensor_bytes(weights) < 32u * 4u || ds4_gpu_tensor_bytes(view) < (uint64_t)rows * 128u * 2u)
         return 0;
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_hot_pipeline(
-            g_dsv41_indexer_score_bf16_pipeline, "kernel_dsv41_indexer_score_bf16");
+        /* below 65536 rows (too few threadgroups for one lane per key pair) S lanes share each key, four below
+         * 10240 rows and two above (measured): the same bits. DS4_METAL_V41_SCORE_SPLIT=0 opts out, =2 or =4 and
+         * DS4_METAL_V41_SCORE_SPLIT_TG / _BELOW override (read per call). */
+        const char *split_env = getenv("DS4_METAL_V41_SCORE_SPLIT");
+        const char *below_env = getenv("DS4_METAL_V41_SCORE_SPLIT_BELOW");
+        const uint32_t split = split_env ? (uint32_t)atoi(split_env) : rows < 10240u ? 4u : 2u;
+        const uint32_t below = below_env ? (uint32_t)atoi(below_env) : 65536u;
+        const uint32_t split_tg = getenv("DS4_METAL_V41_SCORE_SPLIT_TG") ? (uint32_t)atoi(getenv("DS4_METAL_V41_SCORE_SPLIT_TG")) : 256u;
+        id<MTLComputePipelineState> pipeline = nil;
+        NSUInteger tg = 256, keys_per_tg = 512;
+        if ((split == 2u || split == 4u) && rows < below && (split_tg == 128u || split_tg == 256u || split_tg == 512u)) {
+            pipeline = ds4_gpu_get_pipeline(split == 2u ? "kernel_dsv41_indexer_score_rows_split2_bf16" :
+                                                          "kernel_dsv41_indexer_score_rows_split4_bf16");
+            tg = split_tg;
+            keys_per_tg = 2u * split_tg / split;
+        }
+        if (!pipeline) {
+            pipeline = ds4_gpu_hot_pipeline(g_dsv41_indexer_score_bf16_pipeline, "kernel_dsv41_indexer_score_bf16");
+            tg = 256; keys_per_tg = 512;
+        }
         if (!pipeline) return 0;
         ds4_gpu_glm_indexer_score_one_args args = {rows, 32u, 128u, 0u, 1.0f / 64.0f};
         int owned = 0;
@@ -37558,8 +37576,8 @@ int ds4_gpu_dsv41_indexer_score_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tenso
         for (unsigned i = 0; i < 4; i++)
             [enc setBuffer:ds4_gpu_tensor_buffer(t[i]) offset:ds4_gpu_tensor_offset(t[i]) atIndex:i + 1];
         [enc setThreadgroupMemoryLength:(4096u + 32u) * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows + 511u) / 512u, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows + keys_per_tg - 1u) / keys_per_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 bf16 index score");
     }

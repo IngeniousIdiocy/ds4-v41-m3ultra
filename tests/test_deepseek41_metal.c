@@ -1746,7 +1746,7 @@ static float gaussian_value(void) {
  * pieces at an odd boundary; a key with low bits set raises the check flag. */
 static int check_index_score_bf16(void) {
     enum { HEADS = 32, DIM = 128, ROUNDS = 6 };
-    const uint32_t counts[] = {8192, 8200, 65536, 131077, 300000};
+    const uint32_t counts[] = {8192, 8200, 20011, 65536, 131077, 300000};
     const uint32_t max_keys = 300000;
     ds4_gpu_tensor *qt = upload(NULL, (size_t)HEADS * DIM * sizeof(float));
     ds4_gpu_tensor *wt = upload(NULL, (size_t)HEADS * sizeof(float));
@@ -1821,6 +1821,16 @@ static int check_index_score_bf16(void) {
                     "us per call wide=%.0f bf16=%.0f\n", names[dist], keys, differing, positive, rounded,
                     seconds[0] / (ROUNDS - 1) * 1e6, seconds[1] / (ROUNDS - 1) * 1e6);
             CHECK(differing == 0 && positive > keys / 16 && (ci != 0 || rounded > 0));
+            /* the split scorers below 65536 keys (S = 2, 4; 128, 256, 512 threads) and the grouped one there */
+            const char *splits[][2] = {{"0", "256"}, {"2", "128"}, {"2", "512"}, {"4", "128"}, {"4", "256"}, {"4", "512"}};
+            for (size_t si = 0; keys < 65536u && si < sizeof(splits) / sizeof(*splits); si++) {
+                CHECK(setenv("DS4_METAL_V41_SCORE_SPLIT", splits[si][0], 1) == 0 &&
+                      setenv("DS4_METAL_V41_SCORE_SPLIT_TG", splits[si][1], 1) == 0);
+                memset(fast, 0xff, (size_t)keys * sizeof(float));
+                const int ok = ds4_gpu_dsv41_indexer_score_bf16(sb, qt, wt, vt, keys) && ds4_gpu_synchronize();
+                CHECK(unsetenv("DS4_METAL_V41_SCORE_SPLIT") == 0 && unsetenv("DS4_METAL_V41_SCORE_SPLIT_TG") == 0);
+                CHECK(ok && !memcmp(wide, fast, (size_t)keys * sizeof(float)) && fast[keys] == 12345);
+            }
         }
     }
     /* the engine's decode row: the view where the wide scorer runs, the f32
