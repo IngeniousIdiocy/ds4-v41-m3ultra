@@ -9296,14 +9296,14 @@ void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
 }
 
-ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+static ds4_gpu_tensor *ds4_gpu_tensor_alloc_options(uint64_t bytes, MTLResourceOptions options) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
 
     @autoreleasepool {
         DS4MetalTensor *tensor = [DS4MetalTensor new];
         tensor.buffer = [g_device newBufferWithLength:(NSUInteger)bytes
-                                              options:MTLResourceStorageModeShared];
+                                              options:options];
         if (!tensor.buffer) {
             return NULL;
         }
@@ -9335,8 +9335,67 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     }
 }
 
+ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+    return ds4_gpu_tensor_alloc_options(bytes, MTLResourceStorageModeShared);
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return ds4_gpu_tensor_alloc(bytes);
+}
+
+/* Weights built at load: the model views' storage options (untracked with DS4_METAL_MODEL_UNTRACKED, which is safe
+ * for buffers the CPU fills once before any GPU use and nothing writes afterwards). */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes) {
+    return ds4_gpu_tensor_alloc_options(bytes, ds4_gpu_model_resource_options());
+}
+
+/* Weights built at load in a residency set of their own, as the model views are in theirs (residency requested
+ * now and the set added to the queue), so the first decode token does not discover them. Replaces the previous
+ * set; n == 0 only releases it. The same switches as the views' set apply. */
+static id g_weight_residency_set;
+static int g_weight_residency_added_to_queue;
+static void ds4_gpu_weight_residency_clear(void) {
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        if (g_weight_residency_set) {
+            if (g_weight_residency_added_to_queue && g_queue &&
+                [g_queue respondsToSelector:@selector(removeResidencySet:)])
+                [g_queue removeResidencySet:g_weight_residency_set];
+            [g_weight_residency_set endResidency];
+            [g_weight_residency_set removeAllAllocations];
+            g_weight_residency_set = nil;
+        }
+    }
+#endif
+    g_weight_residency_added_to_queue = 0;
+}
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n) {
+    ds4_gpu_weight_residency_clear();
+    if (!n || !g_device || g_ssd_streaming_mode || g_model_residency_skipped || getenv("DS4_METAL_NO_RESIDENCY")) return 1;
+#if TARGET_OS_OSX
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"ds4_built_weights";
+        desc.initialCapacity = n;
+        NSError *error = nil;
+        g_weight_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+        if (!g_weight_residency_set) {
+            fprintf(stderr, "ds4: Metal built-weight residency set creation failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            return 0;
+        }
+        for (uint32_t i = 0; i < n; i++)
+            if (tensors[i]) [g_weight_residency_set addAllocation:ds4_gpu_tensor_buffer(tensors[i])];
+        [g_weight_residency_set commit];
+        [g_weight_residency_set requestResidency];
+        if (getenv("DS4_METAL_DISABLE_QUEUE_RESIDENCY_SET") == NULL && g_queue &&
+            [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [g_queue addResidencySet:g_weight_residency_set];
+            g_weight_residency_added_to_queue = 1;
+        }
+    }
+#endif
+    return 1;
 }
 
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
@@ -12129,6 +12188,7 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache_evictions = 0;
         g_model_buffer_cache_over_limit = 0;
         ds4_gpu_model_residency_clear();
+        ds4_gpu_weight_residency_clear();
         ds4_gpu_model_views_clear();
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
@@ -21785,8 +21845,11 @@ static int ds4_blend_on(void) { return getenv("DS4_METAL_DISABLE_V41_BLEND") == 
 /* Each blend dispatch, by reader family (0 router, 1 Engram, 2 indexer q_b): counted for
  * ds4_gpu_dsv41_blend_counts, and one stderr line per family on its first one, so a run's log shows which ran. */
 static uint64_t g_blend_counts[3];
+static int g_blend_quiet;   /* load-time warm-up dispatches: neither counted nor announced */
+void ds4_gpu_dsv41_blend_quiet(int on) { g_blend_quiet = on; }
 static void ds4_blend_note(int family) {
     static const char *const name[3] = {"router", "Engram", "indexer q_b"};
+    if (g_blend_quiet) return;
     if (!g_blend_counts[family]++)
         fprintf(stderr, "ds4: V4.1 decode %s reads through the blend kernel\n", name[family]);
 }

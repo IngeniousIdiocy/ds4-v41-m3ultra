@@ -50,6 +50,10 @@ void ds4_gpu_cleanup(void);
  * in the footprint). ds4.c opens one around every public engine/session entry point (DS4_POOL_SCOPE). */
 void *ds4_gpu_autorelease_push(void);
 void ds4_gpu_autorelease_pop(void *pool);
+/* Weights built at load (Metal): allocated with the model views' storage options, and kept in a residency set of
+ * their own (requested at once, added to the queue); ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
 #endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);

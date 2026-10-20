@@ -41054,6 +41054,9 @@ static void ds41_fp8_copy_free(ds41_fp8_copy *c) {
 }
 
 static DS4_MAYBE_UNUSED void ds41_narrow_free(void) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (g_ds41_narrow.owner) ds4_gpu_weight_residency(NULL, 0);
+#endif
     for (uint32_t il = 0; il < DS41_NARROW_LAYERS; il++) {
         ds4_gpu_tensor_free(g_ds41_narrow.router[il]);
         ds41_fp8_copy_free(&g_ds41_narrow.indexer[il]);
@@ -41137,7 +41140,7 @@ static bool ds41_fp8_copy_build(const ds4_model *m, const ds4_tensor *t, ds41_fp
     memset(out, 0, sizeof(*out));
     if (!t || t->type != DS4_TENSOR_F16 || t->dim[0] % 32u || t->dim[1] % 32u) return false;
     const uint64_t cols = t->dim[0], rows = t->dim[1], nb = (rows / 32u) * (cols / 32u);
-    ds41_fp8_copy c = {ds4_gpu_tensor_alloc(rows * cols), ds4_gpu_tensor_alloc(nb), true};
+    ds41_fp8_copy c = {ds4_gpu_tensor_alloc_weights(rows * cols), ds4_gpu_tensor_alloc_weights(nb), true};
     ds41_e4m3_job job = {(const __fp16 *)(m->map + t->abs_offset), cols,
         c.codes ? ds4_gpu_tensor_contents(c.codes) : NULL, c.e8m0 ? ds4_gpu_tensor_contents(c.e8m0) : NULL, false};
     bool ok = job.codes && job.e8m0;
@@ -41171,7 +41174,7 @@ static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
         const uint32_t *src = (const uint32_t *)(m->map + t->abs_offset);
         bool exact = t->type == DS4_TENSOR_F32;
         for (uint64_t i = 0; exact && i < n; i++) exact = (src[i] & 0xffffu) == 0;
-        ds4_gpu_tensor *dst = exact ? ds4_gpu_tensor_alloc(n * sizeof(uint16_t)) : NULL;
+        ds4_gpu_tensor *dst = exact ? ds4_gpu_tensor_alloc_weights(n * sizeof(uint16_t)) : NULL;
         uint16_t *o = dst ? ds4_gpu_tensor_contents(dst) : NULL;
         if (!o) {
             ds4_gpu_tensor_free(dst);
@@ -41202,16 +41205,57 @@ static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
         }
     }
     uint64_t bytes = 0;
+    ds4_gpu_tensor *all[DS41_NARROW_LAYERS * 3u + 4u];
+    uint32_t n_all = 0;
     for (uint32_t il = 0; il < DS41_NARROW_LAYERS; il++) {
-        if (g_ds41_narrow.router[il]) bytes += ds4_gpu_tensor_bytes(g_ds41_narrow.router[il]);
-        if (g_ds41_narrow.indexer[il].codes)
-            bytes += ds4_gpu_tensor_bytes(g_ds41_narrow.indexer[il].codes) + ds4_gpu_tensor_bytes(g_ds41_narrow.indexer[il].e8m0);
+        if (g_ds41_narrow.router[il]) all[n_all++] = g_ds41_narrow.router[il];
+        if (g_ds41_narrow.indexer[il].codes) {
+            all[n_all++] = g_ds41_narrow.indexer[il].codes;
+            all[n_all++] = g_ds41_narrow.indexer[il].e8m0;
+        }
     }
     for (uint32_t i = 0; i < 2u; i++)
-        if (g_ds41_narrow.engram[i].codes)
-            bytes += ds4_gpu_tensor_bytes(g_ds41_narrow.engram[i].codes) + ds4_gpu_tensor_bytes(g_ds41_narrow.engram[i].e8m0);
-    fprintf(stderr, "ds4: V4.1 narrow decode copies built at load in %.1f ms (%.1f MiB): router %s, Engram %s, indexer q_b %s\n",
-            (now_sec() - t0) * 1e3, (double)bytes / 1048576.0, rs, es, is);
+        if (g_ds41_narrow.engram[i].codes) {
+            all[n_all++] = g_ds41_narrow.engram[i].codes;
+            all[n_all++] = g_ds41_narrow.engram[i].e8m0;
+        }
+    for (uint32_t i = 0; i < n_all; i++) bytes += ds4_gpu_tensor_bytes(all[i]);
+    const double t1 = now_sec();
+    /* Make the copies resident now and compile their readers' pipelines with one dispatch each (zero input,
+     * scratch output, the decode's own entry points and switches), so the first decode token pays neither. */
+    const bool resident = ds4_gpu_weight_residency(all, n_all) != 0;
+    bool warmed = false;
+    {
+        const ds4_gpu_tensor *rt = NULL;
+        const ds41_fp8_copy *ec = g_ds41_narrow.engram[0].codes ? &g_ds41_narrow.engram[0] : NULL, *ic = NULL;
+        uint32_t iil = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!rt) rt = g_ds41_narrow.router[il];
+            if (!ic && g_ds41_narrow.indexer[il].codes) { ic = &g_ds41_narrow.indexer[il]; iil = il; }
+        }
+        const ds4_tensor *et = ec ? w->layer[1].engram_kv : NULL, *it = ic ? w->layer[iil].indexer_attn_q_b : NULL;
+        uint64_t in_max = rt ? DS4_N_EMBD : 0, out_max = rt ? DS4_N_EXPERT : 0;
+        if (et) { in_max = et->dim[0] > in_max ? et->dim[0] : in_max; out_max = et->dim[1] > out_max ? et->dim[1] : out_max; }
+        if (it) { in_max = it->dim[0] > in_max ? it->dim[0] : in_max; out_max = it->dim[1] > out_max ? it->dim[1] : out_max; }
+        ds4_gpu_tensor *x = in_max ? ds4_gpu_tensor_alloc(in_max * sizeof(float)) : NULL;
+        ds4_gpu_tensor *y = out_max ? ds4_gpu_tensor_alloc(out_max * sizeof(float)) : NULL;
+        if (in_max && !ds4_gpu_commands_active()) {   /* never into another caller's open batch */
+            warmed = x && y && ds4_gpu_tensor_fill_f32(x, 0.0f, in_max);
+            ds4_gpu_dsv41_blend_quiet(1);
+            if (warmed && rt) warmed = ds4_gpu_matmul_bf16_router_weights(y, rt, DS4_N_EMBD, DS4_N_EXPERT, x) != 0;
+            if (warmed && et) warmed = ds4_gpu_matmul_engram_fp8_weights(y, ec->codes, ec->e8m0, (uint32_t)et->dim[0],
+                                                                         (uint32_t)et->dim[1], x, ec->table_ok) != 0;
+            if (warmed && it) warmed = ds4_gpu_dsv41_project_fp8_bf16_weights(y, ic->codes, ic->e8m0, (uint32_t)it->dim[0],
+                                                                              (uint32_t)it->dim[1], x) != 0;
+            ds4_gpu_dsv41_blend_quiet(0);
+        }
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(y);
+    }
+    fprintf(stderr, "ds4: V4.1 narrow decode copies built at load in %.1f ms (%.1f MiB): router %s, Engram %s, indexer q_b %s;"
+            " %s, readers %s in %.1f ms\n",
+            (t1 - t0) * 1e3, (double)bytes / 1048576.0, rs, es, is, resident ? "resident" : "residency request failed",
+            warmed ? "warmed" : "not warmed", (now_sec() - t1) * 1e3);
 #else
     (void)m; (void)w;
 #endif
