@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the DeepSeek V4.1 Engram KV projections as an FP8 GGUF sidecar.
 
-The engine maps it when DS4_V41_ENGRAM_FP8_SIDECAR points at it; the resident
+The engine maps it when --v41-sidecar names it; the resident
 Metal decode Engram projection then reads it. For each Engram layer the original `layers.N.engram.wkv`
 E4M3 codes [25600, 6144] and E8M0 32x32 block scales [800, 192] are copied
 byte-for-byte from the released safetensors, as two raw byte tensors:

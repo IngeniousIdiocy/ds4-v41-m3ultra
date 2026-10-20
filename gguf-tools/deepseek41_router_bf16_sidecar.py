@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the DeepSeek V4.1 router gates as a small BF16 GGUF sidecar.
 
-The engine maps it when DS4_V41_ROUTER_BF16_SIDECAR points at it; the
+The engine maps it when --v41-sidecar names it; the
 resident Metal decode router then reads it. The 40 `layers.N.ffn.gate.weight`
 tensors are copied byte-for-byte from the released BF16 safetensors, so the
 values are exactly the ones the main GGUF stores widened to F32.

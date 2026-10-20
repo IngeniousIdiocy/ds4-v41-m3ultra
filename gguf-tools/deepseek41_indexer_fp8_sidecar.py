@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the DeepSeek V4.1 indexer query projection (indexer.wq_b) as an FP8 GGUF sidecar.
 
-The engine maps it when DS4_V41_INDEXER_FP8_SIDECAR points at it; the resident Metal decode
+The engine maps it when --v41-sidecar names it; the resident Metal decode
 index-source q projection then reads it. For each index-source layer
 (2, 8, 14, 20, 24, 28, 32, 36) the released `layers.N.attn.indexer.wq_b` E4M3 codes and E8M0 32x32 block
 scales are copied byte-for-byte from the safetensors as raw byte tensors (GGUF dims are [cols, rows]):
