@@ -19588,7 +19588,7 @@ static int ds4_gpu_indexer_topk_tensor_impl(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        /* DS4_V41_S1TG has k (the decode call through the prefix merge): the levels with more than ten runs through the
+        /* S1TG k (default; the decode call through the prefix merge): the levels with more than ten runs through the
          * staged merge, the rest of the ladder in one threadgroup. The same outputs as the prefix merge's ladder. */
         const bool s1k = decode_k512 && nth == 1024 && block_top_k == 512 && n_comp <= 65536u &&
             !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") && ds4_s1tg_on('k');
@@ -49762,18 +49762,13 @@ static id<MTLBuffer> ds4_gpu_v41_deferred_counter(void) {
     return buffer;
 }
 
-/* DS4_V41_S1TG=<letters> (read per call): c the deferred HC collapse as two dispatches over 32 + 10 groups, k the decode
- * indexer top-k's merge ladder staged in threadgroup memory and fused into one group. Each gave the replaced kernel's
- * bits in its micro; their stack exactness is still being measured. Unset: the originals. */
+/* The V4.1 decode single-group latency kernels, both on by default and exact: c the deferred HC collapse as two
+ * dispatches over 32 + 10 groups, k the decode indexer top-k's merge ladder staged in threadgroup memory and fused into
+ * one group. DS4_V41_S1TG (read per call), when set, names exactly the letters to use: "c", "k", or "" / "none" for the
+ * original kernels. */
 static int ds4_s1tg_on(char k) {
     const char *s = getenv("DS4_V41_S1TG");
-    const int on = s && strchr(s, k) != NULL;
-    static int announced;
-    if (on && !announced) {
-        announced = 1;
-        fprintf(stderr, "ds4: V4.1 single-group latency kernels on: %s\n", s);
-    }
-    return on;
+    return s ? strchr(s, k) != NULL : 1;
 }
 
 /* The split collapse's 32 partial sums, between its two dispatches. */
@@ -49809,7 +49804,7 @@ int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
         id<MTLBuffer> count=ds4_gpu_v41_deferred_counter();
         if (!w || !count) return 0;
         const struct { int32_t n_embd,n_hc,iters; float hc_eps,norm_eps; } args={5120,4,0,0,eps};
-        if (ds4_s1tg_on('c')) {
+        if (ds4_s1tg_on('c')) {   /* S1TG c (default): the split collapse */
             id<MTLComputePipelineState> part = ds4_gpu_get_pipeline("kernel_dsv41_deferred_collapse_part");
             id<MTLComputePipelineState> fin = ds4_gpu_get_pipeline("kernel_dsv41_deferred_collapse_norm");
             id<MTLBuffer> slots = ds4_gpu_v41_collapse_slots();
