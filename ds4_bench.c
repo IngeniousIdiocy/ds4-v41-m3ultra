@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_snapstore.h"
 #include "ds4_tp.h"
 
 /* Purpose-built throughput benchmark.
@@ -675,13 +676,17 @@ extern char **environ;
 
 /* ---- Resident job runner (--jobs FILE --token-csv PATH) ----
  * One process, one engine and session, many experiment jobs:
- *   save fixture=PATH depth=N cache=PATH   prefill the first N tokens, write the
- *                                           engine payload + a .meta identity file
+ *   save fixture=PATH depth=N cache=PATH [canary=M]
+ *                                           prefill the first N tokens, write the engine
+ *                                           payload + a .meta identity file (snapshot format 4,
+ *                                           ds4_snapstore.h); canary=M also records the logits of
+ *                                           a fresh M-token prefill of the fixture in a side session
  *   load fixture=PATH depth=N cache=PATH [expect=reject]
  *                                           restore a saved frontier of exactly that
  *                                           fixture prefix (no prefill fallback: a missing,
- *                                           unverifiable or mismatched cache fails the job;
- *                                           expect=reject inverts that for negative checks)
+ *                                           incomplete, corrupt, incompatible or unverifiable
+ *                                           cache fails the job; expect=reject inverts that
+ *                                           for negative checks)
  *   run label=L tokens=N seed=S [mode=sampled|greedy|teacher] [temp= top_p= top_k= min_p=]
  *       [set=NAME=VALUE ...] [unset=NAME ...] [warm=1] [fixture=PATH] [state=1] [dump=PATH]
  *                                           restore the current frontier, apply the
@@ -690,7 +695,12 @@ extern char **environ;
  * Each run restores the in-memory snapshot of the last save/load, so arms switch at a
  * quiescent boundary. Per token: PATH; per job: PATH.jobs.csv, with the decode paths'
  * dispatch counts of the run (Engram gate form, fused index query, blend readers, GPU
- * selector outcomes, pre-encoded buffers, GPU bridge). */
+ * selector outcomes, pre-encoded buffers, GPU bridge).
+ * Snapshots: payload and meta are each written to a temporary file, fsynced and
+ * renamed, never over an existing snapshot; the meta ends with "end". A load checks
+ * the producer identity by category, then the payload's size and hash, before the
+ * engine sees a byte. A save that extends the frontier of the last save/load records
+ * it as "base PATH HASH DEPTH". Format-3 caches (BENCH_CACHE_FORMAT) still load. */
 #define BENCH_CACHE_FORMAT "ds4-bench-prefill-cache-3"
 /* Versioned contract of what produces a V4.1 prefix frontier. Bump it when a new
  * prefix producer appears (e.g. an FP8 prefill path), never stamp old payloads. */
@@ -792,6 +802,39 @@ static int cache_identity(const bench_config *cfg, ds4_engine *engine, ds4_sessi
     return ok;
 }
 
+/* Format 4 identity (ds4_snapstore.h): the same producer inputs plus the
+ * prefill weight representation; weights compare by size+sha, not path/mtime. */
+static int cache_identity4(const bench_config *cfg, ds4_engine *engine, ds4_session *session,
+                           char *out, size_t cap) {
+    char legacy[8192];
+    const int ok = cache_identity(cfg, engine, session, legacy, sizeof(legacy));
+    const char *body = strchr(legacy, '\n');   /* drop the format-3 line */
+    int n = snprintf(out, cap, "format %s%s", DS4_SS_FORMAT, body ? body : "\n");
+    if (n > 0 && (size_t)n < cap)
+        snprintf(out + n, cap - (size_t)n, "prefill_repr %s\nprefill_values %s\n",
+                 ds4_engine_prefill_repr(engine), ds4_engine_prefill_values(engine));
+    return ok;
+}
+
+/* Numerics canary: logits hash of a FRESH prefill of the fixture's first len
+ * tokens in a small side session of the same engine. A compatible rebuild
+ * reproduces it; a prefill numerics change does not. "LEN PREFIX LOGITS". */
+static int bench_canary(ds4_engine *engine, const ds4_tokens *all, int len, char *out, size_t cap) {
+    if (!all || len <= 0 || len > all->len) return 1;
+    ds4_session *cs = NULL;
+    char err[256];
+    ds4_tokens pre = {.v = all->v, .len = len, .cap = len};
+    float *buf = malloc((size_t)(1 << 18) * sizeof(float));
+    int rc = !buf || ds4_session_create(&cs, engine, len + 64) != 0 ||
+             ds4_session_sync(cs, &pre, err, sizeof(err)) != 0;
+    if (!rc) snprintf(out, cap, "%d %016llx %016llx", len,
+                      (unsigned long long)bench_fnv_tokens(all->v, len),
+                      (unsigned long long)bench_fnv_logits(cs, buf, 1 << 18));
+    if (cs) ds4_session_free(cs);
+    free(buf);
+    return rc;
+}
+
 /* The decode paths' dispatch counters, in jobs.csv column order: engram_add_tg, irq_tab, blend_router,
  * blend_engram, blend_indexer, sel_encoded, sel_decided .. sel_stale (9), pe_prep, pe_used, pe_pending,
  * pe_drop, gpu_bridge, gpu_bridge_retired, gpu_bridge_failed. pe_pending is a level, the rest are counts. */
@@ -846,6 +889,11 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
     ds4_session_snapshot snap = {0};
     bool have_snap = false;
     char cache[PATH_MAX] = "-";
+    /* Lineage: the snapshot the session's current frontier came from (load or
+     * save), so a longer save records which prefix it extended. */
+    char lin_path[PATH_MAX] = "";
+    unsigned long long lin_hash = 0;
+    int lin_depth = 0;
     char err[256], line[4096];
     int rc = 0, job = 0;
     for (;;) {
@@ -888,6 +936,12 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
                     break;
                 }
                 ds4_tokens prefix = { .v = all->v, .len = depth, .cap = depth };
+                int base_len = 0;   /* > 0: this save extends the session's current frontier */
+                {
+                    const ds4_tokens *cur = ds4_session_tokens(session);
+                    if (cur && cur->len > 0 && cur->len < depth &&
+                        !memcmp(cur->v, all->v, (size_t)cur->len * sizeof(int))) base_len = cur->len;
+                }
                 uint64_t c0[BENCH_JOB_COUNTERS], c1[BENCH_JOB_COUNTERS], pe[BENCH_PE_STATS];
                 job_counters(c0, pe);
                 if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
@@ -908,25 +962,59 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
                     break;
                 }
                 const uint64_t t1 = bench_now_ns();
-                FILE *fp = fopen(path, "wb");
-                FILE *mp = fopen(meta_path, "wb");
-                if (!fp || !mp || ds4_session_save_payload(session, fp, err, sizeof(err)) != 0) {
-                    fprintf(stderr, "ds4-bench: job %d: cannot write %s: %s\n", job, path, fp ? err : strerror(errno));
-                    if (fp) fclose(fp);
-                    if (mp) fclose(mp);
+                /* Format 4: payload then meta, each tmp+fsync+rename, never over an
+                 * existing snapshot; the meta's last line "end" marks completeness. */
+                char ident4[8192], serr[256], canary[96] = "";
+                const char *cv = job_get(kv, n, "canary");
+                (void)cache_identity4(cfg, engine, session, ident4, sizeof(ident4));
+                ds4_session_snapshot fs = {0};
+                if (ds4_session_save_snapshot(session, &fs, err, sizeof(err)) != 0 ||
+                    ds4_ss_write_file_atomic(path, fs.ptr, (size_t)fs.len, false, serr, sizeof(serr)) != 0) {
+                    fprintf(stderr, "ds4-bench: job %d: cannot write %s: %s\n", job, path,
+                            fs.len ? serr : err);
+                    ds4_session_snapshot_free(&fs);
                     rc = 1;
                     break;
                 }
-                fclose(fp);
-                fprintf(mp, "%sfixture %s\ndepth %d\nprefix_fnv64 %016llx\nlogits_fnv64 %016llx\n"
-                            "prefill_ns %llu\nsave_ns %llu\n",
-                        ident, fx.path, depth,
-                        (unsigned long long)bench_fnv_tokens(prefix.v, depth),
-                        (unsigned long long)bench_fnv_logits(session, logits, logits_cap),
-                        (unsigned long long)(t1 - t0), (unsigned long long)(bench_now_ns() - t1));
+                const unsigned long long ph = ds4_ss_hash_bytes(fs.ptr, (size_t)fs.len);
+                const unsigned long long pbytes = fs.len;
+                ds4_session_snapshot_free(&fs);
+                const uint64_t t2w = bench_now_ns();
+                if (cv && atoi(cv) > 0 && bench_canary(engine, all, atoi(cv), canary, sizeof(canary)) != 0) {
+                    fprintf(stderr, "ds4-bench: job %d: canary prefill failed\n", job);
+                    rc = 1;
+                    break;
+                }
+                const unsigned long long lg = bench_fnv_logits(session, logits, logits_cap);
+                size_t mcap = 65536, mn = 0;
+                char *mt = malloc(mcap);
+                if (!mt) { rc = 1; break; }
+#define MT_ADD(...) do { if (mn < mcap) mn += (size_t)snprintf(mt + mn, mcap - mn, __VA_ARGS__); } while (0)
+                MT_ADD("%s", ident4);
+                if (canary[0]) MT_ADD("canary %s\n", canary);
+                MT_ADD("fixture %s\ndepth %d\nprefix_fnv64 %016llx\nlogits_fnv64 %016llx\n"
+                       "prefill_ns %llu\nsave_ns %llu\npayload_bytes %llu\npayload_hash %016llx\n",
+                       fx.path, depth, (unsigned long long)bench_fnv_tokens(prefix.v, depth), lg,
+                       (unsigned long long)(t1 - t0), (unsigned long long)(t2w - t1), pbytes, ph);
+                if (base_len > 0 && lin_path[0] && lin_depth == base_len)
+                    MT_ADD("base %s %016llx %d\n", lin_path, lin_hash, lin_depth);
+                else
+                    MT_ADD("base - (fresh prefill from %d tokens)\n", base_len);
                 for (char **e = environ; *e; e++)   /* provenance only, not compared */
-                    if (!strncmp(*e, "DS4_", 4)) fprintf(mp, "env %s\n", *e);
-                fclose(mp);
+                    if (!strncmp(*e, "DS4_", 4)) MT_ADD("env %s\n", *e);
+                MT_ADD("end\n");
+#undef MT_ADD
+                if (mn >= mcap || ds4_ss_write_file_atomic(meta_path, mt, mn, false, serr, sizeof(serr)) != 0) {
+                    fprintf(stderr, "ds4-bench: job %d: cannot write %s: %s\n", job, meta_path,
+                            mn >= mcap ? "metadata too long" : serr);
+                    free(mt);
+                    rc = 1;
+                    break;
+                }
+                free(mt);
+                snprintf(lin_path, sizeof(lin_path), "%s", path);
+                lin_hash = ph;
+                lin_depth = depth;
             } else {
                 /* Outer compatibility check before the engine payload's own: the
                  * producer signature, then the job's own fixture/depth identity. */
@@ -935,12 +1023,62 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
                 const char *why = NULL;
                 char *meta = NULL;
                 unsigned long long want_prefix = 0, want_logits = 0;
+                unsigned long long load_hash = 0;   /* verified payload hash (format 4; format 3 has none) */
                 FILE *mp = fopen(meta_path, "rb");
                 if (mp) { fclose(mp); meta = read_file(meta_path); }
                 if (!all || depth <= 0 || depth > all->len) why = "load needs fixture= and 0 < depth <= tokens";
                 else if (!ident_ok) why = "unverifiable model/drafter digest";
-                else if (!meta) why = "no metadata";
-                else if (strncmp(meta, ident, strlen(ident)) != 0) {
+                else if (!meta) why = "no metadata (incomplete snapshot)";
+                else if (!strncmp(meta, "format " DS4_SS_FORMAT "\n", strlen("format " DS4_SS_FORMAT "\n"))) {
+                    /* Format 4: compatibility by category, completeness, payload integrity. */
+                    static char why4[640];
+                    char ident4[8192], canary[96] = "";
+                    ds4_ss_meta have_m = {0}, need_m = {0};
+                    (void)cache_identity4(cfg, engine, session, ident4, sizeof(ident4));
+                    const bool pm = ds4_ss_meta_parse(meta, &have_m) == 0;
+                    const char *hc = pm ? ds4_ss_meta_get(&have_m, "canary") : NULL;
+                    size_t il = strlen(ident4);
+                    if (hc && atoi(hc) > 0 && bench_canary(engine, all, atoi(hc), canary, sizeof(canary)) == 0)
+                        snprintf(ident4 + il, sizeof(ident4) - il, "canary %s\n", canary);
+                    else if (hc)   /* compat then refuses the snapshot as UNVERIFIABLE */
+                        fprintf(stderr, "ds4-bench: job %d: canary '%s' could not be recomputed\n", job, hc);
+                    const bool nm = ds4_ss_meta_parse(ident4, &need_m) == 0;
+                    ds4_ss_verdict vd = pm && nm ? ds4_ss_compat(&have_m, &need_m, why4, sizeof(why4)) : DS4_SS_INCOMPLETE;
+                    uint64_t want_b = 0, want_h = 0, got_b = 0, got_h = 0;
+                    if (vd == DS4_SS_OK) {
+                        if (!ds4_ss_meta_get_u64(&have_m, "payload_bytes", 10, &want_b) ||
+                            !ds4_ss_meta_get_u64(&have_m, "payload_hash", 16, &want_h)) {
+                            vd = DS4_SS_INCOMPLETE;
+                            snprintf(why4, sizeof(why4), "metadata lacks payload_bytes/payload_hash");
+                        } else if (ds4_ss_hash_file(path, &got_b, &got_h, why4, sizeof(why4)) != 0 || got_b != want_b) {
+                            vd = DS4_SS_INCOMPLETE;
+                            if (!why4[0] || got_b != want_b)
+                                snprintf(why4, sizeof(why4), "payload is %llu bytes, metadata says %llu",
+                                         (unsigned long long)got_b, (unsigned long long)want_b);
+                        } else if (got_h != want_h) {
+                            vd = DS4_SS_CORRUPT;
+                            snprintf(why4, sizeof(why4), "payload hash %016llx, metadata says %016llx",
+                                     (unsigned long long)got_h, (unsigned long long)want_h);
+                        }
+                    }
+                    if (vd != DS4_SS_OK) {
+                        static char whyv[720];
+                        snprintf(whyv, sizeof(whyv), "%s: %s", ds4_ss_verdict_name(vd), why4);
+                        why = whyv;
+                    } else {
+                        uint64_t dv = 0;
+                        if (!ds4_ss_meta_get_u64(&have_m, "prefix_fnv64", 16, &dv)) why = "metadata lacks prefix_fnv64";
+                        else want_prefix = dv;
+                        if (!why && ds4_ss_meta_get_u64(&have_m, "logits_fnv64", 16, &dv)) want_logits = dv;
+                        else if (!why) why = "metadata lacks logits_fnv64";
+                        if (!why && (!ds4_ss_meta_get_u64(&have_m, "depth", 10, &dv) || (int)dv != depth ||
+                                     want_prefix != bench_fnv_tokens(all->v, depth)))
+                            why = "cache holds a different fixture prefix or depth";
+                        if (!why) load_hash = got_h;
+                    }
+                    ds4_ss_meta_free(&have_m);
+                    ds4_ss_meta_free(&need_m);
+                } else if (strncmp(meta, ident, strlen(ident)) != 0) {
                     why = "producer signature differs from this engine/session";
                     size_t k = 0;   /* name the first differing signature line */
                     while (meta[k] && meta[k] == ident[k]) k++;
@@ -991,6 +1129,9 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
                     break;
                 }
                 fprintf(stderr, "ds4-bench: job %d: cache HIT %s (%d tokens)\n", job, path, have->len);
+                snprintf(lin_path, sizeof(lin_path), "%s", path);
+                lin_hash = load_hash;
+                lin_depth = depth;
             }
             setup_ns = bench_now_ns() - t0;
             const uint64_t t2 = bench_now_ns();

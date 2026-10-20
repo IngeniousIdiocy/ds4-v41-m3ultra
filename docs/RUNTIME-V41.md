@@ -70,7 +70,10 @@ alignment).
 - `--token-csv PATH` writes per-token times, plus per-frontier prefix and
   final-logit digests to `PATH.runs.csv`.
 - `--jobs FILE` keeps one engine resident and runs save, load, run and quit
-  job lines (see `ds4_bench.c`).
+  job lines (see `ds4_bench.c`). Saved caches are snapshot format 4
+  (`ds4_snapstore.h`): a load checks the producer identity, then the
+  payload's size and hash, before restoring; `canary=N` on a save also binds
+  the cache to the prefill numerics. Format-3 caches still load.
 
 `DS4_BENCH_SHA_DIR` names a directory of recorded `*.sha256` files for the
 job runner's cache identity.
