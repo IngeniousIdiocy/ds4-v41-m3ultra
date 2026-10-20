@@ -590,31 +590,13 @@ static bool kv_put_payload_hash(FILE *fp, uint64_t hash) {
            fwrite(b, 1, sizeof(b), fp) == sizeof(b);
 }
 
-struct ds4_kvstore_canary_run {
-    ds4_session *session;
-    ds4_tokens prompt;      /* all tokens; len is the prefilled prefix */
-    int tokens;
-    float *logits;
-    int vocab;
-};
-
-void ds4_kvstore_canary_end(ds4_kvstore_canary_run *run) {
-    if (!run) return;
-    if (run->session) ds4_session_free(run->session);
-    ds4_tokens_free(&run->prompt);
-    free(run->logits);
-    free(run);
-}
-
-ds4_kvstore_canary_run *ds4_kvstore_canary_begin(ds4_engine *engine, int tokens,
-                                                 char *err, size_t err_len) {
-    if (!engine || tokens <= 0) {
+int ds4_kvstore_engine_canary(ds4_engine *engine, int tokens, uint64_t *out,
+                              char *err, size_t err_len) {
+    if (out) *out = 0;
+    if (!engine || !out || tokens <= 0) {
         snprintf(err, err_len, "invalid canary request");
-        return NULL;
+        return 1;
     }
-    ds4_kvstore_canary_run *run = kv_xmalloc(sizeof(*run));
-    memset(run, 0, sizeof(*run));
-    run->tokens = tokens;
     /* Fixed prompt: decimal numbers from a 32-bit LCG, each at least one
      * token, through the bound tokenizer (part of the identity). */
     kv_buf text = {0};
@@ -624,52 +606,41 @@ ds4_kvstore_canary_run *ds4_kvstore_canary_begin(ds4_engine *engine, int tokens,
         kv_buf_printf(&text, "%05u ", (unsigned)(x % 100000u));
     }
     char *t = kv_buf_take(&text);
-    ds4_tokenize_text(engine, t, &run->prompt);
+    ds4_tokens prompt = {0};
+    ds4_tokenize_text(engine, t, &prompt);
     free(t);
-    run->vocab = ds4_engine_vocab_size(engine);
-    run->logits = run->vocab > 0 ? malloc((size_t)run->vocab * sizeof(float)) : NULL;
-    if (run->prompt.len < tokens) {
-        snprintf(err, err_len, "canary prompt tokenized to %d of %d tokens", run->prompt.len, tokens);
-    } else if (!run->logits) {
-        snprintf(err, err_len, "no vocabulary for the canary logits");
-    } else if (ds4_session_create(&run->session, engine, tokens + 64) != 0) {
-        run->session = NULL;
-        snprintf(err, err_len, "canary session (ctx %d) could not be created", tokens + 64);
-    } else {
-        run->prompt.len = 0;
-        return run;
-    }
-    ds4_kvstore_canary_end(run);
-    return NULL;
-}
-
-int ds4_kvstore_canary_step(ds4_kvstore_canary_run *run, uint64_t *out,
-                            char *err, size_t err_len) {
-    if (!run || !run->session || !out) {
-        snprintf(err, err_len, "invalid canary run");
-        return -1;
-    }
-    const int done = run->prompt.len;
-    run->prompt.len = done + DS4_KVSTORE_CANARY_STEP < run->tokens ? done + DS4_KVSTORE_CANARY_STEP : run->tokens;
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = vocab > 0 ? malloc((size_t)vocab * sizeof(float)) : NULL;
+    ds4_session *cs = NULL;
     char serr[160] = {0};
-    if (ds4_session_sync(run->session, &run->prompt, serr, sizeof(serr)) != 0) {
-        snprintf(err, err_len, "canary prefill failed at %d tokens: %s", run->prompt.len,
-                 serr[0] ? serr : "unknown error");
-        return -1;
+    int rc = 1;
+    if (prompt.len >= tokens) prompt.len = tokens;
+    if (prompt.len < tokens) {
+        snprintf(err, err_len, "canary prompt tokenized to %d of %d tokens", prompt.len, tokens);
+    } else if (!logits) {
+        snprintf(err, err_len, "no vocabulary for the canary logits");
+    } else if (ds4_session_create(&cs, engine, tokens + 64) != 0) {
+        snprintf(err, err_len, "canary session (ctx %d) could not be created", tokens + 64);
+    } else if (ds4_session_sync(cs, &prompt, serr, sizeof(serr)) != 0) {
+        snprintf(err, err_len, "canary prefill failed: %s", serr[0] ? serr : "unknown error");
+    } else {
+        const int n = ds4_session_copy_logits(cs, logits, vocab);
+        if (n <= 0) {
+            snprintf(err, err_len, "canary prefill produced no logits");
+        } else {
+            ds4_kvstore_hash s;
+            ds4_kvstore_hash_init(&s);
+            ds4_kvstore_hash_update(&s, prompt.v, (size_t)tokens * sizeof(prompt.v[0]));
+            ds4_kvstore_hash_update(&s, logits, (size_t)n * sizeof(float));
+            const uint64_t h = ds4_kvstore_hash_final(&s);
+            *out = h ? h : 1;
+            rc = 0;
+        }
     }
-    if (run->prompt.len < run->tokens) return 1;
-    const int n = ds4_session_copy_logits(run->session, run->logits, run->vocab);
-    if (n <= 0) {
-        snprintf(err, err_len, "canary prefill produced no logits");
-        return -1;
-    }
-    ds4_kvstore_hash s;
-    ds4_kvstore_hash_init(&s);
-    ds4_kvstore_hash_update(&s, run->prompt.v, (size_t)run->tokens * sizeof(run->prompt.v[0]));
-    ds4_kvstore_hash_update(&s, run->logits, (size_t)n * sizeof(float));
-    const uint64_t h = ds4_kvstore_hash_final(&s);
-    *out = h ? h : 1;
-    return 0;
+    if (cs) ds4_session_free(cs);
+    free(logits);
+    ds4_tokens_free(&prompt);
+    return rc;
 }
 
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
