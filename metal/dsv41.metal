@@ -472,6 +472,59 @@ kernel void kernel_dsv41_norm_pair(
     }
 }
 
+/* DS4_V41_S1TG has n: kernel_dsv41_norm_pair with every load issued at entry (the original's norm weight loads wait for
+ * the reduction). The same threads, elements, accumulation order, reduction and expressions. Host contract as the
+ * original plus n / 4 <= 2 x the row's thread count (the decode rows give one element per thread). */
+kernel void kernel_dsv41_norm_pair_hoist(
+        constant ds4_metal_args_dsv41_norm_pair &args,
+        device const float4 *x0,
+        device const float4 *w0,
+        device float4 *y0,
+        device const float4 *x1,
+        device const float4 *w1,
+        device float4 *y1,
+        threadgroup float *shmem [[threadgroup(0)]],
+        uint2 tg [[threadgroup_position_in_grid]],
+        ushort2 tpos [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const ushort tid = tpos.x;
+    const bool second = tid >= args.ntg0;
+    const uint ntg = second ? args.ntg1 : args.ntg0;
+    const uint t = second ? tid - args.ntg0 : tid;
+    const uint sg = second ? sgitg - args.ntg0 / 32u : sgitg;
+    const int n = int(second ? args.n1 : args.n0);
+    const int ne00_t = n / 4;
+    const uint row = tg.y;   /* grid row = activation row */
+    device const float4 *x = (second ? x1 : x0) + (ulong)row * ne00_t;
+    device const float4 *w = second ? w1 : w0;
+    device float4 *y = (second ? y1 : y0) + (ulong)row * ne00_t;
+    threadgroup float *sh = shmem + (second ? 32u : 0u);
+    const int i0 = int(t), i1 = int(t + ntg);
+    const bool h0 = i0 < ne00_t, h1 = i1 < ne00_t;
+    float4 xa = 0.0f, xb = 0.0f, wa = 0.0f, wb = 0.0f;
+    if (h0) { xa = x[i0]; wa = w[i0]; }
+    if (h1) { xb = x[i1]; wb = w[i1]; }
+    if (sg == 0) {
+        sh[tiisg] = 0.0f;
+    }
+    float sumf = 0.0f;
+    if (h0) sumf += dot(xa, xa);
+    if (h1) sumf += dot(xb, xb);
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sh[sg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = sh[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean  = sumf/n;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+    if (h0) { float4 v = xa*scale; v = v*wa; y[i0] = dsv41_bf16(v); }
+    if (h1) { float4 v = xb*scale; v = v*wb; y[i1] = dsv41_bf16(v); }
+}
+
 struct ds4_metal_args_dsv41_engram {
     uint width;
     uint rows;
@@ -1037,6 +1090,66 @@ kernel void kernel_dsv41_deferred_collapse(
 
     if (tid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
 
+}
+
+/* DS4_V41_S1TG has c: kernel_dsv41_deferred_collapse as two dispatches with the same bits. The single 1024-thread group
+ * spends most of its time pulling 100 KB through one core; here the loads spread over 32 groups.
+ * Part: group s is the original's simdgroup s (thread t = 32 s + lane owns elements t and t + 1024, as there) and stores
+ * the collapsed values and its simd_sum partial in slots[s]. The four-row sum is written as the fma chain the original's
+ * `acc += x * w` sequence compiles to under fast math (checked bit for bit against it), so the two cannot drift apart.
+ * Norm: every simdgroup reloads the 32 partials, lane = slot, and repeats the original's second simd_sum over the same 32
+ * values in the same lanes, then normalizes its elements from the stored collapsed values. Group 0 resets the counter as
+ * the original does at its end. Host contract: n_embd 5120, n_hc 4 (as the original). */
+kernel void kernel_dsv41_deferred_collapse_part(
+        constant ds4_deferred_hc_args &args,
+        device const float *x, device const float *pre,
+        device float *collapsed, device float *slots,
+        uint group [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n_embd = (uint)args.n_embd, n4 = n_embd >> 2;
+    const uint i0 = group * 32u + tiisg, i1 = i0 + 1024u;
+    const bool h0 = i0 < n4, h1 = i1 < n4;
+    device const float4 *x0 = (device const float4 *)(x + 0u * n_embd);
+    device const float4 *x1 = (device const float4 *)(x + 1u * n_embd);
+    device const float4 *x2 = (device const float4 *)(x + 2u * n_embd);
+    device const float4 *x3 = (device const float4 *)(x + 3u * n_embd);
+    const float w0 = pre[0], w1 = pre[1], w2 = pre[2], w3 = pre[3];
+    float4 a0 = 0.0f, b0 = 0.0f, c0 = 0.0f, d0 = 0.0f, a1 = 0.0f, b1 = 0.0f, c1 = 0.0f, d1 = 0.0f;
+    if (h0) { a0 = x0[i0]; b0 = x1[i0]; c0 = x2[i0]; d0 = x3[i0]; }
+    if (h1) { a1 = x0[i1]; b1 = x1[i1]; c1 = x2[i1]; d1 = x3[i1]; }
+    device float4 *collapsed4 = (device float4 *)collapsed;
+    float sumf = 0.0f;
+    if (h0) {
+        const float4 v = dsv41_bf16(fma(d0, w3, fma(c0, w2, fma(b0, w1, a0 * w0))));
+        collapsed4[i0] = v;
+        sumf += dot(v, v);
+    }
+    if (h1) {
+        const float4 v = dsv41_bf16(fma(d1, w3, fma(c1, w2, fma(b1, w1, a1 * w0))));
+        collapsed4[i1] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+    if (tiisg == 0) slots[group] = sumf;
+}
+
+kernel void kernel_dsv41_deferred_collapse_norm(
+        constant ds4_deferred_hc_args &args,
+        device const float *collapsed, device const float *slots,
+        device const float *norm_weight, device float *norm_dst, device atomic_uint *counter,
+        uint gid [[thread_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n4 = (uint)args.n_embd >> 2;
+    float sumf = slots[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean  = sumf / (float)args.n_embd;
+    const float rscale = 1.0f / sqrt(mean + args.norm_eps);
+    if (gid < n4) {
+        const float4 r = ((device const float4 *)collapsed)[gid];
+        const float4 v = (r * rscale) * ((device const float4 *)norm_weight)[gid];
+        ((device float4 *)norm_dst)[gid] = float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
+    }
+    if (gid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
 }
 
 kernel void kernel_dsv41_query_deferred_hc(

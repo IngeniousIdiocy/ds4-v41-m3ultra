@@ -49723,6 +49723,32 @@ static id<MTLBuffer> ds4_gpu_v41_deferred_counter(void) {
     return buffer;
 }
 
+/* DS4_V41_S1TG=<letters> (read per call): c the deferred HC collapse as two dispatches over 32 + 10 groups, n the paired
+ * norm with its loads issued at entry. Both give the replaced kernels' bits. Unset: the single-group kernels. */
+static int ds4_s1tg_on(char k) {
+    const char *s = getenv("DS4_V41_S1TG");
+    const int on = s && strchr(s, k) != NULL;
+    static int announced;
+    if (on && !announced) {
+        announced = 1;
+        fprintf(stderr, "ds4: V4.1 single-group latency kernels on: %s\n", s);
+    }
+    return on;
+}
+
+/* The split collapse's 32 partial sums, between its two dispatches. */
+static id<MTLBuffer> ds4_gpu_v41_collapse_slots(void) {
+    if (!g_dsv4_completion_cache) return nil;
+    id<MTLBuffer> buffer = [g_dsv4_completion_cache objectForKey:@"v41_collapse_slots"];
+    if (!buffer) {
+        buffer = [g_device newBufferWithLength:128 options:MTLResourceStorageModeShared];
+        if (!buffer) return nil;
+        [g_dsv4_completion_cache setObject:buffer forKey:@"v41_collapse_slots"];
+    }
+    [g_transient_buffers addObject:buffer];
+    return buffer;
+}
+
 int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
         const ds4_gpu_tensor *residual, const ds4_gpu_tensor *pre,
         const void *model_map, uint64_t model_size, uint64_t norm_offset, float eps) {
@@ -49743,6 +49769,33 @@ int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
         id<MTLBuffer> count=ds4_gpu_v41_deferred_counter();
         if (!w || !count) return 0;
         const struct { int32_t n_embd,n_hc,iters; float hc_eps,norm_eps; } args={5120,4,0,0,eps};
+        if (ds4_s1tg_on('c')) {
+            id<MTLComputePipelineState> part = ds4_gpu_get_pipeline("kernel_dsv41_deferred_collapse_part");
+            id<MTLComputePipelineState> fin = ds4_gpu_get_pipeline("kernel_dsv41_deferred_collapse_norm");
+            id<MTLBuffer> slots = ds4_gpu_v41_collapse_slots();
+            if (!part || !fin || !slots) return 0;
+            int owned=0;id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned);
+            id<MTLComputeCommandEncoder> enc=cb?ds4_gpu_compute_encoder(cb):nil;if(!enc)return 0;
+            [enc setComputePipelineState:part];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(residual) offset:ds4_gpu_tensor_offset(residual) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(pre) offset:ds4_gpu_tensor_offset(pre) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:3];
+            [enc setBuffer:slots offset:0 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+            /* the norm reads the collapsed values and partials (a serial encoder orders them; a concurrent one needs this) */
+            if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:fin];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+            [enc setBuffer:slots offset:0 atIndex:2];
+            [enc setBuffer:w offset:(NSUInteger)inner atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(norm) offset:ds4_gpu_tensor_offset(norm) atIndex:4];
+            [enc setBuffer:count offset:0 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(10,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            ds4_gpu_end_compute_encoder(cb,enc);
+            return ds4_gpu_finish_command_buffer(cb,owned,"V4.1 independent HC collapse (split)");
+        }
         int owned=0;id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc=cb?ds4_gpu_compute_encoder(cb):nil;if(!enc)return 0;
         [enc setComputePipelineState:pipeline];
@@ -50173,7 +50226,8 @@ int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0,
         uint64_t inner0 = 0, inner1 = 0;
         id<MTLBuffer> w0 = ds4_gpu_wrap_model_range(model_map, model_size, weight0_offset, (uint64_t)n0 * sizeof(float), &inner0);
         id<MTLBuffer> w1 = ds4_gpu_wrap_model_range(model_map, model_size, weight1_offset, (uint64_t)n1 * sizeof(float), &inner1);
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_norm_pair");
+        const int hoist = n0 / 4u <= 2u * ntg0 && n1 / 4u <= 2u * ntg1 && ds4_s1tg_on('n');
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(hoist ? "kernel_dsv41_norm_pair_hoist" : "kernel_dsv41_norm_pair");
         if (!w0 || !w1 || !pipeline || ntg0 + ntg1 > pipeline.maxTotalThreadsPerThreadgroup) return 0;
         const struct { uint32_t n0, n1, ntg0, ntg1; float eps; } args = {n0, n1, (uint32_t)ntg0, (uint32_t)ntg1, eps};
         int owned = 0;
