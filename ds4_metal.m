@@ -30722,10 +30722,14 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     }
 
     /* One simdgroup per head over the whole key walk: eight heads share a
-     * threadgroup, and the cache lines of the keys they all read. */
+     * threadgroup, and the cache lines of the keys they all read. Multi-row
+     * calls share by default; DS4_V41_S1TG has h: the single-row decode call
+     * shares too, padded last key block included (each head keeps its walk,
+     * reductions and partial slots, so the partials keep their bits). */
     static int share = -1;
     if (share < 0) share = getenv("DS4_METAL_DISABLE_FLASH_HEAD_SHARE") == NULL;
-    const int32_t hs = share && rows > 1u && !use_packed && !has_kvpad && nsg == 1u && n_head % 8u == 0 ? 8 : 1;
+    const bool share_rows = rows > 1u ? !has_kvpad : ds4_s1tg_on('h');
+    const int32_t hs = share && share_rows && !use_packed && nsg == 1u && n_head % 8u == 0 ? 8 : 1;
     const uint32_t nsg_tg = hs > 1 ? (uint32_t)hs : nsg;
     id<MTLComputePipelineState> vec_pipeline = nil;
     id<MTLComputePipelineState> reduce_pipeline = nil;
@@ -49765,8 +49769,8 @@ static id<MTLBuffer> ds4_gpu_v41_deferred_counter(void) {
 
 /* DS4_V41_S1TG=<letters> (read per call): c the deferred HC collapse as two dispatches over 32 + 10 groups, n the paired
  * norm with its loads issued at entry, k the decode indexer top-k's merge ladder staged in threadgroup memory and fused
- * into one group, r the hierarchical router with ballot nominations. All give the replaced kernels' bits. Unset: the
- * originals. */
+ * into one group, r the hierarchical router with ballot nominations, h the single-row FlashAttention call with eight
+ * heads per threadgroup. All give the replaced kernels' bits. Unset: the originals. */
 static int ds4_s1tg_on(char k) {
     const char *s = getenv("DS4_V41_S1TG");
     const int on = s && strchr(s, k) != NULL;
