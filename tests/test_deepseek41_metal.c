@@ -1613,6 +1613,7 @@ static int check_index_candidates(void) {
     const uint32_t *l = ds4_gpu_tensor_contents(list);
     uint32_t *list_w = ds4_gpu_tensor_contents(list);
     const int32_t *a = ds4_gpu_tensor_contents(old_sel), *b = ds4_gpu_tensor_contents(new_sel);
+    int32_t *new_sel_w = ds4_gpu_tensor_contents(new_sel);
     for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
         const uint32_t n = widths[wi], blocks = (n + 7) / 8, count = 16384 - (blocks * 8 - n);
         double seconds[4] = {0, 0, 0, 0};
@@ -1682,6 +1683,53 @@ static int check_index_candidates(void) {
                 "once-reuse=%.0f\n", n, count, ties, seconds[0] / (4 * (ROUNDS - 1)) * 1e6,
                 seconds[1] / (4 * (ROUNDS - 1)) * 1e6, seconds[2] / (4 * (ROUNDS - 1)) * 1e6,
                 seconds[3] / (4 * (ROUNDS - 1)) * 1e6);
+    }
+    {   /* The engine's list record: prefill and verify rows are copies of the decode graph that carry its record but
+         * read their own mask views and share its list. After the graph built the list for pos on its mask A, rows
+         * at pos with masks B and C, and a row at pos - 1 (a rewind) followed by one at pos, must not reuse another
+         * mask's list; the graph itself still reuses its own. The last width's keys and scores are kept. */
+        const uint32_t n = max_keys, blocks = max_blocks, pos = n - 1;
+        ds4_gpu_tensor *masks[3] = {mask, upload(NULL, (size_t)max_blocks * 4), upload(NULL, (size_t)max_blocks * 4)};
+        CHECK(masks[1] && masks[2]);
+        int32_t ref[3][TOP];
+        for (int i = 0; i < 3; i++) {
+            for (uint32_t j = 0; j < n; j++) s[j] = (float)((j * (7919u + 104u * (uint32_t)i) + (uint32_t)i) % 1048573u);
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_candidate_blocks(blocks_t, source, n, 1, n - 1, 1));
+            CHECK(ds4_gpu_indexer_topk_tensor(picked, blocks_t, blocks, 1, 2048));
+            CHECK(ds4_gpu_dsv4_topk_mask_tensor(masks[i], picked, blocks, 1, 2048));
+            CHECK(ds4_gpu_dsv41_indexer_score_masked(full, qt, wt, kt, masks[i], n));
+            CHECK(ds4_gpu_dsv41_candidate_filter(full, masks[i], n, 1, n - 1, 1, 0));
+            CHECK(ds4_gpu_indexer_topk_tensor(old_sel, full, n, 1, TOP));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+            memcpy(ref[i], a, sizeof(ref[i]));
+        }
+        CHECK(memcmp(ref[0], ref[1], sizeof(ref[0])) && memcmp(ref[1], ref[2], sizeof(ref[0])));
+        /* {mask, pos, from the graph's record (else the previous row's)} */
+        const struct { int mask; uint32_t pos; int from_graph; } steps[] = {
+            {0, pos, 1}, {0, pos, 1},                 /* the graph builds, then reuses its own list */
+            {1, pos, 1}, {2, pos, 1},                 /* two rows at pos with other masks */
+            {1, pos - 1, 1}, {2, pos, 1},             /* a row at pos - 1, then one at pos (after a rewind) */
+            {1, pos - 1, 1}, {2, pos, 0}, {2, pos, 0} /* one row copy over both rows, then reusing its own list */
+        };
+        uint32_t graph_pos = 0, row_pos = 0;
+        const ds4_gpu_tensor *graph_mask = NULL, *row_mask = NULL;
+        for (size_t i = 0; i < sizeof(steps) / sizeof(*steps); i++) {
+            uint32_t *lp = &row_pos;
+            const ds4_gpu_tensor **lm = &row_mask;
+            if (steps[i].mask == 0) { lp = &graph_pos; lm = &graph_mask; }
+            else if (steps[i].from_graph) { row_pos = graph_pos; row_mask = graph_mask; }
+            memset(new_sel_w, 0xff, TOP * sizeof(*new_sel_w));
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_test_v41_candidates_row(new_sel, cand, list, qt, wt, kt, masks[steps[i].mask], n, steps[i].pos,
+                                              lp, lm));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+            CHECK(!memcmp(b, ref[steps[i].mask], TOP * sizeof(*b)));
+            CHECK(*lp == steps[i].pos + 1 && *lm == masks[steps[i].mask]);
+        }
+        ds4_gpu_tensor_free(masks[1]);
+        ds4_gpu_tensor_free(masks[2]);
+        fprintf(stderr, "V4.1 candidate list record: graph reuse and row copies (other masks, rewind) PASS\n");
     }
     CHECK(!ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt, mask,
         16384, 1.0f / 64.0f, TOP, 0));

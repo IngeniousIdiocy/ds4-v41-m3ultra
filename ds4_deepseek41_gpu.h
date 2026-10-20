@@ -147,6 +147,12 @@ int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
 /* list_ready != 0: list already holds block_mask's candidates (an earlier call since the mask was written); the list
  * is then not rebuilt, and the winners' sort writes the key ids through it (DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE=1
  * rebuilds it every call and maps the ids in their own dispatch). */
+/* Test entry implemented by the engine (ds4.c, Metal builds): the decode graph's candidate-only index row at pos on
+ * mask, deciding list_ready from the record *list_pos / *list_mask and updating it as the graph does. */
+int ds4_test_v41_candidates_row(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores, ds4_gpu_tensor *list,
+                                ds4_gpu_tensor *q, ds4_gpu_tensor *weights, ds4_gpu_tensor *keys,
+                                ds4_gpu_tensor *mask, uint32_t n_comp, uint32_t pos,
+                                uint32_t *list_pos, const ds4_gpu_tensor **list_mask);
 int ds4_gpu_dsv41_tensor_ops_available(void);
 /* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
  * casts retain the F32 arithmetic for the affected tile. */

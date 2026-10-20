@@ -40318,8 +40318,11 @@ typedef struct {
     bool rope_tab_on;
     uint32_t rope_tab_pos;
     /* candidate list once per token: pos + 1 once block_list holds the candidates of block_mask as layer 20 wrote it for
-     * pos (set by a candidate-only index row, cleared when layer 20 writes the mask); 0 = not ready. */
+     * pos (set by a candidate-only index row, cleared when layer 20 writes the mask); 0 = not ready.
+     * block_list_mask is the mask it was built from: prefill and verify rows are copies of the graph that read their
+     * own mask views but share block_list, so a copied record must not make a row reuse another mask's list. */
     uint32_t block_list_pos;
+    const ds4_gpu_tensor *block_list_mask;
     /* The decode reduce wrote this layer's heads already inverse-roped and bf16-rounded (heads_once_arm); the next
      * low projection must be the plain one. Set by ds41_attention, cleared by its consumer and at step end. */
     bool heads_once;
@@ -41366,6 +41369,44 @@ static bool ds41_index_q_rope_quantize(ds41_gpu_graph *g, uint32_t il, uint32_t 
         ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0);
 }
 
+#ifdef __APPLE__
+/* The candidate-only index row over layer 20's 2,048 candidate blocks, with the once-per-token list: reused only when
+ * it was built for this position from this graph's own mask (row copies read their own mask views but share the
+ * list). False: unavailable, the caller scores the full row. */
+static bool ds41_candidates_row(ds41_gpu_graph *g, uint32_t owner, uint32_t n_comp) {
+    if (!ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
+            g->index_q, g->index_weights, g->index_cache[owner], g->block_mask, n_comp, 1.0f / 64.0f,
+            DS4_N_INDEXER_TOP_K, g->block_list_pos == g->pos + 1u && g->block_list_mask == g->block_mask))
+        return false;
+    g->block_list_pos = g->pos + 1u;
+    g->block_list_mask = g->block_mask;
+    return true;
+}
+#endif
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Test entry (tests/test_deepseek41_metal --index-candidates): ds41_candidates_row on a graph holding only these
+ * tensors at pos, with the list record *list_pos / *list_mask carried in and out, so a test can run the decode
+ * graph and its row copies (other mask views, the same list) in any order. */
+int ds4_test_v41_candidates_row(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores, ds4_gpu_tensor *list,
+                                ds4_gpu_tensor *q, ds4_gpu_tensor *weights, ds4_gpu_tensor *keys,
+                                ds4_gpu_tensor *mask, uint32_t n_comp, uint32_t pos,
+                                uint32_t *list_pos, const ds4_gpu_tensor **list_mask) {
+    ds41_gpu_graph *g = calloc(1, sizeof(*g));
+    if (!g || !list_pos || !list_mask) { free(g); return 0; }
+    g->selected_comp = selected; g->index_scores = scores; g->block_list = list;
+    g->index_q = q; g->index_weights = weights; g->index_cache[0] = keys; g->block_mask = mask;
+    g->pos = pos;
+    g->block_list_pos = *list_pos;
+    g->block_list_mask = *list_mask;
+    const bool ok = ds41_candidates_row(g, 0, n_comp);
+    *list_pos = g->block_list_pos;
+    *list_mask = g->block_list_mask;
+    free(g);
+    return ok;
+}
+#endif
+
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
                                             const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41379,12 +41420,7 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
         /* Past layer 20 only layer 20's candidate blocks can be selected:
          * score those keys alone and select among them. */
         if (il > 20u && n_comp > 16384u && DS4_N_INDEXER_HEAD == 32u &&
-            ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
-                g->index_q, g->index_weights, g->index_cache[owner], g->block_mask, n_comp,
-                1.0f / 64.0f, DS4_N_INDEXER_TOP_K, g->block_list_pos == pos + 1u)) {
-            g->block_list_pos = pos + 1u;
-            return true;
-        }
+            ds41_candidates_row(g, owner, n_comp)) return true;
         if (!((il > 20u && n_comp > 16384u && DS4_N_INDEXER_HEAD == 32u &&
                ds4_gpu_dsv41_indexer_score_masked(g->index_scores,g->index_q,g->index_weights,
                    g->index_cache[owner],g->block_mask,n_comp)) ||
