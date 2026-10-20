@@ -270,6 +270,49 @@ static void check_excluding_argmax_case(const float *logits, uint32_t n,
           label, excluded_id, unrolled, expected);
 }
 
+/* The NEON first-pass scan must equal the scalar one bit for bit: finite
+ * count, maximum (sign of zero included) and the earliest index of it. */
+static void check_scan_case(const float *logits, uint32_t n, const char *label) {
+    uint32_t fs = 0, fv = 0;
+    float ms = 0.0f, mv = 0.0f;
+    int bs = -1, bv = -1;
+    ds4_test_sample_scan(logits, n, 0, &fs, &ms, &bs);
+    ds4_test_sample_scan(logits, n, 1, &fv, &mv, &bv);
+    CHECK(fs == fv && bs == bv && memcmp(&ms, &mv, sizeof(ms)) == 0,
+          "%s n=%u scalar (%u, %a, %d) simd (%u, %a, %d)",
+          label, n, fs, ms, bs, fv, mv, bv);
+}
+
+static void check_scan_equivalence(void) {
+    enum { N = 129280 };
+    float *x = malloc((size_t)N * sizeof(*x));
+    CHECK(x != NULL, "scan scratch allocation");
+    if (!x) return;
+    uint64_t seed = 0x5ca7ULL;
+    for (int round = 0; round < 64; round++) {
+        for (uint32_t i = 0; i < N; i++) {
+            const uint64_t r = data_rng_next(&seed);
+            const uint32_t kind = (uint32_t)(r >> 59);
+            /* few distinct values, so equal maxima land in many lanes */
+            x[i] = (float)((int32_t)((r >> 32) % 7) - 3);
+            if (kind == 0) x[i] = NAN;
+            else if (kind == 1) x[i] = (r & 1) ? INFINITY : -INFINITY;
+            else if (kind == 2) x[i] = (r & 1) ? 0.0f : -0.0f;
+        }
+        if (round & 1) for (uint32_t i = 0; i < N; i++) if (x[i] > 0.0f) x[i] = -x[i];
+        const uint32_t n = round < 48 ? (uint32_t)round : N - (uint32_t)(round - 48);
+        check_scan_case(x, n, "scan-random");
+    }
+    for (uint32_t i = 0; i < 67; i++) x[i] = NAN;
+    for (uint32_t n = 0; n <= 67; n++) check_scan_case(x, n, "scan-all-nonfinite");
+    for (uint32_t i = 0; i < 67; i++) x[i] = (i % 2) ? 0.0f : -0.0f;
+    for (uint32_t n = 0; n <= 67; n++) check_scan_case(x, n, "scan-signed-zero");
+    for (uint32_t i = 0; i < 67; i++) x[i] = -INFINITY;
+    x[40] = -1.0e30f;
+    check_scan_case(x, 67, "scan-one-finite");
+    free(x);
+}
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -356,6 +399,7 @@ static void check_speculative_distribution(void) {
 
 int main(void) {
     check_speculative_distribution();
+    check_scan_equivalence();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));

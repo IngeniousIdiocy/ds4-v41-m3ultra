@@ -476,6 +476,8 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
+void ds4_test_sample_scan(const float *logits, uint32_t n_vocab, int simd,
+                          uint32_t *finite, float *max_logit, int *best);
 int ds4_test_engram_fp8_sidecar(const char *path, uint64_t in_dim, uint64_t out_dim);
 int ds4_test_indexer_fp8_sidecar(const char *path, int check_identity, uint64_t *offs);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,

@@ -45728,14 +45728,10 @@ static bool sample_fast_top_p(
     return true;
 }
 
-static int sample_full_vocab(
-        const float *logits,
-        uint32_t     n_vocab,
-        float        temperature,
-        float        top_p,
-        float        min_p,
-        uint64_t    *rng,
-        float       *prob_scratch) {
+/* The sampler's first pass: finite count, maximum and its earliest index
+ * (strict >, so ties and -0/+0 keep the first). Scalar reference. */
+static DS4_MAYBE_UNUSED void sample_scan_scalar(const float *logits, uint32_t n_vocab,
+                               uint32_t *finite_out, float *max_out, int *best_out) {
     float max_logit = DS4_NEG_INF;
     int best = 0;
     uint32_t finite = 0;
@@ -45748,6 +45744,87 @@ static int sample_full_vocab(
             best = (int)i;
         }
     }
+    *finite_out = finite;
+    *max_out = max_logit;
+    *best_out = best;
+}
+
+/* The same scan with 16 NEON lanes. Each lane keeps its own first strict
+ * maximum and index; the lanes merge by value, then by smallest index among
+ * equal values, and the tail continues with the scalar rule, so every output
+ * matches the scalar scan bit for bit (value taken from the winning element,
+ * sign included). */
+static void sample_scan_simd(const float *logits, uint32_t n_vocab,
+                             uint32_t *finite_out, float *max_out, int *best_out) {
+#if defined(__ARM_NEON)
+    const uint32_t nv = n_vocab & ~15u;
+    const uint32x4_t exp_mask = vdupq_n_u32(0x7f800000u);   /* finite: exponent not all ones */
+    float32x4_t mv[4];
+    uint32x4_t mi[4], cnt[4], idx[4];
+    const uint32x4_t step = vdupq_n_u32(16);
+    for (int k = 0; k < 4; k++) {
+        const uint32_t base[4] = {4u * k, 4u * k + 1u, 4u * k + 2u, 4u * k + 3u};
+        mv[k] = vdupq_n_f32(DS4_NEG_INF);
+        mi[k] = vdupq_n_u32(0);
+        cnt[k] = vdupq_n_u32(0);
+        idx[k] = vld1q_u32(base);
+    }
+    for (uint32_t i = 0; i < nv; i += 16) {
+        for (int k = 0; k < 4; k++) {
+            const float32x4_t v = vld1q_f32(logits + i + 4u * k);
+            const uint32x4_t fin = vmvnq_u32(vceqq_u32(vandq_u32(vreinterpretq_u32_f32(v), exp_mask),
+                                                        exp_mask));   /* false for NaN and +-inf */
+            const uint32x4_t gt = vandq_u32(fin, vcgtq_f32(v, mv[k]));
+            cnt[k] = vsubq_u32(cnt[k], fin);
+            mv[k] = vbslq_f32(gt, v, mv[k]);
+            mi[k] = vbslq_u32(gt, idx[k], mi[k]);
+            idx[k] = vaddq_u32(idx[k], step);
+        }
+    }
+    float max_logit = DS4_NEG_INF;
+    uint32_t best = 0, finite = 0;
+    for (int k = 0; k < 4; k++) {
+        float lv[4];
+        uint32_t li[4];
+        vst1q_f32(lv, mv[k]);
+        vst1q_u32(li, mi[k]);
+        finite += vaddvq_u32(cnt[k]);
+        for (int j = 0; j < 4; j++) {
+            if (lv[j] > max_logit || (lv[j] == max_logit && lv[j] > DS4_NEG_INF && li[j] < best)) {
+                max_logit = lv[j];
+                best = li[j];
+            }
+        }
+    }
+    for (uint32_t i = nv; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        finite++;
+        if (v > max_logit) {
+            max_logit = v;
+            best = i;
+        }
+    }
+    *finite_out = finite;
+    *max_out = max_logit;
+    *best_out = (int)best;
+#else
+    sample_scan_scalar(logits, n_vocab, finite_out, max_out, best_out);
+#endif
+}
+
+static int sample_full_vocab(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng,
+        float       *prob_scratch) {
+    float max_logit = DS4_NEG_INF;
+    int best = 0;
+    uint32_t finite = 0;
+    sample_scan_simd(logits, n_vocab, &finite, &max_logit, &best);
     if (finite == 0) return sample_argmax(logits, n_vocab);
 
     int fast_token = best;
@@ -45964,6 +46041,12 @@ static int sample_top_p_min_p(
 }
 
 #ifdef DS4_TEST_HOOKS
+void ds4_test_sample_scan(const float *logits, uint32_t n_vocab, int simd,
+                          uint32_t *finite, float *max_logit, int *best) {
+    if (simd) sample_scan_simd(logits, n_vocab, finite, max_logit, best);
+    else sample_scan_scalar(logits, n_vocab, finite, max_logit, best);
+}
+
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
