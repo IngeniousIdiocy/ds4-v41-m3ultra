@@ -164,7 +164,63 @@ Scope: this result does not isolate individual optimizations or establish
 quality equivalence. It does not replace the composed 131K/300K checks or
 the pinned-profile checks.
 
-## Candidate-block index scoring (9b9dfee)
+## Disk KV cache v2 and saved checkpoints (W6, W7; P24, P27)
+
+KV v2 entries bind to the engine identity, a numerics canary and a payload
+hash (d49d1158).
+
+Window W6 (P24) ran the state-depth tree's server with the production
+flags. Each run was greedy 64 tokens, then SIGTERM, a restart and a resend.
+Every restored answer's text and token count equalled the cold one:
+
+| Depth | Cold request | Restored request | Load | Largest entry |
+| ---: | ---: | ---: | ---: | ---: |
+| 8K (8,238) | 13.9 s | 2.55 s | 49 ms | 64 MiB |
+| 64K (67,310) | 87.2 s | 8.09 s | 190 ms | 423 MiB |
+| 300K (303,908) | 461.2 s | 8.69 s | 825 ms | 1,869 MiB |
+
+- An entry was refused, with nothing restored, when its payload byte was
+  flipped, its canary bytes were changed, or its identity bytes were changed.
+- Its one-shot canary cost 7.28 s at startup.
+- Those entries carry that tree's identity (`028036d5c520a07d`) and canary
+  (`772938c1f52ab041`), so this branch, whose identity differs, does not
+  index them.
+
+Window W7 (P27) ran on this branch at 2357478c, with the stepped canary
+that ran between requests (04d4db75):
+
+- **Server:** the canary was `e8c0517e0b2d6638` in all six lifetimes, idle
+  and under load. Under a continuous request stream the cache came on 42 to
+  51 s after start; idle, after 12 s. No entry was stored or loaded early.
+  A request sent while the canary was pending (8,238 tokens) was prefilled
+  again rather than restored. That is the gap fbd9ff30 closes: requests now
+  queue behind a one-shot canary, which is still to be measured. Entries
+  under `e8c0517e` are refused by the new canary and evicted normally.
+- **ds4-agent:** store, hit, then a payload flip and an identity flip. Each
+  was refused and re-saved, and the identity refusal was logged. ds4-agent
+  binds no numerics canary yet.
+- **ds4-bench snapshot format 4:** a c8k save carries its canary, and the
+  c16k lineage names c8k's hash at depth 8,192. Five damaged copies were each
+  rejected with the right verdict: canary, prefill representation, short
+  payload, missing end marker, payload hash. Runs were equal across save,
+  load, extension and a new process.
+
+These are checkpoint checks, not whole-session qualification.
+
+## Public 1017 weights: download and header check
+
+- Nine GGUF shards, `DeepSeek-V4.1-Flash-1017-MXFP4-experts-0000N-of-00009`,
+  501,602,535,360 bytes in all. Every size and SHA-256 matches the pinned
+  manifest (`425d8d0a…`).
+- The download log (sha256 `5a106dde…`) ends `ALL VERIFIED`. Six transfer
+  attempts failed and were retried. Each shard was verified after its final
+  attempt.
+- Header comparison with the local GGUF: all 1,046 tensor names, shapes,
+  types and payload lengths match. Metadata differs in calibration and
+  imatrix provenance, alignment, source URL and split keys.
+- This proves no payload equality. A streamed per-tensor comparison is
+  designed but not yet run.
+
 
 *Score only the candidate blocks of later DeepSeek V4.1 index layers*:
 Tarjei Mandt (kernelpool), adapted from 2d5ef0d3.
@@ -282,9 +338,35 @@ with the builder on.
 
 cddebae removes the first-token cost. It adds the built buffers to the
 residency set right after the build and compiles their readers' pipelines
-with one warm-up dispatch each. Its cold-start A/B (startup, prefill, first
-token, steady decode and memory) is pending and not yet
-recorded here.
+with one warm-up dispatch each.
+
+Window fp8pf-a5's builder rows (P26) measured the at-load builder (BON)
+against the original-checkpoint sidecars (SC) and against neither (BOFF,
+wide reads). Cold 8K prompt, 512 tokens; all thirteen rows are VALID.
+
+| Arm | Steady tok/s (runs) | Mean | 4K / 8K, two frontiers |
+| --- | --- | ---: | --- |
+| BON | 40.88, 38.78 | 39.83 | 41.62 / 40.85 |
+| SC | 40.78, 40.70 | 40.74 | 41.35 / 40.73 |
+| BOFF | 39.37, 39.40 | 39.39 | 39.91 / 39.43 |
+
+- BON's 38.78 (b06) is a single outlier that breached no gate. The repeat is
+  still to be checked. Built or sidecar, the narrow readers are about +1.4
+  tok/s over the wide reads.
+- **Plain launch** (b13, no `DS4_*` variable): 40.79 tok/s, bit-identical to
+  BON (b01).
+- **Cold first token** (exec to prefill start + prefill + token 1):
+  - BON 2.39 + 11.04 + 0.036 = 13.46 s;
+  - SC 9.01 + 11.02 + 0.036 = 20.07 s (mapping the sidecars costs 6.6 s);
+  - BOFF 13.39 s.
+- The build takes 105 ms (490.3 MiB), and the readers warm in 7 ms.
+- **Peak RSS:** BON 3.48 GB, SC 2.30 GB, BOFF 1.94 GB. BON's extra 1.2 GB
+  over SC is the built copies while the wide views stay mapped. Unmapping
+  the wide views is designed, not done.
+- The at-load builder stays the default. Sidecars remain an option
+  (`--v41-sidecar`).
+- Caveat: BON's single slow run (b06) is unexplained, and the BON mean
+  carries it.
 
 ## Shared FP8 prefill and public-derived values (P11, P17)
 
