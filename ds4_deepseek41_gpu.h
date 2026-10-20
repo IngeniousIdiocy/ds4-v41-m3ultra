@@ -219,6 +219,11 @@ int ds4_gpu_dsv41_rope_quantize(const ds4_gpu_tensor *x, ds4_gpu_tensor *dst, ui
 int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                    uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
                                    const ds4_gpu_tensor *x);
+/* The same single-token dispatch with the weight read as E4M3 codes
+ * [out_dim][in_dim] and E8M0 32x32 scales from fp8_map. */
+int ds4_gpu_dsv41_project_fp8_bf16(ds4_gpu_tensor *out, const void *fp8_map, uint64_t fp8_size,
+                                   uint64_t codes_off, uint64_t scales_off, uint32_t in_dim, uint32_t out_dim,
+                                   const ds4_gpu_tensor *x);
 /* Decode attention over the raw ring and the compressed rows selected by
  * ids, staged in one pass (0: not available; `selected` is gather scratch). */
 /* The same for `rows` consecutive query rows in one dispatch: row r uses the

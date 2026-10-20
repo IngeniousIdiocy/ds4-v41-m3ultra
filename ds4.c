@@ -40277,6 +40277,10 @@ typedef struct {
      * sets it; prefix steps and prefill keep the F16 projection. */
     bool engram_fp8;
     const struct ds4_model *engram_model;
+    /* Likewise for the index-source q projections: all of the step's read the
+     * FP8 indexer sidecar, or none do. */
+    bool indexer_fp8;
+    const struct ds4_model *indexer_model;
     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;   /* verify-block row partials, two slots per layer */
@@ -40797,6 +40801,7 @@ static bool ds41_short_sweep_off(void) { static int c = -1; return ds41_env_flag
 static bool ds41_capture_in_head_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_CAPTURE_IN_HEAD", &c); }
 static bool ds41_router_bf16_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ROUTER_BF16", &c); }
 static bool ds41_engram_fp8_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ENGRAM_FP8", &c); }
+static bool ds41_indexer_fp8_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_INDEXER_FP8", &c); }
 
 /* One block's HC input: the mixer projection, then split, weighted sum with
  * the previous block's pre weights and norm; each half fused where the fused
@@ -40979,13 +40984,26 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
         ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
 }
 
+/* The index-source q projection (BF16-rounded): from the FP8 sidecar while the
+ * step reads it (the F16 path's single-token dispatch), else the F16 tensor. */
+static bool ds41_indexer_q(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (g->indexer_fp8 && l->indexer_attn_q_b_fp8)
+        return ds4_gpu_dsv41_project_fp8_bf16(g->index_q, g->indexer_model->map, g->indexer_model->size,
+                                              l->indexer_attn_q_b_fp8->abs_offset, l->indexer_attn_q_b_e8m0->abs_offset,
+                                              (uint32_t)l->indexer_attn_q_b->dim[0], (uint32_t)l->indexer_attn_q_b->dim[1],
+                                              g->qr) != 0;
+#endif
+    return ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true);
+}
+
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
                                             const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
-        if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
+        if (!ds41_indexer_q(g, m, l) ||
             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
@@ -42346,6 +42364,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->engram_model = w->engram_fp8_model;
     g->engram_fp8 = logits && g->engram_model && g->tp_world == 1 && !g->streaming && !g->quality &&
         !ds41_engram_fp8_off();
+    g->indexer_model = w->indexer_fp8_model;
+    g->indexer_fp8 = logits && g->indexer_model && g->tp_world == 1 && !g->streaming && !g->quality &&
+        !ds41_indexer_fp8_off();
     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     /* With the head queued, the drafter's capture of this token is encoded after
@@ -42396,6 +42417,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->scalar_decode = false;
     g->router_bf16 = false;
     g->engram_fp8 = false;
+    g->indexer_fp8 = false;
     g->tp_gate_fused = false;
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */

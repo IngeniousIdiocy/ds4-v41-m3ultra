@@ -21660,6 +21660,70 @@ int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *out, const void *model_map, u
                                           in_dim, out_dim, x, 1, false, 1);
 }
 
+/* ds4_gpu_dsv41_project_f16_bf16's single-token dispatch (ds4_gpu_matmul_f16_tensor_impl with n_tok 1 and
+ * round_bf16: the same args, NSG, NR0 rules, threadgroup memory and grid) with the weight read as E4M3 codes
+ * [out_dim][in_dim] and E8M0 32x32 scales. */
+int ds4_gpu_dsv41_project_fp8_bf16(ds4_gpu_tensor *out, const void *fp8_map, uint64_t fp8_size,
+                                   uint64_t codes_off, uint64_t scales_off, uint32_t in_dim, uint32_t out_dim,
+                                   const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!fp8_map || !in_dim || !out_dim || (in_dim % 32u) || (out_dim % 32u)) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < (uint64_t)in_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < (uint64_t)out_dim * sizeof(float)) {
+            fprintf(stderr, "ds4: Metal FP8 indexer matvec received undersized activation buffers\n");
+            return 0;
+        }
+        const uint64_t codes_bytes = (uint64_t)in_dim * out_dim, scales_bytes = (uint64_t)(in_dim / 32u) * (out_dim / 32u);
+        if (codes_off > fp8_size || codes_bytes > fp8_size - codes_off ||
+            scales_off > fp8_size || scales_bytes > fp8_size - scales_off) {
+            fprintf(stderr, "ds4: Metal FP8 indexer matvec range is outside the mapped sidecar\n");
+            return 0;
+        }
+        uint64_t codes_inner = 0, scales_inner = 0;
+        id<MTLBuffer> cbuf = ds4_gpu_wrap_model_range(fp8_map, fp8_size, codes_off, codes_bytes, &codes_inner);
+        id<MTLBuffer> sbuf = cbuf ? ds4_gpu_wrap_model_range(fp8_map, fp8_size, scales_off, scales_bytes, &scales_inner) : nil;
+        if (!cbuf || !sbuf) return 0;
+
+        ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+        mv_args.ne11 = mv_args.ne1 = 1;
+        mv_args.nb12 = mv_args.nb13 = (uint64_t)in_dim * sizeof(float);
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
+        if (!g_quality_mode && (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
+            mv_dispatch.nr0 = 4;
+            mv_dispatch.smem = 32u * 4u * sizeof(float);
+        }
+        if (ds4_gpu_plain_mv_single_row(out_dim)) {
+            mv_dispatch.nr0 = 1;
+            mv_dispatch.smem = 32u * sizeof(float);
+        }
+        mv_args.nr0 = mv_dispatch.nr0;
+        if (strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4") != 0) return 0;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_fp8_f32_4_bf16", mv_dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:cbuf offset:(NSUInteger)codes_inner atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setBuffer:sbuf offset:(NSUInteger)scales_inner atIndex:4];
+        if (mv_dispatch.smem) [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "FP8 indexer matvec") ? 1 : 0;
+    }
+}
+
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const void *model_map, uint64_t model_size,
                                  uint64_t weight_offset, uint32_t width,
