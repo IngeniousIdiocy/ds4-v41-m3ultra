@@ -17,11 +17,16 @@ Run from the repository checkout, or pass `--chdir` (see section 4):
     --kv-disk-dir /path/to/kvcache --kv-disk-space-mb 98304 \
     --kv-cache-cold-max-tokens 393216 --kv-cache-continued-interval-tokens 4096 \
     --default-top-p 0.95 --default-min-p 0 \
-    --utility-ctx 32768
+    --utility-ctx 32768 --serial-reasoning
 ```
 
 This is the production launch on the M3 Ultra, minus local paths. Nothing in
 the environment is required.
+
+Project Trench needs `--serial-reasoning`. Its earlier server kept V4.1
+reasoning serial unconditionally and drafted only answers and tool calls. Here
+that policy is an option, off by default. Without it, DSpark also drafts
+reasoning spans.
 
 ## 2. Options
 
