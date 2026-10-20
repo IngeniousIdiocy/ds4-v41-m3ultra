@@ -40317,6 +40317,9 @@ typedef struct {
     ds4_gpu_tensor *rope_tab;
     bool rope_tab_on;
     uint32_t rope_tab_pos;
+    /* DS4_V41_IDX_CAND_ONCE: pos + 1 once block_list holds the candidates of block_mask as layer 20 wrote it for
+     * pos (set by a candidate-only index row, cleared when layer 20 writes the mask); 0 = not ready. */
+    uint32_t block_list_pos;
     /* The decode reduce wrote this layer's heads already inverse-roped and bf16-rounded (heads_once_arm); the next
      * low projection must be the plain one. Set by ds41_attention, cleared by its consumer and at step end. */
     bool heads_once;
@@ -41039,6 +41042,7 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     if (n_comp && ds41_index_source(il) && (n_comp + 7u) / 8u > 2048u) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u;
+            g->block_list_pos = 0;
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
                 !ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, 2048u) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, 2048u)) return false;
@@ -41373,7 +41377,10 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
         if (il > 20u && n_comp > 16384u && DS4_N_INDEXER_HEAD == 32u &&
             ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
                 g->index_q, g->index_weights, g->index_cache[owner], g->block_mask, n_comp,
-                1.0f / 64.0f, DS4_N_INDEXER_TOP_K)) return true;
+                1.0f / 64.0f, DS4_N_INDEXER_TOP_K, g->block_list_pos == pos + 1u)) {
+            g->block_list_pos = pos + 1u;
+            return true;
+        }
         if (!((il > 20u && n_comp > 16384u && DS4_N_INDEXER_HEAD == 32u &&
                ds4_gpu_dsv41_indexer_score_masked(g->index_scores,g->index_q,g->index_weights,
                    g->index_cache[owner],g->block_mask,n_comp)) ||
