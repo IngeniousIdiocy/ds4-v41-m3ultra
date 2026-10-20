@@ -147,11 +147,9 @@ per bench fixture and is worth roughly 24 GiB.
 
 ### DSpark speculative decoding
 
-`--dspark` is opt-in, requires `--mtp-model`, and is admitted only when
-`DS4_V41_DSPARK_DECODE_READY=1` is set in the environment:
+`--dspark` is opt-in and requires `--mtp-model`:
 
 ```
-DS4_V41_DSPARK_DECODE_READY=1 \
 ./ds4-server -m DeepSeek-V4.1-Flash-Q4.gguf \
     --mtp-model DeepSeek-V4.1-Flash-DSpark-Q4.gguf --dspark \
     -c 131072 --host 127.0.0.1 --port 8095 \
@@ -572,8 +570,6 @@ The later update's additional validation and remaining limits are documented in 
 * **`--prefill-chunk` above 8,192 has no effect on V4.1.** `DS41_PREFILL_CAP` is a
   compile-time 8,192 that the prefill path allocates its batch buffers against, so
   a larger value is parsed and then clamped. Raising it is a memory-plan decision.
-  Separately, `--dspark` does not imply `DS4_V41_DSPARK_DECODE_READY=1`; that
-  environment gate has to be set by hand.
 * **The Spec-Bench subset is a subset** — 72 questions, the first 12 rows per
   category across six, frozen and hash-bound before any result was seen, with its
   categories weighted by its own shape rather than by any workload. And the two

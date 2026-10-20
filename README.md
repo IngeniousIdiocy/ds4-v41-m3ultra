@@ -23,6 +23,7 @@ setup, controller selection and validation limits.
 
 Implementation and failed experiments: [decode](docs/METAL-V41-DECODE.md),
 [prefill](docs/METAL-V41-PREFILL.md), [DSpark](docs/METAL-V41-DSPARK.md).
+Runtime options, server policy and the diagnostic switches: [RUNTIME-V41.md](docs/RUNTIME-V41.md).
 The [coding-agent prompting guide](docs/PROMPTING-V41.md) still applies: draft
 code in real files, then inspect and iterate, rather than writing the implementation in reasoning.
 

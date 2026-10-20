@@ -100,17 +100,15 @@ chain is 176 MB against a 22-23 GB verify, and it is serial by construction.
 ## 3. Run it
 
 ```
-DS4_V41_DSPARK_DECODE_READY=1 \
 ./ds4-server -m DeepSeek-V4.1-Flash-Q4.gguf \
     --mtp-model DeepSeek-V4.1-Flash-DSpark-Q4.gguf --dspark \
     -c 131072 --host 127.0.0.1 --port 8095
 ```
 
 - `--dspark` requires `--mtp-model`.
-- `--dspark` is admitted only when `DS4_V41_DSPARK_DECODE_READY=1` is set. Without
-  it the drafter can still be validated, bound and inspected — `--mtp-model` alone,
-  or `--inspect` — but decode stays refused. Making `--dspark` imply the gate is
-  queued as a production change with its own re-gate window; until then, set it.
+- The drafter can also be validated, bound and inspected without drafting:
+  `--mtp-model` alone, or `--inspect`. (The September release also required
+  `DS4_V41_DSPARK_DECODE_READY=1`; the engine no longer reads it.)
 - **The admission controller is on by default** under `--dspark`, and needs no
   configuration file: it prices itself from the wall time it measures on the
   request it is serving. Section 4 is the policy and its levers.
@@ -454,8 +452,6 @@ against the serial control for 128 tokens at each length with a fresh prefill.
 - Taking 11 ms off the verify would move break-even from ~3.76 to ~3.42, which
   would still leave `agent2` at about 0.89x. **No kernel result in reach makes
   drafting pay on that fixture. Only declining to draft does.**
-- `--dspark` still needs `DS4_V41_DSPARK_DECODE_READY=1` in the environment.
-  Making the flag imply the gate is queued as a production change.
 - **Widths 2..5 are unmeasured and therefore unavailable, not estimated.** Only
   the full trained block and the four-row shape were ever measured, and four rows
   lost. `dspark_verify_rows` will cap the block if you ask it to; nothing selects
