@@ -146,7 +146,8 @@ default replaced, for A/B checks and bisection.
 | `DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE` | building the candidate list once per token |
 | `DS4_METAL_DISABLE_V41_TOPK_SORT512` | 512-wide sort of the top-k winners |
 | `DS4_METAL_DISABLE_V41_INDEX_MMA` | register-resident prefill indexer scores |
-| `DS4_V41_S1TG` (not 1: names the letters to keep; `none` or empty keeps neither) | single-group latency kernels: split HC collapse (`c`) and fused top-k merge ladder (`k`), both on when unset |
+| `DS4_METAL_DISABLE_V41_SPLIT_COLLAPSE` | the decode HC collapse split over 32 + 10 groups (one 1024-thread group instead) |
+| `DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE` | the decode top-k's staged and fused merge ladder (one dispatch per merge level instead) |
 | `DS4_QWEN4_Q8_PREFILL_UNPACK=0` | unpack-then-F16 GEMM for wide BF16 Q8 prefill matmuls |
 | `DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY` | aligned tensor copies in the open compute encoder |
 | `DS4_METAL_MODEL_TRACKED` | untracked V4.1 model views (`DS4_METAL_MODEL_UNTRACKED=1` still forces untracked views for any model) |

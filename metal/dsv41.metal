@@ -1058,7 +1058,7 @@ kernel void kernel_dsv41_deferred_collapse(
 
 }
 
-/* DS4_V41_S1TG has c: kernel_dsv41_deferred_collapse as two dispatches with the same bits. The single 1024-thread group
+/* The split HC collapse: kernel_dsv41_deferred_collapse as two dispatches with the same bits. The single 1024-thread group
  * spends most of its time pulling 100 KB through one core; here the loads spread over 32 groups.
  * Part: group s is the original's simdgroup s (thread t = 32 s + lane owns elements t and t + 1024, as there) and stores
  * the collapsed values and its simd_sum partial in slots[s]. The four-row sum is written as the fma chain the original's

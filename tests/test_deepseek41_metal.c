@@ -1531,11 +1531,9 @@ static int check_decode_topk(void) {
 }
 
 #ifdef __APPLE__
-/* The default single-group latency kernels against the originals (DS4_V41_S1TG set empty), bitwise, fresh inputs on
- * every call. c: the split HC collapse (collapsed row and RMS norm). k: the decode top-k's staged and fused merge
- * ladder, at widths that take one level, the fused ladder only, and staged levels before it; random, tied, -inf-tailed,
- * signed-zero and NaN rows. */
-static int check_s1tg(void) {
+/* The split HC collapse against the single-group collapse (DS4_METAL_DISABLE_V41_SPLIT_COLLAPSE), bitwise, fresh
+ * inputs on every call: the collapsed row and the RMS norm. */
+static int check_split_collapse(void) {
     {
         const uint64_t wb = 65536;
         void *model = NULL;
@@ -1552,9 +1550,9 @@ static int check_s1tg(void) {
             for (int i = 0; i < 4; i++) p[i] = random_value();
             CHECK(ds4_gpu_begin_commands() && ds4_gpu_dsv41_deferred_collapse(x1, n1, res, pre, model, wb, 0, 1e-6f) &&
                   ds4_gpu_end_commands() && ds4_gpu_synchronize());
-            CHECK(setenv("DS4_V41_S1TG", "", 1) == 0 && ds4_gpu_begin_commands());
+            CHECK(setenv("DS4_METAL_DISABLE_V41_SPLIT_COLLAPSE", "1", 1) == 0 && ds4_gpu_begin_commands());
             const int ok = ds4_gpu_dsv41_deferred_collapse(x2, n2, res, pre, model, wb, 0, 1e-6f);
-            CHECK(unsetenv("DS4_V41_S1TG") == 0 && ok && ds4_gpu_end_commands() && ds4_gpu_synchronize());
+            CHECK(unsetenv("DS4_METAL_DISABLE_V41_SPLIT_COLLAPSE") == 0 && ok && ds4_gpu_end_commands() && ds4_gpu_synchronize());
             CHECK(!memcmp(ds4_gpu_tensor_contents(x1), ds4_gpu_tensor_contents(x2), 5120 * 4));
             CHECK(!memcmp(ds4_gpu_tensor_contents(n1), ds4_gpu_tensor_contents(n2), 5120 * 4));
             values += 2 * 5120;
@@ -1562,9 +1560,20 @@ static int check_s1tg(void) {
         ds4_gpu_tensor_free(res); ds4_gpu_tensor_free(pre);
         ds4_gpu_tensor_free(x1); ds4_gpu_tensor_free(n1); ds4_gpu_tensor_free(x2); ds4_gpu_tensor_free(n2);
         free(model);
-        fprintf(stderr, "V4.1 S1TG c: split HC collapse == single group, 0 of %llu values differ PASS\n",
+        fprintf(stderr, "V4.1 split HC collapse == single group, 0 of %llu values differ PASS\n",
                 (unsigned long long)values);
     }
+    return 1;
+}
+#else
+static int check_split_collapse(void) { return 1; }
+#endif
+
+#ifdef __APPLE__
+/* The fused merge ladder against the prefix merge ladder (DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE), bitwise, at
+ * widths that take one level, the fused ladder only, and staged levels before it; random, tied, -inf-tailed,
+ * signed-zero, NaN and constant rows. */
+static int check_fused_merge(void) {
     {
         const uint32_t widths[] = {1024, 1500, 4096, 5000, 9000, 10240, 10241, 12288, 16000, 16383, 20480, 32768, 65536};
         ds4_gpu_tensor *scores = upload(NULL, 65536u * sizeof(float));
@@ -1582,12 +1591,12 @@ static int check_s1tg(void) {
                            pattern == 4 ? (i % 5 == 0 ? NAN : random_value()) : 1.0f;
                 a[512] = b[512] = 0x5eed;
                 CHECK(ds4_gpu_indexer_topk_tensor(fused, scores, width, 1, 512) && ds4_gpu_synchronize());
-                CHECK(setenv("DS4_V41_S1TG", "", 1) == 0);
+                CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE", "1", 1) == 0);
                 const int ok = ds4_gpu_indexer_topk_tensor(plain, scores, width, 1, 512) && ds4_gpu_synchronize();
-                CHECK(unsetenv("DS4_V41_S1TG") == 0 && ok && a[512] == 0x5eed && b[512] == 0x5eed);
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE") == 0 && ok && a[512] == 0x5eed && b[512] == 0x5eed);
                 for (uint32_t k = 0; k < 512u; k++) {
                     if (a[k] != b[k]) {
-                        fprintf(stderr, "S1TG k width=%u pattern=%u rank=%u: %d vs %d\n", width, pattern, k, a[k], b[k]);
+                        fprintf(stderr, "fused merge width=%u pattern=%u rank=%u: %d vs %d\n", width, pattern, k, a[k], b[k]);
                         CHECK(0);
                     }
                 }
@@ -1595,13 +1604,13 @@ static int check_s1tg(void) {
             }
         }
         ds4_gpu_tensor_free(scores); ds4_gpu_tensor_free(fused); ds4_gpu_tensor_free(plain);
-        fprintf(stderr, "V4.1 S1TG k: fused merge ladder == prefix merge ladder, 0 of %llu selections differ PASS\n",
+        fprintf(stderr, "V4.1 fused merge ladder == prefix merge ladder, 0 of %llu selections differ PASS\n",
                 (unsigned long long)picked);
     }
     return 1;
 }
 #else
-static int check_s1tg(void) { return 1; }
+static int check_fused_merge(void) { return 1; }
 #endif
 
 /* Rows with at most 512 visible keys select every key; other slots stay. */
@@ -2275,8 +2284,13 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
-    if (argc == 2 && !strcmp(argv[1], "--s1tg")) {
-        const int ok = ds4_gpu_init() && check_s1tg();
+    if (argc == 2 && !strcmp(argv[1], "--split-collapse")) {
+        const int ok = ds4_gpu_init() && check_split_collapse();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--fused-merge")) {
+        const int ok = ds4_gpu_init() && check_fused_merge();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
@@ -2305,7 +2319,7 @@ int main(int argc, char **argv) {
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() &&
              check_index_candidates() && check_engram_decode() && check_blend() &&
-             check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_decode_topk() && check_s1tg() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_literal_shapes() && check_attention_output(false) &&
+             check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_decode_topk() && check_split_collapse() && check_fused_merge() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_literal_shapes() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;

@@ -325,7 +325,7 @@ template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel
 // total, so a row holding NaN (inconsistent compares) may order differently than the full merge.
 template [[host_name("kernel_argsort_merge_f32_i32_desc_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 
-// DS4_V41_S1TG has k: the decode call's prefix merge ladder with the same outputs, shorter serial chains.
+// The fused merge ladder's wide levels: the decode call's prefix merge with the same outputs, shorter serial chains.
 // The prefix merge's threads each binary-search the two runs in device memory, two dependent loads (index, then score)
 // per step, and then merge from device memory. The staged form first copies the two (at most 512-entry) runs and their
 // scores into threadgroup memory with independent loads; the search and the merge then read the copies. Host contract:

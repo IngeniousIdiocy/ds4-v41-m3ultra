@@ -19475,8 +19475,6 @@ static int ds4_gpu_indexer_topk_select(id<MTLBuffer> selbuf, NSUInteger sel_off,
     return ds4_gpu_finish_command_buffer(cb, owned, "indexer top-k select") ? 1 : 0;
 }
 
-static int ds4_s1tg_on(char k);
-
 static int ds4_gpu_indexer_topk_tensor_impl(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -19588,13 +19586,13 @@ static int ds4_gpu_indexer_topk_tensor_impl(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
-        /* S1TG k (default; the decode call through the prefix merge): the levels with more than ten runs through the
-         * staged merge, the rest of the ladder in one threadgroup. The same outputs as the prefix merge's ladder. */
-        const bool s1k = decode_k512 && nth == 1024 && block_top_k == 512 && n_comp <= 65536u &&
-            !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") && ds4_s1tg_on('k');
-        id<MTLComputePipelineState> staged_pipeline = s1k ?
+        /* The fused merge ladder (the decode call through the prefix merge): the levels with more than ten runs go
+         * through the staged merge, the rest of the ladder runs in one threadgroup. The prefix ladder's outputs. */
+        const bool fused_ladder = decode_k512 && nth == 1024 && block_top_k == 512 && n_comp <= 65536u &&
+            !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") && !getenv("DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE");
+        id<MTLComputePipelineState> staged_pipeline = fused_ladder ?
             ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix_staged") : nil;
-        id<MTLComputePipelineState> fused_pipeline = s1k ?
+        id<MTLComputePipelineState> fused_pipeline = fused_ladder ?
             ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix_fused") : nil;
         if (fused_pipeline && fused_pipeline.maxTotalThreadsPerThreadgroup < 1024u) fused_pipeline = nil;
         int32_t len = block_top_k;
@@ -49762,15 +49760,6 @@ static id<MTLBuffer> ds4_gpu_v41_deferred_counter(void) {
     return buffer;
 }
 
-/* The V4.1 decode single-group latency kernels, both on by default and exact: c the deferred HC collapse as two
- * dispatches over 32 + 10 groups, k the decode indexer top-k's merge ladder staged in threadgroup memory and fused into
- * one group. DS4_V41_S1TG (read per call), when set, names exactly the letters to use: "c", "k", or "" / "none" for the
- * original kernels. */
-static int ds4_s1tg_on(char k) {
-    const char *s = getenv("DS4_V41_S1TG");
-    return s ? strchr(s, k) != NULL : 1;
-}
-
 /* The split collapse's 32 partial sums, between its two dispatches. */
 static id<MTLBuffer> ds4_gpu_v41_collapse_slots(void) {
     if (!g_dsv4_completion_cache) return nil;
@@ -49804,7 +49793,7 @@ int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
         id<MTLBuffer> count=ds4_gpu_v41_deferred_counter();
         if (!w || !count) return 0;
         const struct { int32_t n_embd,n_hc,iters; float hc_eps,norm_eps; } args={5120,4,0,0,eps};
-        if (ds4_s1tg_on('c')) {   /* S1TG c (default): the split collapse */
+        if (!getenv("DS4_METAL_DISABLE_V41_SPLIT_COLLAPSE")) {   /* the collapse over 32 + 10 groups */
             id<MTLComputePipelineState> part = ds4_gpu_get_pipeline("kernel_dsv41_deferred_collapse_part");
             id<MTLComputePipelineState> fin = ds4_gpu_get_pipeline("kernel_dsv41_deferred_collapse_norm");
             id<MTLBuffer> slots = ds4_gpu_v41_collapse_slots();
