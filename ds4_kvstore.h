@@ -255,8 +255,9 @@ uint64_t ds4_kvstore_payload_hash(const void *p, size_t n);
 int ds4_kvstore_verify_payload(FILE *fp, const ds4_kvstore_entry *e,
                                char *why, size_t why_len);
 /* The entry body after a filled header: header, text length, text, the
- * staged payload (digested on the way), the trailer, then the digest into
- * header bytes 64..71. The caller flushes, fsyncs and renames. */
+ * staged payload (digested on the way; NULL = text-only entry), the trailer,
+ * then the digest into header bytes 64..71. The caller flushes, fsyncs and
+ * renames. */
 bool ds4_kvstore_write_entry(FILE *fp, const uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              const char *text, size_t text_len,
                              const ds4_session_payload_file *staged,

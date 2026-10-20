@@ -21579,6 +21579,48 @@ static void test_server_idle_gate_for_canary(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/* ds4-agent writes text-only entries (no staged payload) and its title as a
+ * trailer through ds4_kvstore_write_entry: the empty payload still gets a
+ * digest, the trailer follows the (empty) payload, and the entry verifies. */
+static bool test_kv_title_hook(void *ud, FILE *fp, const char *text, uint64_t *written) {
+    (void)text;
+    const char *title = ud;
+    uint8_t tb[4];
+    le_put32(tb, (uint32_t)strlen(title));
+    *written = 4u + strlen(title);
+    return fwrite(tb, 1, 4, fp) == 4 && fwrite(title, 1, strlen(title), fp) == strlen(title);
+}
+
+static void test_kv_cache_text_only_entry_verifies(void) {
+    char tmpl[] = "/tmp/ds4-kv-text-only-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char *path = path_join(dir, "session.kv");
+    const char *text = "a transcript too long to resume";
+    const ds4_kvstore_trailer_hooks hooks = {.ud = (void *)"title", .write = test_kv_title_hook};
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 0, 2, DS4_KVSTORE_REASON_AGENT_SESSION, DS4_KVSTORE_EXT_SESSION_TITLE,
+                            512, 0, 32768, 100, 100, 0);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    uint64_t trailer = 0, ph = 0;
+    char err[160] = {0}, why[160] = {0};
+    if (fp) {
+        TEST_ASSERT(ds4_kvstore_write_entry(fp, h, text, strlen(text), NULL, &hooks, &trailer, &ph,
+                                            err, sizeof(err)));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    TEST_ASSERT(trailer == 9 && ph == ds4_kvstore_payload_hash(NULL, 0) && ph != 0);
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 0);
+    struct stat st;
+    TEST_ASSERT(stat(path, &st) == 0 &&
+                (uint64_t)st.st_size == KV_CACHE_FIXED_HEADER + 4u + strlen(text) + trailer);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
 static void test_kv_tool_map_filters_by_dsml_text(void) {
     const char *dsml_keep =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -22857,6 +22899,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_payload_hash_round_trip();
     test_kv_cache_canary_gate();
     test_server_idle_gate_for_canary();
+    test_kv_cache_text_only_entry_verifies();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

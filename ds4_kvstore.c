@@ -1275,7 +1275,8 @@ bool ds4_kvstore_write_entry(FILE *fp, const uint8_t h[DS4_KVSTORE_FIXED_HEADER]
     return fwrite(h, 1, DS4_KVSTORE_FIXED_HEADER, fp) == DS4_KVSTORE_FIXED_HEADER &&
            fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
            fwrite(text, 1, text_len, fp) == text_len &&
-           kv_copy_staged_hashed(staged, fp, payload_hash, err, err_len) == 0 &&
+           (staged ? kv_copy_staged_hashed(staged, fp, payload_hash, err, err_len) == 0 :
+                     (*payload_hash = ds4_kvstore_payload_hash(NULL, 0), true)) &&
            kv_trailer_write(hooks, fp, text, trailer_bytes) &&
            kv_put_payload_hash(fp, *payload_hash);
 }
