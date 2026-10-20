@@ -67,19 +67,27 @@ at load, and each blend reader family prints one line on its first dispatch.
 `./ds4-server --help kv-cache` lists the rest (minimum tokens, boundary trim and
 alignment).
 
-The disk cache turns on only after a numerics canary completes. The canary is a
-4,096-token prefill whose hash binds every entry to this build's prefill
-numerics. The server listens and serves at once; until the canary completes it
-neither loads nor stores disk entries, and it logs one line saying so. The
-canary takes nine turns at the model (session setup, then eight 512-token
-steps; about 12 s of model time in all on the M3 Ultra), one turn in each gap
-between requests, so a request waits for at most
-one step. Under unbroken load, with a request always queued, the canary waits,
-and the disk cache stays off until enough gaps have passed. With one client
-sending requests back to back this took 42 to 51 s after start, against 12 s on
-an idle server. `KV disk cache on: canary ...` in the log marks the moment the
-cache turns on. If the canary fails, the cache stays off for the life of the
-process, and a warning says why.
+The disk cache turns on only after a numerics canary passes. The canary is a
+one-shot 4,096-token prefill in a side session; its logits hash binds every
+entry to this build's prefill numerics. It runs once, as soon as the server
+listens, ahead of any request. The server accepts requests meanwhile and queues
+them, and none runs until the canary's verdict, so no request is served cold
+just because the cache is not on yet: once the canary passes, a queued request
+whose prefix is saved on disk restores it.
+
+This has a startup cost. For about the canary's duration after listen (one
+4,096-token prefill; measurement pending), every request waits for the
+verdict, including requests that have no disk hit.
+`KV disk cache on: canary ...` in the log marks the verdict and gives its time.
+If the canary fails, the queued requests run with the cache off for the life of
+the process, and a warning says why. Entries stay on disk and are still evicted
+under the space budget. Entries saved under a different canary are refused and
+evicted the same way. That includes entries written by the stepped canary of
+earlier development builds of this branch (canary `e8c0517e0b2d6638`).
+
+To exercise the failure path, `make ds4-server-testhooks` builds a separate
+test binary in which `DS4_KV_CANARY_FAIL_TEST=1` turns a completed canary into
+a failed verdict. `ds4-server` does not read that variable.
 
 ## 3. Benchmarking
 
