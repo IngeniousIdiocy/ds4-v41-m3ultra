@@ -374,6 +374,48 @@ kernel void kernel_dsv41_rope_quantize(
     if (valid) dst[column] = dsv41_bf16(result);
 }
 
+/* The decode indexer query's rope and quantization in ONE dispatch over every head, in place (S40-IRQ): grid
+ * (width / block, heads) x 32, each threadgroup one block of one head row. The arithmetic is dsv41_rope_quantize_body
+ * with the coefficients read from the step's RoPE coefficient table (kernel_dsv41_rope_coeff_table: float2(cos, sin)
+ * of the same theta; the host binds the half the frequencies select, compressed = entries 32..63 at byte 256). Each
+ * lane reads its own word before the pair shuffle and writes it last. */
+kernel void kernel_dsv41_rope_quantize_heads_tab(
+        constant ds4_metal_args_dsv41_rope_quantize &args,
+        device float *x,
+        device const float2 *tab,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    device float *row = x + (ulong)group.y * args.width;
+    const uint block = args.mode == 3u ? 16u : 32u;
+    const uint column = group.x * block + lane;
+    const bool valid = lane < block && column < args.width;
+    float value = valid ? row[column] : 0.0f;
+    const float other = simd_shuffle_xor(value, 1u);
+    const uint rotary = args.width - 64u;
+    if (valid && column >= rotary) {
+        const float2 cs = tab[(column - rotary) >> 1u];
+        const float c = cs.x;
+        const float s = args.inverse ? -cs.y : cs.y;
+        const float re = (column & 1u) ? other : value;
+        const float im = (column & 1u) ? value : other;
+        /* the contraction kernel_dsv41_rope compiles to */
+        value = (column & 1u) ? dsv41_bf16(fma(im, c, re * s)) : dsv41_bf16(fma(re, c, -(im * s)));
+    }
+    value = dsv41_bf16(value);
+    const float amax = simd_max(abs(value));
+    float result = value;
+    if (args.mode == 1u) {
+        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
+        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
+    } else if (args.mode == 2u || args.mode == 3u) {
+        const float scale = args.mode == 3u
+            ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
+            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
+        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+    }
+    if (valid) row[column] = dsv41_bf16(result);
+}
+
 struct ds4_metal_args_dsv41_norm_pair {
     uint n0, n1, ntg0, ntg1;
     float eps;

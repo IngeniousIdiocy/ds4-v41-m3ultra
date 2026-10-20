@@ -298,6 +298,12 @@ int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint
  * rope_tab reads it (bound at byte 0 raw or 256 compressed) instead of computing them: the same bits; NULL = the
  * inline kernel. */
 int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos);
+/* Metal: rope + quantization of `heads` rows of `width`, in place, in ONE dispatch with the coefficients from that
+ * step's table (bound at byte 0 raw / 256 compressed); 0: not dispatched (the caller runs the separate rope and
+ * quantize). The count of such dispatches. */
+int ds4_gpu_dsv41_rope_quantize_heads_tab(ds4_gpu_tensor *x, uint32_t width, uint32_t heads, uint32_t start,
+                                          bool compressed, ds4_v41_activation_format format, const ds4_gpu_tensor *tab);
+uint64_t ds4_gpu_irq_count(void);
 int ds4_gpu_dsv41_attention_low_ex(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
                                    uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
                                    uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed,

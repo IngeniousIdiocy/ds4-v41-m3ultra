@@ -49902,6 +49902,44 @@ int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos) {
     }
 }
 
+/* The decode indexer query's rope + quantization over every head, in place, in one dispatch reading the step's RoPE
+ * coefficient table (S40-IRQ). */
+static uint64_t g_irq_count;
+uint64_t ds4_gpu_irq_count(void) { return g_irq_count; }
+
+int ds4_gpu_dsv41_rope_quantize_heads_tab(ds4_gpu_tensor *x, uint32_t width, uint32_t heads, uint32_t start,
+                                          bool compressed, ds4_v41_activation_format format, const ds4_gpu_tensor *tab) {
+    const uint32_t block = format == DS4_V41_FP4_E4M3 ? 16u : 32u;
+    if (width < 64u || width % block || !heads || heads > 65535u || format < DS4_V41_FP8_E8M0 ||
+        format > DS4_V41_FP4_E4M3 || start >= 1048576u || !dsv41_tensor_has_floats(x, (uint64_t)width * heads) ||
+        !tab || ds4_gpu_tensor_bytes(tab) < 64u * 2u * sizeof(float)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope_quantize_heads_tab");
+        if (!pipeline) return 0;
+        /* the arguments ds4_gpu_dsv41_rope_quantize passes (the same frequencies as the separate rope) */
+        struct {
+            uint32_t width, start, inverse, mode;
+            float frequencies[32];
+        } args = {width, start, 0u, (uint32_t)format, {0}};
+        memcpy(args.frequencies, ds4_gpu_dsv41_rope_frequencies(compressed), sizeof(args.frequencies));
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(tab)
+                offset:ds4_gpu_tensor_offset(tab) + (compressed ? 32u * 2u * sizeof(float) : 0u) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(width / block, heads, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        g_irq_count++;
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 indexer query rope + quantization");
+    }
+}
+
 int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
                                 uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
                                 uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed) {

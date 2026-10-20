@@ -40853,6 +40853,7 @@ static bool ds41_engram_fp8_off(void) { static int c = -1; return ds41_env_flag(
 static bool ds41_indexer_fp8_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_INDEXER_FP8", &c); }
 static DS4_MAYBE_UNUSED bool ds41_rope_tab_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ROPE_TAB", &c); }
 static DS4_MAYBE_UNUSED bool ds41_heads_once_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_HEADS_ONCE", &c); }
+static DS4_MAYBE_UNUSED bool ds41_irq_table_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_IRQ_TABLE", &c); }
 static DS4_MAYBE_UNUSED bool ds41_engram_add_tg_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG", &c); }
 static DS4_MAYBE_UNUSED bool ds41_sampler_gpu_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_SAMPLER_GPU", &c); }
 
@@ -41342,6 +41343,21 @@ static bool ds41_indexer_q(ds41_gpu_graph *g, const ds4_model *m, const ds4_laye
     return ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true);
 }
 
+/* The decode index query's rope + FP4_E8M0 quantization: one dispatch reading this step's RoPE coefficient table on a
+ * compressed layer while the table is this position's (S40-IRQ), else the separate rope and quantize. */
+static bool ds41_index_q_rope_quantize(ds41_gpu_graph *g, uint32_t il, uint32_t pos) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    if (compressed && g->rope_tab_on && g->rope_tab && g->rope_tab_pos == pos && g->tp_world == 1 &&
+        !ds41_irq_table_off() &&
+        ds4_gpu_dsv41_rope_quantize_heads_tab(g->index_q, 128, DS4_N_INDEXER_HEAD, pos, compressed, DS4_V41_FP4_E8M0,
+                                              g->rope_tab))
+        return true;
+#endif
+    return ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) &&
+        ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0);
+}
+
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
                                             const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41349,8 +41365,7 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
         if (!ds41_indexer_q(g, m, l, il) ||
-            !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
-            !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
+            !ds41_index_q_rope_quantize(g, il, pos) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) return false;
 #ifdef __APPLE__
         /* Past layer 20 only layer 20's candidate blocks can be selected:

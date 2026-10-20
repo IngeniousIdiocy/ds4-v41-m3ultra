@@ -663,6 +663,23 @@ static int check_rope_tab(void) {
         }
         fprintf(stderr, "V4.1 attention low pos=%u: RoPE table (static and generic) == inline sincos, raw and compressed PASS\n",
                 positions[pi]);
+        /* the indexer query (32 heads x 128): the fused table rope + FP4_E8M0 quantization == rope then quantize */
+        for (int compressed = 0; compressed < 2; compressed++) {
+            const uint32_t pos = positions[pi], qn = 32u * 128u;
+            CHECK(ds4_gpu_tensor_write(heads, 0, h, qn * 4) && ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_rope(heads, 128, 32, 1, pos, compressed, false));
+            CHECK(ds4_gpu_dsv41_quantize(heads, 128, 32, DS4_V41_FP4_E8M0));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_tensor_read(heads, 0, ds4_gpu_tensor_contents(a), qn * 4));
+            const uint64_t n0 = ds4_gpu_irq_count();
+            CHECK(ds4_gpu_tensor_write(heads, 0, h, qn * 4) && ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_rope_coeff_table(tab, pos));
+            CHECK(ds4_gpu_dsv41_rope_quantize_heads_tab(heads, 128, 32, pos, compressed, DS4_V41_FP4_E8M0, tab));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_irq_count() == n0 + 1u);
+            CHECK(ds4_gpu_tensor_read(heads, 0, ds4_gpu_tensor_contents(b), qn * 4));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(a), ds4_gpu_tensor_contents(b), qn * 4));
+        }
+        fprintf(stderr, "V4.1 indexer query pos=%u: fused table rope + quantize == rope then quantize, raw and compressed PASS\n",
+                positions[pi]);
     }
     ds4_gpu_tensor_free(heads); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(c);
     ds4_gpu_tensor_free(tab);
