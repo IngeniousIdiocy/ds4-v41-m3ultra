@@ -41425,8 +41425,9 @@ static bool ds41_index_q_rope_quantize(ds41_gpu_graph *g, uint32_t il, uint32_t 
  * it was built for this position from this graph's own mask (row copies read their own mask views but share the
  * list). False: unavailable, the caller scores the full row. */
 static bool ds41_candidates_row(ds41_gpu_graph *g, uint32_t owner, uint32_t n_comp) {
+    const ds4_gpu_tensor *view = g->index_bf16_ok && !ds41_index_bf16_off() ? g->index_bf16[owner] : NULL;
     if (!ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
-            g->index_q, g->index_weights, g->index_cache[owner], g->block_mask, n_comp, 1.0f / 64.0f,
+            g->index_q, g->index_weights, g->index_cache[owner], view, g->block_mask, n_comp, 1.0f / 64.0f,
             DS4_N_INDEXER_TOP_K, g->block_list_pos == g->pos + 1u && g->block_list_mask == g->block_mask))
         return false;
     g->block_list_pos = g->pos + 1u;

@@ -2227,6 +2227,73 @@ kernel void kernel_dsv41_indexer_score_candidates(
     scores[slot] = score;
 }
 
+/* kernel_dsv41_indexer_score_candidates with two lanes per key (heads 0..15
+ * and 16..31) and two keys per lane, over the bf16 key view (B) or the f32
+ * keys. Each head's dot is the wide kernel's expression; the head sum runs
+ * 0..31 in order, the first lane handing its partial sum to the second, so
+ * the scores are the candidate kernel's bits. 256 threads score 256 keys. */
+template <bool B>
+kernel void kernel_dsv41_indexer_score_candidates_split(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *qf,
+        device const float *weights,
+        device const void *keys,
+        device float *scores,
+        device const uint *list,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        uint3 ntg_u [[threads_per_threadgroup]]) {
+    const uint ntg = ntg_u.x;
+    threadgroup float *qs = shared;           /* [32][128] */
+    threadgroup float *ws = shared + 4096u;   /* [32] */
+    for (uint i = tid; i < 4096u; i += ntg) qs[i] = qf[i];
+    if (tid < 32u) ws[tid] = weights[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    const uint part = tid & 1u, lanes = ntg >> 1;
+    uint slot[2], row[2];
+    FOR_UNROLL (uint r = 0; r < 2u; r++) {
+        slot[r] = tgpig.x * ntg + r * lanes + (tid >> 1);
+        const uint s = min(slot[r], args.n_rows - 1u);
+        row[r] = list[s >> 3] * 8u + (s & 7u);
+    }
+    float acc[2][16];
+    FOR_UNROLL (uint r = 0; r < 2u; r++) FOR_UNROLL (uint i = 0; i < 16u; i++) acc[r][i] = 0.0f;
+    for (uint d0 = 0; d0 < 128u; d0 += 16u) {
+        float4 k[2][4];
+        FOR_UNROLL (uint r = 0; r < 2u; r++) {
+            if (B) {
+                device const ushort4 *kb = (device const ushort4 *)keys + (((uint64_t)row[r] * 128u + d0) >> 2);
+                FOR_UNROLL (uint i = 0; i < 4u; i++) k[r][i] = as_type<float4>(uint4(kb[i]) << 16);
+            } else {
+                device const float4 *kf = (device const float4 *)keys + (((uint64_t)row[r] * 128u + d0) >> 2);
+                FOR_UNROLL (uint i = 0; i < 4u; i++) k[r][i] = kf[i];
+            }
+        }
+        FOR_UNROLL (uint i = 0; i < 16u; i++) {
+            threadgroup const float4 *q4 = (threadgroup const float4 *)(qs + (part * 16u + i) * 128u + d0);
+            FOR_UNROLL (uint r = 0; r < 2u; r++)
+                acc[r][i] += dot(q4[0], k[r][0]) + dot(q4[1], k[r][1]) + dot(q4[2], k[r][2]) + dot(q4[3], k[r][3]);
+        }
+    }
+    FOR_UNROLL (uint r = 0; r < 2u; r++) {
+        float score = 0.0f;
+        FOR_UNROLL (uint p = 0; p < 2u; p++) {
+            if (p) score = simd_shuffle_up(score, (ushort)1);
+            if (part == p) {
+                FOR_UNROLL (uint i = 0; i < 16u; i++) score += max(acc[r][i] * args.scale, 0.0f) * ws[p * 16u + i];
+            }
+        }
+        if (part == 1u && slot[r] < args.n_rows) scores[slot[r]] = score;
+    }
+}
+#define DSV41_CAND_SPLIT(NAME, B) template [[host_name(NAME)]] kernel void kernel_dsv41_indexer_score_candidates_split<B>( \
+    constant ds4_metal_args_glm_indexer_score_one &, device const float *, device const float *, device const void *, \
+    device float *, device const uint *, threadgroup float *, uint3, ushort, uint3);
+DSV41_CAND_SPLIT("kernel_dsv41_indexer_score_candidates_split_bf16", true)
+DSV41_CAND_SPLIT("kernel_dsv41_indexer_score_candidates_split_f32", false)
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,

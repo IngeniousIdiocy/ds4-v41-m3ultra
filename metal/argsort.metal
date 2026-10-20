@@ -813,3 +813,180 @@ kernel void kernel_topk_select_sort512(
     }
     if (tid < args.top_k) out[tid] = map ? (int)(list[id >> 3] * 8u + (id & 7u)) : (int)id;
 }
+
+struct ds4_metal_args_topk_select_one {
+    uint n;        // scores, at most 16384
+    uint top_k;    // at most 512
+};
+
+// count of keys >= c over the threadgroup (1024 threads, 16 keys each)
+static inline uint ds4_topk_one_count_ge(thread const uint *key, uint c, threadgroup uint *part,
+                                         uint lane, uint simd) {
+    uint m = 0u;
+    FOR_UNROLL (uint j = 0; j < 16u; j++) m += key[j] >= c ? 1u : 0u;
+    m = simd_sum(m);
+    if (lane == 0u) part[simd] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t = simd_sum(part[lane]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return t;
+}
+
+// The whole radix select (hist x 3, count, write, sort512 with the candidate
+// map) for one row of at most 16384 scores, in one threadgroup of 1024
+// threads holding 16 consecutive keys each. Histograms of key bits 31..21 and
+// 20..10 find the 21-bit prefix of the k-th key; the keys with that prefix
+// (at most 4096, else every key) are searched bit by bit for the k-th key
+// itself. The winners are
+// the keys above it and the lowest ids equal to it, sorted by (score
+// descending, id ascending): a total order, so the result is the radix
+// select's. Ids map through the candidate list: list[p / 8] * 8 + p % 8.
+kernel void kernel_topk_select_one(
+        constant ds4_metal_args_topk_select_one & args,
+        device const float * scores,
+        device int * selected,
+        device const uint * list,
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup atomic_uint hist[2048];
+    threadgroup uint cand[4096];
+    threadgroup uint part[128];
+    threadgroup uint tk[512], ti[512];
+    threadgroup atomic_uint n_gt, n_cand;
+    const uint per = (args.n + 1023u) / 1024u;
+    uint key[16];
+    FOR_UNROLL (uint j = 0; j < 16u; j++) {
+        const uint i = tid * per + j;
+        key[j] = j < per && i < args.n ? ds4_topk_key(scores[i]) : 0u;   // 0: below every score's key
+    }
+    for (uint i = tid; i < 2048u; i += 1024u) atomic_store_explicit(hist + i, 0u, memory_order_relaxed);
+    if (tid == 0u) {
+        atomic_store_explicit(&n_gt, 0u, memory_order_relaxed);
+        atomic_store_explicit(&n_cand, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (uint j = 0; j < 16u; j++)
+        if (key[j]) atomic_fetch_add_explicit(hist + (key[j] >> 21), 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // thread t owns bins 2047 - 2t and 2046 - 2t, counted from the top
+    const uint c0 = atomic_load_explicit(hist + 2047u - 2u * tid, memory_order_relaxed);
+    const uint c1 = atomic_load_explicit(hist + 2046u - 2u * tid, memory_order_relaxed);
+    const uint ex = simd_prefix_exclusive_sum(c0 + c1);
+    if (lane == 31u) part[simd] = ex + c0 + c1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0u) part[32u + lane] = simd_prefix_exclusive_sum(part[lane]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint before = part[32u + simd] + ex;
+    if (before < args.top_k && before + c0 >= args.top_k) {
+        part[64] = 2047u - 2u * tid; part[65] = before; part[66] = c0;
+    } else if (before + c0 < args.top_k && before + c0 + c1 >= args.top_k) {
+        part[64] = 2046u - 2u * tid; part[65] = before + c0; part[66] = c1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint bin = part[64], above_bin = part[65];
+    // second pass: key bits 20..10 of the keys in that bin
+    for (uint i = tid; i < 2048u; i += 1024u) atomic_store_explicit(hist + i, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (uint j = 0; j < 16u; j++)
+        if (key[j] && (key[j] >> 21) == bin)
+            atomic_fetch_add_explicit(hist + ((key[j] >> 10) & 0x7ffu), 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint need = args.top_k - above_bin;
+    const uint d0 = atomic_load_explicit(hist + 2047u - 2u * tid, memory_order_relaxed);
+    const uint d1 = atomic_load_explicit(hist + 2046u - 2u * tid, memory_order_relaxed);
+    const uint ex1 = simd_prefix_exclusive_sum(d0 + d1);
+    if (lane == 31u) part[simd] = ex1 + d0 + d1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0u) part[32u + lane] = simd_prefix_exclusive_sum(part[lane]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint before1 = part[32u + simd] + ex1;
+    if (before1 < need && before1 + d0 >= need) {
+        part[68] = 2047u - 2u * tid; part[69] = before1; part[70] = d0;
+    } else if (before1 + d0 < need && before1 + d0 + d1 >= need) {
+        part[68] = 2046u - 2u * tid; part[69] = before1 + d0; part[70] = d1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint prefix = (bin << 11) | part[68], above_prefix = above_bin + part[69], in_prefix = part[70];
+    uint threshold;
+    if (in_prefix <= 4096u) {
+        // the last 10 bits: one SIMD group searches the prefix's keys
+        FOR_UNROLL (uint j = 0; j < 16u; j++)
+            if (key[j] && (key[j] >> 10) == prefix)
+                cand[atomic_fetch_add_explicit(&n_cand, 1u, memory_order_relaxed)] = key[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0u) {
+            // the largest t with (prefix keys >= t) >= the count still wanted
+            const uint want = args.top_k - above_prefix;
+            uint t = prefix << 10;
+            for (int b = 9; b >= 0; b--) {
+                const uint c = t | (1u << b);
+                uint m = 0u;
+                for (uint i = lane; i < in_prefix; i += 32u) m += cand[i] >= c ? 1u : 0u;
+                if (simd_sum(m) >= want) t = c;
+            }
+            if (lane == 0u) part[67] = t;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threshold = part[67];
+    } else {
+        // over 4096 keys share 21 key bits: search all keys bit by bit
+        threshold = 0u;
+        for (int b = 31; b >= 0; b--) {
+            const uint c = threshold | (1u << b);
+            if (ds4_topk_one_count_ge(key, c, part, lane, simd) >= args.top_k) threshold = c;
+        }
+    }
+    // keys above the threshold, then the wanted equal keys by ascending id
+    uint gt = 0u, eq = 0u;
+    FOR_UNROLL (uint j = 0; j < 16u; j++) {
+        gt += key[j] > threshold ? 1u : 0u;
+        eq += key[j] == threshold ? 1u : 0u;
+    }
+    const uint gt_sum = simd_sum(gt), eq_ex = simd_prefix_exclusive_sum(eq);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 31u) part[simd] = eq_ex + eq;
+    if (lane == 0u) part[32u + simd] = gt_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0u) {
+        part[64u + lane] = simd_prefix_exclusive_sum(part[lane]);
+        const uint all_gt = simd_sum(part[32u + lane]);
+        if (lane == 0u) part[96] = all_gt;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint above = part[96], wanted = args.top_k - above;
+    uint r = part[64u + simd] + eq_ex;
+    FOR_UNROLL (uint j = 0; j < 16u; j++) {
+        const uint i = tid * per + j;
+        if (key[j] > threshold) {
+            const uint at = atomic_fetch_add_explicit(&n_gt, 1u, memory_order_relaxed);
+            tk[at] = key[j]; ti[at] = i;
+        } else if (key[j] == threshold) {
+            if (r < wanted) { tk[above + r] = key[j]; ti[above + r] = i; }
+            r++;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // kernel_topk_select_sort512's bitonic sort
+    uint k = 0u, id = 0xffffffffu;
+    if (tid < args.top_k) { k = tk[tid]; id = ti[tid]; }
+    for (uint kk = 2u; kk <= 512u; kk <<= 1) {
+        for (uint j = kk >> 1; j > 0u; j >>= 1) {
+            uint pk, pi;
+            if (j < 32u) {
+                pk = simd_shuffle_xor(k, (ushort)j);
+                pi = simd_shuffle_xor(id, (ushort)j);
+            } else {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < 512u) { tk[tid] = k; ti[tid] = id; }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                pk = tid < 512u ? tk[tid ^ j] : 0u;
+                pi = tid < 512u ? ti[tid ^ j] : 0u;
+            }
+            const bool mine_first = k > pk || (k == pk && id < pi);
+            const bool keep_first = ((tid & j) == 0u) == ((tid & kk) == 0u);
+            if (mine_first != keep_first) { k = pk; id = pi; }
+        }
+    }
+    if (tid < args.top_k) selected[tid] = (int)(list[id >> 3] * 8u + (id & 7u));
+}

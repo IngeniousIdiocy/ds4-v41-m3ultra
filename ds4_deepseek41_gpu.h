@@ -149,8 +149,12 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
 int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores,
                                            ds4_gpu_tensor *list, const ds4_gpu_tensor *q,
                                            const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+                                           const ds4_gpu_tensor *view,
                                            const ds4_gpu_tensor *block_mask, uint32_t n_comp,
                                            float scale, uint32_t top_k, int list_ready);
+/* view: keys' bf16 view (ds4_gpu_dsv41_index_keys_bf16) or NULL; the candidate scores read it when set (the same
+ * bits). By default two lanes score each key and one threadgroup selects (DS4_METAL_DISABLE_V41_CAND_SPLIT=1 and
+ * DS4_METAL_DISABLE_V41_CAND_SELECT_ONE=1 restore the one-lane scorer and the radix select; read per call). */
 /* list_ready != 0: list already holds block_mask's candidates (an earlier call since the mask was written); the list
  * is then not rebuilt, and the winners' sort writes the key ids through it (DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE=1
  * rebuilds it every call and maps the ids in their own dispatch). */

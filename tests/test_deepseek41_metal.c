@@ -1891,8 +1891,9 @@ static int check_index_candidates(void) {
     ds4_gpu_tensor *list = upload(NULL, 2048 * 4), *blocks_t = upload(NULL, (size_t)max_blocks * 4);
     ds4_gpu_tensor *picked = upload(NULL, 2048 * 4), *mask = upload(NULL, (size_t)max_blocks * 4);
     ds4_gpu_tensor *old_sel = upload(NULL, TOP * 4), *new_sel = upload(NULL, TOP * 4);
+    ds4_gpu_tensor *vt = upload(NULL, (size_t)max_keys * DIM * 2);
     CHECK(qt && wt && kt && full && plain && source && cand && list && blocks_t && picked && mask &&
-          old_sel && new_sel);
+          old_sel && new_sel && vt);
     float *q = ds4_gpu_tensor_contents(qt), *w = ds4_gpu_tensor_contents(wt);
     float *k = ds4_gpu_tensor_contents(kt), *s = ds4_gpu_tensor_contents(source);
     const float *p = ds4_gpu_tensor_contents(plain), *c = ds4_gpu_tensor_contents(cand);
@@ -1903,7 +1904,8 @@ static int check_index_candidates(void) {
     int32_t *new_sel_w = ds4_gpu_tensor_contents(new_sel);
     for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
         const uint32_t n = widths[wi], blocks = (n + 7) / 8, count = 16384 - (blocks * 8 - n);
-        double seconds[4] = {0, 0, 0, 0};
+        enum { PATHS = 7 };
+        double seconds[PATHS] = {0};
         uint32_t ties = 0;
         for (int mode = 0; mode < 4; mode++) {
             /* bit 0: block exponents over +-20 instead of +-2; bit 1: ties */
@@ -1927,6 +1929,7 @@ static int check_index_candidates(void) {
                     memcpy(k + (size_t)(i ^ 5) % n * DIM, k + (size_t)best * DIM, DIM * 4);
             }
             CHECK(ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_index_keys_bf16(vt, kt, 0, n, NULL));
             CHECK(ds4_gpu_dsv41_candidate_blocks(blocks_t, source, n, 1, n - 1, 1));
             CHECK(ds4_gpu_indexer_topk_tensor(picked, blocks_t, blocks, 1, 2048));
             CHECK(ds4_gpu_dsv4_topk_mask_tensor(mask, picked, blocks, 1, 2048));
@@ -1934,16 +1937,20 @@ static int check_index_candidates(void) {
             CHECK(ds4_gpu_end_commands());
             for (int round = 0; round < ROUNDS; round++) {
                 /* path 0 full row; 1 candidates under DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE=1 (list_ready ignored: a
-                 * zeroed list is rebuilt); 2 the default once-per-token path building the zeroed list; 3 reusing
-                 * path 2's list */
-                for (int path = 0; path < 4; path++) {
+                 * zeroed list is rebuilt) with the one-lane f32 scorer and the radix select; 2 the default
+                 * once-per-token path (bf16 view) building the zeroed list; 3 reusing path 2's list; 4 reusing it
+                 * with the f32 keys; 5 with the radix select; 6 with the one-lane scorer */
+                for (int path = 0; path < PATHS; path++) {
                     if (path == 1 || path == 2) memset(list_w, 0, 2048 * sizeof(*list_w));
                     if (path < 2) CHECK(setenv("DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE", "1", 1) == 0);
+                    if (path == 1 || path == 6) CHECK(setenv("DS4_METAL_DISABLE_V41_CAND_SPLIT", "1", 1) == 0);
+                    if (path == 1 || path == 5) CHECK(setenv("DS4_METAL_DISABLE_V41_CAND_SELECT_ONE", "1", 1) == 0);
                     const double t0 = monotonic_seconds();
                     CHECK(ds4_gpu_begin_commands());
                     if (path) {
-                        CHECK(ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt, mask,
-                            n, 1.0f / 64.0f, TOP, path != 2));
+                        memset(new_sel_w, 0xff, TOP * sizeof(*new_sel_w));
+                        CHECK(ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt,
+                            path == 1 || path == 4 ? NULL : vt, mask, n, 1.0f / 64.0f, TOP, path != 2));
                     } else {
                         CHECK(ds4_gpu_dsv41_indexer_score_masked(full, qt, wt, kt, mask, n));
                         CHECK(ds4_gpu_dsv41_candidate_filter(full, mask, n, 1, n - 1, 1, 0));
@@ -1952,6 +1959,8 @@ static int check_index_candidates(void) {
                     CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
                     if (round) seconds[path] += monotonic_seconds() - t0;
                     CHECK(unsetenv("DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE") == 0);
+                    CHECK(unsetenv("DS4_METAL_DISABLE_V41_CAND_SPLIT") == 0);
+                    CHECK(unsetenv("DS4_METAL_DISABLE_V41_CAND_SELECT_ONE") == 0);
                     if (path) CHECK(!memcmp(a, b, TOP * sizeof(*a)));
                 }
             }
@@ -1966,10 +1975,12 @@ static int check_index_candidates(void) {
             for (uint32_t i = 0; i < TOP; i++) ties += i && p[a[i]] == p[a[i - 1]];
         }
         fprintf(stderr, "V4.1 candidate index rows keys=%u candidates=%u: ids, order and scores "
-                "identical (%u tied neighbours) us per row full=%.0f candidates=%.0f once-build=%.0f "
-                "once-reuse=%.0f\n", n, count, ties, seconds[0] / (4 * (ROUNDS - 1)) * 1e6,
-                seconds[1] / (4 * (ROUNDS - 1)) * 1e6, seconds[2] / (4 * (ROUNDS - 1)) * 1e6,
-                seconds[3] / (4 * (ROUNDS - 1)) * 1e6);
+                "identical (%u tied neighbours) us per row full=%.0f legacy=%.0f once-build=%.0f "
+                "once-reuse=%.0f f32-split=%.0f radix=%.0f one-lane=%.0f\n", n, count, ties,
+                seconds[0] / (4 * (ROUNDS - 1)) * 1e6, seconds[1] / (4 * (ROUNDS - 1)) * 1e6,
+                seconds[2] / (4 * (ROUNDS - 1)) * 1e6, seconds[3] / (4 * (ROUNDS - 1)) * 1e6,
+                seconds[4] / (4 * (ROUNDS - 1)) * 1e6, seconds[5] / (4 * (ROUNDS - 1)) * 1e6,
+                seconds[6] / (4 * (ROUNDS - 1)) * 1e6);
     }
     {   /* The engine's list record: prefill and verify rows are copies of the decode graph that carry its record but
          * read their own mask views and share its list. After the graph built the list for pos on its mask A, rows
@@ -2018,10 +2029,10 @@ static int check_index_candidates(void) {
         ds4_gpu_tensor_free(masks[2]);
         fprintf(stderr, "V4.1 candidate list record: graph reuse and row copies (other masks, rewind) PASS\n");
     }
-    CHECK(!ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt, mask,
+    CHECK(!ds4_gpu_dsv41_indexer_candidates_tensor(new_sel, cand, list, qt, wt, kt, vt, mask,
         16384, 1.0f / 64.0f, TOP, 0));
     ds4_gpu_tensor *tensors[] = {qt, wt, kt, full, plain, source, cand, list, blocks_t, picked, mask,
-                                 old_sel, new_sel};
+                                 old_sel, new_sel, vt};
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
     return 1;
 }

@@ -50593,9 +50593,11 @@ int ds4_gpu_dsv41_candidate_mask_batch(ds4_gpu_tensor *mask,
 int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores,
                                            ds4_gpu_tensor *list, const ds4_gpu_tensor *q,
                                            const ds4_gpu_tensor *weights, const ds4_gpu_tensor *keys,
+                                           const ds4_gpu_tensor *view,
                                            const ds4_gpu_tensor *block_mask, uint32_t n_comp,
                                            float scale, uint32_t top_k, int list_ready) {
     static id<MTLComputePipelineState> list_pipeline, score_pipeline, ids_pipeline;
+    static id<MTLComputePipelineState> split_bf16_pipeline, split_f32_pipeline, select_one_pipeline;
     static int env = -1;
     if (env < 0) env = !getenv("DS4_METAL_DISABLE_V41_INDEX_CANDIDATES");
     /* default (DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE=1 opts out, read per call): reuse a ready list; ids mapped
@@ -50621,8 +50623,20 @@ int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
             if (!hist || hist.maxTotalThreadsPerThreadgroup < 1024u || !score_pipeline || !ids_pipeline ||
                 list_pipeline.maxTotalThreadsPerThreadgroup < 1024u) list_pipeline = nil;
             if (!list_pipeline) env = 0;
+            split_bf16_pipeline = ds4_gpu_get_pipeline("kernel_dsv41_indexer_score_candidates_split_bf16");
+            split_f32_pipeline = ds4_gpu_get_pipeline("kernel_dsv41_indexer_score_candidates_split_f32");
+            select_one_pipeline = ds4_gpu_get_pipeline("kernel_topk_select_one");
+            if (select_one_pipeline && select_one_pipeline.maxTotalThreadsPerThreadgroup < 1024u)
+                select_one_pipeline = nil;
         }
         if (!list_pipeline) return 0;
+        /* default (opt-outs read per call): two lanes and two keys per thread scoring the bf16 view (else the f32
+         * keys), and the select in one threadgroup with the ids mapped */
+        const bool use_view = view && dsv41_tensor_has_floats(view, (uint64_t)n_comp * 64u);
+        id<MTLComputePipelineState> split = getenv("DS4_METAL_DISABLE_V41_CAND_SPLIT") ? nil :
+            use_view ? split_bf16_pipeline : split_f32_pipeline;
+        id<MTLComputePipelineState> select_one = top_k <= 512u && !getenv("DS4_METAL_DISABLE_V41_CAND_SELECT_ONE") ?
+            select_one_pipeline : nil;
         const ds4_gpu_glm_indexer_score_one_args args = {
             .n_rows = count, .n_head = 32u, .head_dim = 128u, .cache_f16 = 0u, .scale = scale,
         };
@@ -50639,16 +50653,28 @@ int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
             ds4_gpu_end_compute_encoder(cb, enc);
             enc = ds4_gpu_compute_encoder(cb);
         }
-        [enc setComputePipelineState:score_pipeline];
+        [enc setComputePipelineState:split ? split : score_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
-        const ds4_gpu_tensor *inputs[] = {q, weights, keys, scores, list};
+        const ds4_gpu_tensor *inputs[] = {q, weights, split && use_view ? view : keys, scores, list};
         for (NSUInteger i = 0; i < 5; i++)
             [enc setBuffer:ds4_gpu_tensor_buffer(inputs[i])
                     offset:ds4_gpu_tensor_offset(inputs[i]) atIndex:i + 1];
         [enc setThreadgroupMemoryLength:(4096u + 32u) * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)   /* 256 keys either way */
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        if (select_one) {
+            const struct { uint32_t n, top_k; } sargs = {count, top_k};
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:select_one];
+            [enc setBytes:&sargs length:sizeof(sargs) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(list) offset:ds4_gpu_tensor_offset(list) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 candidate index row");
+        }
         int mapped = 0;
         if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 candidate index scores") ||
             !ds4_gpu_indexer_topk_select(ds4_gpu_tensor_buffer(selected), ds4_gpu_tensor_offset(selected),
