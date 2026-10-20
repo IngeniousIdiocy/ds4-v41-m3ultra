@@ -202,12 +202,23 @@ These were measured and are not in the branch:
 The micros ran with production up, so their absolute times carry
 contention; the A/B order repeated.
 
-## Split HC collapse and hoisted paired norm (f45f4e8, opt-in)
+## Single-group latency kernels (f45f4e8, 77eea27, 913aa61; opt-in, experimental)
 
-Worker D's `DS4_V41_S1TG=cn`. In a model-free micro at the decode shapes it
-is bit-identical: 0 of 16.4M collapse values and 0 of 1.4M paired-norm values
-differ. The micro saves −125 to −200 µs/token on the collapse. The stack
-timing is pending a window; the switch stays opt-in until then.
+Worker D's `DS4_V41_S1TG`:
+
+- `cn`: the split HC collapse and the hoisted paired norm. In a model-free
+  micro at the decode shapes it is bit-identical: 0 of 16.4M collapse values
+  and 0 of 1.4M paired-norm values differ. The micro saves −125 to
+  −200 µs/token on the collapse.
+- `k` and `r`: the fused top-k merge ladder and the ballot router.
+- `h`: eight heads per threadgroup in single-row decode attention.
+
+`k`, `r` and `h` are also bit-identical in their micros.
+
+On the stack, `cn` is **not exact**. In window fp8pf-a5 (d01) its arm's
+digests differed from the control. The cause is under investigation by worker
+D. Until it is found and fixed, every letter (`cnkrh`) stays opt-in and
+experimental, and none of them enters a measured basis.
 
 ## Clean-checkout check (25b45ea)
 
