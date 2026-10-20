@@ -79,6 +79,55 @@ The 8K row is a composed run of this branch. A composed run at depth (64K and
 beyond) on this branch is still pending. Windows, arms and per-run numbers are
 in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
 
+### Compared with DwarfStar main
+
+Window W8 served the same requests from DwarfStar main and from this branch:
+
+- U: antirez/ds4 main `5379c1c9ac315f1540371b06a3db88491d4059ff`.
+- P: this branch at `0a72af29a080a136d12fe816d2da4f0c64582838`, with
+  `--serial-reasoning`.
+
+Both arms used the same MXFP4 GGUF, the same server flags (393K context, a
+fresh disk-cache directory per server lifetime) and no DSpark. Each cell
+was run three times, in the order U P P U U P; the numbers are medians.
+Decode is the server log's rate over 512-token answers.
+
+| Context | U decode | P decode | P/U | U cold TTFT | P cold TTFT | P/U |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2K | 19.56 | 41.32 | ×2.11 | 6.275 s | 5.110 s | 0.81 |
+| 8K | 19.84 | 40.78 | ×2.06 | 23.413 s | 15.300 s | 0.65 |
+| 32K | 19.14 | 40.43 | ×2.11 | 49.030 s | 41.576 s | 0.85 |
+| 64K | 18.64 | 40.21 | ×2.16 | 95.724 s | 79.477 s | 0.83 |
+
+Other results from the same window:
+
+- **Reasoning decode** (thinking on, effort high): ×2.07 to ×2.16.
+- **Warm agent turn** (a 32K code conversation, next turn from the live
+  cache): 2.389 s on U, 2.079 s on P.
+- **Restart, then resend** (restored from the disk cache):
+  - U: 2.484 / 2.897 / 3.546 s at 8K / 64K / 128K;
+  - P: 2.485 / 2.518 / 3.131 s.
+- **Load to ready:** 2.29 to 2.30 s on both arms.
+- **Memory:** both arms plan 290.12 GiB, and both peak at 296 to 297 GiB
+  wired at 64K. P's idle RSS is 1.5 GB higher: these are the narrow decode
+  copies built at load while the wide views stay mapped.
+
+Scope and caveats:
+
+- These are serving measurements of the two builds. They do not isolate
+  individual optimizations or establish quality equivalence.
+- On P, the 2K answers stopped at 494 tokens; every other decode answer ran
+  to 512.
+- P's binary predates the queued canary. An 8K resend right after a
+  restart, before its canary finished, was refused by the cache and
+  prefilled cold: 14.580 s against 2.485 s after cache-on. Requests now wait
+  for the canary instead ([RUNTIME-V41.md](docs/RUNTIME-V41.md)). That
+  change has not been measured in a window yet.
+
+The receipts give the ranges, answer lengths and the corrections to the
+window's first summary. Source: W8's summary
+(`ux-compare/runs/w8-a1/summary.txt`, not published).
+
 ### Prepare the model
 
 ```

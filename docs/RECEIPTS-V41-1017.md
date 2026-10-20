@@ -63,6 +63,107 @@ single-group kernels section below.
 The depth rows of the README (64K, 131K, 300K) are still W5 on the
 state-depth tree. A composed depth run on this branch is pending.
 
+## Serving comparison with DwarfStar main (W8, P29)
+
+Arms:
+
+- U: antirez/ds4 main `5379c1c9ac315f1540371b06a3db88491d4059ff`, server
+  binary sha256 `887992a8…`.
+- P: this branch at `0a72af29a080a136d12fe816d2da4f0c64582838`, server
+  binary sha256 `d808adbf…`, with `--serial-reasoning`.
+
+Setup:
+
+- Same MXFP4 GGUF and the same flags on both arms: `-c 393216
+  --prefill-chunk 8192 --kv-disk-space-mb 98304 --kv-cache-cold-max-tokens
+  393216 --kv-cache-continued-interval-tokens 4096`, with a fresh kv
+  directory for each lifetime.
+- No DSpark on either arm. DwarfStar main refuses this branch's DSpark GGUF,
+  which lacks `dspark.target_architecture`.
+- Cycles ran in the order U P P U U P, with three runs per arm and cell.
+- Every cell is VALID.
+
+Medians [ranges] over the three runs.
+
+Decode, server log, 512-token answers:
+
+| Context | U tok/s | P tok/s | P/U |
+| ---: | ---: | ---: | ---: |
+| 2K | 19.56 [19.41–19.58] | 41.32 [41.31–41.37] | 2.112 |
+| 8K (8,215 tokens) | 19.84 [19.48–19.87] | 40.78 [40.73–40.78] | 2.055 |
+| 32K | 19.14 [19.11–19.28] | 40.43 [40.43–40.46] | 2.112 |
+| 64K (66,752 tokens) | 18.64 [18.58–18.68] | 40.21 [40.20–40.21] | 2.157 |
+
+Cold TTFT, thinking off:
+
+| Context | U s | P s | P/U |
+| ---: | ---: | ---: | ---: |
+| 2K | 6.275 [6.244–6.319] | 5.110 [5.100–5.112] | 0.814 |
+| 8K | 23.413 [23.403–23.479] | 15.300 [15.282–15.302] | 0.653 |
+| 32K | 49.030 [48.973–49.224] | 41.576 [41.511–41.593] | 0.848 |
+| 64K | 95.724 [95.686–95.964] | 79.477 [79.252–79.483] | 0.830 |
+
+Other cells:
+
+- **Reasoning decode** (effort high, max_tokens 1024, server log):
+  - U: 19.84 / 19.65 / 18.59 tok/s at 2K / 8K / 64K;
+  - P: 41.41 / 40.77 / 40.22 tok/s;
+  - P/U ×2.07 to ×2.16.
+- **Warm agent turn:** both arms resume from a cached start of 29,748
+  tokens and append 437. TTFT is 2.389 [2.382–2.401] s on U and 2.079
+  [2.058–2.092] s on P.
+- **Restart and restore:** one run per arm. The server gets SIGTERM, is
+  relaunched on the same kv directory, and a follow-up turn is resent. These
+  are follow-up turns, not fresh-versus-restored quality checks.
+
+  | Context | U TTFT | P TTFT | U load | P load |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 8K | 2.484 s | 2.485 s | 10.7 ms | 23.4 ms |
+  | 64K | 2.897 s | 2.518 s | 54.6 ms | 172.3 ms |
+  | 128K | 3.546 s | 3.131 s | 80.6 ms | 303.9 ms |
+
+  The restored prefixes are 8,201 / 67,635 / 131,172 tokens. P's longer
+  file load is the v2 payload digest.
+- **Startup restore window:** P's resend at 8K sent before cache-on (M4R2now)
+  was refused ("the numerics canary has not completed yet") and prefilled
+  cold, in 14.580 s. P's cache came on 14.35 to 29.06 s after launch, with
+  canary `e8c0517e0b2d6638`. fbd9ff30 replaces that policy. Requests now
+  queue behind a one-shot canary; that change is not measured yet.
+- **Load** (launch to ready, page cache warm): U 2.30 [2.28–2.31] s, P 2.29
+  [2.28–2.30] s.
+- **Memory:**
+  - Planned memory is 290.12 GiB on both arms.
+  - The 64K wired peak is 295.4 to 296.3 GiB on U and 296.6 to 297.2 GiB on
+    P.
+  - Idle RSS is 1.66 GB on U and 3.19 GB on P (the at-load builder, P26).
+
+Answer lengths:
+
+- Every 512-token decode answer ran to its limit, except P's at 2K, which
+  stopped at 494 tokens in all three runs.
+- Reasoning answers had medians of 695 completion tokens on U and 958 on P,
+  with different samples. That difference is not treated as a finding.
+
+Corrections to the window's first summary (relabels only; the raw data are
+unchanged):
+
+- `stop_s` is the server's lifetime from launch, not its shutdown time.
+  The exit instant is not logged, so shutdown is bounded instead. The
+  shutdown checkpoint store took 31 to 291 ms, and the upper bounds are 1.30
+  to 1.71 s.
+- The window's launcher is a Perl shim (`/usr/bin/perl`) that execs the
+  driver, which spawns the server. The server identity is the hash of
+  `ds4-server` above, not the launcher's.
+- The contention warnings name the window's own registered server children.
+  They are ownership false positives, not outside contention.
+- The client-side decode figure is an SSE throughput estimate. The tables
+  above use the server log.
+- Prompt tokens / TTFT is a user-visible rate, not the prefill kernel's rate.
+
+Scope: this result does not isolate individual optimizations or establish
+quality equivalence. It does not replace the composed 131K/300K checks or
+the pinned-profile checks.
+
 ## Candidate-block index scoring (9b9dfee)
 
 *Score only the candidate blocks of later DeepSeek V4.1 index layers*:
