@@ -360,6 +360,8 @@ static void print_server_api(FILE *fp, const help_colors *c) {
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
     para(fp, c, "DeepSeek-compatible chat requests default to high-effort thinking.");
+    opt(fp, c, "--default-reasoning-effort E", "Effort of a thinking request that names none: low, medium, high or max. Default: high");
+    opt(fp, c, "--default-top-p F, --default-min-p F", "Server sampler defaults for requests that set none. Defaults: 1, 0.05");
     para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");

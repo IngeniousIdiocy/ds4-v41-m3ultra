@@ -987,6 +987,8 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
 /* Private UAT serving defaults; explicit request sampling values still win. */
 static float g_default_top_p = DS4_DEFAULT_TOP_P;
 static float g_default_min_p = DS4_DEFAULT_MIN_P;
+/* --default-reasoning-effort: the effort of a thinking request that names none. */
+static ds4_think_mode g_default_reasoning_effort = DS4_THINK_HIGH;
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
@@ -999,7 +1001,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = g_default_top_p;
     r->min_p = g_default_min_p;
-    r->think_mode = DS4_THINK_HIGH;
+    r->think_mode = g_default_reasoning_effort;
 }
 
 static bool parse_ignore_eos_value(const char **p, request *r) {
@@ -4110,7 +4112,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    ds4_think_mode reasoning_effort = g_default_reasoning_effort;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -4314,7 +4316,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    ds4_think_mode reasoning_effort = g_default_reasoning_effort;
     chat_msgs msgs = {0};
     char *system = NULL;
     char *tool_schemas = NULL;
@@ -5309,7 +5311,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     bool tool_choice_none = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    ds4_think_mode reasoning_effort = g_default_reasoning_effort;
     chat_msgs msgs = {0};
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
@@ -5613,7 +5615,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     char *prompt = NULL;
     bool got_thinking = false;
     bool thinking_enabled = true;
-    ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
+    ds4_think_mode reasoning_effort = g_default_reasoning_effort;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -15538,6 +15540,10 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--default-min-p")) {
             g_default_min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             if (!(g_default_min_p >= 0.0f && g_default_min_p < 1.0f)) die("--default-min-p must be in [0,1)");
+        } else if (!strcmp(arg, "--default-reasoning-effort")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "none") || !parse_reasoning_effort_name(v, &g_default_reasoning_effort))
+                die("--default-reasoning-effort must be low, medium, high or max");
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
             c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -17543,6 +17549,20 @@ static void test_request_defaults_use_min_p_filtering(void) {
     request_free(&r);
     g_default_top_p = DS4_DEFAULT_TOP_P;
     g_default_min_p = DS4_DEFAULT_MIN_P;
+
+    request_init(&r, REQ_CHAT, 128);
+    TEST_ASSERT(r.think_mode == DS4_THINK_HIGH);
+    request_free(&r);
+    char *effort_argv[] = {"ds4-server", "--default-reasoning-effort", "max"};
+    (void)parse_options(3, effort_argv);
+    TEST_ASSERT(g_default_reasoning_effort == DS4_THINK_MAX);
+    request_init(&r, REQ_CHAT, 128);
+    TEST_ASSERT(r.think_mode == DS4_THINK_MAX);
+    request_free(&r);
+    char *low_argv[] = {"ds4-server", "--default-reasoning-effort", "low"};
+    (void)parse_options(3, low_argv);
+    TEST_ASSERT(g_default_reasoning_effort == DS4_THINK_LOW);
+    g_default_reasoning_effort = DS4_THINK_HIGH;
 }
 
 static void test_chat_ignore_eos_contract(void) {
