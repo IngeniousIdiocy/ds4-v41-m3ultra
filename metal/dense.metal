@@ -1044,6 +1044,55 @@ kernel void kernel_mul_mv_q8_0_f32_bf16_pair(
     }
 }
 
+/* kernel_mul_mv_q8_0_f32_bf16_pair at its V4.1 decode call (ds41_attention_project: 5120 -> q_a 1280 and
+ * 5120 -> kv 512, Q8_0, one activation row) with every args value it reads or forwards replaced by the literal of
+ * ds4_gpu_make_q8_0_mv_args(5120, out_dim) and nr0 2: the same group split (the leading 640 threadgroups take q_a's row
+ * pairs, the next 256 kv's), the same impl, NSG (function constant), NR0, lane mapping, K walk and bf16 output
+ * rounding. args_a/args_b stay bound but unread. */
+[[host_name("kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv(
+        constant ds4_metal_args_mul_mv & args_a,
+        constant ds4_metal_args_mul_mv & args_b,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)args_a; (void)args_b;
+    ds4_metal_args_mul_mv sa = {
+        /*.ne00 =*/ 5120,
+        /*.ne01 =*/ 1280,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ 34,
+        /*.nb01 =*/ 5440,
+        /*.nb02 =*/ 5440ull*1280ull,
+        /*.nb03 =*/ 5440ull*1280ull,
+        /*.ne10 =*/ 5120,
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ 4,
+        /*.nb11 =*/ 20480,
+        /*.nb12 =*/ 20480,
+        /*.nb13 =*/ 20480,
+        /*.ne0  =*/ 1280,
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ 2,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+    if (tgpig.x < 640u) {
+        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true>(sa, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
+    } else {
+        sa.ne01 = 512; sa.nb02 = sa.nb03 = 5440ull*512ull; sa.ne0 = 512;
+        tgpig.x -= 640u;
+        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true>(sa, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see

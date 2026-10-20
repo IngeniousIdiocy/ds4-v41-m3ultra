@@ -20259,8 +20259,13 @@ int ds4_gpu_dsv41_project_pair_q8(ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
         ds4_gpu_q8_0_matvec_args args_a = ds4_gpu_make_q8_0_mv_args(in_dim, out_a_dim);
         ds4_gpu_q8_0_matvec_args args_b = ds4_gpu_make_q8_0_mv_args(in_dim, out_b_dim);
         args_a.nr0 = args_b.nr0 = dispatch.nr0;
+        /* the V4.1 q_a/kv shape takes the literal-shape kernel (its args are literals of this shape with nr0 2); every
+         * other shape keeps the pair kernel (opt-out read per call) */
+        const bool literal = in_dim == 5120u && out_a_dim == 1280u && out_b_dim == 512u && dispatch.nr0 == 2 &&
+            getenv("DS4_METAL_DISABLE_V41_QA_KV_PAIR_LITERAL") == NULL;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q8_0_f32_bf16_pair", dispatch.nsg);
+            ds4_gpu_get_mul_mv_pipeline(literal ? "kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv"
+                                                : "kernel_mul_mv_q8_0_f32_bf16_pair", dispatch.nsg);
         if (!pipeline) return 0;
         const NSUInteger nr0 = (NSUInteger)dispatch.nr0;
         const NSUInteger groups = ((NSUInteger)out_a_dim + nr0 - 1u) / nr0 +

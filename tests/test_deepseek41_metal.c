@@ -773,6 +773,24 @@ static int check_literal_shapes(void) {
         ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(out);
         fprintf(stderr, "V4.1 literal serial HC join == generic PASS\n");
     }
+    {   /* the attention q_a/kv pair: 5120 -> 1280 and 5120 -> 512, one row, bf16 outputs */
+        uint64_t wb = 0;
+        void *model = q8_weights(1280 + 512, 5120, &wb);
+        CHECK(model && ds4_gpu_set_model_map(model, wb));
+        const uint64_t off_b = 1280ull * (5120 / 32) * 34;
+        float *h = malloc(5120 * 4);
+        CHECK(h);
+        for (int i = 0; i < 5120; i++) h[i] = random_value();
+        ds4_gpu_tensor *x = upload(h, 5120 * 4), *qa = upload(NULL, 1280 * 4), *kv = upload(NULL, 512 * 4);
+        CHECK(x && qa && kv);
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_QA_KV_PAIR_LITERAL", qa, 1280 * 4,
+                     ds4_gpu_dsv41_project_pair_q8(qa, kv, model, wb, 0, off_b, 5120, 1280, 512, x));
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_QA_KV_PAIR_LITERAL", kv, 512 * 4,
+                     ds4_gpu_dsv41_project_pair_q8(qa, kv, model, wb, 0, off_b, 5120, 1280, 512, x));
+        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(qa); ds4_gpu_tensor_free(kv);
+        free(h); free(model);
+        fprintf(stderr, "V4.1 literal q_a/kv pair == generic PASS\n");
+    }
     return 1;
 }
 #else
