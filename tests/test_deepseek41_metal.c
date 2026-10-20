@@ -1719,10 +1719,67 @@ static int check_engram_decode(void) {
     ds4_gpu_tensor_free(owt); ds4_gpu_tensor_free(ows); ds4_gpu_tensor_free(oidx);
     return 1;
 }
+
+/* The blend readers give the default readers' bits: Engram (table and F16-pattern fallback, E8M0 109..119), the FP8
+ * indexer q_b at K 1280 and the BF16 router at K 5120, against the same calls with DS4_METAL_DISABLE_V41_BLEND set. */
+static int check_blend(void) {
+    {   /* Engram 6144 -> 256 and indexer q_b 1280 -> 256: E4M3 codes with E8M0 32x32 block bytes */
+        const uint32_t ins[2] = {6144, 1280}, out = 256;
+        for (int which = 0; which < 2; which++) {
+            const uint32_t in = ins[which];
+            unsigned char *codes = malloc((size_t)in * out), *scales = malloc((size_t)(in / 32) * (out / 32));
+            CHECK(codes && scales);
+            for (size_t i = 0; i < (size_t)(in / 32) * (out / 32); i++) { (void)random_value(); scales[i] = (unsigned char)(109u + seed % 11u); }
+            for (size_t i = 0; i < (size_t)in * out; i++) {
+                (void)random_value();
+                unsigned char c = (unsigned char)(seed >> 3);
+                if ((c & 0x7f) == 0x7f) c ^= 1;   /* no NaN codes */
+                codes[i] = c;
+            }
+            float *x = malloc((size_t)in * 4);
+            CHECK(x);
+            for (uint32_t i = 0; i < in; i++) x[i] = random_value() / 4;
+            ds4_gpu_tensor *ct = upload(codes, (size_t)in * out), *st = upload(scales, (size_t)(in / 32) * (out / 32));
+            ds4_gpu_tensor *xt = upload(x, (size_t)in * 4), *o = upload(NULL, out * 4);
+            CHECK(ct && st && xt && o);
+            if (which == 0) {
+                for (int table_ok = 0; table_ok < 2; table_ok++)
+                    LITERAL_PAIR("DS4_METAL_DISABLE_V41_BLEND", o, out * 4,
+                                 ds4_gpu_matmul_engram_fp8_weights(o, ct, st, in, out, xt, table_ok));
+            } else {
+                LITERAL_PAIR("DS4_METAL_DISABLE_V41_BLEND", o, out * 4,
+                             ds4_gpu_dsv41_project_fp8_bf16_weights(o, ct, st, in, out, xt));
+            }
+            ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o);
+            free(codes); free(scales); free(x);
+        }
+    }
+    {   /* BF16 router 5120 -> 384 */
+        const uint32_t in = 5120, out = 384;
+        uint16_t *w = malloc((size_t)in * out * 2);
+        float *x = malloc((size_t)in * 4);
+        CHECK(w && x);
+        for (size_t i = 0; i < (size_t)in * out; i++) {
+            const float v = random_value() / 64;
+            uint32_t bits;
+            memcpy(&bits, &v, 4);
+            w[i] = (uint16_t)(bits >> 16);
+        }
+        for (uint32_t i = 0; i < in; i++) x[i] = random_value();
+        ds4_gpu_tensor *wt = upload(w, (size_t)in * out * 2), *xt = upload(x, (size_t)in * 4), *o = upload(NULL, out * 4);
+        CHECK(wt && xt && o);
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_BLEND", o, out * 4, ds4_gpu_matmul_bf16_router_weights(o, wt, in, out, xt));
+        ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o);
+        free(w); free(x);
+    }
+    fprintf(stderr, "V4.1 blend readers (Engram, indexer q_b, router) == default readers PASS\n");
+    return 1;
+}
 #else
 static int check_index_score_wide(void) { return 1; }
 static int check_index_candidates(void) { return 1; }
 static int check_engram_decode(void) { return 1; }
+static int check_blend(void) { return 1; }
 #endif
 
 static int check_compact_carry(void) {
@@ -1955,6 +2012,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--blend")) {
+        const int ok = ds4_gpu_init() && check_blend();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--literal-shapes")) {
         const int ok = ds4_gpu_init() && check_literal_shapes();
         ds4_gpu_cleanup();
@@ -1989,7 +2051,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() &&
-             check_index_candidates() && check_engram_decode() &&
+             check_index_candidates() && check_engram_decode() && check_blend() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_decode_topk() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_literal_shapes() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();

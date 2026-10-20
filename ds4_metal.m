@@ -21778,35 +21778,10 @@ int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *out, const void *model_map, u
                                           in_dim, out_dim, x, 1, false, 1);
 }
 
-/* DS4_V41_BLEND=<letters> (read once): e Engram, r BF16 router, x FP8 indexer q_b read through the blend kernels
- * (metal/dense.metal), each bit-identical to the reader it replaces. Unset or empty: the default readers. */
-static uint64_t g_blend_calls[3], g_blend_total[3];   /* engram, router, indexer: blend dispatches, all dispatches */
-static void ds4_blend_exit(void) {
-    fprintf(stderr, "ds4: V4.1 blend calls engram %llu of %llu, router %llu of %llu, indexer %llu of %llu\n",
-            (unsigned long long)g_blend_calls[0], (unsigned long long)g_blend_total[0],
-            (unsigned long long)g_blend_calls[1], (unsigned long long)g_blend_total[1],
-            (unsigned long long)g_blend_calls[2], (unsigned long long)g_blend_total[2]);
-}
-static int ds4_blend_on(char reader) {
-    static int mask = -1;
-    if (mask < 0) {
-        const char *s = getenv("DS4_V41_BLEND");
-        mask = 0;
-        if (s && s[0]) {
-            int ok = 1;
-            for (const char *p = s; *p; p++) {
-                if (*p == 'e') mask |= 1; else if (*p == 'r') mask |= 2; else if (*p == 'x') mask |= 4; else ok = 0;
-            }
-            if (!ok) { fprintf(stderr, "ds4: DS4_V41_BLEND=%s refused (want letters from e, r, x)\n", s); mask = 0; }
-            else {
-                fprintf(stderr, "ds4: V4.1 blend readers on:%s%s%s\n", (mask & 1) ? " engram" : "",
-                        (mask & 2) ? " router" : "", (mask & 4) ? " indexer" : "");
-                atexit(ds4_blend_exit);
-            }
-        }
-    }
-    return (mask & (reader == 'e' ? 1 : reader == 'r' ? 2 : 4)) != 0;
-}
+/* The V4.1 decode Engram, BF16 router and FP8 indexer q_b matvecs read through the blend kernels (metal/dense.metal),
+ * each bit-identical to the reader it replaces. One switch for all three: they ship as a unit, since Engram alone slows
+ * the router matvec beside it. DS4_METAL_DISABLE_V41_BLEND=1 (read per call) restores the default readers. */
+static int ds4_blend_on(void) { return getenv("DS4_METAL_DISABLE_V41_BLEND") == NULL; }
 
 /* ds4_gpu_dsv41_project_f16_bf16's single-token dispatch (ds4_gpu_matmul_f16_tensor_impl with n_tok 1 and
  * round_bf16: the same args, NSG, NR0 rules, threadgroup memory and grid) with the weight read as E4M3 codes
@@ -21843,7 +21818,7 @@ static int ds4_gpu_dsv41_project_fp8_dispatch(ds4_gpu_tensor *out, id<MTLBuffer>
         if (strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4") != 0) return 0;
         /* blend: only the simdgroups that own a 32-column block (at most one per lane), two rows */
         const int16_t xnsg = (int16_t)((in_dim / 32u + 15u) / 16u);
-        const int xblend = mv_dispatch.nr0 == 2 && xnsg <= mv_dispatch.nsg && ds4_blend_on('x');
+        const int xblend = mv_dispatch.nr0 == 2 && xnsg <= mv_dispatch.nsg && ds4_blend_on();
         if (xblend) mv_dispatch.nsg = xnsg;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
             xblend ? "kernel_indexer_blend_r2" : "kernel_mul_mv_fp8_f32_4_bf16", mv_dispatch.nsg);
@@ -21863,8 +21838,6 @@ static int ds4_gpu_dsv41_project_fp8_dispatch(ds4_gpu_tensor *out, id<MTLBuffer>
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        g_blend_total[2]++;
-        if (xblend) g_blend_calls[2]++;
         return ds4_gpu_finish_command_buffer(cb, owned, "FP8 indexer matvec") ? 1 : 0;
     }
 }
@@ -22773,7 +22746,7 @@ static int ds4_gpu_bf16_router_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> wbuf,
         mv_args.nb02 = mv_args.nb03 = weight_bytes;
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
         /* blend: 16-byte weight loads, one row per threadgroup */
-        const int rblend = (in_dim % 32u) == 0 && (inner_offset % 16u) == 0 && ds4_blend_on('r');
+        const int rblend = (in_dim % 32u) == 0 && (inner_offset % 16u) == 0 && ds4_blend_on();
         if (rblend || ds4_gpu_plain_mv_single_row(out_dim)) {
             mv_dispatch.nr0 = 1;
             mv_dispatch.smem = 32u * sizeof(float);
@@ -22798,8 +22771,6 @@ static int ds4_gpu_bf16_router_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> wbuf,
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        g_blend_total[1]++;
-        if (rblend) g_blend_calls[1]++;
         return ds4_gpu_finish_command_buffer(cb, owned, "BF16 router matvec");
     }
 }
@@ -22869,7 +22840,7 @@ static int ds4_gpu_engram_fp8_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> cbuf, 
             const char *v = getenv("DS4_V41_ENGRAM_DECODE");
             g_engram_decode_shift = v && !strcmp(v, "shift");
         }
-        const int blend = (code_inner % 16u) == 0 && ds4_blend_on('e');   /* 16-byte code loads; exact for any E8M0 byte */
+        const int blend = (code_inner % 16u) == 0 && ds4_blend_on();   /* 16-byte code loads; exact for any E8M0 byte */
         const int shift = !blend && (g_engram_decode_shift || !table_ok);
         const int table = !blend && !shift;
         if (table && !g_engram_lut_buf) {
@@ -22912,8 +22883,6 @@ static int ds4_gpu_engram_fp8_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> cbuf, 
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / nr0, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)base.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        g_blend_total[0]++;
-        if (blend) g_blend_calls[0]++;
         return ds4_gpu_finish_command_buffer(cb, owned, "Engram FP8 matvec");
     }
 }
