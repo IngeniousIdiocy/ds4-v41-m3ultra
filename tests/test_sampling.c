@@ -319,6 +319,215 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+/* The V4.1 GPU top-p selector's CPU consumer: the production (fast, sort-free) consumer must match the reference
+ * consumer on every summary (return path, token, RNG state after, and on paths 0-2 the summary it leaves, bitwise),
+ * and a decided step on a summary built from real logits must give the CPU sampler's token and RNG state.
+ * Summaries are built the way metal/sampler_selector.metal lays them out; some are then corrupted. */
+enum { SELT_NV = 129280u, SELT_NB = 129280u / 256u, SELT_SUPB = 2048u };
+typedef struct { uint32_t n, finite, best, cap; float M; uint32_t b1, above1, b2, above2, t, above, pad[5]; } selt_hdr;
+typedef struct { float logit; uint32_t id; } selt_cand;
+typedef struct { int id; float logit, prob; } selt_sum;
+static uint64_t selt_s;
+static uint64_t selt_r64(void) {
+    uint64_t z = (selt_s += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+static double selt_u(void) { return ((double)(selt_r64() >> 11) + 0.5) / 9007199254740992.0; }
+static uint32_t selt_ri(uint32_t n) { return (uint32_t)(selt_r64() % n); }
+static float selt_bitsf(uint32_t u) { float v; memcpy(&v, &u, 4); return v; }
+static uint32_t selt_fbits(float v) { uint32_t u; memcpy(&u, &v, 4); return u; }
+static int selt_fin(float v) { return (selt_fbits(v) & 0x7f800000u) != 0x7f800000u; }
+static uint32_t selt_okey(float v) {
+    uint32_t u = selt_fbits(v);
+    if (u == 0x80000000u) u = 0;
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+static int selt_cmp_u32_desc(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x < y) - (x > y);
+}
+static int selt_cmp_f_desc(const void *a, const void *b) {
+    const float x = *(const float *)a, y = *(const float *)b;
+    return (x < y) - (x > y);
+}
+
+/* the summary of the NG values VALS at ids IDS (LG holds them; finite = NG when FINITE_ALL, else the whole
+ * vocabulary). PMODE: 0 random heap share, 1 at the heap-mass boundary, 2 at a nucleus boundary, 3 zero,
+ * 4 the true in-order FP32 block partials of LG (FINITE_ALL only). Returns 0 when NG cannot fill a heap. */
+static int selt_build(selt_hdr *h, float *P, selt_cand *c, const float *lg, const uint32_t *ids, const float *vals,
+                      uint32_t ng, int finite_all, int pmode) {
+    static uint32_t keys[4096], order[4096];
+    static float top[4096];
+    memset(h, 0, sizeof(*h));
+    const uint32_t finite = finite_all ? ng : SELT_NV;
+    const uint32_t cap = finite < 512u ? finite : 512u;
+    if (ng == 0 || ng < cap) return 0;
+    for (uint32_t i = 0; i < ng; i++) keys[i] = selt_okey(vals[i]);
+    qsort(keys, ng, sizeof(keys[0]), selt_cmp_u32_desc);
+    const uint32_t b = keys[cap - 1u] >> 21;
+    uint32_t above = 0, n = 0, m = 0;
+    for (uint32_t i = 0; i < ng; i++) {
+        const uint32_t bk = selt_okey(vals[i]) >> 21;
+        above += bk > b;
+        n += bk >= b;
+        if (bk >= b) order[m++] = i;
+    }
+    for (uint32_t i = m; i > 1; i--) {   /* the GPU emits in no particular order */
+        const uint32_t j = selt_ri(i), x = order[i - 1u];
+        order[i - 1u] = order[j];
+        order[j] = x;
+    }
+    memset(c, 0, SELT_SUPB * sizeof(*c));
+    for (uint32_t i = 0; i < m && i < SELT_SUPB; i++) c[i] = (selt_cand){vals[order[i]], ids[order[i]]};
+    uint32_t bi = 0;
+    for (uint32_t i = 1; i < ng; i++)
+        if (vals[i] > vals[bi] || (vals[i] == vals[bi] && ids[i] < ids[bi])) bi = i;
+    h->finite = finite; h->cap = cap; h->b1 = b; h->above1 = above; h->b2 = n; h->n = n; h->t = b << 21;
+    h->best = ids[bi]; h->M = lg[ids[bi]];
+    if (pmode == 4) {
+        for (uint32_t k = 0; k < SELT_NB; k++) {
+            float acc = 0.0f;
+            for (uint32_t j = k * 256u; j < k * 256u + 256u; j++)
+                if (selt_fin(lg[j])) acc += expf(lg[j] - h->M);
+            P[k] = acc;
+        }
+        return 1;
+    }
+    for (uint32_t i = 0; i < ng; i++) top[i] = vals[i];
+    qsort(top, ng, sizeof(top[0]), selt_cmp_f_desc);
+    double H = 0.0, pre[512];
+    for (uint32_t i = 0; i < cap; i++) { H += (double)expf(top[i] - h->M); pre[i] = H; }
+    const double S = pmode == 0 ? H / (0.80 + 0.20 * selt_u()) :
+                     pmode == 1 ? H / 0.95 * (1.0 + (selt_u() - 0.5) * 8e-6) :
+                     pmode == 2 ? pre[selt_ri(cap)] / 0.95 * (1.0 + (selt_u() - 0.5) * 8e-6) : 0.0;
+    const int ragged = pmode != 3 && selt_u() < 0.5;
+    for (uint32_t k = 0; k < SELT_NB; k++) P[k] = (float)(S / SELT_NB * (ragged ? 0.5 + selt_u() : 1.0));
+    return 1;
+}
+
+/* one corruption (the reference decides what the summary then is) */
+static void selt_corrupt(selt_hdr *h, float *P, selt_cand *c, float *lg, int k) {
+    const uint32_t ne = h->n < SELT_SUPB ? h->n : SELT_SUPB;
+    const uint32_t i = ne ? selt_ri(ne) : 0, j = ne > 1 ? (i + 1u + selt_ri(ne - 1u)) % ne : 0;
+    switch (k) {
+    case 0: if (ne > 1) c[j] = c[i]; break;                                       /* duplicate candidate */
+    case 1: if (ne > 1) c[j].id = c[i].id; break;                                 /* duplicate id, other logit */
+    case 2: c[i].id = SELT_NV + selt_ri(1000); break;                             /* id out of range */
+    case 3: c[i].logit = selt_bitsf(0x7fc00000u); break;                          /* NaN candidate */
+    case 4: lg[c[i].id] = selt_bitsf(selt_fbits(lg[c[i].id]) ^ (1u << selt_ri(32))); break;  /* logits disagree */
+    case 5: h->above1 += 1u; break;
+    case 6: h->n += 1u; break;
+    case 7: h->cap -= 1u; break;
+    case 8: h->finite = 0; break;
+    case 9: h->M = selt_bitsf(selt_fbits(h->M) ^ 1u); break;
+    case 10: P[selt_ri(SELT_NB)] = -1e-3f; break;
+    case 11: P[selt_ri(SELT_NB)] = selt_bitsf(0x7f800000u); break;
+    case 12: if (h->n <= 2048u) { const uint32_t d = 2049u - h->n; h->n += d; h->b2 += d;
+                 if (h->finite < h->b2) h->finite = h->b2; } break;                /* superset overflow */
+    default: break;
+    }
+}
+
+static void check_selector_consumer(void) {
+    float *lg = malloc((size_t)SELT_NV * sizeof(*lg));
+    float *scratch = malloc((size_t)SELT_NV * sizeof(*scratch));
+    float *P = malloc(SELT_NB * sizeof(*P));
+    selt_cand *c = malloc(SELT_SUPB * sizeof(*c));
+    selt_sum *ref_sum = malloc(SELT_SUPB * sizeof(*ref_sum));
+    static uint32_t ids[4096], stamp[SELT_NV], epoch;
+    static float vals[4096];
+    CHECK(lg && scratch && P && c && ref_sum, "selector test allocation");
+    if (!lg || !scratch || !P || !c || !ref_sum) return;
+    selt_s = 0x5e1ec7042026ULL;
+    uint64_t paths[6] = {0}, cases = 0, differ = 0, prod_cases = 0, prod_differ = 0;
+    for (uint32_t it = 0; it < 30000u; it++) {
+        const int fam = (int)selt_ri(5), prod = it % 10u == 0;
+        uint32_t ng = selt_u() < 0.6 ? 512u + selt_ri(800) : selt_u() < 0.75 ? 1200u + selt_ri(900) : 2000u + selt_ri(900);
+        int finite_all = prod || selt_u() < 0.3, clustered = 0;
+        if (fam == 4) { ng = 1u + selt_ri(511); finite_all = 1; }
+        /* values: 0 realistic tail, 1 heavy ties (and signed zeros), 2 a few ulps apart, 3 any finite bits */
+        const float M0 = (float)(-5.0 + 45.0 * selt_u());
+        const double sc = 4.0 + 12.0 * selt_u();
+        float pool[8];
+        const uint32_t npool = 1u + selt_ri(8);
+        for (uint32_t q = 0; q < npool; q++)
+            pool[q] = selt_u() < 0.15 ? (selt_u() < 0.5 ? 0.0f : -0.0f) : M0 - (float)(3.0 * selt_u());
+        for (uint32_t i = 0; i < ng; i++) {
+            float v;
+            switch (prod ? 0 : fam) {
+            case 1: v = pool[selt_ri(npool)]; clustered = it & 1u; break;
+            case 2: v = selt_bitsf(selt_fbits(M0) + selt_ri(64)); clustered = 1; break;
+            case 3: do v = selt_bitsf((uint32_t)selt_r64()); while (!selt_fin(v)); break;
+            default: v = M0 - (float)(sc * pow(-log(selt_u()), 0.7)); break;
+            }
+            vals[i] = v;
+        }
+        epoch++;
+        if (clustered) {
+            const uint32_t s0 = selt_ri(SELT_NV - ng);
+            for (uint32_t i = 0; i < ng; i++) ids[i] = s0 + i;
+        } else {
+            for (uint32_t i = 0; i < ng; i++) {
+                uint32_t id;
+                do id = selt_ri(SELT_NV); while (stamp[id] == epoch);
+                stamp[id] = epoch;
+                ids[i] = id;
+            }
+        }
+        /* the other logits: absent (-inf) when only NG are finite, else finite and below every candidate */
+        const float rest = finite_all ? -INFINITY : -3.0e38f;
+        for (uint32_t i = 0; i < SELT_NV; i++) lg[i] = rest;
+        for (uint32_t i = 0; i < ng; i++) lg[ids[i]] = vals[i];
+        selt_hdr h;
+        const int pmode = prod ? 4 : (int)selt_ri(4);
+        if (!selt_build(&h, P, c, lg, ids, vals, ng, finite_all, pmode)) continue;
+        if (!prod && selt_u() < 0.35) selt_corrupt(&h, P, c, lg, (int)selt_ri(13));
+        const uint64_t seed = selt_r64() | 1u;
+        uint64_t r_ref = seed, r_fast = seed;
+        int t_ref = -1, t_fast = -1;
+        const int p_ref = ds4_test_selector_consume(&h, P, c, lg, &r_ref, &t_ref);
+        const uint32_t ncap = h.cap < SELT_SUPB ? h.cap : SELT_SUPB;
+        if (p_ref <= 2) memcpy(ref_sum, ds4_test_selector_summary(), ncap * sizeof(*ref_sum));
+        const int p_fast = ds4_test_selector_consume_fast(&h, P, c, lg, &r_fast, &t_fast);
+        bool same = p_ref == p_fast && r_ref == r_fast && (p_ref != 0 || t_ref == t_fast);
+        if (same && p_ref <= 2) same = !memcmp(ref_sum, ds4_test_selector_summary(), ncap * sizeof(*ref_sum));
+        cases++;
+        if (p_ref >= 0 && p_ref <= 5) paths[p_ref]++;
+        if (!same) {
+            if (differ < 5) fprintf(stderr, "selector case %u: reference path %d token %d, fast path %d token %d\n",
+                                    it, p_ref, t_ref, p_fast, t_fast);
+            differ++;
+        }
+        if (prod && p_ref == 0) {   /* a decided step must be the CPU sampler's */
+            uint64_t r_cpu = seed;
+            const int t_cpu = ds4_test_sample_logits(lg, SELT_NV, 1.0f, 0, 0.95f, 0.0f, &r_cpu, scratch);
+            prod_cases++;
+            if (t_cpu != t_ref || r_cpu != r_ref) {
+                if (prod_differ < 5) fprintf(stderr, "selector case %u: decided token %d, CPU sampler %d\n", it, t_ref, t_cpu);
+                prod_differ++;
+            }
+        }
+    }
+    printf("selector consumer: %llu cases (decided %llu, mass short %llu, ambiguous %llu, overflow %llu, invalid %llu,"
+           " zero finite %llu), %llu fast/reference differences; %llu decided real-partial cases, %llu differ from the"
+           " CPU sampler\n",
+           (unsigned long long)cases, (unsigned long long)paths[0], (unsigned long long)paths[1],
+           (unsigned long long)paths[2], (unsigned long long)paths[3], (unsigned long long)paths[4],
+           (unsigned long long)paths[5], (unsigned long long)differ, (unsigned long long)prod_cases,
+           (unsigned long long)prod_differ);
+    CHECK(differ == 0, "selector fast consumer differs from the reference in %llu cases", (unsigned long long)differ);
+    CHECK(prod_differ == 0, "selector decided %llu steps unlike the CPU sampler", (unsigned long long)prod_differ);
+    CHECK(paths[0] > 0 && paths[1] > 0 && paths[2] > 0 && paths[3] > 0 && paths[4] > 0 && paths[5] > 0 && prod_cases > 0,
+          "selector test did not reach every consumer path");
+    free(lg);
+    free(scratch);
+    free(P);
+    free(c);
+    free(ref_sum);
+}
+
 static void check_speculative_distribution(void) {
     const float filter_logits[] = {
         logf(0.50f), logf(0.30f), logf(0.15f), logf(0.05f),
@@ -400,6 +609,7 @@ static void check_speculative_distribution(void) {
 int main(void) {
     check_speculative_distribution();
     check_scan_equivalence();
+    check_selector_consumer();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));

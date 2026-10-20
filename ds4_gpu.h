@@ -54,6 +54,15 @@ void ds4_gpu_autorelease_pop(void *pool);
  * their own (requested at once, added to the queue); ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
 int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
+/* The V4.1 GPU top-p selector (Metal): init compiles metal/sampler_selector.metal once (0: unavailable); encode
+ * appends its passes over a logits tensor to the open batch; out(0) header, out(1) block mass partials, out(2)
+ * slots, valid after that batch completed; reset clears H1 after a failed step. */
+int ds4_gpu_selector_init(void);
+int ds4_gpu_selector_ready(void);
+int ds4_gpu_selector_encode(const ds4_gpu_tensor *logits);
+const void *ds4_gpu_selector_out(int which);
+void ds4_gpu_selector_reset(void);
+uint64_t ds4_gpu_selector_encoded_count(void);
 #endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
