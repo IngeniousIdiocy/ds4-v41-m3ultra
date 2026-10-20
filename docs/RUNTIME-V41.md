@@ -34,7 +34,7 @@ reasoning spans.
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `-c N` | — | Allocated context. Think Max needs `-c 393216` or more. |
+| `-c N` | — | Allocated context. V4.1 keeps Think Max at any context; V4 models drop it to high below `-c 393216`. |
 | `--prefill-chunk N` | 4096 | Prefill chunk; V4.1 clamps at 8192. |
 | `--mtp-model FILE --dspark` | off | Load the DSpark drafter and its admission controller. |
 | `--mtp-exact-sampling` | off | Keep the sampled distribution exact under drafting. |
