@@ -53,6 +53,9 @@ void ds4_gpu_autorelease_pop(void *pool);
 /* Weights built at load (Metal): allocated with the model views' storage options, and kept in a residency set of
  * their own (requested at once, added to the queue); ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
+/* Metal: model views and weights built at load skip hazard tracking unless DS4_METAL_MODEL_TRACKED is set (call
+ * before the model is mapped). */
+void ds4_gpu_set_model_untracked_default(int on);
 int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
 /* The V4.1 GPU top-p selector (Metal): init compiles metal/sampler_selector.metal once (0: unavailable); encode
  * appends its passes over a logits tensor to the open batch; out(0) header, out(1) block mass partials, out(2)

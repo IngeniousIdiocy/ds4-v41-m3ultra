@@ -1647,9 +1647,16 @@ static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
            strcmp(label, "ds4_attention_output_group_ids") == 0;
 }
 
+/* Set by the engine for DeepSeek V4.1 before the model is mapped: the model views and the weights built at load are
+ * read-only to the GPU, so they skip hazard tracking by default, as every V4.1 release measurement and deployment ran
+ * them (DS4_METAL_MODEL_UNTRACKED=1). DS4_METAL_MODEL_TRACKED=1 (diagnostic) keeps tracking. */
+static int g_model_untracked_default;
+void ds4_gpu_set_model_untracked_default(int on) { g_model_untracked_default = on != 0; }
+
 static MTLResourceOptions ds4_gpu_model_resource_options(void) {
     MTLResourceOptions options = MTLResourceStorageModeShared;
-    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL) {
+    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL ||
+        (g_model_untracked_default && getenv("DS4_METAL_MODEL_TRACKED") == NULL)) {
         options |= MTLResourceHazardTrackingModeUntracked;
     }
     return options;
