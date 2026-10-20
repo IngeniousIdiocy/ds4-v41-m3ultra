@@ -3707,6 +3707,73 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rope_tab_static(
         nullptr, nullptr, nullptr, nullptr, nullptr, rope_tab);
 }
 
+/* kernel_dsv4_attn_out_low_q8_0_f32 (no input rounding or rotation) with every args value it reads or forwards
+ * replaced by the literal of ds4.c's (4096, 1024, 8) call, as the static table low (mechanism credit Ivan Fioravanti,
+ * upstream 0c2a0d5); args stays bound but unread. The low projection of heads the decode reduce already rounded and
+ * inverse-rotated (ds4_gpu_dsv41_attention_low_plain). */
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_static(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int32_t  S_nei0 = 8;
+    constexpr int32_t  S_ne00 = 4096;
+    constexpr int32_t  S_ne01 = 1024;
+    constexpr uint64_t S_nb00 = 34;
+    constexpr uint64_t S_nb01 = 4352;
+    constexpr uint64_t S_nb02 = 1024ull*4352ull;
+    constexpr int32_t  S_ne10 = 4096;
+    constexpr int32_t  S_ne11 = 8;
+    constexpr uint64_t S_nb10 = 4;
+    constexpr uint64_t S_nb11 = 16384;
+    constexpr uint64_t S_nb12 = 8ull*16384ull;
+    constexpr int32_t  S_ne0  = 1024;
+    constexpr int32_t  S_ne1  = 8;
+    constexpr int32_t  S_nr0  = 2;
+    (void)args;
+
+    const int iid1 = tgpig.z/S_nei0;
+    const int idx  = tgpig.z%S_nei0;
+
+    tgpig.z = 0;
+
+    const int64_t i11 = idx % S_ne11;
+    const int64_t i12 = iid1;
+
+    device const char * src0_cur = src0s + idx*S_nb02;
+    device const char * src1_cur = src1  + i11*S_nb11 + i12*S_nb12;
+    device       char * dst_cur  = dst   + (idx*S_ne0 + i12*S_ne1*S_ne0)*sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        /*.ne00 =*/ S_ne00,
+        /*.ne01 =*/ S_ne01,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ S_nb00,
+        /*.nb01 =*/ S_nb01,
+        /*.nb02 =*/ S_nb02,
+        /*.nb03 =*/ S_nb02,
+        /*.ne10 =*/ S_ne10,
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ S_nb10,
+        /*.nb11 =*/ S_nb11,
+        /*.nb12 =*/ S_nb12,
+        /*.nb13 =*/ S_nb12,
+        /*.ne0  =*/ S_ne0,
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ S_nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+        args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
+}
+
 /* The per-step RoPE coefficient table (512 B): entries 0..31 the raw frequencies, 32..63 the compressed ones,
  * float2(cos, sin) of theta = float(start) * frequency, exactly the low kernels' expression; the consumer keeps the
  * inverse sign. One dispatch of 64 threads per decode step. */

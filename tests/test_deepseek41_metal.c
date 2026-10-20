@@ -663,8 +663,55 @@ static int check_rope_tab(void) {
     free(h); free(model);
     return 1;
 }
+
+/* Heads transformed once: the decode reduce with the inverse RoPE and bf16 rounding applied, then the plain low,
+ * gives the table low's bits on the plain reduce's heads; raw and compressed, positions up to the 1M limit. */
+static int check_heads_once(void) {
+    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, NROWS = 64, DV = 512, NWG = 32 };
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint64_t a_bytes = (uint64_t)GROUPS * RANK * GROUP / 32 * sizeof(q8_block);
+    const uint64_t hb = (uint64_t)NROWS * DV * 4, lb = (uint64_t)GROUPS * RANK * 4;
+    const uint64_t tn = (uint64_t)NROWS * (DV * NWG + 2u * NWG);
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), a_bytes) == 0);
+    q8_block *w = model;
+    for (uint64_t i = 0; i < a_bytes / sizeof(*w); i++) {
+        w[i].d = (uint16_t)(0x1c00 + (int)(random_value() * 8192) % 1024);
+        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 127);
+    }
+    float *t = malloc(tn * 4);
+    CHECK(t);
+    for (uint64_t i = 0; i < (uint64_t)NROWS * DV * NWG; i++) t[i] = random_value();
+    for (uint64_t i = (uint64_t)NROWS * DV * NWG; i < tn; i += 2) {
+        t[i] = fabsf(random_value()) + 0.25f;   /* S */
+        t[i + 1] = random_value();              /* M */
+    }
+    ds4_gpu_tensor *tmp = upload(t, tn * 4), *plain = upload(NULL, hb), *once = upload(NULL, hb);
+    ds4_gpu_tensor *a = upload(NULL, lb), *b = upload(NULL, lb), *tab = upload(NULL, 512);
+    CHECK(tmp && plain && once && a && b && tab && ds4_gpu_set_model_map(model, a_bytes));
+    const uint32_t positions[] = {0, 1, 7, 4095, 65535, 300000, 1048575};
+    for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) {
+        for (int compressed = 0; compressed < 2; compressed++) {
+            const uint32_t pos = positions[pi];
+            CHECK(ds4_gpu_begin_commands() && ds4_gpu_dsv41_rope_coeff_table(tab, pos));
+            CHECK(ds4_gpu_dsv41_flash_attn_reduce_check(plain, tmp, NROWS, 0, NULL, false));
+            CHECK(ds4_gpu_dsv41_flash_attn_reduce_check(once, tmp, NROWS, 1, tab, compressed));
+            CHECK(ds4_gpu_dsv41_attention_low_ex(a, model, a_bytes, 0, GROUP, RANK, GROUPS, plain, pos, compressed, tab));
+            CHECK(ds4_gpu_dsv41_attention_low_plain(b, model, a_bytes, 0, GROUP, RANK, GROUPS, once));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+            CHECK(!memcmp(ds4_gpu_tensor_contents(a), ds4_gpu_tensor_contents(b), lb));
+        }
+        fprintf(stderr, "V4.1 heads once pos=%u: transformed reduce + plain low == table low, raw and compressed PASS\n",
+                positions[pi]);
+    }
+    ds4_gpu_tensor_free(tmp); ds4_gpu_tensor_free(plain); ds4_gpu_tensor_free(once);
+    ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(tab);
+    free(t); free(model);
+    return 1;
+}
 #else
 static int check_rope_tab(void) { return 1; }
+static int check_heads_once(void) { return 1; }
 #endif
 
 static int check_attention_output(bool large) {
@@ -1823,6 +1870,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--heads-once")) {
+        const int ok = ds4_gpu_init() && check_heads_once();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--decode-topk")) {
         const int ok = ds4_gpu_init() && check_decode_topk();
         ds4_gpu_cleanup();
@@ -1848,7 +1900,7 @@ int main(int argc, char **argv) {
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() &&
              check_index_candidates() && check_engram_decode() &&
-             check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_decode_topk() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_attention_output(false) &&
+             check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_decode_topk() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;

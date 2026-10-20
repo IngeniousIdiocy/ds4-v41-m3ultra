@@ -1158,3 +1158,75 @@ kernel void kernel_dsv41_markov_post_part(
         part_idx[tgpig] = bi;
     }
 }
+
+/* The split-K decode reduce of flash_attn.metal (the same body, line for line) whose final writer stores the
+ * attention-output low projection's prepared input instead of the raw head: every coordinate as
+ * ds4_bf16_round(v*S), and the rotary tail (the last 64 of each 512-wide head) inverse-rotated with the step's
+ * coefficient table exactly as kernel_mul_mv_q8_0_f32_rope_impl<.., ROUND_IN, ROPE_IN, .., ROPE_TAB> does it on its
+ * rounded inputs (s = -sin, the same FMA order, BF16 after each FMA). rope_tab is the table already offset to the
+ * layer's mode (raw entries 0..31, compressed 32..63). The plain low projection (no round, no rope) then reads these
+ * words; ds4_bf16_round is idempotent, so its K walk sees exactly the bits the table consumer computes. */
+static __attribute__((noinline)) void ds4_dsv41_flash_attn_vec_reduce_heads_row(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        device const float2 * rope_tab,
+        uint   tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        short  NWG_,
+        short  DV_) {
+    const uint64_t rid = tgpig;
+
+    const short iwg = tiisg;
+
+    device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV_*NWG_;
+
+    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
+    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+
+    const float m  = simd_max(M);
+    const float ms = exp(M - m);
+
+    S = simd_sum(S*ms);
+    S = S == 0.0f ? 0.0f : 1.0f/S;
+
+    const short DV4 = DV_/4;
+
+    device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG_;
+    device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+
+    for (short i = sgitg; i < DV4; i += NWG_) {
+        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+
+        if (iwg == 0) {
+            const float4 t = v*S;
+            float4 r = float4(ds4_bf16_round(t.x), ds4_bf16_round(t.y), ds4_bf16_round(t.z), ds4_bf16_round(t.w));
+            if (i >= DV4 - 16) {
+                const short p0 = 2*(i - (DV4 - 16));
+                const float2 c0 = rope_tab[p0];
+                const float2 c1 = rope_tab[p0 + 1];
+                const float s0 = -c0.y, s1 = -c1.y;
+                const float re0 = r.x, im0 = r.y, re1 = r.z, im1 = r.w;
+                r.x = ds4_bf16_round(fma(re0, c0.x, -(im0 * s0)));
+                r.y = ds4_bf16_round(fma(im0, c0.x, re0 * s0));
+                r.z = ds4_bf16_round(fma(re1, c1.x, -(im1 * s1)));
+                r.w = ds4_bf16_round(fma(im1, c1.x, re1 * s1));
+            }
+            dst4[i] = r;
+        }
+    }
+}
+
+kernel void kernel_dsv41_flash_attn_vec_reduce_heads(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        device const float2 * rope_tab,
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_dsv41_flash_attn_vec_reduce_heads_row(args, htmp, dst, rope_tab, tgpig, tiisg, sgitg,
+                                              (short)FC_flash_attn_ext_vec_reduce_NWG,
+                                              (short)FC_flash_attn_ext_vec_reduce_DV);
+}
