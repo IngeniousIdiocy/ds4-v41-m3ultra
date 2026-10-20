@@ -1424,9 +1424,71 @@ static int check_index_candidates(void) {
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
     return 1;
 }
+
+/* The V4.1 decode Engram projection over E4M3 codes and E8M0 32x32 scales:
+ * the value-table decode and the F16-bit-pattern decode give the same bits,
+ * and for scales >= 112 (every weight exact in F16) both give the F16
+ * projection's bits. Scales 109..111 put some weights below F16's range, so
+ * there only the two FP8 decodes are compared. */
+static int check_engram_decode(void) {
+    enum { IN = 6144, OUT = 256 };
+    const size_t f16_bytes = (size_t)IN * OUT * 2, code_bytes = (size_t)IN * OUT;
+    const size_t scale_bytes = (size_t)(IN / 32) * (OUT / 32), page = (size_t)getpagesize();
+    const size_t code_off = (f16_bytes + page - 1) / page * page;
+    const size_t scale_off = code_off + (code_bytes + page - 1) / page * page;
+    const size_t map_bytes = scale_off + (scale_bytes + page - 1) / page * page;
+    unsigned char *map = NULL;
+    CHECK(posix_memalign((void **)&map, page, map_bytes) == 0);
+    memset(map, 0, map_bytes);
+    _Float16 *w16 = (_Float16 *)map;
+    unsigned char *codes = map + code_off, *scales = map + scale_off;
+    CHECK(ds4_gpu_set_model_map(map, map_bytes));
+    float x[IN];
+    for (int i = 0; i < IN; i++) x[i] = random_value() / 4;
+    ds4_gpu_tensor *xt = upload(x, sizeof(x));
+    ds4_gpu_tensor *o16 = upload(NULL, OUT * 4), *otab = upload(NULL, OUT * 4), *oshift = upload(NULL, OUT * 4);
+    CHECK(xt && o16 && otab && oshift);
+    const float *r16 = ds4_gpu_tensor_contents(o16), *rtab = ds4_gpu_tensor_contents(otab);
+    const float *rshift = ds4_gpu_tensor_contents(oshift);
+    for (int pass = 0; pass < 4; pass++) {
+        const uint32_t e_lo = pass < 2 ? 112u : 109u, e_n = pass < 2 ? 8u : 11u;
+        for (size_t i = 0; i < scale_bytes; i++) { (void)random_value(); scales[i] = (unsigned char)(e_lo + seed % e_n); }
+        for (size_t i = 0; i < code_bytes; i++) {
+            (void)random_value();
+            unsigned char c = (unsigned char)(seed >> 3);
+            if ((c & 0x7f) == 0x7f) c ^= 1;   /* no NaN codes, as the sidecar audit requires */
+            if (pass & 1) c = (unsigned char)(c & 0x87);   /* subnormal and small codes */
+            codes[i] = c;
+        }
+        for (size_t r = 0; r < OUT; r++)
+            for (size_t k = 0; k < IN; k++) {
+                const unsigned char c = codes[r * IN + k], a = c & 0x7f;
+                const uint32_t ex = (a >> 3) & 15u, m = a & 7u;
+                float v = a == 0 ? 0.0f : ex == 0 ? ldexpf((float)m, -9) : ldexpf(1.0f + m / 8.0f, (int)ex - 7);
+                if (c & 0x80) v = -v;
+                v *= ldexpf(1.0f, (int)scales[(r / 32) * (IN / 32) + k / 32] - 127);
+                w16[r * IN + k] = (_Float16)v;
+            }
+        CHECK(ds4_gpu_begin_commands());
+        if (pass < 2) CHECK(ds4_gpu_dsv41_project_f16_bf16(o16, map, map_bytes, 0, IN, OUT, xt));
+        ds4_gpu_set_engram_decode_shift(0);
+        CHECK(ds4_gpu_matmul_engram_fp8_tensor(otab, map, map_bytes, code_off, scale_off, IN, OUT, xt));
+        ds4_gpu_set_engram_decode_shift(1);
+        CHECK(ds4_gpu_matmul_engram_fp8_tensor(oshift, map, map_bytes, code_off, scale_off, IN, OUT, xt));
+        CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+        CHECK(!memcmp(rtab, rshift, OUT * sizeof(float)));
+        if (pass < 2) CHECK(!memcmp(r16, rtab, OUT * sizeof(float)));
+        fprintf(stderr, "V4.1 Engram FP8 decode pass %d (E8M0 %u..%u%s): table == F16 pattern%s PASS\n",
+                pass, e_lo, e_lo + e_n - 1, pass & 1 ? ", small codes" : "", pass < 2 ? " == F16 projection" : "");
+    }
+    ds4_gpu_set_engram_decode_shift(0);
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o16); ds4_gpu_tensor_free(otab); ds4_gpu_tensor_free(oshift);
+    return 1;
+}
 #else
 static int check_index_score_wide(void) { return 1; }
 static int check_index_candidates(void) { return 1; }
+static int check_engram_decode(void) { return 1; }
 #endif
 
 static int check_compact_carry(void) {
@@ -1644,6 +1706,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--engram-decode")) {
+        const int ok = ds4_gpu_init() && check_engram_decode();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-topk")) {
         const int ok = ds4_gpu_init() && check_causal_topk();
         ds4_gpu_cleanup();
@@ -1668,7 +1735,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() &&
-             check_index_candidates() &&
+             check_index_candidates() && check_engram_decode() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_indexer_all() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();

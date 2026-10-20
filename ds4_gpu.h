@@ -1117,6 +1117,9 @@ int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map
 int ds4_gpu_matmul_engram_fp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                      uint64_t code_offset, uint64_t scale_offset,
                                      uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
+/* Its weight decode: 0 the value table (default), 1 the F16 bit pattern
+ * (DS4_V41_ENGRAM_DECODE=shift). For tests; production reads the variable. */
+void ds4_gpu_set_engram_decode_shift(int on);
 
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
