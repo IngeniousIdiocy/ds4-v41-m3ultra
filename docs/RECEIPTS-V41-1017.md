@@ -128,7 +128,7 @@ Other cells:
   was refused ("the numerics canary has not completed yet") and prefilled
   cold, in 14.580 s. P's cache came on 14.35 to 29.06 s after launch, with
   canary `e8c0517e0b2d6638`. fbd9ff30 replaces that policy. Requests now
-  queue behind a one-shot canary; that change is not measured yet.
+  queue behind a one-shot canary, which W9 measured (below).
 - **Load** (launch to ready, page cache warm): U 2.30 [2.28–2.31] s, P 2.29
   [2.28–2.30] s.
 - **Memory:**
@@ -182,9 +182,10 @@ Every restored answer's text and token count equalled the cold one:
 - An entry was refused, with nothing restored, when its payload byte was
   flipped, its canary bytes were changed, or its identity bytes were changed.
 - Its one-shot canary cost 7.28 s at startup.
-- Those entries carry that tree's identity (`028036d5c520a07d`) and canary
-  (`772938c1f52ab041`), so this branch, whose identity differs, does not
-  index them.
+- Those entries carry identity `028036d5c520a07d` and canary
+  `772938c1f52ab041`. This branch at aeab950a reports the same pair (W9),
+  so it indexes them. An earlier version of this page said the branch's
+  identity differs; W9 showed that it does not.
 
 Window W7 (P27) ran on this branch at 2357478c, with the stepped canary
 that ran between requests (04d4db75):
@@ -194,7 +195,7 @@ that ran between requests (04d4db75):
   51 s after start; idle, after 12 s. No entry was stored or loaded early.
   A request sent while the canary was pending (8,238 tokens) was prefilled
   again rather than restored. That is the gap fbd9ff30 closes: requests now
-  queue behind a one-shot canary, which is still to be measured. Entries
+  queue behind a one-shot canary, which W9 measured (below). Entries
   under `e8c0517e` are refused by the new canary and evicted normally.
 - **ds4-agent:** store, hit, then a payload flip and an identity flip. Each
   was refused and re-saved, and the identity refusal was logged. ds4-agent
@@ -206,6 +207,66 @@ that ran between requests (04d4db75):
   load, extension and a new process.
 
 These are checkpoint checks, not whole-session qualification.
+
+## DSpark, serial reasoning and restart behaviour (W9)
+
+Trees:
+
+- P: this branch at `aeab950a7b28c56bacbab373ebc9848cc0b22b8b`, server
+  binary sha256 `65c8eb01…`. Cell k6 used the same tree's test build that
+  can force the canary to fail (`ds4-server-testhooks`, `114f4a8a…`).
+- Production: our production server build of the September 18 stack with
+  later serving changes (`872e03cf`, not published), binary `59876783…`.
+- For the test cells only: Ivan Fioravanti's main at `a74d62a5` and this
+  branch at `04e85391`.
+
+Setup:
+
+- Both servers used the same MXFP4 GGUF and drafter, and the README's Run
+  flags: 393K context, prefill chunk 8192, `--dspark
+  --mtp-exact-sampling`, a 98,304 MiB disk KV cache with a 4,096-token
+  continued interval, `--utility-ctx 32768` and `--serial-reasoning`.
+- The decode rates are from the server log. DSpark counters came from
+  `DS4_DSPARK_STATS`.
+- The window ran every cell once, in order. Its verdict was 10 PASS, 1 FAIL
+  (k4).
+
+DSpark and reasoning:
+
+| Cell | Result |
+| --- | --- |
+| d2 | P, a 36-token code prompt, 600-token answers, three runs: 57.51 / 57.70 / 57.73 tok/s (median 57.70). 95.40% of drafted tokens accepted; 1.703 accepted per cycle. |
+| d3 | Production, the same requests: 52.54 / 52.73 / 52.61 (median 52.61); 89.63% accepted; 1.650 per cycle. P/production ×1.097. All six answers were sane code. |
+| d4 | P with reasoning on: the reasoning span (context 62 to 2,112) ran 0 DSpark cycles; the answer after it ran 139. 45.71 tok/s over all 2,902 tokens. |
+| d5 | An 8K follow-up turn from the disk cache with DSpark on: 8,137 of 8,632 tokens cached, TTFT 2.134 s against 15.277 s cold. |
+| d6 | `ds4_test --dspark-verify-depth` on Ivan's main fails on the V4-only prefix-capture assertion, as on this branch before 764ff1cb. |
+| d7 | The same test passes at 04e85391, which skips that check on V4.1. |
+
+Restart and the disk cache (each restart reuses the same cache directory):
+
+| Cell | Result |
+| --- | --- |
+| k0 | Cold: a 303,912-token conversation, TTFT 391.612 s; an 8K one, 16.513 s. Identity `028036d5c520a07d`, canary `772938c1f52ab041`; the canary took 7.15 s idle, and the cache came on 13.76 s after launch. |
+| k1 | 8K resend right after a restart: TTFT 9.226 s, 8,105 of 8,600 cached. A fresh 11-token prompt at the same point: 7.361 s. |
+| k2 | 300K resend right after a restart: 303,944 of 304,463 cached, prompt done 3.205 s, TTFT 11.172 s. |
+| k3 | 300K, 8K and an 11-token request sent together during the canary: answered in that order at 10.876 / 14.748 / 15.506 s. |
+| k4 | **FAIL.** SIGTERM 2 s after listen, with the 300K request queued. The server exited 0 in 7.25 s, but the queued request's prefill was interrupted, its 303,944-token entry was deleted (8 entries to 7), and the client saw "Remote end closed connection without response". |
+| k5 | Next restart: the 300K conversation restored from its continued checkpoint, 303,104 of 304,472 cached, prompt done 6.149 s, TTFT 14.078 s. |
+| k6 | Canary forced to fail: "KV disk cache stays off", no stores, entries unchanged; an 8K request prefilled cold, TTFT 20.231 s. |
+| k7 | The cache plus entries seeded from the W8 build (stepped canary `e8c0517e`), relaunched with a 1,024 MiB budget: 18 entries evicted as disk-cache-full, 19 to 1 (60.8 MiB left), including all 11 seeded entries. |
+
+k4 had two causes, and both predate the V4.1 work:
+
+- A failed prefill from a disk entry always deleted the entry, including a
+  prefill that shutdown or a client disconnect had interrupted.
+- Once shutdown was requested, every reply write failed, so the drain could
+  not answer anyone.
+
+e2136edd fixes both. An interrupted prefill keeps the entry and logs "kv cache
+kept reason=prefill-interrupted". During shutdown, an interrupted prefill and
+a job taken off the queue are both answered 503 "server is shutting down".
+The server unit test `test_shutdown_prefill_keeps_kv_and_answers` covers this
+(`ds4_test --server`); the cell itself has not been re-run in a window.
 
 ## Public 1017 weights: download and header check
 

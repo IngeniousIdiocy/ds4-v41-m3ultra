@@ -128,18 +128,60 @@ original checkpoint load with `--v41-sidecar FILE`.
 
 ### Run
 
+The recommended serving launch, from the checkout, with the paths that
+Prepare writes:
+
 ```
 make
-./ds4-server -m DeepSeek-V4.1-Flash-MXFP4.gguf --metal -c 393216 --prefill-chunk 8192 \
-    --mtp-model DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling
+./ds4-server -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --metal \
+    --host 127.0.0.1 --port 8195 -c 393216 --prefill-chunk 8192 \
+    --mtp-model gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling \
+    --kv-disk-dir kvcache --kv-disk-space-mb 98304 \
+    --kv-cache-cold-max-tokens 393216 --kv-cache-continued-interval-tokens 4096 \
+    --default-top-p 0.95 --default-min-p 0 \
+    --utility-ctx 32768 --serial-reasoning
 ```
 
-DSpark (`--mtp-model ... --dspark`) was validated on the 0917 release. On this
-composed stack, the DSpark check is still pending.
+- The server listens on 127.0.0.1 only. Pass `--host 0.0.0.0` (or an
+  interface address) to serve other machines; it has no authentication.
+- `--kv-disk-dir` keeps prompt checkpoints on disk (created if missing),
+  within the `--kv-disk-space-mb` budget (96 GiB here). A 300K-token
+  checkpoint is about 1.8 GiB. Requests
+  that resume a saved prefix, including after a restart, skip its prefill.
+- Right after start the server runs a one-shot numerics canary (about 7 s);
+  requests sent in that time wait for it, then use the cache.
+- `--serial-reasoning` decodes reasoning one token at a time and drafts
+  answers and tool calls with DSpark. Without it, DSpark also drafts
+  reasoning.
+
+DSpark on this stack (window W9, this branch at aeab950a with the launch
+above, a short code request answered in 600 tokens, three runs): 57.70 tok/s
+median by the server log, against 52.61 on our production build of the
+September 18 stack (×1.097). 95.4% of drafted tokens were accepted, against
+89.6%. With `--serial-reasoning`, a 2,050-token reasoning span ran no DSpark
+cycles and the answer that followed was drafted.
 
 [RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every option: the server policy
 that Project Trench uses, the disk KV cache, and the diagnostic switches. No
 environment variable is needed: b13 above was a plain launch.
+
+### Test
+
+```
+make ds4_test tests/test_deepseek41_metal
+./ds4_test --server                       # server unit tests, no model
+./tests/test_deepseek41_metal             # V4.1 Metal kernels, no model
+DS4_TEST_MODEL=gguf/DeepSeek-V4.1-Flash-MXFP4.gguf ./ds4_test
+DS4_TEST_MODEL=gguf/DeepSeek-V4.1-Flash-MXFP4.gguf \
+    DS4_TEST_DSPARK=gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf ./ds4_test --dspark-verify-depth
+```
+
+`./ds4_test --help` lists the tests. Some are skipped on V4.1 by design:
+- `--logprob-vectors` and `--local-golden-vectors` default to the
+  DeepSeek V4 Flash 0731 fixtures, which are invalid for another model
+  ([tests/test-vectors/README.md](tests/test-vectors/README.md));
+- `--dspark-verify-depth` skips its V4-only prefix-capture check, since V4.1
+  verifies through its own path.
 
 ### DwarfStar main reference
 
@@ -185,12 +227,45 @@ Scope and caveats:
 - P's binary predates the queued canary. An 8K resend right after a
   restart, before its canary finished, was refused by the cache and
   prefilled cold: 14.580 s against 2.485 s after cache-on. Requests now wait
-  for the canary instead ([RUNTIME-V41.md](docs/RUNTIME-V41.md)). That
-  change has not been measured in a window yet.
+  for the canary instead ([RUNTIME-V41.md](docs/RUNTIME-V41.md)). Window W9
+  measured that; see "Restart and the disk cache" below.
 
 The receipts give the ranges, answer lengths and the corrections to the
 window's first summary. Source: W8's summary
 (`ux-compare/runs/w8-a1/summary.txt`, not published).
+
+### Restart and the disk cache
+
+Window W9 ran this branch at aeab950a with the launch under Run, restarting
+the server on the same cache directory:
+
+- **300K restore.** A 303,912-token conversation took 391.6 s to first
+  token cold. Sent again right after a restart, it was restored from its
+  1.8 GiB checkpoint: 11.17 s to first token, including the canary.
+- **The canary's cost.** In the first seconds after a restart, every
+  request waits for the one-shot canary (7.15 s). An 8K resend took 9.23 s
+  to first token and a fresh 11-token prompt 7.36 s. Three requests sent
+  together during the canary (300K, 8K, short) were answered in that
+  order, at 10.9, 14.7 and 15.5 s.
+- **Canary failure.** With the canary forced to fail (a test build), the
+  cache stayed off and an 8K request prefilled cold (20.2 s).
+- **Old entries.** Entries from earlier builds' canary were refused and
+  evicted under the disk budget.
+- **DSpark follow-up.** An 8K follow-up turn resumed from the cache in
+  2.13 s, against 15.28 s cold.
+
+One cell failed. A SIGTERM 2 s after listen, with the 300K request queued,
+deleted that request's checkpoint, and the client saw a dropped
+connection. Both causes predate the V4.1 work: a failed prefill from a
+checkpoint always deleted it, even when shutdown had interrupted the
+prefill, and replies were dropped once shutdown began. e2136edd fixes both.
+An interrupted prefill keeps the checkpoint, and requests still queued at
+shutdown get a 503 "server is shutting down". A server unit test covers the
+fix; it has not been re-run in a window. In the same window, the next
+restart restored the conversation from its continued checkpoint at 303,104
+tokens (14.08 s to first token).
+
+The receipts have each cell.
 
 ## DeepSeek V4.1 Flash on M3 Ultra — September 18 update
 

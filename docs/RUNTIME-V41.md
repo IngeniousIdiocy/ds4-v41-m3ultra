@@ -11,16 +11,17 @@ them, and the defaults they turn off are the configuration that was measured
 Run from the repository checkout, or pass `--chdir` (see section 4):
 
 ```
-./ds4-server -m DeepSeek-V4.1-Flash-MXFP4.gguf --metal \
+./ds4-server -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --metal \
     --host 127.0.0.1 --port 8195 -c 393216 --prefill-chunk 8192 \
-    --mtp-model DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling \
+    --mtp-model gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling \
     --kv-disk-dir /path/to/kvcache --kv-disk-space-mb 98304 \
     --kv-cache-cold-max-tokens 393216 --kv-cache-continued-interval-tokens 4096 \
     --default-top-p 0.95 --default-min-p 0 \
     --utility-ctx 32768 --serial-reasoning
 ```
 
-This is the production launch on the M3 Ultra, minus local paths. Nothing in
+This is the production launch on the M3 Ultra, with the model paths that
+the README's Prepare step writes. Nothing in
 the environment is required.
 
 Project Trench needs `--serial-reasoning`. Its earlier server kept V4.1
