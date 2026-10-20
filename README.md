@@ -57,9 +57,8 @@ a01 rows did not run.
 Window w1-a2 recorded both metrics for the same runs. At 8K, greedy 128, Ivan's
 steady metric gave 40.130 and ours 40.087.
 
-In that window, the same `ds4-bench` sweep run on Ivan Fioravanti's main
-branch (a74d62a5) measured 38.08 tok/s at 2K and 37.22 at 8K on his steady
-metric (window w1-a2).
+Comparison against Ivan Fioravanti's performance branch
+(`v41-tp-decode-engram-warm`, 8d6a39f): pending window a8.
 
 Cold prefill at 64K was 889 tok/s, against 841 without Ivan's indexer MMA
 (+5.7%, bit-exact; window w1-a2). That was measured on the campaign tree with
@@ -91,9 +90,35 @@ The 8K row is a composed run of this branch. A composed run at depth (64K and
 beyond) on this branch is still pending. Windows, arms and per-run numbers are
 in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
 
-### Compared with DwarfStar main
+### Prepare the model
 
-Window W8 served the same requests from DwarfStar main and from this branch:
+```
+<model preparation command — to be filled in by the weights work>
+```
+
+The engine needs only the MXFP4 GGUF. It builds the narrow decode copies
+(BF16 router, E4M3 Engram and indexer q_b) at load. Optional sidecars from the
+original checkpoint load with `--v41-sidecar FILE`.
+
+### Run
+
+```
+make
+./ds4-server -m DeepSeek-V4.1-Flash-MXFP4.gguf --metal -c 393216 --prefill-chunk 8192 \
+    --mtp-model DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling
+```
+
+DSpark (`--mtp-model ... --dspark`) was validated on the 0917 release. On this
+composed stack, the DSpark check is still pending.
+
+[RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every option: the server policy
+that Project Trench uses, the disk KV cache, and the diagnostic switches. No
+environment variable is needed: b13 above was a plain launch.
+
+### DwarfStar main reference
+
+For reference, window W8 served the same requests from DwarfStar main and
+from this branch:
 
 - U: antirez/ds4 main `5379c1c9ac315f1540371b06a3db88491d4059ff`.
 - P: this branch at `0a72af29a080a136d12fe816d2da4f0c64582838`, with
@@ -104,16 +129,17 @@ fresh disk-cache directory per server lifetime) and no DSpark. Each cell
 was run three times, in the order U P P U U P; the numbers are medians.
 Decode is the server log's rate over 512-token answers.
 
-| Context | U decode | P decode | P/U | U cold TTFT | P cold TTFT | P/U |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2K | 19.56 | 41.32 | ×2.11 | 6.275 s | 5.110 s | 0.81 |
-| 8K | 19.84 | 40.78 | ×2.06 | 23.413 s | 15.300 s | 0.65 |
-| 32K | 19.14 | 40.43 | ×2.11 | 49.030 s | 41.576 s | 0.85 |
-| 64K | 18.64 | 40.21 | ×2.16 | 95.724 s | 79.477 s | 0.83 |
+| Context | U decode tok/s | P decode tok/s | U cold TTFT | P cold TTFT |
+| ---: | ---: | ---: | ---: | ---: |
+| 2K | 19.56 | 41.32 | 6.275 s | 5.110 s |
+| 8K | 19.84 | 40.78 | 23.413 s | 15.300 s |
+| 32K | 19.14 | 40.43 | 49.030 s | 41.576 s |
+| 64K | 18.64 | 40.21 | 95.724 s | 79.477 s |
 
 Other results from the same window:
 
-- **Reasoning decode** (thinking on, effort high): ×2.07 to ×2.16.
+- **Reasoning decode** (thinking on, effort high, server log): U 19.84 / 19.65 /
+  18.59 tok/s at 2K / 8K / 64K; P 41.41 / 40.77 / 40.22.
 - **Warm agent turn** (a 32K code conversation, next turn from the live
   cache): 2.389 s on U, 2.079 s on P.
 - **Restart, then resend** (restored from the disk cache):
@@ -139,31 +165,6 @@ Scope and caveats:
 The receipts give the ranges, answer lengths and the corrections to the
 window's first summary. Source: W8's summary
 (`ux-compare/runs/w8-a1/summary.txt`, not published).
-
-### Prepare the model
-
-```
-<model preparation command — to be filled in by the weights work>
-```
-
-The engine needs only the MXFP4 GGUF. It builds the narrow decode copies
-(BF16 router, E4M3 Engram and indexer q_b) at load. Optional sidecars from the
-original checkpoint load with `--v41-sidecar FILE`.
-
-### Run
-
-```
-make
-./ds4-server -m DeepSeek-V4.1-Flash-MXFP4.gguf --metal -c 393216 --prefill-chunk 8192 \
-    --mtp-model DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling
-```
-
-DSpark (`--mtp-model ... --dspark`) was validated on the 0917 release. On this
-composed stack, the DSpark check is still pending.
-
-[RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every option: the server policy
-that Project Trench uses, the disk KV cache, and the diagnostic switches. No
-environment variable is needed: b13 above was a plain launch.
 
 ## DeepSeek V4.1 Flash on M3 Ultra — September 18 update
 

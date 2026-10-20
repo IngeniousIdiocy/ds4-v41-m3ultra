@@ -63,7 +63,7 @@ single-group kernels section below.
 The depth rows of the README (64K, 131K, 300K) are still W5 on the
 state-depth tree. A composed depth run on this branch is pending.
 
-## Serving comparison with DwarfStar main (W8, P29)
+## DwarfStar main reference (W8, P29)
 
 Arms:
 
