@@ -10165,6 +10165,7 @@ struct server {
     int ctx_size;
     server_slot *utility_slot;   /* NULL unless --utility-ctx; non-batched only */
     int utility_ctx;
+    bool serial_reasoning;       /* --serial-reasoning: V4.1 reasoning never drafts */
     bool batched_mode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
@@ -13877,10 +13878,12 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        /* The alternative admission policy keeps reasoning serial. */
+        /* The alternative admission policy keeps reasoning serial;
+         * --serial-reasoning does so for every V4.1 reasoning span. */
         if (!s->batched_mode && !slot->utility &&
             !(thinking.inside &&
-              ds4_session_ds41_dspark_adaptive_stats(slot->session, NULL, NULL)) &&
+              ((s->serial_reasoning && ds4_engine_is_deepseek41(s->engine)) ||
+               ds4_session_ds41_dspark_adaptive_stats(slot->session, NULL, NULL))) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -15299,6 +15302,7 @@ typedef struct {
     int batched_sessions;
     int mixed_prefill_quantum;
     int utility_ctx;
+    bool serial_reasoning;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15556,6 +15560,8 @@ static server_config parse_options(int argc, char **argv) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--utility-ctx")) {
             c.utility_ctx = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--serial-reasoning")) {
+            c.serial_reasoning = true;
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -15837,6 +15843,7 @@ int main(int argc, char **argv) {
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
+    s.serial_reasoning = cfg.serial_reasoning;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
@@ -16144,6 +16151,9 @@ static void test_utility_request_parse(void) {
     TEST_ASSERT(parse_options(1, default_argv).utility_ctx == 0);
     char *utility_argv[] = {"ds4-server", "--utility-ctx", "32768"};
     TEST_ASSERT(parse_options(3, utility_argv).utility_ctx == 32768);
+    TEST_ASSERT(!parse_options(1, default_argv).serial_reasoning);
+    char *serial_argv[] = {"ds4-server", "--serial-reasoning"};
+    TEST_ASSERT(parse_options(2, serial_argv).serial_reasoning);
 
     /* A recognized key is type-checked; an unknown one would be skipped and
      * the parse would fail later on the missing messages instead. */
