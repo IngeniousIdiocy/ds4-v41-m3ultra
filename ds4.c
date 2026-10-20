@@ -42785,7 +42785,7 @@ static void ds41_step_prologue(ds41_gpu_graph *g, const ds4_model *m, const ds4_
      * prefill, verify, TP and streaming never encode it. */
     g->sel_gpu = queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() && !ds41_sampler_gpu_off();
     /* The Engram gate with one 256-thread group per stream on this decode step (the 32-lane kernel's bits); prefill,
-     * verify, TP, streaming and quality keep the 32-lane form. */
+     * TP, streaming and quality keep the 32-lane form (DSpark verify sets it for its own pass). */
     ds4_gpu_set_engram_add_tg(logits && g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
 #else
     (void)queued_head;
@@ -44288,6 +44288,10 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
     if (tp_block && !ds4_tp_batch_block_begin(g_tp_block_ctx, n, 2u * DS4_N_LAYER)) return false;
     g->tp_verify_block = tp_block;
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The 256-thread Engram gate gives the 32-lane kernel's bits, so verify takes it too (unmasked rows only). */
+    ds4_gpu_set_engram_add_tg(g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
+#endif
     bool ok = ds4_gpu_begin_commands() &&
         (!retain || ds4_gpu_tensor_copy(d->rewind_ring, 0, d->ring, 0, ds4_gpu_tensor_bytes(d->ring))) &&
         ds41_draft_slots(g, g->pos, 1, n, true) &&
@@ -44325,6 +44329,9 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
 #endif
     d->verify_rows = 0;
     ds4_gpu_dsv41_verify_rows(0);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_set_engram_add_tg(0);
+#endif
     if (!ok) { g->valid = false; return false; }
     return !logits_rows || ds4_gpu_tensor_read(d->rows_logits, 0, logits_rows,
                                                 (uint64_t)n * DS4_N_VOCAB * sizeof(float));
