@@ -3585,6 +3585,74 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rope(
         args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg, &rope);
 }
 
+/* kernel_dsv4_attn_out_low_q8_0_f32_rope with the inverse rope's (cos, sin) read from the step's coefficient table
+ * (kernel_dsv41_rope_coeff_table) instead of computed per lane: the same values, FMA order and BF16 rounding. */
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_rope_tab(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_rope & rope,
+        device const float2 * rope_tab,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int iid1 = tgpig.z/args.nei0;
+    const int idx  = tgpig.z%args.nei0;
+
+    tgpig.z = 0;
+
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+
+    device const char * src0_cur = src0s + idx*args.nb02;
+    device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
+    device       char * dst_cur  = dst   + (idx*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
+
+    ds4_metal_args_mul_mv args0 = {
+        /*.ne00 =*/ args.ne00,
+        /*.ne01 =*/ args.ne01,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ args.nb00,
+        /*.nb01 =*/ args.nb01,
+        /*.nb02 =*/ args.nb02,
+        /*.nb03 =*/ args.nb02,
+        /*.ne10 =*/ args.ne10,
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ args.nb10,
+        /*.nb11 =*/ args.nb11,
+        /*.nb12 =*/ args.nb12,
+        /*.nb13 =*/ args.nb12,
+        /*.ne0  =*/ args.ne0,
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ args.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, false, true, true, false, false, true>(
+        args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg, &rope,
+        nullptr, nullptr, nullptr, nullptr, nullptr, rope_tab);
+}
+
+/* The per-step RoPE coefficient table (512 B): entries 0..31 the raw frequencies, 32..63 the compressed ones,
+ * float2(cos, sin) of theta = float(start) * frequency, exactly the low kernels' expression; the consumer keeps the
+ * inverse sign. One dispatch of 64 threads per decode step. */
+kernel void kernel_dsv41_rope_coeff_table(
+        constant ds4_metal_args_mv_rope & raw,
+        constant ds4_metal_args_mv_rope & comp,
+        device float2 * tab,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= 64u) return;
+    constant ds4_metal_args_mv_rope * r = tid < 32u ? &raw : &comp;
+    const float theta = float(r->start) * r->frequencies[tid & 31u];
+    float c;
+    const float sn = precise::sincos(theta, c);
+    tab[tid] = float2(c, sn);
+}
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,

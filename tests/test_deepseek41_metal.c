@@ -616,6 +616,48 @@ static int check_sparse_gather(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+/* The decode attention low projection with the inverse rope: (cos, sin) from the step's coefficient table give the
+ * inline kernel's bits, raw and compressed frequencies, across positions up to the 1M context limit. */
+static int check_rope_tab(void) {
+    enum { GROUP = 4096, RANK = 1024, GROUPS = 8 };
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint64_t a_bytes = (uint64_t)GROUPS * RANK * GROUP / 32 * sizeof(q8_block);
+    const uint64_t hb = (uint64_t)GROUPS * GROUP * 4, lb = (uint64_t)GROUPS * RANK * 4;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), a_bytes) == 0);
+    q8_block *w = model;
+    for (uint64_t i = 0; i < a_bytes / sizeof(*w); i++) {
+        w[i].d = (uint16_t)(0x1c00 + (int)(random_value() * 8192) % 1024);   /* F16 scales around 2^-8 */
+        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 127);
+    }
+    float *h = malloc(hb);
+    CHECK(h);
+    for (uint64_t i = 0; i < hb / 4; i++) h[i] = random_value();
+    ds4_gpu_tensor *heads = upload(h, hb), *a = upload(NULL, lb), *b = upload(NULL, lb), *tab = upload(NULL, 512);
+    CHECK(heads && a && b && tab && ds4_gpu_set_model_map(model, a_bytes));
+    const uint32_t positions[] = {0, 1, 2, 7, 511, 4095, 8191, 65535, 131071, 300000, 1048575};
+    for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) {
+        for (int compressed = 0; compressed < 2; compressed++) {
+            const uint32_t pos = positions[pi];
+            CHECK(ds4_gpu_tensor_write(heads, 0, h, hb) && ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_attention_low(a, model, a_bytes, 0, GROUP, RANK, GROUPS, heads, pos, compressed));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_tensor_write(heads, 0, h, hb) && ds4_gpu_begin_commands());
+            CHECK(ds4_gpu_dsv41_rope_coeff_table(tab, pos));
+            CHECK(ds4_gpu_dsv41_attention_low_ex(b, model, a_bytes, 0, GROUP, RANK, GROUPS, heads, pos, compressed, tab));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+            CHECK(!memcmp(ds4_gpu_tensor_contents(a), ds4_gpu_tensor_contents(b), lb));
+        }
+        fprintf(stderr, "V4.1 attention low pos=%u: RoPE table == inline sincos, raw and compressed PASS\n", positions[pi]);
+    }
+    ds4_gpu_tensor_free(heads); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(tab);
+    free(h); free(model);
+    return 1;
+}
+#else
+static int check_rope_tab(void) { return 1; }
+#endif
+
 static int check_attention_output(bool large) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
     const uint32_t ROWS = large ? 8192u : 513u;
@@ -1767,6 +1809,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--rope-tab")) {
+        const int ok = ds4_gpu_init() && check_rope_tab();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--decode-topk")) {
         const int ok = ds4_gpu_init() && check_decode_topk();
         ds4_gpu_cleanup();
@@ -1792,7 +1839,7 @@ int main(int argc, char **argv) {
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() &&
              check_index_candidates() && check_engram_decode() &&
-             check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_decode_topk() && check_indexer_all() && check_compact_carry() && check_attention_output(false) &&
+             check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_decode_topk() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;

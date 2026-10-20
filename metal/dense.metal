@@ -270,7 +270,7 @@ static inline void helper_mv_reduce_and_write_hc_expand4(
 }
 
 template<short NR0, typename args_t, bool ROUND = false, bool ROUND_IN = false,
-         bool ROPE_IN = false, bool ROPE_OUT = false, bool HC_OUT = false>
+         bool ROPE_IN = false, bool ROPE_OUT = false, bool HC_OUT = false, bool ROPE_TAB = false>
 void kernel_mul_mv_q8_0_f32_rope_impl(
         args_t args,
         device const char * src0,
@@ -285,7 +285,8 @@ void kernel_mul_mv_q8_0_f32_rope_impl(
         device const float * hc_add = nullptr,
         device const float * hc_residual = nullptr,
         device const float * hc_post = nullptr,
-        device const float * hc_comb = nullptr) {
+        device const float * hc_comb = nullptr,
+        device const float2 * rope_tab = nullptr) {
     const short NSG = FC_mul_mv_nsg;
 
     constexpr short NW = N_SIMDWIDTH;
@@ -332,9 +333,16 @@ void kernel_mul_mv_q8_0_f32_rope_impl(
             if (col >= rope->width - 64u) {
                 const uint pair0 = (col - (rope->width - 64u)) >> 1u;
                 FOR_UNROLL (short p = 0; p < NQ/2; ++p) {
-                    const float theta = float(rope->start) * rope->frequencies[pair0 + p];
-                    float c;
-                    const float sn = precise::sincos(theta, c);
+                    /* ROPE_TAB reads (cos, sin) of the same FP32 theta from the per-step table; the
+                     * inverse sign, FMA order and BF16 rounding below are unchanged. */
+                    float c, sn;
+                    if (ROPE_TAB) {
+                        const float2 cs = rope_tab[pair0 + p];
+                        c = cs.x; sn = cs.y;
+                    } else {
+                        const float theta = float(rope->start) * rope->frequencies[pair0 + p];
+                        sn = precise::sincos(theta, c);
+                    }
                     const float s = rope->inverse ? -sn : sn;
                     const float re = yl[2*p], im = yl[2*p + 1];
                     yl[2*p] = ds4_bf16_round(fma(re, c, -(im * s)));

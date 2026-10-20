@@ -40281,6 +40281,12 @@ typedef struct {
      * FP8 indexer sidecar, or none do. */
     bool indexer_fp8;
     const struct ds4_model *indexer_model;
+    /* The step's RoPE coefficient table (512 B, allocated with the graph): produced at rope_tab_pos after the
+     * embed of a single-host decode step and read by that step's low projections only while rope_tab_pos == pos;
+     * rope_tab_on is cleared at step end, so no other step or path reads it. */
+    ds4_gpu_tensor *rope_tab;
+    bool rope_tab_on;
+    uint32_t rope_tab_pos;
     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;   /* verify-block row partials, two slots per layer */
@@ -40334,6 +40340,9 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_tensor_free(g->tp_logits_half);
     ds4_gpu_tensor_free(g->selected_half);
     ds4_gpu_tensor_free(g->route_weights_half);
+    ds4_gpu_tensor_free(g->rope_tab);
+    g->rope_tab = NULL;
+    g->rope_tab_on = false;
     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
 #define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
         DS41_PREFILL_ROWS(DS41_ROW_FREE)
@@ -40534,6 +40543,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
 #undef DS41_CARRY_ALLOC
     ds41_graph_reset(g);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    g->rope_tab = ds4_gpu_tensor_alloc(64u * 2u * sizeof(float));   /* optional: without it the lows compute (cos, sin) */
+#endif
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
             (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
     return true;
@@ -40802,6 +40814,7 @@ static bool ds41_capture_in_head_off(void) { static int c = -1; return ds41_env_
 static bool ds41_router_bf16_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ROUTER_BF16", &c); }
 static bool ds41_engram_fp8_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ENGRAM_FP8", &c); }
 static bool ds41_indexer_fp8_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_INDEXER_FP8", &c); }
+static DS4_MAYBE_UNUSED bool ds41_rope_tab_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ROPE_TAB", &c); }
 
 /* One block's HC input: the mixer projection, then split, weighted sum with
  * the previous block's pre weights and norm; each half fused where the fused
@@ -40876,9 +40889,17 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
     if (!tensor_nbytes(l->attn_output_a->type, 4096, &output_row)) return false;
     const uint64_t offset = l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row;
     const bool compressed = rope_il >= 0 && ds4_layer_compress_ratio((uint32_t)rope_il) != 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* the step's coefficient table, only at the position it was produced for */
+    const ds4_gpu_tensor *tab = g->rope_tab_on && g->rope_tab_pos == g->pos && g->tp_world == 1 ? g->rope_tab : NULL;
+    const bool fused = rope_il >= 0 &&
+        ds4_gpu_dsv41_attention_low_ex(g->low, m->map, m->size, offset, 4096, 1024, groups,
+                                       g->heads, g->pos, compressed, tab);
+#else
     const bool fused = rope_il >= 0 &&
         ds4_gpu_dsv41_attention_low(g->low, m->map, m->size, offset, 4096, 1024, groups,
                                     g->heads, g->pos, compressed);
+#endif
     if (!fused &&
         ((rope_il >= 0 && !ds4_gpu_dsv41_rope_bf16(g->heads, DS4_N_HEAD_DIM, groups * 8u, 1,
                                                     g->pos, compressed, true)) ||
@@ -42574,6 +42595,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->indexer_model = w->indexer_fp8_model;
     g->indexer_fp8 = logits && (g->indexer_model || ds41_narrow_indexer(m, 2)) && g->tp_world == 1 && !g->streaming &&
         !g->quality && !ds41_indexer_fp8_off();
+    /* One RoPE coefficient table per decode step, in this step's command stream before layer 0, read by the
+     * step's low projections in place of per-lane sincos; a failed producer leaves the lows on their own trig. */
+    g->rope_tab_on = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ok && logits && g->rope_tab && g->tp_world == 1 && !g->streaming && !g->quality && !layer_resident &&
+        ds4_gpu_commands_active() && !ds41_rope_tab_off()) {
+        g->rope_tab_pos = g->pos;
+        g->rope_tab_on = ds4_gpu_dsv41_rope_coeff_table(g->rope_tab, g->pos) != 0;
+    }
+#endif
     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     /* With the head queued, the drafter's capture of this token is encoded after
@@ -42625,6 +42656,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->router_bf16 = false;
     g->engram_fp8 = false;
     g->indexer_fp8 = false;
+    g->rope_tab_on = false;   /* the table never outlives its step */
     g->tp_gate_fused = false;
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */

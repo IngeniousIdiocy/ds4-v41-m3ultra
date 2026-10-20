@@ -284,6 +284,15 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
 int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
                                 uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
                                 uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed);
+/* The per-step RoPE coefficient table (64 float2 = 512 B: entries 0..31 the raw frequencies, 32..63 the compressed
+ * ones) holds (cos, sin) of theta = float(pos) * frequency, the low kernel's own expression. attention_low_ex with
+ * rope_tab reads it (bound at byte 0 raw or 256 compressed) instead of computing them: the same bits; NULL = the
+ * inline kernel. */
+int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos);
+int ds4_gpu_dsv41_attention_low_ex(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                   uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
+                                   uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed,
+                                   const ds4_gpu_tensor *rope_tab);
 /* Two weighted RMS norms rounded to bf16 in one dispatch. */
 int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0, uint64_t weight0_offset, uint32_t n0,
                                  ds4_gpu_tensor *out1, const ds4_gpu_tensor *x1, uint64_t weight1_offset, uint32_t n1,

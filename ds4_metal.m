@@ -49672,12 +49672,46 @@ int ds4_gpu_dsv41_matmul_expand(ds4_gpu_tensor *out_hc, const void *model_map, u
                                             x, add, residual_hc, split, n_hc, 1u);
 }
 
+int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!tab || pos >= 1048576u || ds4_gpu_tensor_bytes(tab) < 64u * 2u * sizeof(float)) return 0;
+    @autoreleasepool {
+        /* the same argument structs the low kernels receive at this position (the sign does not enter the table) */
+        const ds4_gpu_mv_rope_args raw = ds4_gpu_dsv41_mv_rope_args(512u, pos, false, true);
+        const ds4_gpu_mv_rope_args comp = ds4_gpu_dsv41_mv_rope_args(512u, pos, true, true);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope_coeff_table");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&raw length:sizeof(raw) atIndex:0];
+        [enc setBytes:&comp length:sizeof(comp) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(tab) offset:ds4_gpu_tensor_offset(tab) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        /* the low dispatches read the table next (a serial encoder orders them; a concurrent one needs this) */
+        if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 RoPE coefficient table");
+    }
+}
+
 int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
                                 uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
                                 uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed) {
+    return ds4_gpu_dsv41_attention_low_ex(low, model_map, model_size, out_a_offset, group_dim, rank, n_groups,
+                                          heads, pos, compressed, NULL);
+}
+
+int ds4_gpu_dsv41_attention_low_ex(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                   uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
+                                   uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed,
+                                   const ds4_gpu_tensor *rope_tab) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!low || !heads || !model_map || !group_dim || group_dim % 512u || !rank || !n_groups ||
         pos >= 1048576u || (uint64_t)n_groups * rank > UINT32_MAX) return 0;
+    if (rope_tab && ds4_gpu_tensor_bytes(rope_tab) < 64u * 2u * sizeof(float)) return 0;
     @autoreleasepool {
         const uint64_t row_a_bytes = (uint64_t)(group_dim / 32u) * 34u;
         const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
@@ -49711,7 +49745,8 @@ int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint
         };
         const ds4_gpu_mv_rope_args rope = ds4_gpu_dsv41_mv_rope_args(512u, pos, compressed, true);
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32_rope", 4);
+            ds4_gpu_get_mul_mv_pipeline(rope_tab ? "kernel_dsv4_attn_out_low_q8_0_f32_rope_tab"
+                                                 : "kernel_dsv4_attn_out_low_q8_0_f32_rope", 4);
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -49723,6 +49758,9 @@ int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint
         [enc setBuffer:ds4_gpu_tensor_buffer(heads) offset:ds4_gpu_tensor_offset(heads) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(low) offset:ds4_gpu_tensor_offset(low) atIndex:3];
         [enc setBytes:&rope length:sizeof(rope) atIndex:4];
+        if (rope_tab)   /* raw entries at byte 0, compressed at 256 (32 float2) */
+            [enc setBuffer:ds4_gpu_tensor_buffer(rope_tab)
+                    offset:ds4_gpu_tensor_offset(rope_tab) + (compressed ? 32u * 2u * sizeof(float) : 0u) atIndex:5];
         [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rank + 1u) / 2u, 1, n_groups)
              threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
