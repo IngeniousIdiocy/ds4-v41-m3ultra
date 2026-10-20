@@ -9,6 +9,33 @@ campaign record.
 Unless stated otherwise: one M3 Ultra (512 GB), the 1017 MXFP4 target
 weights, decode at concurrency 1, and the campaign's prose and code fixtures.
 
+## Composed run of this branch at 8K (fp8pf-a5 d01, P25)
+
+Setup:
+
+- The tree: a clean export of 77eea27c, the default build, with no
+  environment set.
+- Each fixture is prefilled cold to 8K. The W72 fixtures (prose and code) are
+  used.
+- Each run samples 512 tokens at temp 1 and top_p 0.95, with seed 1017. There
+  are two runs per fixture.
+- The rate uses our metric: first sampling to last evaluation.
+
+| Fixture | Run 1 | Run 2 | prefix | logits | state |
+| --- | ---: | ---: | --- | --- | --- |
+| prose | 40.437 | 40.482 | `3cd4d4bba0ab9986` | `ed3ca952608e6274` | `6d2d529ba8c0e5c0` |
+| code | 40.508 | 40.418 | `166bd265feac6270` | `c1c571c0a9ade5be` | `428ef17df51250d8` |
+
+The digests are those of the campaign's irqres-a1 arms. The T arm and its
+control give the same three digests per fixture (`batch_summary.txt`, p01–p08).
+So the branch reproduces irqres-a1 T bit for bit from a cold prefill.
+
+The same window ran the `DS4_V41_S1TG` arms. Their result is in the
+single-group kernels section below.
+
+The depth rows of the README (64K, 131K, 300K) are still W5 on the
+state-depth tree. A composed depth run on this branch is pending.
+
 ## Candidate-block index scoring (9b9dfee)
 
 *Score only the candidate blocks of later DeepSeek V4.1 index layers*:
@@ -216,7 +243,14 @@ Worker D's `DS4_V41_S1TG`:
 `k`, `r` and `h` are also bit-identical in their micros.
 
 On the stack, `cn` is **not exact**. In window fp8pf-a5 (d01) its arm's
-digests differed from the control. The cause is under investigation by worker
+digests differed from the control:
+
+- The prefix digests are equal.
+- The logits and state digests differ. On prose they are `2bbe429e4417fcb6` /
+  `4feb7562d5a596e7`, against `ed3ca952608e6274` / `6d2d529ba8c0e5c0`. On
+  code they are `afdf72f24377f997` / `e3de3dfb45ec2ab7`, against
+  `c1c571c0a9ade5be` / `428ef17df51250d8`.
+- `cn` and `cnkr` give the same digests as each other in both repeats. The cause is under investigation by worker
 D. Until it is found and fixed, every letter (`cnkrh`) stays opt-in and
 experimental, and none of them enters a measured basis.
 

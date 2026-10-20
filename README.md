@@ -30,10 +30,18 @@ measured in its own window, with the method named in that row:
 | Context | Decode tok/s | Window and method |
 | ---: | ---: | --- |
 | 2K | 40.60 | q2k-a1: campaign stack, greedy 128, Ivan Fioravanti's steady metric (wall time of tokens 2..N); ours read the same |
-| 8K | 40.52 (prose) / 40.52 (code) | blend-a2: campaign stack plus the blended readers, campaign fixtures, 512 tokens, our metric (first sampling to last evaluation) |
-| 64K | 39.70 | W5: candidate scoring + sort512 + candidate list once, greedy 128 on saved snapshots, eval-interval metric |
-| 131K | 39.07 | W5, as above |
-| 300K | 38.02 | W5, as above |
+| 8K | 40.44 / 40.48 (prose), 40.51 / 40.42 (code) | fp8pf-a5 d01: this branch (a clean export of 77eea27c, default build, no environment), cold prefill, W72 fixtures, 512 tokens at temp 1 / top_p 0.95, seed 1017, two runs each, our metric (first sampling to last evaluation) |
+| 64K | 39.70 | W5 on the state-depth tree: candidate scoring + sort512 + candidate list once, greedy 128 on saved snapshots, eval-interval metric |
+| 131K | 39.07 | W5 on the state-depth tree, as above |
+| 300K | 38.02 | W5 on the state-depth tree, as above |
+
+The 8K runs are bit-identical to the irqres-a1 T arm of the campaign: the
+prefix, final logits and session state digests are the same.
+
+| Fixture | prefix | logits | state |
+| --- | --- | --- | --- |
+| prose | `3cd4d4bba0ab9986` | `ed3ca952608e6274` | `6d2d529ba8c0e5c0` |
+| code | `166bd265feac6270` | `c1c571c0a9ade5be` | `428ef17df51250d8` |
 
 Window w1-a2 recorded both metrics for the same runs. At 8K, greedy 128, Ivan's
 steady metric gave 40.130 and ours 40.087.
@@ -56,8 +64,9 @@ Exactness method:
   reduction, is on by default and can be turned off with
   `DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG=1`.
 
-A single composed run of this branch is pending. Windows, arms and per-run
-numbers are in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
+The 8K row is a composed run of this branch. A composed run at depth (64K and
+beyond) on this branch is still pending. Windows, arms and per-run numbers are
+in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
 
 ### Prepare the model
 
