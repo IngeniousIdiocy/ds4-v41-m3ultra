@@ -101,3 +101,4 @@ __pycache__/
 /tests/test_v41_router_hier
 /tests/test_v41_spec_rewind
 /tests/test_ds41_dspark_adaptive
+/ds4-server-testhooks

@@ -14853,6 +14853,19 @@ static void server_canary_finish(server *s, uint64_t canary, const char *err, do
     pthread_mutex_unlock(&s->mu);
 }
 
+#ifdef DS4_TEST_HOOKS
+/* Test builds only (make ds4-server-testhooks; release builds never read it):
+ * DS4_KV_CANARY_FAIL_TEST=1 turns a completed canary into a failed verdict, to
+ * exercise the cache-off path. The canary value and the engine identity are
+ * computed exactly as in a release build, so both share cache entries. */
+static bool server_canary_forced_failure(char *err, size_t err_len) {
+    const char *v = getenv("DS4_KV_CANARY_FAIL_TEST");
+    if (!v || strcmp(v, "1") != 0) return false;
+    snprintf(err, err_len, "forced by DS4_KV_CANARY_FAIL_TEST");
+    return true;
+}
+#endif
+
 /* The numerics canary verifies this build's prefill before the disk cache is
  * used. It runs once, one-shot, as soon as the server listens: requests are
  * accepted and queued meanwhile (the workers take none until the verdict), so
@@ -14873,6 +14886,13 @@ static void *server_canary_main(void *arg) {
             canary = 0;
         pthread_mutex_unlock(&s->inference_mu);
     }
+#ifdef DS4_TEST_HOOKS
+    if (canary && server_canary_forced_failure(err, sizeof(err))) {
+        server_log(DS4_LOG_WARNING, "ds4-server: test hook: canary %016llx computed; reporting failure",
+                   (unsigned long long)canary);
+        canary = 0;
+    }
+#endif
     server_canary_finish(s, canary, err, now_sec() - t0);
     return NULL;
 }
@@ -21591,6 +21611,33 @@ static void test_server_jobs_wait_for_canary(void) {
     pthread_mutex_lock(&s.mu);
     TEST_ASSERT(!s.canary_pending && s.head == &j1);
     pthread_mutex_unlock(&s.mu);
+
+#ifdef DS4_TEST_HOOKS
+    /* The forced-failure hook fires only on DS4_KV_CANARY_FAIL_TEST=1, and its
+     * verdict releases waiters with the cache off. */
+    char herr[96] = {0};
+    unsetenv("DS4_KV_CANARY_FAIL_TEST");
+    TEST_ASSERT(!server_canary_forced_failure(herr, sizeof(herr)));
+    setenv("DS4_KV_CANARY_FAIL_TEST", "0", 1);
+    TEST_ASSERT(!server_canary_forced_failure(herr, sizeof(herr)));
+    setenv("DS4_KV_CANARY_FAIL_TEST", "1", 1);
+    TEST_ASSERT(server_canary_forced_failure(herr, sizeof(herr)) &&
+                strstr(herr, "DS4_KV_CANARY_FAIL_TEST"));
+    unsetenv("DS4_KV_CANARY_FAIL_TEST");
+    s.batched_mode = false;
+    s.stopping = false;
+    s.head = s.tail = NULL;
+    j1.next = NULL;
+    ds4_kvstore_canary_pending();
+    s.canary_pending = true;
+    canary_dequeue_probe h = {.s = &s};
+    TEST_ASSERT(pthread_create(&t, NULL, canary_dequeue_probe_main, &h) == 0);
+    canary_test_enqueue(&s, &j1);
+    server_canary_finish(&s, 0, herr, 0.0);
+    canary_test_stop(&s);
+    pthread_join(t, NULL);
+    TEST_ASSERT(!ds4_kvstore_canary_ready() && h.n == 1 && h.got[0] == &j1);
+#endif
 
     ds4_kvstore_set_canary(0);   /* ready, no canary bound: later tests check identity only */
     pthread_cond_destroy(&s.cv);
