@@ -8,7 +8,14 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define DS4_KVSTORE_FIXED_HEADER 48u
+/* v2 header (80 bytes): the v1 fields at 0..47, then the verified-content
+ * binding: [48] engine identity, [56] numerics canary (0 = not computed),
+ * [64] payload hash (ds4_kvstore_payload_hash of the payload bytes), [72]
+ * reserved zero. v1 files have the 48-byte header. */
+#define DS4_KVSTORE_FIXED_HEADER 80u
+#define DS4_KVSTORE_V1_HEADER 48u
+/* Tokens of the fixed canary prompt: past 2,048 so the sparse index selects. */
+#define DS4_KVSTORE_CANARY_TOKENS 4096
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
 
@@ -54,6 +61,12 @@ typedef struct {
     uint64_t payload_bytes;
     uint64_t text_bytes;
     uint64_t file_size;
+    uint8_t version;
+    uint64_t identity, canary, payload_hash;
+    /* NULL when this engine may load the entry; otherwise why it is refused
+     * (old version, payload ABI, identity or canary). Refused entries are
+     * indexed only so eviction can reclaim their space. */
+    const char *refusal;
 } ds4_kvstore_entry;
 
 typedef struct {
@@ -200,6 +213,42 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                              uint32_t *text_bytes);
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out);
+/* Identity of the weights/representation this store's entries belong to
+ * (model + drafter GGUF header fingerprints, quant, variant, prefill repr).
+ * Set it before ds4_kvstore_open so foreign entries are never indexed. */
+uint64_t ds4_kvstore_engine_identity(ds4_engine *engine);
+void ds4_kvstore_set_identity(uint64_t identity);
+/* Numerics canary: logits hash of a fresh prefill of a fixed tokens-long
+ * prompt in a side session. Catches a prefill numerics change (kernels,
+ * numerics switches) that the identity cannot see. 0 on success. Once set,
+ * entries need an equal canary; with none set (ds4-agent) it is not checked. */
+int ds4_kvstore_engine_canary(ds4_engine *engine, int tokens, uint64_t *out,
+                              char *err, size_t err_len);
+void ds4_kvstore_set_canary(uint64_t canary);
+/* Word-wise 64-bit FNV-style digest (integrity, not security). */
+typedef struct {
+    uint64_t h, n;
+    uint8_t tail[8];
+    unsigned tl;
+} ds4_kvstore_hash;
+void ds4_kvstore_hash_init(ds4_kvstore_hash *s);
+void ds4_kvstore_hash_update(ds4_kvstore_hash *s, const void *p, size_t n);
+uint64_t ds4_kvstore_hash_final(const ds4_kvstore_hash *s);
+uint64_t ds4_kvstore_payload_hash(const void *p, size_t n);
+/* fp at the payload start: hashes e->payload_bytes and compares with the
+ * header's payload hash, then seeks back. 0 = verified; otherwise why says
+ * why the entry is refused. Runs before any session state is touched. */
+int ds4_kvstore_verify_payload(FILE *fp, const ds4_kvstore_entry *e,
+                               char *why, size_t why_len);
+/* The entry body after a filled header: header, text length, text, the
+ * staged payload (digested on the way), the trailer, then the digest into
+ * header bytes 64..71. The caller flushes, fsyncs and renames. */
+bool ds4_kvstore_write_entry(FILE *fp, const uint8_t h[DS4_KVSTORE_FIXED_HEADER],
+                             const char *text, size_t text_len,
+                             const ds4_session_payload_file *staged,
+                             const ds4_kvstore_trailer_hooks *hooks,
+                             uint64_t *trailer_bytes, uint64_t *payload_hash,
+                             char *err, size_t err_len);
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
                              uint8_t reason, uint8_t ext_flags,

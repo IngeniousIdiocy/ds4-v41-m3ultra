@@ -15917,8 +15917,26 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.kv_disk_dir) {
-        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        /* Entries bind to the engine identity and to this build's prefill
+         * numerics (canary); without a canary the disk cache stays off. */
+        const uint64_t identity = ds4_kvstore_engine_identity(engine);
+        uint64_t canary = 0;
+        char cerr[192] = {0};
+        const double ct0 = now_sec();
+        ds4_kvstore_set_identity(identity);
+        if (ds4_kvstore_engine_canary(engine, DS4_KVSTORE_CANARY_TOKENS, &canary,
+                                      cerr, sizeof(cerr)) != 0) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: KV disk cache disabled: numerics canary failed: %s", cerr);
+        } else {
+            ds4_kvstore_set_canary(canary);
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: KV disk cache identity %016llx canary %016llx (%d tokens, %.2fs)",
+                       (unsigned long long)identity, (unsigned long long)canary,
+                       DS4_KVSTORE_CANARY_TOKENS, now_sec() - ct0);
+            kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                          cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        }
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -20978,7 +20996,7 @@ static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(voi
 
 static void test_kv_cache_file_size_must_fit_budget(void) {
     kv_disk_cache kc = {0};
-    kc.budget_bytes = 1100;
+    kc.budget_bytes = 1100 + (KV_CACHE_FIXED_HEADER - 48u);   /* boundaries written for the 48-byte v1 header */
 
     TEST_ASSERT(kv_cache_file_size_fits(&kc, 100, 930, 0, NULL, NULL));
     TEST_ASSERT(!kv_cache_file_size_fits(&kc, 100, 938, 0, NULL, NULL));
@@ -21166,6 +21184,228 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
                                              0, 2, 32768) < 0);
 
     kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+/* KV v2: entries bind to verified content (engine identity, numerics canary,
+ * payload digest). */
+static void test_kv_cache_payload_hash_vectors(void) {
+    uint8_t buf[1000];
+    for (int i = 0; i < 1000; i++) buf[i] = (uint8_t)(i * 37 + 11);
+    /* Fixed vectors: a changed digest would refuse every stored entry. */
+    TEST_ASSERT(ds4_kvstore_payload_hash("abc", 3) == UINT64_C(0xd5ae3d1b0d54b173));
+    TEST_ASSERT(ds4_kvstore_payload_hash(buf, sizeof(buf)) == UINT64_C(0x7c47d8383fd6d07d));
+    ds4_kvstore_hash s;
+    ds4_kvstore_hash_init(&s);
+    for (size_t o = 0; o < sizeof(buf); o += 7)
+        ds4_kvstore_hash_update(&s, buf + o, o + 7 > sizeof(buf) ? sizeof(buf) - o : 7);
+    TEST_ASSERT(ds4_kvstore_hash_final(&s) == UINT64_C(0x7c47d8383fd6d07d));
+}
+
+static void test_kv_cache_refuses_identity_and_canary_mismatch(void) {
+    char tmpl[] = "/tmp/ds4-kv-identity-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "identity bound prefix";
+    const char *prompt = "identity bound prefix and tail";
+    ds4_kvstore_set_identity(0x1111);
+    ds4_kvstore_set_canary(0xc1);
+    test_kv_text_stub_file(dir, text, KV_REASON_COLD, 512, 0);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768) >= 0);
+
+    /* Other weights or prefill representation: refused, never a candidate. */
+    ds4_kvstore_set_identity(0x2222);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768) < 0);
+    TEST_ASSERT(kc.len == 1 && kc.entry[0].refusal &&
+                strstr(kc.entry[0].refusal, "identity"));
+    TEST_ASSERT(kc.len == 1 && kc.entry[0].identity == 0x1111);
+
+    /* Same identity, other prefill numerics: refused on the canary. */
+    ds4_kvstore_set_identity(0x1111);
+    ds4_kvstore_set_canary(0xc2);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768) < 0);
+    TEST_ASSERT(kc.len == 1 && kc.entry[0].refusal &&
+                strstr(kc.entry[0].refusal, "canary"));
+    ds4_kvstore_entry e = {0};
+    TEST_ASSERT(!ds4_kvstore_read_entry_file(path, sha, &e));
+
+    /* No canary bound (ds4-agent): the identity alone decides. */
+    ds4_kvstore_set_canary(0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768) >= 0);
+
+    /* Refused entries still count against the budget and are reclaimed. */
+    ds4_kvstore_set_canary(0xc2);
+    kc.budget_bytes = 1;
+    ds4_kvstore_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(access(path, F_OK) != 0);
+
+    ds4_kvstore_set_identity(0);
+    ds4_kvstore_set_canary(0);
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_v1_entries_refused_and_evictable(void) {
+    char tmpl[] = "/tmp/ds4-kv-v1-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "v1 rendered prefix";
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        /* The v1 layout is the first 48 bytes of v2 with version 1. */
+        uint8_t h[KV_CACHE_FIXED_HEADER];
+        kv_fill_header(h, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
+        h[3] = 1;
+        uint8_t text_len[4];
+        le_put32(text_len, (uint32_t)strlen(text));
+        TEST_ASSERT(fwrite(h, 1, DS4_KVSTORE_V1_HEADER, fp) == DS4_KVSTORE_V1_HEADER);
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "v1 rendered prefix and tail",
+                                             0, 2, 32768) < 0);
+    TEST_ASSERT(kc.len == 1 && kc.entry[0].version == 1 && kc.entry[0].refusal &&
+                kc.entry[0].tokens == 512);
+    kc.budget_bytes = 1;
+    ds4_kvstore_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(access(path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+/* 0 when the payload after the header and text verifies and fp is left at
+ * the payload start. */
+static int test_kv_verify_file(const char *path, char *why, size_t why_len) {
+    FILE *fp = fopen(path, "rb");
+    ds4_kvstore_entry e = {0};
+    uint32_t text_bytes = 0;
+    int rc = 1;
+    if (fp && ds4_kvstore_read_header(fp, &e, &text_bytes) &&
+        fseeko(fp, (off_t)text_bytes, SEEK_CUR) == 0)
+    {
+        const off_t at = ftello(fp);
+        rc = ds4_kvstore_verify_payload(fp, &e, why, why_len);
+        if (rc == 0 && ftello(fp) != at) rc = 2;
+    }
+    if (fp) fclose(fp);
+    return rc;
+}
+
+static bool test_kv_patch_file(const char *path, long off, const void *bytes, size_t n) {
+    FILE *fp = fopen(path, "r+b");
+    if (!fp) return false;
+    bool ok = fseek(fp, off, SEEK_SET) == 0 && fwrite(bytes, 1, n, fp) == n;
+    return fclose(fp) == 0 && ok;
+}
+
+static void test_kv_cache_payload_hash_round_trip(void) {
+    char tmpl[] = "/tmp/ds4-kv-payload-hash-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* A staged payload as ds4_session_stage_payload leaves it: spans two
+     * copy chunks and ends in a partial word. */
+    const size_t n = ((size_t)9 << 20) + 5;
+    uint8_t *payload = malloc(n);
+    TEST_ASSERT(payload != NULL);
+    if (!payload) return;
+    for (size_t i = 0; i < n; i++) payload[i] = (uint8_t)(i * 131u + (i >> 13));
+    char *staged_path = path_join(dir, "staged.payload");
+    FILE *sp = fopen(staged_path, "wb");
+    TEST_ASSERT(sp != NULL && fwrite(payload, 1, n, sp) == n);
+    if (sp) TEST_ASSERT(fclose(sp) == 0);
+    ds4_session_payload_file staged = {.path = staged_path, .bytes = n};
+
+    const char *text = "verified content prefix";
+    const long payload_at = (long)KV_CACHE_FIXED_HEADER + 4 + (long)strlen(text);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    ds4_kvstore_set_identity(0x3333);
+    ds4_kvstore_set_canary(0xc3);
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 0, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, n);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    uint64_t trailer = 0, ph = 0;
+    char err[160] = {0}, why[160] = {0};
+    if (fp) {
+        TEST_ASSERT(ds4_kvstore_write_entry(fp, h, text, strlen(text), &staged, NULL,
+                                            &trailer, &ph, err, sizeof(err)));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    TEST_ASSERT(ph == ds4_kvstore_payload_hash(payload, n));
+
+    /* The header carries the identity, the canary and the digest. */
+    ds4_kvstore_entry e = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.identity == 0x3333 && e.canary == 0xc3 && e.payload_hash == ph);
+    ds4_kvstore_entry_free(&e);
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 0);
+
+    /* A cache hit's touch keeps the binding. */
+    TEST_ASSERT(ds4_kvstore_touch_file(path, 7));
+    memset(&e, 0, sizeof(e));
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.hits == 7 && e.identity == 0x3333 && e.canary == 0xc3 && e.payload_hash == ph);
+    ds4_kvstore_entry_free(&e);
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 0);
+
+    /* One flipped payload byte is refused before any restore. */
+    uint8_t flipped = (uint8_t)(payload[n / 2] ^ 0x40);
+    TEST_ASSERT(test_kv_patch_file(path, payload_at + (long)(n / 2), &flipped, 1));
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 1 && strstr(why, "corrupt"));
+    TEST_ASSERT(test_kv_patch_file(path, payload_at + (long)(n / 2), &payload[n / 2], 1));
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 0);
+
+    /* A short payload and a missing digest are refused too. */
+    TEST_ASSERT(truncate(path, (off_t)(payload_at + (long)n - 100)) == 0);
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 1 && strstr(why, "shorter"));
+    uint8_t zero[8] = {0};
+    TEST_ASSERT(test_kv_patch_file(path, 64, zero, sizeof(zero)));
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 1 && strstr(why, "no payload hash"));
+
+    ds4_kvstore_set_identity(0);
+    ds4_kvstore_set_canary(0);
+    free(payload);
+    unlink(staged_path);
+    free(staged_path);
     unlink(path);
     free(path);
     rmdir(dir);
@@ -22443,6 +22683,10 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_kv_cache_payload_hash_vectors();
+    test_kv_cache_refuses_identity_and_canary_mismatch();
+    test_kv_cache_v1_entries_refused_and_evictable();
+    test_kv_cache_payload_hash_round_trip();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();
