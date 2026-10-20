@@ -10197,6 +10197,10 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
+    int jobs_active;            /* non-batched: jobs dequeued and not yet complete (mu) */
+    bool idle_task;             /* the numerics canary holds the model between jobs (mu) */
+    pthread_t canary_thread;
+    bool canary_started;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
@@ -14737,7 +14741,7 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
 }
 
 static void dispatch_jobs_locked(server *s) {
-    if (!s || !s->batched_mode) return;
+    if (!s || !s->batched_mode || s->idle_task) return;
     for (;;) {
         job *chosen = NULL;
         job *chosen_prev = NULL;
@@ -14787,19 +14791,16 @@ static bool enqueue(server *s, job *j) {
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
-    if (s->batched_mode) {
-        dispatch_jobs_locked(s);
-        pthread_cond_broadcast(&s->cv);
-    } else {
-        pthread_cond_signal(&s->cv);
-    }
+    if (s->batched_mode) dispatch_jobs_locked(s);
+    /* broadcast: the canary thread waits on cv too */
+    pthread_cond_broadcast(&s->cv);
     pthread_mutex_unlock(&s->mu);
     return true;
 }
 
 static job *dequeue(server *s) {
     pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+    while ((!s->head && !s->stopping) || s->idle_task) pthread_cond_wait(&s->cv, &s->mu);
     if (!s->head) {
         pthread_mutex_unlock(&s->mu);
         return NULL;
@@ -14807,6 +14808,7 @@ static job *dequeue(server *s) {
     job *j = s->head;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
+    s->jobs_active++;
     pthread_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
@@ -14826,6 +14828,90 @@ static void *worker_main(void *arg) {
         if (!j) break;
         generate_job(s, worker_slot_for_job(s, j), j);
         job_complete(j);
+        pthread_mutex_lock(&s->mu);
+        s->jobs_active--;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+    }
+    return NULL;
+}
+
+/* Background model work between jobs (the numerics canary): nothing queued and
+ * nothing running. Caller holds mu. */
+static bool server_model_idle_locked(const server *s) {
+    if (s->head) return false;
+    if (!s->batched_mode) return s->jobs_active == 0;
+    for (int i = 0; i < s->slot_count; i++)
+        if (s->slots[i].busy) return false;
+    return true;
+}
+
+/* Waits until the model is idle, then holds new jobs back until
+ * server_idle_leave. false (nothing held) once the server is stopping. */
+static bool server_idle_enter(server *s) {
+    pthread_mutex_lock(&s->mu);
+    while (!s->stopping && !server_model_idle_locked(s)) pthread_cond_wait(&s->cv, &s->mu);
+    const bool ok = !s->stopping;
+    if (ok) s->idle_task = true;
+    pthread_mutex_unlock(&s->mu);
+    return ok;
+}
+
+static void server_idle_leave(server *s) {
+    pthread_mutex_lock(&s->mu);
+    s->idle_task = false;
+    dispatch_jobs_locked(s);
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* The disk cache opens with loads and stores refused; this thread prefills the
+ * canary one step at a time while no job runs (a request waits at most one
+ * step) and then turns the cache on, or leaves it off if the canary fails. */
+static void *server_canary_main(void *arg) {
+    server *s = arg;
+    char err[192] = {0};
+    uint64_t canary = 0;
+    ds4_kvstore_canary_run *run = NULL;
+    const double t0 = now_sec();
+    double model_s = 0.0;
+    int rc = 1, steps = 0;
+    while (rc == 1) {
+        if (!server_idle_enter(s)) {
+            snprintf(err, sizeof(err), "the server is stopping");
+            rc = -1;
+            break;
+        }
+        const double b0 = now_sec();
+        pthread_mutex_lock(&s->inference_mu);
+        if (!run) {
+            run = ds4_kvstore_canary_begin(s->engine, DS4_KVSTORE_CANARY_TOKENS, err, sizeof(err));
+            rc = run ? 1 : -1;
+        } else {
+            rc = ds4_kvstore_canary_step(run, &canary, err, sizeof(err));
+            steps++;
+        }
+        if (rc != 1 && run) {
+            ds4_kvstore_canary_end(run);
+            run = NULL;
+        }
+        pthread_mutex_unlock(&s->inference_mu);
+        model_s += now_sec() - b0;
+        server_idle_leave(s);
+    }
+    if (run) {   /* stopping: the workers are draining or gone */
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_kvstore_canary_end(run);
+        pthread_mutex_unlock(&s->inference_mu);
+    }
+    if (rc == 0) {
+        ds4_kvstore_set_canary(canary);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: KV disk cache on: canary %016llx (%d tokens in %d steps, %.2fs model, %.2fs since start)",
+                   (unsigned long long)canary, DS4_KVSTORE_CANARY_TOKENS, steps, model_s, now_sec() - t0);
+    } else {
+        ds4_kvstore_canary_failed();
+        server_log(DS4_LOG_WARNING, "ds4-server: KV disk cache stays off: numerics canary failed: %s", err);
     }
     return NULL;
 }
@@ -14852,6 +14938,7 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
         dispatch_jobs_locked(s);
+        pthread_cond_broadcast(&s->cv);   /* the canary thread waits for idle */
         pthread_mutex_unlock(&s->mu);
     }
     return NULL;
@@ -15918,25 +16005,17 @@ int main(int argc, char **argv) {
 
     if (cfg.kv_disk_dir) {
         /* Entries bind to the engine identity and to this build's prefill
-         * numerics (canary); without a canary the disk cache stays off. */
+         * numerics (canary). The canary runs between requests after the
+         * server starts listening; until it completes the disk cache refuses
+         * loads and stores, and if it fails the cache stays off. */
         const uint64_t identity = ds4_kvstore_engine_identity(engine);
-        uint64_t canary = 0;
-        char cerr[192] = {0};
-        const double ct0 = now_sec();
         ds4_kvstore_set_identity(identity);
-        if (ds4_kvstore_engine_canary(engine, DS4_KVSTORE_CANARY_TOKENS, &canary,
-                                      cerr, sizeof(cerr)) != 0) {
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: KV disk cache disabled: numerics canary failed: %s", cerr);
-        } else {
-            ds4_kvstore_set_canary(canary);
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: KV disk cache identity %016llx canary %016llx (%d tokens, %.2fs)",
-                       (unsigned long long)identity, (unsigned long long)canary,
-                       DS4_KVSTORE_CANARY_TOKENS, now_sec() - ct0);
-            kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                          cfg.kv_cache_reject_different_quant, cfg.kv_cache);
-        }
+        ds4_kvstore_canary_pending();
+        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: KV disk cache identity %016llx; loads and stores wait for the numerics canary "
+                   "(%d tokens, prefilled between requests)", (unsigned long long)identity, DS4_KVSTORE_CANARY_TOKENS);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -16017,6 +16096,14 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    if (s.kv.enabled) {
+        if (pthread_create(&s.canary_thread, NULL, server_canary_main, &s) == 0) {
+            s.canary_started = true;
+        } else {
+            ds4_kvstore_canary_failed();
+            server_log(DS4_LOG_WARNING, "ds4-server: KV disk cache stays off: cannot start the canary thread");
+        }
+    }
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
@@ -16069,6 +16156,7 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&s.mu);
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
+    if (s.canary_started) pthread_join(s.canary_thread, NULL);
 
     for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
@@ -21411,6 +21499,86 @@ static void test_kv_cache_payload_hash_round_trip(void) {
     rmdir(dir);
 }
 
+/* Non-blocking canary: the disk cache refuses loads and stores until the
+ * canary completes (and for good if it fails); the canary thread takes the
+ * model only while no job is queued or running, and holds jobs back while it
+ * runs a step. */
+static void test_kv_cache_canary_gate(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    ds4_tokens tokens = {0};
+    for (int i = 0; i < 600; i++) ds4_tokens_push(&tokens, 1);
+
+    /* The gate returns before any engine or session call (both NULL here). */
+    ds4_kvstore_canary_pending();
+    TEST_ASSERT(!ds4_kvstore_canary_ready());
+    TEST_ASSERT(!ds4_kvstore_store_live_prefix_text(&kc, NULL, NULL, &tokens, 600, "cold",
+                                                     NULL, 0, NULL, NULL, NULL, 0));
+    TEST_ASSERT(ds4_kvstore_try_load_text(&kc, NULL, NULL, "prompt", NULL, NULL, NULL, false) == 0);
+
+    ds4_kvstore_canary_failed();
+    TEST_ASSERT(!ds4_kvstore_canary_ready());
+    TEST_ASSERT(!ds4_kvstore_store_live_prefix_text(&kc, NULL, NULL, &tokens, 600, "cold",
+                                                     NULL, 0, NULL, NULL, NULL, 0));
+    TEST_ASSERT(ds4_kvstore_try_load_text(&kc, NULL, NULL, "prompt", NULL, NULL, NULL, false) == 0);
+
+    ds4_kvstore_set_canary(0xc0ffee);
+    TEST_ASSERT(ds4_kvstore_canary_ready());
+    ds4_kvstore_set_canary(0);   /* ready, no canary bound: later tests check identity only */
+    ds4_tokens_free(&tokens);
+}
+
+static void test_server_idle_gate_for_canary(void) {
+    server s = {0};
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+
+    /* Non-batched: idle with nothing queued or running. */
+    TEST_ASSERT(server_idle_enter(&s) && s.idle_task);
+    server_idle_leave(&s);
+    TEST_ASSERT(!s.idle_task);
+    job queued = {0};
+    pthread_mutex_lock(&s.mu);
+    s.jobs_active = 1;
+    TEST_ASSERT(!server_model_idle_locked(&s));
+    s.jobs_active = 0;
+    s.head = s.tail = &queued;
+    TEST_ASSERT(!server_model_idle_locked(&s));
+    s.head = s.tail = NULL;
+    TEST_ASSERT(server_model_idle_locked(&s));
+    pthread_mutex_unlock(&s.mu);
+
+    /* Batched: a busy slot is not idle; dispatch holds queued jobs back while
+     * the canary runs a step. */
+    server_slot slots[2];
+    memset(slots, 0, sizeof(slots));
+    s.batched_mode = true;
+    s.slots = slots;
+    s.slot_count = 2;
+    pthread_mutex_lock(&s.mu);
+    slots[1].busy = true;
+    TEST_ASSERT(!server_model_idle_locked(&s));
+    slots[1].busy = false;
+    TEST_ASSERT(server_model_idle_locked(&s));
+    s.idle_task = true;
+    s.head = s.tail = &queued;
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(s.head == &queued && !slots[0].assigned && !slots[1].assigned);
+    s.head = s.tail = NULL;
+    s.idle_task = false;
+    pthread_mutex_unlock(&s.mu);
+
+    /* Stopping: the canary thread gets nothing and holds nothing. */
+    s.stopping = true;
+    TEST_ASSERT(!server_idle_enter(&s) && !s.idle_task);
+
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
 static void test_kv_tool_map_filters_by_dsml_text(void) {
     const char *dsml_keep =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -22687,6 +22855,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_refuses_identity_and_canary_mismatch();
     test_kv_cache_v1_entries_refused_and_evictable();
     test_kv_cache_payload_hash_round_trip();
+    test_kv_cache_canary_gate();
+    test_server_idle_gate_for_canary();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

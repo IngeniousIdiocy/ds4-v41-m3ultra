@@ -400,6 +400,11 @@ static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
  * by the first store or load, and the canary is not checked). */
 static uint64_t g_kv_identity;
 static uint64_t g_kv_canary;
+/* Canary gate, read by request threads while the canary thread completes it. */
+enum { KV_CANARY_NONE, KV_CANARY_PENDING, KV_CANARY_READY, KV_CANARY_FAILED };
+static int g_kv_canary_state;
+
+static uint64_t kv_canary(void) { return __atomic_load_n(&g_kv_canary, __ATOMIC_ACQUIRE); }
 
 static uint64_t kv_mix64(uint64_t h, uint64_t v) {
     for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; }
@@ -419,7 +424,35 @@ uint64_t ds4_kvstore_engine_identity(ds4_engine *engine) {
 }
 
 void ds4_kvstore_set_identity(uint64_t identity) { g_kv_identity = identity; }
-void ds4_kvstore_set_canary(uint64_t canary) { g_kv_canary = canary; }
+void ds4_kvstore_canary_pending(void) {
+    __atomic_store_n(&g_kv_canary_state, KV_CANARY_PENDING, __ATOMIC_RELEASE);
+}
+
+void ds4_kvstore_set_canary(uint64_t canary) {
+    __atomic_store_n(&g_kv_canary, canary, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_kv_canary_state, KV_CANARY_READY, __ATOMIC_RELEASE);
+}
+
+void ds4_kvstore_canary_failed(void) {
+    __atomic_store_n(&g_kv_canary_state, KV_CANARY_FAILED, __ATOMIC_RELEASE);
+}
+
+bool ds4_kvstore_canary_ready(void) {
+    const int st = __atomic_load_n(&g_kv_canary_state, __ATOMIC_ACQUIRE);
+    return st == KV_CANARY_NONE || st == KV_CANARY_READY;
+}
+
+/* One line per gate state per process: why the disk cache is not used yet. */
+static bool kv_canary_gate(ds4_kvstore *kc, const char *what) {
+    if (ds4_kvstore_canary_ready()) return true;
+    static int logged = -1;
+    const int st = __atomic_load_n(&g_kv_canary_state, __ATOMIC_ACQUIRE);
+    if (__atomic_exchange_n(&logged, st, __ATOMIC_ACQ_REL) != st)
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE, "%s: kv cache %s refused: %s", kv_log_name(kc), what,
+                st == KV_CANARY_PENDING ? "the numerics canary has not completed yet (the cache turns on when it does)" :
+                                          "the numerics canary failed (the cache stays off)");
+    return false;
+}
 
 /* ---- payload digest: a word-wise FNV-style mix ---- */
 
@@ -557,13 +590,31 @@ static bool kv_put_payload_hash(FILE *fp, uint64_t hash) {
            fwrite(b, 1, sizeof(b), fp) == sizeof(b);
 }
 
-int ds4_kvstore_engine_canary(ds4_engine *engine, int tokens, uint64_t *out,
-                              char *err, size_t err_len) {
-    if (out) *out = 0;
-    if (!engine || !out || tokens <= 0) {
+struct ds4_kvstore_canary_run {
+    ds4_session *session;
+    ds4_tokens prompt;      /* all tokens; len is the prefilled prefix */
+    int tokens;
+    float *logits;
+    int vocab;
+};
+
+void ds4_kvstore_canary_end(ds4_kvstore_canary_run *run) {
+    if (!run) return;
+    if (run->session) ds4_session_free(run->session);
+    ds4_tokens_free(&run->prompt);
+    free(run->logits);
+    free(run);
+}
+
+ds4_kvstore_canary_run *ds4_kvstore_canary_begin(ds4_engine *engine, int tokens,
+                                                 char *err, size_t err_len) {
+    if (!engine || tokens <= 0) {
         snprintf(err, err_len, "invalid canary request");
-        return 1;
+        return NULL;
     }
+    ds4_kvstore_canary_run *run = kv_xmalloc(sizeof(*run));
+    memset(run, 0, sizeof(*run));
+    run->tokens = tokens;
     /* Fixed prompt: decimal numbers from a 32-bit LCG, each at least one
      * token, through the bound tokenizer (part of the identity). */
     kv_buf text = {0};
@@ -573,41 +624,52 @@ int ds4_kvstore_engine_canary(ds4_engine *engine, int tokens, uint64_t *out,
         kv_buf_printf(&text, "%05u ", (unsigned)(x % 100000u));
     }
     char *t = kv_buf_take(&text);
-    ds4_tokens prompt = {0};
-    ds4_tokenize_text(engine, t, &prompt);
+    ds4_tokenize_text(engine, t, &run->prompt);
     free(t);
-    const int vocab = ds4_engine_vocab_size(engine);
-    float *logits = vocab > 0 ? malloc((size_t)vocab * sizeof(float)) : NULL;
-    ds4_session *cs = NULL;
-    char serr[160] = {0};
-    int rc = 1;
-    if (prompt.len >= tokens) prompt.len = tokens;
-    if (prompt.len < tokens) {
-        snprintf(err, err_len, "canary prompt tokenized to %d of %d tokens", prompt.len, tokens);
-    } else if (!logits) {
+    run->vocab = ds4_engine_vocab_size(engine);
+    run->logits = run->vocab > 0 ? malloc((size_t)run->vocab * sizeof(float)) : NULL;
+    if (run->prompt.len < tokens) {
+        snprintf(err, err_len, "canary prompt tokenized to %d of %d tokens", run->prompt.len, tokens);
+    } else if (!run->logits) {
         snprintf(err, err_len, "no vocabulary for the canary logits");
-    } else if (ds4_session_create(&cs, engine, tokens + 64) != 0) {
+    } else if (ds4_session_create(&run->session, engine, tokens + 64) != 0) {
+        run->session = NULL;
         snprintf(err, err_len, "canary session (ctx %d) could not be created", tokens + 64);
-    } else if (ds4_session_sync(cs, &prompt, serr, sizeof(serr)) != 0) {
-        snprintf(err, err_len, "canary prefill failed: %s", serr[0] ? serr : "unknown error");
     } else {
-        const int n = ds4_session_copy_logits(cs, logits, vocab);
-        if (n <= 0) {
-            snprintf(err, err_len, "canary prefill produced no logits");
-        } else {
-            ds4_kvstore_hash s;
-            ds4_kvstore_hash_init(&s);
-            ds4_kvstore_hash_update(&s, prompt.v, (size_t)tokens * sizeof(prompt.v[0]));
-            ds4_kvstore_hash_update(&s, logits, (size_t)n * sizeof(float));
-            const uint64_t h = ds4_kvstore_hash_final(&s);
-            *out = h ? h : 1;
-            rc = 0;
-        }
+        run->prompt.len = 0;
+        return run;
     }
-    if (cs) ds4_session_free(cs);
-    free(logits);
-    ds4_tokens_free(&prompt);
-    return rc;
+    ds4_kvstore_canary_end(run);
+    return NULL;
+}
+
+int ds4_kvstore_canary_step(ds4_kvstore_canary_run *run, uint64_t *out,
+                            char *err, size_t err_len) {
+    if (!run || !run->session || !out) {
+        snprintf(err, err_len, "invalid canary run");
+        return -1;
+    }
+    const int done = run->prompt.len;
+    run->prompt.len = done + DS4_KVSTORE_CANARY_STEP < run->tokens ? done + DS4_KVSTORE_CANARY_STEP : run->tokens;
+    char serr[160] = {0};
+    if (ds4_session_sync(run->session, &run->prompt, serr, sizeof(serr)) != 0) {
+        snprintf(err, err_len, "canary prefill failed at %d tokens: %s", run->prompt.len,
+                 serr[0] ? serr : "unknown error");
+        return -1;
+    }
+    if (run->prompt.len < run->tokens) return 1;
+    const int n = ds4_session_copy_logits(run->session, run->logits, run->vocab);
+    if (n <= 0) {
+        snprintf(err, err_len, "canary prefill produced no logits");
+        return -1;
+    }
+    ds4_kvstore_hash s;
+    ds4_kvstore_hash_init(&s);
+    ds4_kvstore_hash_update(&s, run->prompt.v, (size_t)run->tokens * sizeof(run->prompt.v[0]));
+    ds4_kvstore_hash_update(&s, run->logits, (size_t)n * sizeof(float));
+    const uint64_t h = ds4_kvstore_hash_final(&s);
+    *out = h ? h : 1;
+    return 0;
 }
 
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
@@ -633,7 +695,7 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     kv_le_put64(h + 32, last_used);
     kv_le_put64(h + 40, payload_bytes);
     kv_le_put64(h + 48, g_kv_identity);
-    kv_le_put64(h + 56, g_kv_canary);
+    kv_le_put64(h + 56, kv_canary());
     /* 64..71: payload hash, written after the payload; 72..79 reserved */
 }
 
@@ -683,7 +745,7 @@ static bool kv_parse_header(FILE *fp, ds4_kvstore_entry *e,
         e->refusal = "graph payload ABI differs";
     else if (g_kv_identity && e->identity != g_kv_identity)
         e->refusal = "engine identity differs (other weights or prefill representation)";
-    else if (g_kv_canary && e->canary != g_kv_canary)
+    else if (kv_canary() && e->canary != kv_canary())
         e->refusal = e->canary ? "prefill numerics canary differs" : "entry records no numerics canary";
     return e->tokens != 0 && ds4_kvstore_quant_bits_supported(e->quant_bits);
 }
@@ -699,7 +761,7 @@ static void kv_note_refusal(const ds4_kvstore_entry *e) {
     fprintf(stderr, "ds4: kv cache entries refused: %s (entry identity %016llx canary %016llx, "
                     "this engine %016llx %016llx); they re-prefill\n",
             e->refusal, (unsigned long long)e->identity, (unsigned long long)e->canary,
-            (unsigned long long)g_kv_identity, (unsigned long long)g_kv_canary);
+            (unsigned long long)g_kv_identity, (unsigned long long)kv_canary());
 }
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
@@ -1232,6 +1294,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         size_t err_len) {
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
+    if (!kv_canary_gate(kc, "store")) return false;
     const int original_len = tokens->len;
 
     ds4_tokens store_tokens = {0};
@@ -1518,7 +1581,7 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                 "this engine %016llx %016llx); nothing restored from it",
                 kv_log_name(kc), e->path, e->tokens, e->refusal,
                 (unsigned long long)e->identity, (unsigned long long)e->canary,
-                (unsigned long long)g_kv_identity, (unsigned long long)g_kv_canary);
+                (unsigned long long)g_kv_identity, (unsigned long long)kv_canary());
     }
     return best;
 }
@@ -1534,6 +1597,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
+    if (!kv_canary_gate(kc, "load")) return 0;
     if (!g_kv_identity) g_kv_identity = ds4_kvstore_engine_identity(engine);
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;

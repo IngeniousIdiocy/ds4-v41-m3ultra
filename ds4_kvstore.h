@@ -14,8 +14,10 @@
  * reserved zero. v1 files have the 48-byte header. */
 #define DS4_KVSTORE_FIXED_HEADER 80u
 #define DS4_KVSTORE_V1_HEADER 48u
-/* Tokens of the fixed canary prompt: past 2,048 so the sparse index selects. */
+/* Tokens of the fixed canary prompt: past 2,048 so the sparse index selects.
+ * It is prefilled in fixed steps, so the value depends only on the build. */
 #define DS4_KVSTORE_CANARY_TOKENS 4096
+#define DS4_KVSTORE_CANARY_STEP 512
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
 
@@ -219,12 +221,24 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
 uint64_t ds4_kvstore_engine_identity(ds4_engine *engine);
 void ds4_kvstore_set_identity(uint64_t identity);
 /* Numerics canary: logits hash of a fresh prefill of a fixed tokens-long
- * prompt in a side session. Catches a prefill numerics change (kernels,
- * numerics switches) that the identity cannot see. 0 on success. Once set,
- * entries need an equal canary; with none set (ds4-agent) it is not checked. */
-int ds4_kvstore_engine_canary(ds4_engine *engine, int tokens, uint64_t *out,
-                              char *err, size_t err_len);
+ * prompt in a side session, in DS4_KVSTORE_CANARY_STEP-token steps. Catches a
+ * prefill numerics change (kernels, numerics switches) that the identity
+ * cannot see. begin tokenizes and creates the session (NULL on failure); each
+ * step prefills one more step: 1 = more to do, 0 = done (*out set), -1 =
+ * failed. The caller serializes them with other engine work; end frees. */
+typedef struct ds4_kvstore_canary_run ds4_kvstore_canary_run;
+ds4_kvstore_canary_run *ds4_kvstore_canary_begin(ds4_engine *engine, int tokens,
+                                                 char *err, size_t err_len);
+int ds4_kvstore_canary_step(ds4_kvstore_canary_run *run, uint64_t *out,
+                            char *err, size_t err_len);
+void ds4_kvstore_canary_end(ds4_kvstore_canary_run *run);
+/* Readiness gate. pending: loads and stores are refused until set_canary
+ * (ready) or failed (refused for good). With none of these called (ds4-agent)
+ * no canary is required or checked. Once set, entries need an equal canary. */
+void ds4_kvstore_canary_pending(void);
 void ds4_kvstore_set_canary(uint64_t canary);
+void ds4_kvstore_canary_failed(void);
+bool ds4_kvstore_canary_ready(void);
 /* Word-wise 64-bit FNV-style digest (integrity, not security). */
 typedef struct {
     uint64_t h, n;
