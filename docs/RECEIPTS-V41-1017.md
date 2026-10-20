@@ -209,6 +209,29 @@ is bit-identical: 0 of 16.4M collapse values and 0 of 1.4M paired-norm values
 differ. The micro saves −125 to −200 µs/token on the collapse. The stack
 timing is pending a window; the switch stays opt-in until then.
 
+## Clean-checkout check (25b45ea)
+
+A fresh `git clone --branch pub/v41-1017-update` with nothing else in the
+directory, on the M3 Ultra (macOS, Xcode command-line tools):
+
+- `make` (docs/METAL.md) builds ds4, ds4-server, ds4-bench, ds4-agent and
+  ds4-eval with no warnings.
+- Every prerequisite of `make test` builds, as does
+  `tests/test_deepseek41_metal`.
+- The Metal library assembled from the clone's `metal/` (26 files) compiles to
+  548 functions. The selector library (`metal/sampler_selector.metal`)
+  compiles with its three kernels. Both resolve from the checkout root; see
+  [RUNTIME-V41.md](RUNTIME-V41.md) section 4.
+- The model-free part of `make test` passes, run from the clone root: ds4-eval
+  case validation and extractor self-tests, `ds4_agent_test`,
+  `ds4_test --server`, test_layer_pack, test_engine_mgpu_placement, test_gpu_args
+  and its CLI script (90/90), test_prompt_prefix, test_sampling,
+  test_deepseek4_vision_image, test_engram, test_linux_memory, the TP command and
+  TCP tests, the web-recovery test, and the Q4_K and MXFP4 dot tests.
+- Not run here: `./ds4_test` without arguments (model-backed and Metal tests)
+  and `tests/test_session_state` (Metal). They need a model or a GPU window, as
+  [TESTING.md](TESTING.md) says.
+
 ## GPU tests
 
 These tests are built with each commit and run by the coordinator in GPU
