@@ -72087,25 +72087,7 @@ static int engram_fp8_sidecar_bind(const ds4_model *sm, uint64_t in_dim, uint64_
     return 0;
 }
 
-#ifdef DS4_TEST_HOOKS
-/* CPU check of the sidecar binding and audit, without a main model. */
-int ds4_test_engram_fp8_sidecar(const char *path, uint64_t in_dim, uint64_t out_dim) {
-    ds4_model sm = {0};
-    model_open(&sm, path, true, false);
-    ds4_str arch = {0};
-    const ds4_tensor *codes[DS4_MAX_LAYER] = {0}, *scales[DS4_MAX_LAYER] = {0};
-    int rc = !model_get_string(&sm, "general.architecture", &arch) ||
-             !ds4_streq(arch, "deepseek41-engram-fp8") ? -1 :
-             engram_fp8_sidecar_bind(&sm, in_dim, out_dim, codes, scales);
-    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++)
-        if (codes[il]) fprintf(stderr, "ds4: bound layer %u codes @%llu scales @%llu\n", il,
-                               (unsigned long long)codes[il]->abs_offset, (unsigned long long)scales[il]->abs_offset);
-    model_close(&sm);
-    return rc;
-}
-#endif
-
-#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+#ifndef DS4_NO_GPU
 /* Bind and audit an opened indexer FP8 sidecar (gguf-tools/deepseek41_indexer_fp8_sidecar.py): per index-source
  * layer the I8 codes indexer.attn_q_b.fp8 [1280, 4096] with E8M0 indexer.attn_q_b.e8m0 [40, 128]; every code a
  * finite E4M3 value, every scale byte in 1..246 (the kernel folds 2^8 into the scale), exactly 2 x 8 tensors. Logs
@@ -72180,19 +72162,6 @@ static int indexer_fp8_sidecar_identity(const ds4_model *sm) {
 #endif
 }
 
-#ifdef DS4_TEST_HOOKS
-/* CPU check of the indexer sidecar identity, binding and audit, without a main model; offs as the bind. */
-int ds4_test_indexer_fp8_sidecar(const char *path, int check_identity, uint64_t *offs) {
-    ds4_model sm = {0};
-    model_open(&sm, path, true, false);
-    ds4_str arch = {0};
-    int rc = !model_get_string(&sm, "general.architecture", &arch) || !ds4_streq(arch, "deepseek41-indexer-fp8") ? -1 :
-             check_identity && indexer_fp8_sidecar_identity(&sm) != 0 ? -1 :
-             indexer_fp8_sidecar_bind(&sm, DS4_N_LAYER, NULL, offs);
-    model_close(&sm);
-    return rc;
-}
-#endif
 #endif
 
 #ifndef DS4_NO_GPU
