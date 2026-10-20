@@ -70,36 +70,22 @@ Exactness method:
 
 - Every arm is compared with its control by FNV-1a digests of the decoded
   tokens, the frontier prefix, the final logits and the whole session state.
-- Every accepted change matched in every run, with one exception.
+- Every accepted change matched in every run.
 
-**The one change that is not bit-identical: EADD.** The Engram gate runs as
-one 256-thread group per stream. That reorders a floating-point reduction, so
-its output is not bitwise equal to the original. It is on by default and
-contributes to the speed figures above. `DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG=1`
-turns it off.
+**EADD, the staged Engram gate.** The decode step's Engram gate runs as one
+256-thread group per stream:
+- all threads stage the inputs into threadgroup memory;
+- one SIMD group runs the 32-lane kernel's reduction chains in the same order;
+- all threads apply the residual update.
 
-Its measured effect on quality is teacher-forced NLL per token, in nats, on
-four prompt sets (decision D144). It was measured on the campaign's
-composition at that time. The other changes are bit-identical, so they do not
-alter this comparison. Lower is better:
+Its output is bit-identical to the 32-lane kernel. The model-free test
+`tests/test_deepseek41_metal --engram-add-exact` found 0 of 3,072,000 fresh
+streams (15.7G values) differing. In a micro at the decode shape, a call takes
+18.6 µs, against 122.5 µs for the 32-lane kernel. EADD is on by default, and
+`DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG=1` turns it off.
 
-| Set | Cases / positions | EADD off | EADD on | Effect | Case-clustered SE |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Short | 14 / 138 | 0.317094 | 0.319634 | +0.002539 | 0.005148 |
-| General | 100 / 2,994 | 0.316464 | 0.319025 | +0.002561 | 0.001367 |
-| Long (8K–33K) | 9 / 576 | 0.449826 | 0.446590 | −0.003236 | 0.003431 |
-| Extended (66K–98K) | 6 / 384 | 0.443758 | 0.434101 | −0.009656 | 0.008841 |
-
-- On the general set, the largest, EADD costs +0.00256 nats/token (SE
-  0.00137).
-- Agreement with the original model's top-1 token, counted as disagreements:
-  86 without EADD and 91 with it on the general set; 2 and 1 on short; 24 and
-  20 on long; 17 and 19 on extended.
-- The general set's 99th-percentile per-position NLL rises from 1.007 to
-  1.037.
-- Nothing here covers 131K or 300K, all-vocabulary or arbitrary prompts.
-  EADD has not passed the campaign's final quality qualification.
-- A bit-exact form is in progress.
+The rows and digests above were measured before this kernel landed. The
+composed run with it (window W10) is pending.
 
 The 8K row is a composed run of this branch. A composed run at depth (64K and
 beyond) on this branch is still pending. Windows, arms and per-run numbers are

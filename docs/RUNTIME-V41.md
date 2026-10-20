@@ -132,7 +132,7 @@ default replaced, for A/B checks and bisection.
 | `DS4_METAL_DISABLE_V41_ROUTER_BF16` | BF16 router copy built at load |
 | `DS4_METAL_DISABLE_V41_ENGRAM_FP8` | Engram E4M3 copy built at load |
 | `DS4_METAL_DISABLE_V41_INDEXER_FP8` | indexer q_b E4M3 copy built at load |
-| `DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG` | one 256-thread group per stream for the Engram gate (EADD, the one lever that changes arithmetic) |
+| `DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG` | the staged Engram gate, one 256-thread group per stream (EADD; bit-identical to the 32-lane kernel) |
 | `DS4_METAL_DISABLE_V41_SAMPLER_GPU` | GPU top-p selector |
 | `DS4_METAL_DISABLE_V41_PREENCODE` | pre-encoding the next token's first command buffer |
 | `DS4_METAL_DISABLE_V41_GPU_BRIDGE` | finite GPU bridge behind the decode head |

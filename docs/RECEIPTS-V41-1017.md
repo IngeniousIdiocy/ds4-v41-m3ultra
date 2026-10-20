@@ -433,6 +433,14 @@ These were measured and are not in the branch:
   a relaxed device-atomic handoff. Plain stores plus a fence left about 26%
   stale probabilities and experts. Fused it was 16.85 µs per layer against
   14.48 separate, about +95 µs/token.
+- **The first, inexact EADD kernel:** the Engram gate's three reductions were
+  summed as float4 lanes, then SIMD sums, then an 8-way threadgroup sum. That
+  is a different order from the 32-lane kernel, and it changed about 1 BF16
+  value in 30k. It measured −0.229 / −0.368 ms/token (prose / code). D144's
+  general-set NLL was +0.00256 nats/token (SE 0.00137). It was replaced
+  because it was not bit-exact. The staged form (worker D) gives the 32-lane
+  bits and keeps about 90% of the gain (micro: 18.6 against 8.25 µs per call,
+  32 lanes 122.5).
 - **EADD fused into the Engram tail (fusion micro):** exact, but 236.3 µs
   (value rows first) or 271.7 µs (in order) against 227.8 separate.
 
