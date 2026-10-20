@@ -25,7 +25,9 @@ authorship:
 ### Headline numbers
 
 One M3 Ultra (512 GB), 1017 MXFP4 weights, concurrency 1. Each row was
-measured in its own window, with the method named in that row:
+measured in its own window, with the method named in that row. Labels such as
+q2k-a1, fp8pf-a5 and W5 name those measurement windows; the
+[receipts](docs/RECEIPTS-V41-1017.md) summarise each one's evidence.
 
 | Context | Decode tok/s | Window and method |
 | ---: | ---: | --- |
@@ -48,7 +50,7 @@ steady metric gave 40.130 and ours 40.087.
 
 In that window, the same `ds4-bench` sweep run on Ivan Fioravanti's main
 branch (a74d62a5) measured 38.08 tok/s at 2K and 37.22 at 8K on his steady
-metric (w1-a2 `p05-sweep-ivanmain.csv`).
+metric (window w1-a2).
 
 Cold prefill at 64K was 889 tok/s, against 841 without Ivan's indexer MMA
 (+5.7%, bit-exact; window w1-a2). That was measured on the campaign tree with

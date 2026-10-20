@@ -46,7 +46,7 @@ int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 #ifdef __APPLE__
 /* Autorelease pool for C callers: objects Metal autoreleases on a thread without a pool go to the thread's
- * implicit pool, which a C program's main or worker thread never drains (W2 a1: freed session buffers stayed
+ * implicit pool, which a C program's main or worker thread never drains (measured: freed session buffers stayed
  * in the footprint). ds4.c opens one around every public engine/session entry point (DS4_POOL_SCOPE). */
 void *ds4_gpu_autorelease_push(void);
 void ds4_gpu_autorelease_pop(void *pool);
@@ -215,7 +215,7 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
-/* Metal: the next decode token's first command buffer, pre-encoded during this token's terminal wait (S40 W72).
+/* Metal: the next decode token's first command buffer, pre-encoded during this token's terminal wait.
  * end_commands_commit / _wait split ds4_gpu_end_commands around the slot's encoding; pe_begin opens the slot as the
  * batch (only between those two), pe_end closes it, pe_commit writes the token word and commits it as the token's
  * first buffer. Any other command buffer drops a held slot first. pe_embed_word: the embed encoded next reads the
@@ -233,7 +233,7 @@ void ds4_gpu_pe_stats(uint64_t *out, int n);
 int ds4_gpu_end_commands_commit(void);
 int ds4_gpu_end_commands_wait(void);
 /* ds4_gpu_end_commands_commit with a finite GPU bridge (bridge_iters ALU iterations) committed behind the head, so the
- * GPU stays busy across the CPU handoff (S40 W71b); counts: committed, retired, failed. */
+ * GPU stays busy across the CPU handoff; counts: committed, retired, failed. */
 int ds4_gpu_end_commands_commit_bridged(uint32_t bridge_iters);
 void ds4_gpu_bridge_counts(uint64_t out[3]);
 int ds4_gpu_synchronize(void);

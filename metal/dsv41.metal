@@ -509,7 +509,7 @@ kernel void kernel_dsv41_rope_quantize(
     if (valid) dst[column] = dsv41_bf16(result);
 }
 
-/* The decode indexer query's rope and quantization in ONE dispatch over every head, in place (S40-IRQ): grid
+/* The decode indexer query's rope and quantization in ONE dispatch over every head, in place: grid
  * (width / block, heads) x 32, each threadgroup one block of one head row. The arithmetic is dsv41_rope_quantize_body
  * with the coefficients read from the step's RoPE coefficient table (kernel_dsv41_rope_coeff_table: float2(cos, sin)
  * of the same theta; the host binds the half the frequencies select, compressed = entries 32..63 at byte 256). Each
@@ -699,8 +699,8 @@ kernel void kernel_dsv41_engram_add(
             gate * dsv41_bf16(kv[value_offset + i]));
 }
 
-/* The decode Engram gate with one 256-thread group per stream instead of one 32-lane SIMD group (S40 EADD,
- * D025-C). Every input element, both RMS norms, the per-element (h * (q*k)) * k product, the gate expression and
+/* The decode Engram gate with one 256-thread group per stream instead of one 32-lane SIMD group.
+ * Every input element, both RMS norms, the per-element (h * (q*k)) * k product, the gate expression and
  * every BF16 boundary are those of kernel_dsv41_engram_add; the three reductions run as float4 lanes -> SIMD sums
  * -> an 8-way threadgroup sum in a fixed order (a different, numerically equivalent summation order), and the
  * residual update runs over all 256 threads. Host: width % 1024 == 0, unmasked. */

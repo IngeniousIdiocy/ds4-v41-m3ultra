@@ -25,7 +25,7 @@
 #define KV_CACHE_MAGIC0 'K'
 #define KV_CACHE_MAGIC1 'V'
 #define KV_CACHE_MAGIC2 'C'
-/* v2 (state-depth): the header grew to 80 bytes and binds the entry to verified
+/* v2: the header grew to 80 bytes and binds the entry to verified
  * content: the producing weights/representation (ds4_kvstore_engine_identity),
  * the prefill numerics canary and the payload hash, which the loader checks
  * before restoring anything. v1 files carry none of these: they are refused,

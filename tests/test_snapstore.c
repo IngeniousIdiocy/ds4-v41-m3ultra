@@ -111,7 +111,7 @@ static void test_compat(void) {
 
     char *nocan = replace(ok, "canary 4096 0123456789abcdef\n", "");
     CHECK(compat_of(nocan, IDENT, why, sizeof(why)) == DS4_SS_OK, "snapshot without a canary: %s", why);
-    /* Codex review: a recorded canary this process could not recompute is refused. */
+    /* A recorded canary this process could not recompute is refused. */
     char *need_nocan = replace(IDENT, "canary 4096 0123456789abcdef\n", "");
     CHECK(compat_of(ok, need_nocan, why, sizeof(why)) == DS4_SS_UNVERIFIABLE && strstr(why, "recompute") &&
           strstr(why, "0123456789abcdef"), "unrecomputed canary: %s", why);

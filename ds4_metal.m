@@ -50046,7 +50046,7 @@ int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos) {
 }
 
 /* The decode indexer query's rope + quantization over every head, in place, in one dispatch reading the step's RoPE
- * coefficient table (S40-IRQ). */
+ * coefficient table. */
 static uint64_t g_irq_count;
 uint64_t ds4_gpu_irq_count(void) { return g_irq_count; }
 
@@ -50336,7 +50336,7 @@ int ds4_gpu_dsv41_rope_quantize(const ds4_gpu_tensor *x, ds4_gpu_tensor *dst, ui
     }
 }
 
-/* The decode step's Engram gate form (S40 EADD): set by the V4.1 decode step for its own duration only. */
+/* The decode step's Engram gate form (256-thread or 32-lane): set by the V4.1 decode step for its own duration only. */
 static int g_engram_add_tg;
 static uint64_t g_engram_add_tg_calls;
 void ds4_gpu_set_engram_add_tg(int on) { g_engram_add_tg = on != 0; }
@@ -53505,7 +53505,7 @@ static void ds4_gpu_selector_release(void) {
     g_sel_ready = 0;
 }
 
-/* ==== The next decode token's first command buffer, pre-encoded (S40 W72) ====
+/* ==== The next decode token's first command buffer, pre-encoded ====
  * ds4.c encodes token N+1's embed (its token id read from g_pe_tokword), RoPE-table producer, layer-0 capture and
  * layer 0 into a second command buffer (the slot) after token N's final buffer was committed and before it is waited
  * on. The slot is closed and never committed until ds4_gpu_pe_commit, which writes the token word and commits it as
@@ -53707,7 +53707,7 @@ int ds4_gpu_end_commands_commit(void) {
     return 1;
 }
 
-/* ==== The finite GPU bridge behind the decode head (S40 W71b) ====
+/* ==== The finite GPU bridge behind the decode head ====
  * Right after the decode step's final (head) buffer is committed, and before the next token's pre-encoded slot is
  * encoded, one finite ALU kernel (kernel_dsv4_tp_keepalive, 1 x 256 threads, N iterations) is committed on the same
  * queue, writing only a private 1 KiB scratch of its own: no model data, nothing the decode reads. It keeps the GPU

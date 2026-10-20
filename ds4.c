@@ -41355,7 +41355,7 @@ static bool ds41_indexer_q(ds41_gpu_graph *g, const ds4_model *m, const ds4_laye
 }
 
 /* The decode index query's rope + FP4_E8M0 quantization: one dispatch reading this step's RoPE coefficient table on a
- * compressed layer while the table is this position's (S40-IRQ), else the separate rope and quantize. */
+ * compressed layer while the table is this position's, else the separate rope and quantize. */
 static bool ds41_index_q_rope_quantize(ds41_gpu_graph *g, uint32_t il, uint32_t pos) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const bool compressed = ds4_layer_compress_ratio(il) != 0;
@@ -42784,7 +42784,7 @@ static void ds41_step_prologue(ds41_gpu_graph *g, const ds4_model *m, const ds4_
     /* The GPU top-p selector only on the queued-head decode step (logits, one host, resident, not quality), so
      * prefill, verify, TP and streaming never encode it. */
     g->sel_gpu = queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() && !ds41_sampler_gpu_off();
-    /* The Engram gate with one 256-thread group per stream on this decode step (numerical, S40 EADD); prefill,
+    /* The Engram gate with one 256-thread group per stream on this decode step (numerical: a different summation order); prefill,
      * verify, TP, streaming and quality keep the 32-lane form. */
     ds4_gpu_set_engram_add_tg(logits && g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
 #else
@@ -42834,7 +42834,7 @@ static void ds41_step_tail_reset(ds41_gpu_graph *g) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 static DS4_MAYBE_UNUSED bool ds41_preencode_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_PREENCODE", &c); }
 
-/* The finite GPU bridge's ALU iterations behind each pre-encoded decode head (S40 W71b): 17591 (M3 Ultra, measured),
+/* The finite GPU bridge's ALU iterations behind each pre-encoded decode head: 17591 (M3 Ultra, measured),
  * DS4_METAL_V41_GPU_BRIDGE_ITERS=N (0..4194304) to retune, 0 or DS4_METAL_DISABLE_V41_GPU_BRIDGE=1 for none. */
 static uint32_t ds41_bridge_iters(void) {
     static int cached = -1;
@@ -42852,7 +42852,7 @@ static uint32_t ds41_bridge_iters(void) {
     return (uint32_t)cached;
 }
 
-/* ==== The next token's first command buffer, pre-encoded (S40 W72) ====
+/* ==== The next token's first command buffer, pre-encoded ====
  * The next token's first command buffer (embed, RoPE-table producer, layer-0 capture, layer 0 at pos + 1) is encoded
  * during this token's terminal wait, after its final buffer was committed, into the Metal slot, and committed after
  * the next selection (the token id is read from a device word written at commit). The Engram hash and row reads
@@ -79375,7 +79375,7 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
     return token;
 }
 
-/* The V4.1 GPU top-p selector's CPU consumer (S40-GSEL, D049-D056; fast form S40-SELFAST, W73).
+/* The V4.1 GPU top-p selector's CPU consumer (the fast form; the reference form is kept for tests).
  *
  * The decode step that produced s->logits also ran three small kernels over them (metal/sampler_selector.metal):
  * the finite count, the maximum and its earliest index, FP32 block partials of expf(v - M) over each 256 logits,
@@ -79454,7 +79454,7 @@ static int sel_fin(const float *x) { uint32_t u; memcpy(&u, x, 4); return (u & 0
 static uint32_t sel_okey(float v) { uint32_t u; memcpy(&u, &v, 4); if (u == 0x80000000u) u = 0; return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
 static sample_candidate g_sel_c[SEL_SUPB];
 #ifdef DS4_TEST_HOOKS
-/* The reference consumer (as screened in D049-D056), kept for the CPU equivalence test of the fast one below.
+/* The reference consumer, the form first measured, kept for the CPU equivalence test of the fast one below.
  * 1 = token chosen, 0 = full-vocabulary fallback, -1 ambiguous. */
 static int sample_blk_decide(sample_candidate *heap, uint32_t n, uint32_t finite,
                              double sum64, float top_p, int best, uint64_t *rng, int *token_out) {

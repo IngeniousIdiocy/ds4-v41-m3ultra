@@ -3,8 +3,19 @@
 The measurements and exactness checks behind the 1017 decode commits on this
 branch. Each commit message carries its own what/why and ledger entry; this
 page collects the results that arrived after a commit landed, or that span
-several commits. Ledger ids (S40-*, D0xx) refer to the serial 40 tok/s
-campaign record.
+several commits.
+
+Glossary for the labels in this page and in the commit messages:
+
+- **Worker A to worker D**: the parallel implementation agents of the serial
+  40 tok/s campaign that produced this branch.
+- **Codex**: the reviewing architect model.
+- **Window labels** such as `fp8pf-a5`, `irqres-a1`, `w1-a2`, `W5` or `W72`:
+  measurement windows, each a protected run on the M3 Ultra. This page
+  summarises their evidence.
+- **P numbers** (P11 to P27) are the results recorded for those windows.
+  **Ledger ids** (`S40-*`, `D0xx`) are entries in the campaign's decision
+  record. That record is not published.
 
 Unless stated otherwise: one M3 Ultra (512 GB), the 1017 MXFP4 target
 weights, decode at concurrency 1, and the campaign's prose and code fixtures.
@@ -27,7 +38,7 @@ Setup:
 | code | 40.508 | 40.418 | `166bd265feac6270` | `c1c571c0a9ade5be` | `428ef17df51250d8` |
 
 The digests are those of the campaign's irqres-a1 arms. The T arm and its
-control give the same three digests per fixture (`batch_summary.txt`, p01–p08).
+control give the same three digests per fixture (runs p01–p08).
 So the branch reproduces irqres-a1 T bit for bit from a cold prefill.
 
 The same window ran the `DS4_V41_S1TG` arms. Their result is in the
@@ -109,7 +120,7 @@ CPU proof:
 
 ## Blended narrow decode readers (1e4efb2, f7ee976, 0f1095d)
 
-Worker D's blend kernels read the Engram projections, the router and the
+The blend kernels read the Engram projections, the router and the
 index-source indexer q_b from the narrow copies. The shift decode of the
 E4M3 codes is co-credited to Ivan Fioravanti. They are the default since
 f7ee976; `DS4_METAL_DISABLE_V41_BLEND=1` opts out.
@@ -143,7 +154,7 @@ inferred, not measured.
 ## Narrow copies built at load: decode and startup (cddebae, P17/P18)
 
 Window fp8pf-a4 first showed a 16-token decode average of 31.48 tok/s with
-the builder on against 37.66 off. Worker B's per-token split traced that to
+the builder on against 37.66 off. A per-token split traced that to
 the first token: 127.7 ms with the builder on against 34.5 ms off. Over
 tokens 2 to 16 the builder is faster: 39.46 against 38.46 tok/s (25.34
 against 26.00 ms/token).
@@ -155,7 +166,7 @@ with the builder on.
 cddebae removes the first-token cost. It adds the built buffers to the
 residency set right after the build and compiles their readers' pipelines
 with one warm-up dispatch each. Its cold-start A/B (startup, prefill, first
-token, steady decode and memory) is assigned to worker B and not yet
+token, steady decode and memory) is pending and not yet
 recorded here.
 
 ## Shared FP8 prefill and public-derived values (P11, P17)
@@ -180,7 +191,7 @@ prefill path is not ported to this branch.
 
 ## Top-k winners' sort and candidate list once (0761f41, e7ab260, 82923a2)
 
-Worker C's state-depth windows used greedy 128 on saved snapshots, mirrored
+The state-depth windows used greedy 128 on saved snapshots, mirrored
 arms, and the same tokens and state hash in every run.
 
 Window W4 (2 runs per arm; tok/s, deltas against A = candidate scoring):
@@ -231,7 +242,7 @@ contention; the A/B order repeated.
 
 ## Single-group latency kernels (f45f4e8, 77eea27, 913aa61; opt-in, experimental)
 
-Worker D's `DS4_V41_S1TG`:
+`DS4_V41_S1TG`:
 
 - `cn`: the split HC collapse and the hoisted paired norm. In a model-free
   micro at the decode shapes it is bit-identical: 0 of 16.4M collapse values
@@ -250,8 +261,8 @@ digests differed from the control:
   `4feb7562d5a596e7`, against `ed3ca952608e6274` / `6d2d529ba8c0e5c0`. On
   code they are `afdf72f24377f997` / `e3de3dfb45ec2ab7`, against
   `c1c571c0a9ade5be` / `428ef17df51250d8`.
-- `cn` and `cnkr` give the same digests as each other in both repeats. The cause is under investigation by worker
-D. Until it is found and fixed, every letter (`cnkrh`) stays opt-in and
+- `cn` and `cnkr` give the same digests as each other in both repeats. The cause is under
+investigation. Until it is found and fixed, every letter (`cnkrh`) stays opt-in and
 experimental, and none of them enters a measured basis.
 
 ## Clean-checkout check (25b45ea)

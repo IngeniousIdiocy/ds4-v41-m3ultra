@@ -134,7 +134,7 @@ static inline void sel_global(device const sel_part *part, ushort tid, ushort la
     for (ushort j = 1; j < 8; j++) sel_take(M, B, F, tm[j], tb[j], tf[j]);
 }
 
-/* ---- D051 superset variant ("superset", tools/selector_superset.h): K1 (unchanged) + R1 + S3 ----
+/* ---- Superset variant ("superset"): K1 (unchanged) + R1 + S3 ----
  * R1, ONE threadgroup: the ordered reduction of the 505 block records once (sel_global), cap = min(finite, 512),
  * the coarse bin b holding the cap-th finite key and the count above it (sel_find_bin over H1), Ncoarse =
  * above + H1[b]; publishes finite/best/cap/M, b (b1), above (above1), Ncoarse (b2) and the threshold key b << 21 (t);
