@@ -1,3 +1,76 @@
+## DeepSeek V4.1 Flash 1017 on M3 Ultra — October update
+
+This branch is our own DwarfStar implementation of DeepSeek V4.1 Flash for Apple
+Silicon. It is built on [antirez's DwarfStar](https://github.com/antirez/ds4) engine
+and on kernelpool's V4.1 Metal work by Tarjei Mandt. The October update
+targets the 1017 checkpoint. It makes serial decode exceed 40 tokens/s on one
+M3 Ultra, with output that is bit-identical to the September engine except for
+the one numerical change named below.
+
+It builds on others' work:
+
+- **Ivan Fioravanti:** the E4M3 shift decode that the blended readers adapt,
+  the literal-shape dispatch mechanism, the narrow decode copies built at load,
+  and the exact prefill indexer MMA. His commits keep his authorship.
+- **Tarjei Mandt (kernelpool):** the V4.1 Metal base, candidate-block index
+  scoring and the radix top-k this branch's 512-wide sort finishes.
+- **antirez:** DwarfStar itself.
+
+### Headline numbers
+
+One M3 Ultra (512 GB), 1017 MXFP4 weights, concurrency 1, greedy decode of 128
+tokens after a saved prefix. Each number is tokens/s on Ivan Fioravanti's
+steady metric (wall time of tokens 2..N) and ours (first sampling to last
+evaluation, per token). Where both were recorded, they agree to within 0.05.
+
+| Context | Decode | Run |
+| ---: | ---: | --- |
+| 2K | 40.60 | q2k-a1, campaign stack |
+| 8K | 40.52 (prose) / 40.52 (code) | blend-a2, campaign stack + blended readers |
+| 64K | 39.70 | W5, candidate scoring + sort512 + candidate list once |
+| 131K | 39.07 | W5 |
+| 300K | 38.02 | W5 |
+
+Under the same bench, upstream Ivan main (a74d62a5) runs 38.08 at 2K and 37.22
+at 8K. Cold prefill at 64K is 889 tokens/s with Ivan's indexer MMA (+5.7%,
+bit-exact).
+
+Exactness method:
+
+- Every arm is compared with its control by FNV-1a digests of the decoded
+  tokens, the frontier prefix, the final logits and the whole session state.
+- Every accepted change matched in every run.
+- The one exception is the Engram gate's 256-thread form (EADD). It reorders a
+  reduction, is on by default and can be turned off with
+  `DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG=1`.
+
+The rows come from separate windows: the depth rows were measured before the
+blended readers landed. A single composed run of this branch is pending.
+Windows, arms and per-run numbers are in
+[RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
+
+### Prepare the model
+
+```
+<model preparation command — to be filled in by the weights work>
+```
+
+The engine needs only the MXFP4 GGUF. It builds the narrow decode copies
+(BF16 router, E4M3 Engram and indexer q_b) at load. Optional sidecars from the
+original checkpoint load with `--v41-sidecar FILE`.
+
+### Run
+
+```
+make
+./ds4-server -m DeepSeek-V4.1-Flash-MXFP4.gguf --metal -c 393216 --prefill-chunk 8192 \
+    --mtp-model DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling
+```
+
+[RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every option: the server policy
+that Project Trench uses, the disk KV cache, and the diagnostic switches. No
+environment variable is needed.
+
 ## DeepSeek V4.1 Flash on M3 Ultra — September 18 update
 
 This branch now blends its prior optimizations with a MXFP4 combination of scalar decode,
