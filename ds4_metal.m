@@ -19475,6 +19475,8 @@ static int ds4_gpu_indexer_topk_select(id<MTLBuffer> selbuf, NSUInteger sel_off,
     return ds4_gpu_finish_command_buffer(cb, owned, "indexer top-k select") ? 1 : 0;
 }
 
+static int ds4_s1tg_on(char k);
+
 static int ds4_gpu_indexer_topk_tensor_impl(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -19586,6 +19588,15 @@ static int ds4_gpu_indexer_topk_tensor_impl(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        /* DS4_V41_S1TG has k (the decode call through the prefix merge): the levels with more than ten runs through the
+         * staged merge, the rest of the ladder in one threadgroup. The same outputs as the prefix merge's ladder. */
+        const bool s1k = decode_k512 && nth == 1024 && block_top_k == 512 && n_comp <= 65536u &&
+            !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") && ds4_s1tg_on('k');
+        id<MTLComputePipelineState> staged_pipeline = s1k ?
+            ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix_staged") : nil;
+        id<MTLComputePipelineState> fused_pipeline = s1k ?
+            ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix_fused") : nil;
+        if (fused_pipeline && fused_pipeline.maxTotalThreadsPerThreadgroup < 1024u) fused_pipeline = nil;
         int32_t len = block_top_k;
         while (len < work_width) {
             const int32_t nm = (work_width + 2 * len - 1) / (2 * len);
@@ -19616,8 +19627,29 @@ static int ds4_gpu_indexer_topk_tensor_impl(
                 .block_top_k = (uint32_t)block_top_k,
             };
 
+            /* the staged kernel runs with the prefix merge's thread count (its chunks decide the NaN-row order) */
+            id<MTLComputePipelineState> level_pipeline = staged_pipeline &&
+                staged_pipeline.maxTotalThreadsPerThreadgroup >= merge_threads ? staged_pipeline : merge_pipeline;
+            const int32_t runs = (work_width + len - 1) / len;
+            if (fused_pipeline && merge_threads == 512u && runs <= 10) {
+                const uint32_t mt = 512u;
+                merge_args.top_k = (int32_t)top_k;
+                enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:fused_pipeline];
+                [enc setBytes:&merge_args length:sizeof(merge_args) atIndex:0];
+                [enc setBytes:&mt length:sizeof(mt) atIndex:1];
+                [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:2];
+                [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:3];
+                [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+                [enc setThreadgroupMemoryLength:((NSUInteger)runs * 512u * 6u + 15u) & ~(NSUInteger)15u atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                break;
+            }
+
             enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:merge_pipeline];
+            [enc setComputePipelineState:level_pipeline];
+            if (level_pipeline == staged_pipeline) [enc setThreadgroupMemoryLength:8192 atIndex:0];
             [enc setBytes:&merge_args length:sizeof(merge_args) atIndex:0];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
             [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:2];
@@ -49535,7 +49567,8 @@ int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
         const bool hier = rows == 1u && n_expert == 384u && top_k == 6u &&
             !getenv("DS4_METAL_DISABLE_V41_ROUTER_HIER");
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
-            hier ? "kernel_dsv41_router_hier" : "kernel_dsv41_router_one");
+            hier ? (ds4_s1tg_on('r') ? "kernel_dsv41_router_hier_ballot" : "kernel_dsv41_router_hier") :
+                   "kernel_dsv41_router_one");
         if (!pipeline) return 0;
         NSUInteger nth = 1;
         while (nth < n_expert) nth *= 2u;
@@ -49731,7 +49764,9 @@ static id<MTLBuffer> ds4_gpu_v41_deferred_counter(void) {
 }
 
 /* DS4_V41_S1TG=<letters> (read per call): c the deferred HC collapse as two dispatches over 32 + 10 groups, n the paired
- * norm with its loads issued at entry. Both give the replaced kernels' bits. Unset: the single-group kernels. */
+ * norm with its loads issued at entry, k the decode indexer top-k's merge ladder staged in threadgroup memory and fused
+ * into one group, r the hierarchical router with ballot nominations. All give the replaced kernels' bits. Unset: the
+ * originals. */
 static int ds4_s1tg_on(char k) {
     const char *s = getenv("DS4_V41_S1TG");
     const int on = s && strchr(s, k) != NULL;
