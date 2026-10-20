@@ -2415,7 +2415,7 @@ template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul
 /* The V4.1 decode router reading the released BF16 gates. */
 template [[host_name("kernel_mul_mv_bf16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, float, float4>;
 
-/* The blend router (DS4_V41_BLEND has r): kernel_mul_mv_bf16_f32_4 (kernel_mul_mv_t_t_4_impl<bfloat, ...>) with the lane's
+/* The blend router: kernel_mul_mv_bf16_f32_4 (kernel_mul_mv_t_t_4_impl<bfloat, ...>) with the lane's
  * 16 BF16 weights loaded as two 16-byte words and widened by integer shifts (the same floats), one row per threadgroup; the
  * K walk, float4 dot grouping, per-lane sums and helper_mv_reduce_and_write are the BF16 router's, so the output is
  * bit-identical. ne00 must be a multiple of 32 (no tail loop); rows 16-byte aligned. */
@@ -2600,7 +2600,7 @@ static inline float4 ds4_blend_dec4(uint w) {
     return float4(float(a.x), float(b.x), float(a.y), float(b.y));
 }
 
-/* The blend indexer q_b (DS4_V41_BLEND has x): kernel_mul_mv_fp8_f32_4_bf16<2> where every lane owns at most one 32-column
+/* The blend indexer q_b: kernel_mul_mv_fp8_f32_4_bf16<2> where every lane owns at most one 32-column
  * block (ne00 <= 16 x the production simdgroup count), dispatched with only the ceil(ne00 / 512) simdgroups that own blocks:
  * the production simdgroups beyond them hold sumf = +0 and add only +0 to the reduction, so it sees the same values. The
  * lane's single 16-code partial is dotted unscaled and multiplied by the block's 2^(e-119) once (exact: a power of two on a
@@ -4434,7 +4434,7 @@ kernel void kernel_engram_fp8_mv(
 typedef decltype(kernel_engram_fp8_mv<2>) engram_fp8_mv_t;
 template [[host_name("kernel_engram_fp8_mv_bf16")]] kernel engram_fp8_mv_t kernel_engram_fp8_mv<2>;
 
-/* The blend Engram reader (DS4_V41_BLEND has e): kernel_engram_fp8_mv<2> without the value table. Each code is decoded as
+/* The blend Engram reader: kernel_engram_fp8_mv<2> without the value table. Each code is decoded as
  * an F16 bit pattern (value / 256, ds4_blend_dec4), widened and multiplied by the block's 2^(e-119), which is the table's
  * float code x 2^(e-127) exactly (a power-of-two scaling, no underflow or overflow for any finite code and E8M0 byte
  * <= 246), and dotted in the table reader's float4 grouping; the K walk, per-lane sums and helper_mv_reduce_and_write are
