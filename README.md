@@ -92,9 +92,35 @@ in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
 
 ### Prepare the model
 
+The engine loads one 16 KiB-aligned MXFP4 GGUF. The public release ships it as nine
+split files; the DSpark drafter is converted from three shards of the original
+checkpoint. Download both, then prepare once:
+
 ```
-<model preparation command — to be filled in by the weights work>
+hf download antirez/deepseek-v4.1-flash-gguf --revision 9dcee51692e6540f697141fc98b097e3c96492a3 \
+    --include 'DeepSeek-V4.1-Flash-1017-MXFP4-experts-*' --local-dir shards
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+    --include config.json tokenizer.json 'model-0004[456]-of-00048.safetensors' --local-dir dspark-source
+pip install numpy tokenizers sympy
+python3 gguf-tools/deepseek41_prepare.py --shards shards --dspark-source dspark-source --out gguf
+python3 gguf-tools/deepseek41_prepare.py --verify --out gguf
 ```
+
+This writes `gguf/DeepSeek-V4.1-Flash-MXFP4.gguf` (467.2 GiB) and
+`gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf` (7.4 GiB). The shards are checked
+against their published SHA-256 while they are merged; only `general.alignment`
+changes and the `split.*` keys are dropped, so every tensor byte is the release's.
+The drafter is the 1017 checkpoint's `mtp.*` stages (7.93 GB of source) in Q8_0 /
+MXFP4, with `dspark.target_architecture=deepseek41`. `--verify` re-reads both
+files and compares every tensor with the digests pinned in
+`gguf-tools/deepseek41_prepare.json`; exit 0 means byte-identical to the reference
+build. `--dry-run` checks inputs, free space and Python modules without writing.
+
+Needs: 543.9 GB free beside `--out` (509.6 GB of output plus a 32 GiB reserve),
+plus the 509.5 GB of inputs if they share the volume; delete the inputs after
+`--verify` passes. Python 3.10+ with numpy, tokenizers and sympy, and `cc` and
+`make` (the quantizer library builds on first use). On an M3 Ultra with inputs and
+outputs on one Thunderbolt NVMe drive: merge 5.7 min, drafter 10 s, verify 2.3 min.
 
 The engine needs only the MXFP4 GGUF. It builds the narrow decode copies
 (BF16 router, E4M3 Engram and indexer q_b) at load. Optional sidecars from the
