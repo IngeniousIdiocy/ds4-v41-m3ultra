@@ -1846,14 +1846,15 @@ static int check_index_score_bf16(void) {
                     "us per call wide=%.0f bf16=%.0f\n", names[dist], keys, differing, positive, rounded,
                     seconds[0] / (ROUNDS - 1) * 1e6, seconds[1] / (ROUNDS - 1) * 1e6);
             CHECK(differing == 0 && positive > keys / 16 && (ci != 0 || rounded > 0));
-            /* the split scorers below 65536 keys (S = 2, 4; 128, 256, 512 threads) and the grouped one there */
+            /* below 65536 keys: the opt-out (the grouped scorer) and the split scorers (S = 2, 4; 128, 256, 512 threads) */
             const char *splits[][2] = {{"0", "256"}, {"2", "128"}, {"2", "512"}, {"4", "128"}, {"4", "256"}, {"4", "512"}};
             for (size_t si = 0; keys < 65536u && si < sizeof(splits) / sizeof(*splits); si++) {
-                CHECK(setenv("DS4_METAL_V41_SCORE_SPLIT", splits[si][0], 1) == 0 &&
+                CHECK(setenv(si ? "DS4_METAL_V41_SCORE_SPLIT" : "DS4_METAL_DISABLE_V41_SCORE_SPLIT", si ? splits[si][0] : "1", 1) == 0 &&
                       setenv("DS4_METAL_V41_SCORE_SPLIT_TG", splits[si][1], 1) == 0);
                 memset(fast, 0xff, (size_t)keys * sizeof(float));
                 const int ok = ds4_gpu_dsv41_indexer_score_bf16(sb, qt, wt, vt, keys) && ds4_gpu_synchronize();
-                CHECK(unsetenv("DS4_METAL_V41_SCORE_SPLIT") == 0 && unsetenv("DS4_METAL_V41_SCORE_SPLIT_TG") == 0);
+                CHECK(unsetenv("DS4_METAL_V41_SCORE_SPLIT") == 0 && unsetenv("DS4_METAL_DISABLE_V41_SCORE_SPLIT") == 0 &&
+                      unsetenv("DS4_METAL_V41_SCORE_SPLIT_TG") == 0);
                 CHECK(ok && !memcmp(wide, fast, (size_t)keys * sizeof(float)) && fast[keys] == 12345);
             }
         }
