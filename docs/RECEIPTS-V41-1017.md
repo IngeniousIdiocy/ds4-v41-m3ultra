@@ -49,7 +49,11 @@ VALID 12/12, every row bitwise equal to irqres-a1 T.
 
 - **Shift decode of the Engram E4M3 codes (3c298c0, opt-in):** −26.7 µs/token
   on prose and −33.4 µs/token on code. On each fixture both S runs were below
-  both control runs. It stays opt-in until the blended narrow readers land.
+  both control runs. It stays opt-in: the blended Engram reader (1e4efb2,
+  default since f7ee976) carries the shift-decode idea and supersedes it on
+  the decode path. Window attr-a1 also explains the small in-stack gain: the
+  shift decode cuts the Engram kernel by −164.9 µs/token, but its neighbours
+  lose most of that (wall +42.5 µs/token under the encoder timeline).
 - **Aligned tensor copies in the open encoder (0f8972d):** −5.4 / −37.3
   µs/token. This is inconclusive (one code run drives it). The commit is kept
   because it is correctness-neutral, with no claimed gain.
@@ -76,6 +80,135 @@ CPU proof:
 - bf16 rounding is idempotent over all 2^32 patterns.
 - 0 non-NaN differences over 87,031,808 words of real reduce output.
 
+## Blended narrow decode readers (1e4efb2, f7ee976, 0f1095d)
+
+Worker D's blend kernels read the Engram projections, the router and the
+index-source indexer q_b from the narrow copies. The shift decode of the
+E4M3 codes is co-credited to Ivan Fioravanti. They are the default since
+f7ee976; `DS4_METAL_DISABLE_V41_BLEND=1` opts out.
+
+Window blend-a2 (8K, order C T T C, VALID 8/8; every measured row bitwise
+equal to the irqres T arm, and T equal to C):
+
+| Fixture | C ms/token | T ms/token | T − C | T tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| Prose | 24.898785 | 24.677890 | −220.9 µs | 40.522 |
+| Code | 24.870855 | 24.681204 | −189.7 µs | 40.517 |
+
+Both T runs were below both C runs on both fixtures, by at least 175 µs.
+
+Window attr-a1 attributed the gain with the encoder timeline. It used 12
+fresh prose processes, mirrored C T E R X S S X R E T C, all with the same
+logits, prefix and state digests. The timeline serializes encoders, so the
+absolute speed reads about 38.0 tok/s; the deltas are in µs/token against C:
+
+| Arm | Wall | Kernel time |
+| --- | ---: | --- |
+| T (all three) | −116.5 | Engram −178.3, router −93.6, indexer −38.8 |
+| E (Engram alone) | +31.7 | Engram −176.6; router matvec +27.2, other +41.6 |
+| R (router alone) | −72.8 | router −119 |
+| X (indexer alone) | −18.2 | indexer −38.6 |
+
+The Engram saving alone is eaten by its neighbours, so the three readers
+ship as one unit. That the router slowdown comes from SLC eviction is
+inferred, not measured.
+
+## Narrow copies built at load: decode and startup (cddebae, P17/P18)
+
+Window fp8pf-a4 first showed a 16-token decode average of 31.48 tok/s with
+the builder on against 37.66 off. Worker B's per-token split traced that to
+the first token: 127.7 ms with the builder on against 34.5 ms off. Over
+tokens 2 to 16 the builder is faster: 39.46 against 38.46 tok/s (25.34
+against 26.00 ms/token).
+
+The build takes 102.9 ms for 490.3 MiB (router BF16, Engram E4M3, indexer
+q_b E4M3), at session creation before prefill. Peak RSS is 1.5 GB higher
+with the builder on.
+
+cddebae removes the first-token cost. It adds the built buffers to the
+residency set right after the build and compiles their readers' pipelines
+with one warm-up dispatch each. Its cold-start A/B (startup, prefill, first
+token, steady decode and memory) is assigned to worker B and not yet
+recorded here.
+
+## Shared FP8 prefill and public-derived values (P11, P17)
+
+These measurements describe the narrow copies themselves; the shared
+prefill path is not ported to this branch.
+
+- **Shared FP8 prefill** (Engram and indexer prefill read the decode's narrow
+  copies, router BF16): bit-exact to the control in frontier logits, final
+  logits and teacher-forced NLL. The counters show zero wide GGUF reads
+  through prefill and decode at 512, 8K and 64K. Prefill costs +0.59% at 8K
+  (717.3 against 721.5 tok/s) and +0.20% at 64K. Decode is unchanged.
+- **Public-derived values** (the at-load builder's re-encode of the public
+  F16 tensors) against the source sidecars, window fp8pf-a3, 8K, 512
+  tokens: identical logits and state digests on both fixtures, with no speed
+  difference.
+- At the Engram output itself the two are not value-identical (window
+  fp8pf-a4: 92 of 409,600 BF16 values differ, mostly by 1 ulp and at most
+  by 11, almost all in layer 1). The differences are absorbed before the
+  logits on these fixtures. This is evidence on the pinned fixtures, not a
+  proof for every input.
+
+## Top-k winners' sort and candidate list once (0761f41, e7ab260, 82923a2)
+
+Worker C's state-depth windows used greedy 128 on saved snapshots, mirrored
+arms, and the same tokens and state hash in every run.
+
+Window W4 (2 runs per arm; tok/s, deltas against A = candidate scoring):
+
+| Depth | A | S (sort512) | O (list once) |
+| --- | ---: | ---: | ---: |
+| 64K | 39.09 | 39.60 (+1.30%) | 39.43 (+0.86%) |
+| 131K | 38.43 | 38.91 (+1.24%) | 38.84 (+1.06%) |
+| 300K | 37.44 | 37.92 (+1.30%) | 37.72 (+0.77%) |
+
+At 131K, sort512 cuts selection from 877 to 551 µs/token and the list-once
+path cuts candidate work from 131 to 73. Widening the radix select per
+threadgroup (T4/T8/T16) lost −0.02 to −1.16% and was removed.
+
+Window W5 (4 runs per arm; tok/s):
+
+| Depth | A (sort512 off) | S | S + O |
+| --- | ---: | ---: | ---: |
+| 64K | 39.148 | 39.648 (+1.28%) | 39.702 (+1.42%) |
+| 131K | 38.515 | 39.018 (+1.31%) | 39.073 (+1.45%) |
+| 300K | 37.481 | 37.936 (+1.22%) | 38.021 (+1.44%) |
+
+The list-once increment over S is +0.14 / +0.14 / +0.22% by the eval-interval
+metric. By the more conservative wall-boundary metric, A to S is −0.30 to
+−0.33 ms/token. Both become the default; `DS4_METAL_DISABLE_V41_TOPK_SORT512=1`
+and `DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE=1` opt out. Against W2's
+pre-candidate depth curve (38.60 / 37.95 / 36.53) the S + O stack is +2.8% /
++3.0% / +4.1%.
+
+## Rejected designs
+
+These were measured and are not in the branch:
+
+- **Guarded MMA index scorer (W5):** exact, with the fast path on 99.93 to
+  99.98% of keys and no guard fallbacks. But index scoring rose from 1638 to
+  1752 µs/token at 300K; S + O + MMA was −0.35 to −0.40% against S. The W4
+  guard capture (100% of keys inside the exactness bound at 64K to 300K) is
+  kept as evidence for a future key-cache layout.
+- **Router selection fused into the matvec (fusion micro):** exact only with
+  a relaxed device-atomic handoff. Plain stores plus a fence left about 26%
+  stale probabilities and experts. Fused it was 16.85 µs per layer against
+  14.48 separate, about +95 µs/token.
+- **EADD fused into the Engram tail (fusion micro):** exact, but 236.3 µs
+  (value rows first) or 271.7 µs (in order) against 227.8 separate.
+
+The micros ran with production up, so their absolute times carry
+contention; the A/B order repeated.
+
+## Split HC collapse and hoisted paired norm (f45f4e8, opt-in)
+
+Worker D's `DS4_V41_S1TG=cn`. In a model-free micro at the decode shapes it
+is bit-identical: 0 of 16.4M collapse values and 0 of 1.4M paired-norm values
+differ. The micro saves −125 to −200 µs/token on the collapse. The stack
+timing is pending a window; the switch stays opt-in until then.
+
 ## GPU tests
 
 These tests are built with each commit and run by the coordinator in GPU
@@ -88,3 +221,8 @@ windows:
 | 21c0519 | `--decode-topk` |
 | dbc6c18, a05c8be | `--rope-tab` |
 | 5c3c02f | `--heads-once` |
+| 1e4efb2, f7ee976, 0f1095d | `--blend` |
+| 0761f41 | `--topk-select` |
+| e7ab260, 82923a2 | `--index-candidates` |
+| 80c86de | no flag (`check_engram` in the full run) |
+| 9ab435c | `--rope-tab` |
