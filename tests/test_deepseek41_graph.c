@@ -1749,12 +1749,16 @@ static int check_memory_plan(const char *path) {
     REQUIRE(!engine_warm_full_model(&opt));
     weights_bind(&e.weights, &e.model, false, 0, UINT32_MAX, true, false);
     REQUIRE(e.model.size < e.model.file_size);
-    const bool q4 = e.weights.layer[0].ffn_gate_exps->type == DS4_TENSOR_Q4_K;
-    REQUIRE(q4 || e.weights.layer[0].ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS);
+    /* Four-bit experts (Q4_K, or MXFP4: about 278 GiB resident) do not fit a 256 GiB host; IQ2_XXS experts do. The
+     * shard and prefill-headroom figures below are generous for both four-bit forms (MXFP4 is 4.25 bits a weight
+     * against Q4_K's 4.5). */
+    const uint32_t experts = e.weights.layer[0].ffn_gate_exps->type;
+    const bool four_bit = experts == DS4_TENSOR_Q4_K || experts == DS4_TENSOR_MXFP4;
+    REQUIRE(four_bit || experts == DS4_TENSOR_IQ2_XXS);
     g_tp_shard_model_bytes = 0;
     uint64_t graph = ds41_graph_bytes(1048576);
     REQUIRE(!ds41_memory_admit_for_host(&e, graph, true, 128 * gib, 110 * gib));
-    REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 256 * gib, 224 * gib) == !q4);
+    REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 256 * gib, 224 * gib) == !four_bit);
     REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 512 * gib, 448 * gib));
     REQUIRE(!ds41_memory_admit_for_host(&e, graph, true, 512 * gib, 110 * gib));
     REQUIRE(!ds41_memory_admit_for_host(&e, graph, true, 0, 224 * gib));
@@ -1762,12 +1766,12 @@ static int check_memory_plan(const char *path) {
     REQUIRE(!ds41_memory_admit_for_host(&e, UINT64_MAX, true, 512 * gib, 448 * gib));
     /* A generous real-shard estimate. No weight pages or GPU buffers are
      * allocated by this test, even for the simulated 512 GiB machine. */
-    g_tp_shard_model_bytes = (q4 ? 153 : 81) * gib;
-    REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 128 * gib, 110 * gib) == !q4);
+    g_tp_shard_model_bytes = (four_bit ? 153 : 81) * gib;
+    REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 128 * gib, 110 * gib) == !four_bit);
     REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 256 * gib, 224 * gib));
     g_tp_shard_model_bytes = 0;
     e.ssd_streaming = true;
-    e.ssd_streaming_prefill_headroom_bytes = (q4 ? 16 : 8) * gib;
+    e.ssd_streaming_prefill_headroom_bytes = (four_bit ? 16 : 8) * gib;
     e.ssd_streaming_cache_experts = DS4_N_LAYER * DS4_N_EXPERT;
     uint64_t expert = 0, fixed = 0;
     REQUIRE(ds4_streaming_routed_expert_bytes(&e.weights, &expert) && expert);
