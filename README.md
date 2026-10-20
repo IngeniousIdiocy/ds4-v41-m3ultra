@@ -3,8 +3,7 @@
 This branch is our own implementation of DeepSeek V4.1 Flash for Apple
 Silicon, written on [antirez's DwarfStar](https://github.com/antirez/ds4)
 engine. The October update targets the 1017 checkpoint. On one M3 Ultra it
-takes serial decode past 40 tokens/s. Its output is bit-identical to the
-September engine except for one numerical change, named below.
+takes serial decode past 40 tokens/s.
 
 We incorporated specific pieces of others' work, and their commits keep their
 authorship:
@@ -32,7 +31,7 @@ q2k-a1, fp8pf-a5 and W5 name those measurement windows; the
 | Context | Decode tok/s | Window and method |
 | ---: | ---: | --- |
 | 2K | 40.60 | q2k-a1: campaign stack, greedy 128, Ivan Fioravanti's steady metric (wall time of tokens 2..N); ours read the same |
-| 8K | 40.44 / 40.48 (prose), 40.51 / 40.42 (code) | fp8pf-a5 d01: this branch (a clean export of 77eea27c, default build, no environment), cold prefill, W72 fixtures, 512 tokens at temp 1 / top_p 0.95, seed 1017, two runs each, our metric (first sampling to last evaluation) |
+| 8K | 40.44 / 40.48 (prose), 40.51 / 40.42 (code) | fp8pf-a5 d01: this branch (a clean export of 77eea27c, default build, the window's builder-on arm), cold prefill, W72 fixtures, 512 tokens at temp 1 / top_p 0.95, seed 1017, two runs each, our metric (first sampling to last evaluation); timing provisional, see below |
 | 64K | 39.70 | W5 on the state-depth tree: candidate scoring + sort512 + candidate list once, greedy 128 on saved snapshots, eval-interval metric |
 | 131K | 39.07 | W5 on the state-depth tree, as above |
 | 300K | 38.02 | W5 on the state-depth tree, as above |
@@ -44,6 +43,16 @@ prefix, final logits and session state digests are the same.
 | --- | --- | --- | --- |
 | prose | `3cd4d4bba0ab9986` | `ed3ca952608e6274` | `6d2d529ba8c0e5c0` |
 | code | `166bd265feac6270` | `c1c571c0a9ade5be` | `428ef17df51250d8` |
+
+The d01 arm set a `DS4_*` variable for the window's builder comparison. The
+one launch in that window with no `DS4_*` variable at all was b13 (40.79
+tok/s steady), and it was bit-identical to the builder-on arm. The d01
+timing, 24.716182 / 24.714071 ms/token (prose / code), is provisional: two
+harness dry runs started during d01 and may have added CPU noise. A clean
+repeat is planned.
+The window as a whole did not pass. Its optional `DS4_V41_S1TG` arm (`cn`)
+failed the exactness gate in d01, so the window stopped and its d02, d03 and
+a01 rows did not run.
 
 Window w1-a2 recorded both metrics for the same runs. At 8K, greedy 128, Ivan's
 steady metric gave 40.130 and ours 40.087.
@@ -88,9 +97,12 @@ make
     --mtp-model DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling
 ```
 
+DSpark (`--mtp-model ... --dspark`) was validated on the 0917 release. On this
+composed stack, the DSpark check is still pending.
+
 [RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every option: the server policy
 that Project Trench uses, the disk KV cache, and the diagnostic switches. No
-environment variable is needed.
+environment variable is needed: b13 above was a plain launch.
 
 ## DeepSeek V4.1 Flash on M3 Ultra — September 18 update
 

@@ -13,7 +13,7 @@ Glossary for the labels in this page and in the commit messages:
 - **Window labels** such as `fp8pf-a5`, `irqres-a1`, `w1-a2`, `W5` or `W72`:
   measurement windows, each a protected run on the M3 Ultra. This page
   summarises their evidence.
-- **P numbers** (P11 to P27) are the results recorded for those windows.
+- **P numbers** (P11 to P29) are the results recorded for those windows.
   **Ledger ids** (`S40-*`, `D0xx`) are entries in the campaign's decision
   record. That record is not published.
 
@@ -24,8 +24,10 @@ weights, decode at concurrency 1, and the campaign's prose and code fixtures.
 
 Setup:
 
-- The tree: a clean export of 77eea27c, the default build, with no
-  environment set.
+- The tree: a clean export of 77eea27c, the default build. d01 ran the
+  window's builder-on arm, which sets a `DS4_*` variable. Only b13, the
+  window's plain launch, ran with no `DS4_*` variable. It was bit-identical to
+  the builder-on arm (P26).
 - Each fixture is prefilled cold to 8K. The W72 fixtures (prose and code) are
   used.
 - Each run samples 512 tokens at temp 1 and top_p 0.95, with seed 1017. There
@@ -40,6 +42,20 @@ Setup:
 The digests are those of the campaign's irqres-a1 arms. The T arm and its
 control give the same three digests per fixture (runs p01–p08).
 So the branch reproduces irqres-a1 T bit for bit from a cold prefill.
+
+Caveats:
+
+- The timing is provisional: 24.716182 / 24.714071 ms/token (prose / code),
+  leaving 0.283818 / 0.285929 ms to the 25 ms (40 tok/s) line. The run-to-run
+  ranges were 0.027327 / 0.054748 ms. Two harness dry runs started during d01.
+  The contention check aborted both at once, and no bits were affected, but
+  they may have added CPU noise. A clean repeat is planned.
+- The window did not pass as a whole. In the same d01 process, the optional
+  `DS4_V41_S1TG` arm (`cn`) failed the exactness gate, which stopped the
+  window. Rows d02 and d03 (the sidecar and builder-off decode arms) and a01
+  did not run. The window's verdict was INVALID, with its rows kept for
+  adjudication and no speed verdict. P25 accepted the d01 default-arm rows on
+  their digests.
 
 The same window ran the `DS4_V41_S1TG` arms. Their result is in the
 single-group kernels section below.
@@ -244,13 +260,28 @@ contention; the A/B order repeated.
 
 `DS4_V41_S1TG`:
 
-- `c`: the split HC collapse. In a model-free micro at the decode shapes it
-  is bit-identical: 0 of 16.4M collapse values differ. The micro saves −125
-  to −200 µs/token.
+- `c`: the split HC collapse.
 - `k` and `r`: the fused top-k merge ladder and the ballot router.
 - `h`: eight heads per threadgroup in single-row decode attention.
 
-`k`, `r` and `h` are also bit-identical in their micros.
+Model-free exactness, counted over distinct inputs. An earlier version of
+these receipts counted repeats of the same inputs: they show determinism, not
+coverage.
+
+- `c`: 0 of 20.48M distinct collapsed and 0 of 20.48M distinct normed values
+  differ, on fresh data for every call, with and without the engine's macros.
+  An engine-linked check adds 0 of 819,200. The earlier "0 of 16.4M" was 20
+  repeats of 819,200 values.
+- `k`: 140 crafted rows (seven widths; Gaussian, many-tie, `-inf`-tail, NaN
+  and all-equal rows), plus 71,680 distinct selected indices per fused form.
+  The merge only compares and moves pairs, with no float arithmetic.
+- `r`: 15,840 distinct values (the printed 316,800 is 20 repeats). That is
+  small coverage for its float part.
+- `h`: 6,316,032 distinct partial values per key count (the printed 18.9M is
+  3 repeats), with one key set per shape.
+
+None of the four gets speed credit. Their micro timings are not added to any
+figure on this page or in the README.
 
 On the stack, `cn` is **not exact**. In window fp8pf-a5 (d01) its arm's
 digests differed from the control:
@@ -263,10 +294,10 @@ digests differed from the control:
 - `cn` and `cnkr` give the same digests as each other in both repeats.
 
 The cause is letter `n`, the hoisted paired norm, and it is removed from the
-branch (P28). In a 1.4M-value micro it had matched the original paired norm.
-Over 71.7M values, 302 differ. Fast math reassociates its
-`(x * scale) * w` into `(x * w) * scale` once the weight loads move ahead of
-the reduction. No exact form of the hoist gained anything. `c`, `k`, `r` and
+branch (P28). Its micro had reported "0 of 1.4M", but that was 20 repeats of
+the same 71,680 values. Over 71.68M distinct values, 302 differ. Fast math
+reassociates its `(x * scale) * w` into `(x * w) * scale` once the weight
+loads move ahead of the reduction. No exact form of the hoist gained anything. `c`, `k`, `r` and
 `h` stay opt-in and experimental until their per-letter stack results are in.
 None of them enters a measured basis.
 
