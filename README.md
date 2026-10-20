@@ -1,109 +1,123 @@
-## DeepSeek V4.1 Flash 1017 on M3 Ultra — October update
+## DeepSeek V4.1 Flash 1017 on the M3 Ultra — October release
 
-This branch is our own implementation of DeepSeek V4.1 Flash for Apple
-Silicon, written on [antirez's DwarfStar](https://github.com/antirez/ds4)
-engine. The October update targets the 1017 checkpoint. On one M3 Ultra it
-takes serial decode past 40 tokens/s.
+This branch is our Metal implementation of DeepSeek V4.1 Flash, built on
+[antirez's DwarfStar](https://github.com/antirez/ds4) engine and tuned for one
+512 GB M3 Ultra. On the 1017 checkpoint it decodes a single stream at **41 tok/s**
+and still does **39.5 tok/s at 300K context**. That is more than twice upstream's
+speed, and every optimization in it is bit-exact against the kernel it replaces. With DSpark
+drafting, code answers run at **47–50 tok/s**.
 
-We incorporated specific pieces of others' work, and their commits keep their
-authorship:
+Same machine, same prepared public 1017 MXFP4 weights, same prompts, one request
+at a time. The upstream column is DwarfStar main at `5379c1c9`:
 
-- **Ivan Fioravanti:**
-  - the E4M3 shift decode that the blended readers adapt;
-  - the literal-shape dispatch mechanism;
-  - the narrow decode copies built at load;
-  - the exact prefill indexer MMA.
-- **Tarjei Mandt (kernelpool):**
-  - candidate-block index scoring (9b9dfee);
-  - the radix top-k select (af7c02b), which this branch's 512-wide winners'
-    sort extends.
-- **antirez:** DwarfStar itself.
+| measurement | DwarfStar main | this branch |
+|---|---:|---:|
+| serial decode, 2K context | 19.68 t/s | **41.45 t/s** |
+| serial decode, 8K context | 19.54 t/s | **41.23 t/s** |
+| serial decode, 32K context | 19.23 t/s | **40.91 t/s** |
+| serial decode, 64K context | 18.78 t/s | **40.74 t/s** |
+| serial decode, code answers (3 prompts, 512 tokens) | 20.0–20.3 t/s | **41.6–41.7 t/s** |
+| DSpark, the same code answers | 29.0–31.4 t/s | **46.7–50.1 t/s** |
+| prefill, 8K prompt (cold) | 606 t/s | **692 t/s** |
+| prefill, 64K prompt (cold) | 697 t/s | **826 t/s** |
 
-[THIRD_PARTY-V41.md](THIRD_PARTY-V41.md) lists the other attributed work.
+Decode rows: the 256 tokens after the prompt, thinking off, temperature 0;
+only decode is timed. Prefill rows: prompt tokens divided by the cold time to
+first token, median of three server runs per engine, interleaved in one window.
+DwarfStar's V4.1 loader expects the drafter's two Markov-head tensors under
+other names (`markov_w1` / `markov_w2`) than the checkpoint's (`embed` /
+`head`), which our prepare command keeps; its DSpark row ran on a copy of our
+drafter with only those two names changed.
 
-### Headline numbers
+At depth, from saved states in our resident benchmark (greedy, 128 tokens,
+median of three):
 
-One M3 Ultra (512 GB), 1017 MXFP4 weights, concurrency 1. Each row was
-measured in its own window, with the method named in that row. Labels such as
-q2k-a1, fp8pf-a5 and W5 name those measurement windows; the
-[receipts](docs/RECEIPTS-V41-1017.md) summarise each one's evidence.
+| context | 8K | 64K | 131K | 300K |
+|---|---:|---:|---:|---:|
+| serial decode | **40.95 t/s** | **40.39 t/s** | **40.09 t/s** | **39.51 t/s** |
+| ms per token | 24.42 | 24.76 | 24.94 | 25.31 |
 
-| Context | Decode tok/s | Window and method |
-| ---: | ---: | --- |
-| 2K | 40.60 | q2k-a1: campaign stack, greedy 128, Ivan Fioravanti's steady metric (wall time of tokens 2..N); ours read the same |
-| 8K | 40.44 / 40.48 (prose), 40.51 / 40.42 (code) | fp8pf-a5 d01: this branch (a clean export of 77eea27c, default build, the window's builder-on arm), cold prefill, W72 fixtures, 512 tokens at temp 1 / top_p 0.95, seed 1017, two runs each, our metric (first sampling to last evaluation); timing provisional, see below |
-| 64K | 39.70 | W5 on the state-depth tree: candidate scoring + sort512 + candidate list once, greedy 128 on saved snapshots, eval-interval metric |
-| 131K | 39.07 | W5 on the state-depth tree, as above |
-| 300K | 38.02 | W5 on the state-depth tree, as above |
+Going from 64K to 300K costs 0.55 ms per token. Our September 18 release
+decoded at 35.8 t/s at 8K.
 
-The 8K runs are bit-identical to the irqres-a1 T arm of the campaign: the
-prefix, final logits and session state digests are the same.
+### DSpark
 
-| Fixture | prefix | logits | state |
-| --- | --- | --- | --- |
-| prose | `3cd4d4bba0ab9986` | `ed3ca952608e6274` | `6d2d529ba8c0e5c0` |
-| code | `166bd265feac6270` | `c1c571c0a9ade5be` | `428ef17df51250d8` |
+DSpark drafts tokens with the checkpoint's own multi-token-prediction stages,
+and the target verifies them in one batched step. On code, where the drafter
+is usually right, it pays well. The three code-writing requests above (an LRU
+cache in C, an asyncio rate limiter in Python, a trie in Rust) decoded at 50.1,
+48.8 and 46.7 t/s with DSpark, against 41.6–41.7 t/s without it, with 90.2% of
+drafted tokens accepted.
 
-The d01 arm set a `DS4_*` variable for the window's builder comparison. The
-one launch in that window with no `DS4_*` variable at all was b13 (40.79
-tok/s steady), and it was bit-identical to the builder-on arm. The d01
-timing, 24.716182 / 24.714071 ms/token (prose / code), is provisional: two
-harness dry runs started during d01 and may have added CPU noise. A clean
-repeat is planned.
-The window as a whole did not pass. Its optional `DS4_V41_S1TG` arm (`cn`)
-failed the exactness gate in d01, so the window stopped and its d02, d03 and
-a01 rows did not run.
+On prose the drafter is usually wrong. The admission controller probes,
+loses, and backs off, and DSpark costs about 3% there (39.6–40.0 against
+40.7–41.5 t/s). `--serial-reasoning` keeps reasoning out of drafting
+altogether: reasoning is decoded one token at a time, and answers and tool
+calls are drafted.
 
-Window w1-a2 recorded both metrics for the same runs. At 8K, greedy 128, Ivan's
-steady metric gave 40.130 and ours 40.087.
+### What makes it fast
 
-Comparison against Ivan Fioravanti's performance branch
-(`v41-tp-decode-engram-warm`, 8d6a39f): pending window a8.
+Every change executes the same model, the same work, with the same
+arithmetic. A token on this branch takes 24.4 ms at 8K, against about
+28.5 ms on our September release and about 51 ms on upstream main. The
+largest pieces:
 
-Cold prefill at 64K was 889 tok/s, against 841 without Ivan's indexer MMA
-(+5.7%, bit-exact; window w1-a2). That was measured on the campaign tree with
-his commit applied. The same path (feed660) is on by default on this branch;
-`DS4_METAL_DISABLE_V41_INDEX_MMA=1` turns it off.
+- **Fixed shapes and once-per-step work.** V4.1's shapes are fixed, so the
+  hot kernels have literal-shape entries: the output projection with RoPE
+  folded in, the routed gate/up entry, the hyper-connection join and the
+  q_a/KV pair. Position-only work, such as RoPE coefficients and the inverse
+  rotation of the attention heads, runs once per step instead of in every
+  consumer.
+- **Token selection on the GPU.** The sparse-attention indexer's top-512 is
+  selected on the GPU with a 512-wide sort, and the candidate list is built
+  once. The CPU keeps only the decision and the RNG.
+- **The indexer at depth.** The indexer's keys are exact BF16 values stored as
+  F32, so its scorers read a BF16 view of them: half the bytes, the same bits.
+  Candidate rows are scored two lanes per key, and a one-row top-k finishes in
+  a single gathered pass. One scorer call over 300K keys went from 494 µs to
+  277 µs.
+  DSpark's verify rows use the same scorer.
+- **The exact Engram gate.** The Engram residual gate was latency-bound at
+  about 120 µs per call. Ours loads each lane's 160 terms into registers in eight
+  segments and hands the running sums from one SIMD group to the next, so the
+  summation order never changes. It now takes 7.5 µs per call and is
+  bit-identical: 0 of 3,072,000 fresh test streams differ.
+- **Narrow copies built at load.** The BF16 router and the E4M3 Engram and
+  indexer q_b copies are built from the public weights when the model loads,
+  and only kept where they reproduce the wide values exactly. Their readers
+  ship as one unit.
+- **The host chain.** The next token's first command buffer is encoded in the
+  CPU slack before the wait, a short GPU bridge keeps the GPU busy across the
+  hand-off, the sampler's scan uses NEON, and the draft capture rides in the
+  head's command buffer.
 
-Exactness method:
+[V41-1017-HISTORY.md](docs/V41-1017-HISTORY.md) has the full route, with each
+lever's measured gain and the many that did not pay.
 
-- Every arm is compared with its control by FNV-1a digests of the decoded
-  tokens, the frontier prefix, the final logits and the whole session state.
-- Every accepted change matched in every run.
+**Exactness.** In the release window, every run gave the same token ids, final
+logits and whole-session state digests as the previous build, at every context.
+Each changed kernel is also tested bit for bit against the one it replaces, at
+the production shapes (`tests/test_deepseek41_metal`). Every optimization has a
+switch that turns it off (`DS4_METAL_DISABLE_V41_*`, listed in
+[RUNTIME-V41.md](docs/RUNTIME-V41.md)); turning off the nine added in this
+release gives the previous build's output bit for bit. DSpark's batched verify is, by the engine's design, not bitwise equal
+to one-token decode, and the server says so at startup.
 
-**EADD, the staged Engram gate.** The decode step's Engram gate runs as one
-256-thread group per stream:
-- all threads stage the inputs into threadgroup memory;
-- one SIMD group runs the 32-lane kernel's reduction chains in the same order;
-- all threads apply the residual update.
+**Ideas we adopted.** This branch uses ideas and code from:
 
-Its output is bit-identical to the 32-lane kernel. The model-free test
-`tests/test_deepseek41_metal --engram-add-exact` found 0 of 3,072,000 fresh
-streams (15.7G values) differing. In a micro at the decode shape, a call takes
-18.6 µs, against 122.5 µs for the 32-lane kernel. EADD is on by default, and
-`DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG=1` turns it off.
+- **Ivan Fioravanti** ([ds4-metal](https://github.com/ivanfioravanti/ds4-metal)):
+  - the fixed-shape decode mechanism, which our literal-shape kernels extend;
+  - building the narrow decode copies at load;
+  - the E4M3 shift decode;
+  - the exact prefill indexer MMA (+5.4% prefill at 64K).
+- **Tarjei Mandt** ([kernelpool](https://github.com/kernelpool/ds4)):
+  - the V4.1 MXFP4 conversion, expert and verification kernels
+    ([antirez/ds4 #1073](https://github.com/antirez/ds4/pull/1073));
+  - candidate-block index scoring;
+  - the radix top-k select.
 
-**Single-group latency kernels.** Two decode kernels run in single-group
-latency forms by default:
-- the HC collapse, as two dispatches over 32 + 10 groups;
-- the indexer top-k merge ladder, staged in threadgroup memory and finished
-  in one group.
-
-Both give the replaced kernels' bits. Window a6 checked each alone at 8K:
-the collapse saved 0.069 / 0.061 ms/token and the ladder 0.118 / 0.105
-(prose / code). Together they gave the base's digests at 8K (window W10-a2),
-and `tests/test_deepseek41_metal --s1tg` compares both with the originals.
-`DS4_V41_S1TG=none` restores the originals.
-
-The rows and digests above were measured before the staged Engram gate and
-these two kernels became the default. The composed run of this release is
-pending.
-
-The 8K row is a composed run of this branch. A composed run at depth (64K and
-beyond) on this branch is still pending. Windows, arms and per-run numbers are
-in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md). How the campaign got
-here, including what was tried and dropped, is in
-[V41-1017-HISTORY.md](docs/V41-1017-HISTORY.md).
+Their commits keep their authorship, and
+[THIRD_PARTY-V41.md](THIRD_PARTY-V41.md) lists every attributed piece.
 
 ### Prepare the model
 
@@ -125,26 +139,16 @@ This writes `gguf/DeepSeek-V4.1-Flash-MXFP4.gguf` (467.2 GiB) and
 `gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf` (7.4 GiB). The shards are checked
 against their published SHA-256 while they are merged; only `general.alignment`
 changes and the `split.*` keys are dropped, so every tensor byte is the release's.
-The drafter is the 1017 checkpoint's `mtp.*` stages (7.93 GB of source) in Q8_0 /
-MXFP4, with `dspark.target_architecture=deepseek41`. `--verify` re-reads both
-files and compares every tensor with the digests pinned in
-`gguf-tools/deepseek41_prepare.json`; exit 0 means byte-identical to the reference
-build. `--dry-run` checks inputs, free space and Python modules without writing.
+`--verify` re-reads both files and compares every tensor with the digests pinned in
+`gguf-tools/deepseek41_prepare.json`. `--dry-run` checks inputs, free space and
+Python modules without writing.
 
-Needs: 543.9 GB free beside `--out` (509.6 GB of output plus a 32 GiB reserve),
-plus the 509.5 GB of inputs if they share the volume; delete the inputs after
-`--verify` passes. Python 3.10+ with numpy, tokenizers and sympy, and `cc` and
-`make` (the quantizer library builds on first use). On an M3 Ultra with inputs and
-outputs on one Thunderbolt NVMe drive: merge 5.7 min, drafter 10 s, verify 2.3 min.
-
-The engine needs only the MXFP4 GGUF. It builds the narrow decode copies
-(BF16 router, E4M3 Engram and indexer q_b) at load. Optional sidecars from the
-original checkpoint load with `--v41-sidecar FILE`.
+Needs: 543.9 GB free beside `--out`, plus the 509.5 GB of inputs if they share the
+volume; delete the inputs after `--verify` passes. Python 3.10+ with numpy,
+tokenizers and sympy, and `cc` and `make`. On an M3 Ultra with inputs and outputs on
+one external Thunderbolt NVMe drive: merge 5.7 min, drafter 10 s, verify 2.3 min.
 
 ### Run
-
-The recommended serving launch, from the checkout, with the paths that
-Prepare writes:
 
 ```
 make
@@ -157,28 +161,36 @@ make
     --utility-ctx 32768 --serial-reasoning
 ```
 
-- The server listens on 127.0.0.1 only. Pass `--host 0.0.0.0` (or an
-  interface address) to serve other machines; it has no authentication.
-- `--kv-disk-dir` keeps prompt checkpoints on disk (created if missing),
-  within the `--kv-disk-space-mb` budget (96 GiB here). A 300K-token
-  checkpoint is about 1.8 GiB. Requests
-  that resume a saved prefix, including after a restart, skip its prefill.
+- The server listens on 127.0.0.1 only. Pass `--host 0.0.0.0` to serve other
+  machines; it has no authentication.
+- `--kv-disk-dir` keeps prompt checkpoints on disk within the
+  `--kv-disk-space-mb` budget. A 300K-token checkpoint is about 1.8 GiB.
 - Right after start the server runs a one-shot numerics canary (about 7 s);
   requests sent in that time wait for it, then use the cache.
-- `--serial-reasoning` decodes reasoning one token at a time and drafts
-  answers and tool calls with DSpark. Without it, DSpark also drafts
-  reasoning.
 
-DSpark on this stack (window W9, this branch at aeab950a with the launch
-above, a short code request answered in 600 tokens, three runs): 57.70 tok/s
-median by the server log, against 52.61 on our production build of the
-September 18 stack (×1.097). 95.4% of drafted tokens were accepted, against
-89.6%. With `--serial-reasoning`, a 2,050-token reasoning span ran no DSpark
-cycles and the answer that followed was drafted.
+[RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every option and switch. No
+environment variable is needed.
 
-[RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every option: the server policy
-that Project Trench uses, the disk KV cache, and the diagnostic switches. No
-environment variable is needed: b13 above was a plain launch.
+### Restart and the disk cache
+
+Measured on this release with the launch above, restarting the server on the
+same cache directory:
+
+- **300K restore.** A 303,912-token conversation took 388.5 s to first token
+  cold. Sent again right after a restart, it restored from its checkpoint in
+  11.0 s, including the canary.
+- **Extending a restored prompt.** A request that restores part of its prompt
+  from disk and prefills the rest now saves a checkpoint at its new length.
+  A 64K prompt extending a restored 8K checkpoint saved its own 64K
+  checkpoint; after a restart it restored 65,536 of its 67,314 tokens in
+  5.6 s instead of 72.2 s, with identical output. Upstream's server saves a
+  checkpoint only when nothing was restored.
+- **Requests during the canary** wait for it, then run in order. Three sent
+  together (300K, 8K, short) were answered at 10.9, 14.5 and 15.3 s.
+- **Shutdown with a request queued** exits in 6.2 s, keeps every cache entry,
+  and answers the queued request with a 503.
+- **Old entries** from an earlier build's canary are refused and evicted under
+  the disk budget.
 
 ### Test
 
@@ -191,95 +203,9 @@ DS4_TEST_MODEL=gguf/DeepSeek-V4.1-Flash-MXFP4.gguf \
     DS4_TEST_DSPARK=gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf ./ds4_test --dspark-verify-depth
 ```
 
-`./ds4_test --help` lists the tests. Some are skipped on V4.1 by design:
-- `--logprob-vectors` and `--local-golden-vectors` default to the
-  DeepSeek V4 Flash 0731 fixtures, which are invalid for another model
-  ([tests/test-vectors/README.md](tests/test-vectors/README.md));
-- `--dspark-verify-depth` skips its V4-only prefix-capture check, since V4.1
-  verifies through its own path.
-
-### DwarfStar main reference
-
-For reference, window W8 served the same requests from DwarfStar main and
-from this branch:
-
-- U: antirez/ds4 main `5379c1c9ac315f1540371b06a3db88491d4059ff`.
-- P: this branch at `0a72af29a080a136d12fe816d2da4f0c64582838`, with
-  `--serial-reasoning`.
-
-Both arms used the same MXFP4 GGUF, the same server flags (393K context, a
-fresh disk-cache directory per server lifetime) and no DSpark. Each cell
-was run three times, in the order U P P U U P; the numbers are medians.
-Decode is the server log's rate over 512-token answers.
-
-| Context | U decode tok/s | P decode tok/s | U cold TTFT | P cold TTFT |
-| ---: | ---: | ---: | ---: | ---: |
-| 2K | 19.56 | 41.32 | 6.275 s | 5.110 s |
-| 8K | 19.84 | 40.78 | 23.413 s | 15.300 s |
-| 32K | 19.14 | 40.43 | 49.030 s | 41.576 s |
-| 64K | 18.64 | 40.21 | 95.724 s | 79.477 s |
-
-Other results from the same window:
-
-- **Reasoning decode** (thinking on, effort high, server log): U 19.84 / 19.65 /
-  18.59 tok/s at 2K / 8K / 64K; P 41.41 / 40.77 / 40.22.
-- **Warm agent turn** (a 32K code conversation, next turn from the live
-  cache): 2.389 s on U, 2.079 s on P.
-- **Restart, then resend** (restored from the disk cache):
-  - U: 2.484 / 2.897 / 3.546 s at 8K / 64K / 128K;
-  - P: 2.485 / 2.518 / 3.131 s.
-- **Load to ready:** 2.29 to 2.30 s on both arms.
-- **Memory:** both arms plan 290.12 GiB, and both peak at 296 to 297 GiB
-  wired at 64K. P's idle RSS is 1.5 GB higher: these are the narrow decode
-  copies built at load while the wide views stay mapped.
-
-Scope and caveats:
-
-- These are serving measurements of the two builds. They do not isolate
-  individual optimizations or establish quality equivalence.
-- On P, the 2K answers stopped at 494 tokens; every other decode answer ran
-  to 512.
-- P's binary predates the queued canary. An 8K resend right after a
-  restart, before its canary finished, was refused by the cache and
-  prefilled cold: 14.580 s against 2.485 s after cache-on. Requests now wait
-  for the canary instead ([RUNTIME-V41.md](docs/RUNTIME-V41.md)). Window W9
-  measured that; see "Restart and the disk cache" below.
-
-The receipts give the ranges, answer lengths and the corrections to the
-window's first summary. Source: W8's summary (not published).
-
-### Restart and the disk cache
-
-Window W9 ran this branch at aeab950a with the launch under Run, restarting
-the server on the same cache directory:
-
-- **300K restore.** A 303,912-token conversation took 391.6 s to first
-  token cold. Sent again right after a restart, it was restored from its
-  1.8 GiB checkpoint: 11.17 s to first token, including the canary.
-- **The canary's cost.** In the first seconds after a restart, every
-  request waits for the one-shot canary (7.15 s). An 8K resend took 9.23 s
-  to first token and a fresh 11-token prompt 7.36 s. Three requests sent
-  together during the canary (300K, 8K, short) were answered in that
-  order, at 10.9, 14.7 and 15.5 s.
-- **Canary failure.** With the canary forced to fail (a test build), the
-  cache stayed off and an 8K request prefilled cold (20.2 s).
-- **Old entries.** Entries from earlier builds' canary were refused and
-  evicted under the disk budget.
-- **DSpark follow-up.** An 8K follow-up turn resumed from the cache in
-  2.13 s, against 15.28 s cold.
-
-One cell failed. A SIGTERM 2 s after listen, with the 300K request queued,
-deleted that request's checkpoint, and the client saw a dropped
-connection. Both causes predate the V4.1 work: a failed prefill from a
-checkpoint always deleted it, even when shutdown had interrupted the
-prefill, and replies were dropped once shutdown began. e2136edd fixes both.
-An interrupted prefill keeps the checkpoint, and requests still queued at
-shutdown get a 503 "server is shutting down". A server unit test covers the
-fix; it has not been re-run in a window. In the same window, the next
-restart restored the conversation from its continued checkpoint at 303,104
-tokens (14.08 s to first token).
-
-The receipts have each cell.
+A fresh clone of this release passed every command above, built per Run, and
+served the launch above (window r1cc-a5). The full evidence for every number
+on this page is in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
 
 ## DeepSeek V4.1 Flash on M3 Ultra — September 18 update
 
