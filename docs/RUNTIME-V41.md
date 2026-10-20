@@ -148,7 +148,7 @@ default replaced, for A/B checks and bisection.
 
 | Switch | What it is | Status |
 | --- | --- | --- |
-| `DS4_V41_S1TG=cnkrh` | single-group latency kernels: split HC collapse (c), hoisted paired norm (n), fused top-k merge ladder (k), ballot router (r), eight heads per threadgroup in single-row decode attention (h) | experimental, opt-in. Bit-identical in micros, but not exact on the stack: `cn` differed in window fp8pf-a5 (d01), investigation pending |
+| `DS4_V41_S1TG=ckrh` | single-group latency kernels: split HC collapse (c), fused top-k merge ladder (k), ballot router (r), eight heads per threadgroup in single-row decode attention (h) | experimental, opt-in. Bit-identical in micros; per-letter stack exactness pending. The hoisted paired norm (former letter n) was removed: it was not exact |
 | `DS4_V41_ENGRAM_DECODE=shift` | Ivan Fioravanti's F16 bit-pattern decode for the non-blend Engram reader | exact; superseded by the blend |
 | `DS4_V41_SUFFIX_ALL=1` | exact decoder-suffix pruning for short sweeps and appends (Ivan Fioravanti) | awaiting a digest comparison |
 | `DS4_METAL_V41_PREFILL_MMA=1` | simdgroup-matrix prefill attention (Ivan Fioravanti) | reassociated sums, not byte-identical; awaiting quality evidence |

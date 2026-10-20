@@ -49767,10 +49767,10 @@ static id<MTLBuffer> ds4_gpu_v41_deferred_counter(void) {
     return buffer;
 }
 
-/* DS4_V41_S1TG=<letters> (read per call): c the deferred HC collapse as two dispatches over 32 + 10 groups, n the paired
- * norm with its loads issued at entry, k the decode indexer top-k's merge ladder staged in threadgroup memory and fused
- * into one group, r the hierarchical router with ballot nominations, h the single-row FlashAttention call with eight
- * heads per threadgroup. All give the replaced kernels' bits. Unset: the originals. */
+/* DS4_V41_S1TG=<letters> (read per call): c the deferred HC collapse as two dispatches over 32 + 10 groups, k the decode
+ * indexer top-k's merge ladder staged in threadgroup memory and fused into one group, r the hierarchical router with
+ * ballot nominations, h the single-row FlashAttention call with eight heads per threadgroup. Each gave the replaced
+ * kernel's bits in its micro; their stack exactness is still being measured. Unset: the originals. */
 static int ds4_s1tg_on(char k) {
     const char *s = getenv("DS4_V41_S1TG");
     const int on = s && strchr(s, k) != NULL;
@@ -50272,8 +50272,7 @@ int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0,
         uint64_t inner0 = 0, inner1 = 0;
         id<MTLBuffer> w0 = ds4_gpu_wrap_model_range(model_map, model_size, weight0_offset, (uint64_t)n0 * sizeof(float), &inner0);
         id<MTLBuffer> w1 = ds4_gpu_wrap_model_range(model_map, model_size, weight1_offset, (uint64_t)n1 * sizeof(float), &inner1);
-        const int hoist = n0 / 4u <= 2u * ntg0 && n1 / 4u <= 2u * ntg1 && ds4_s1tg_on('n');
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(hoist ? "kernel_dsv41_norm_pair_hoist" : "kernel_dsv41_norm_pair");
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_norm_pair");
         if (!w0 || !w1 || !pipeline || ntg0 + ntg1 > pipeline.maxTotalThreadsPerThreadgroup) return 0;
         const struct { uint32_t n0, n1, ntg0, ntg1; float eps; } args = {n0, n1, (uint32_t)ntg0, (uint32_t)ntg1, eps};
         int owned = 0;

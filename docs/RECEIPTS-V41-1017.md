@@ -244,10 +244,9 @@ contention; the A/B order repeated.
 
 `DS4_V41_S1TG`:
 
-- `cn`: the split HC collapse and the hoisted paired norm. In a model-free
-  micro at the decode shapes it is bit-identical: 0 of 16.4M collapse values
-  and 0 of 1.4M paired-norm values differ. The micro saves −125 to
-  −200 µs/token on the collapse.
+- `c`: the split HC collapse. In a model-free micro at the decode shapes it
+  is bit-identical: 0 of 16.4M collapse values differ. The micro saves −125
+  to −200 µs/token.
 - `k` and `r`: the fused top-k merge ladder and the ballot router.
 - `h`: eight heads per threadgroup in single-row decode attention.
 
@@ -261,9 +260,15 @@ digests differed from the control:
   `4feb7562d5a596e7`, against `ed3ca952608e6274` / `6d2d529ba8c0e5c0`. On
   code they are `afdf72f24377f997` / `e3de3dfb45ec2ab7`, against
   `c1c571c0a9ade5be` / `428ef17df51250d8`.
-- `cn` and `cnkr` give the same digests as each other in both repeats. The cause is under
-investigation. Until it is found and fixed, every letter (`cnkrh`) stays opt-in and
-experimental, and none of them enters a measured basis.
+- `cn` and `cnkr` give the same digests as each other in both repeats.
+
+The cause is letter `n`, the hoisted paired norm, and it is removed from the
+branch (P28). In a 1.4M-value micro it had matched the original paired norm.
+Over 71.7M values, 302 differ. Fast math reassociates its
+`(x * scale) * w` into `(x * w) * scale` once the weight loads move ahead of
+the reduction. No exact form of the hoist gained anything. `c`, `k`, `r` and
+`h` stay opt-in and experimental until their per-letter stack results are in.
+None of them enters a measured basis.
 
 ## Clean-checkout check (25b45ea)
 
