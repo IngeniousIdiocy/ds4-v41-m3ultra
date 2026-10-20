@@ -19299,6 +19299,9 @@ static int ds4_gpu_indexer_topk_tensor_impl(
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 || top_k > n_comp) return 0;
 
     @autoreleasepool {
+        /* The decode call (non-causal, one row, k = 512) takes the causal path's two exact shortcuts: the
+         * SIMD-shuffle block sort and the ordered top-512 prefix merge. The same opt-outs cover both calls. */
+        const bool decode_k512 = !causal_ratio && n_tokens == 1u && top_k == 512u;
         id<MTLComputePipelineState> sort_pipeline = causal_ratio ?
             ds4_gpu_get_pipeline(getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") ?
                 "kernel_argsort_f32_i32_desc_causal" : "kernel_argsort_f32_i32_desc_causal_shuffle") :
@@ -19306,7 +19309,9 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         id<MTLComputePipelineState> merge_pipeline = causal_ratio ?
             ds4_gpu_get_pipeline(top_k == 512u && !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") ?
                 "kernel_argsort_merge_f32_i32_desc_causal_prefix" :
-                "kernel_argsort_merge_f32_i32_desc_causal") : g_argsort_merge_f32_i32_desc_pipeline;
+                "kernel_argsort_merge_f32_i32_desc_causal") :
+            decode_k512 && !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") ?
+                ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix") : g_argsort_merge_f32_i32_desc_pipeline;
         if (!sort_pipeline || !merge_pipeline) return 0;
         const uint64_t score_bytes = (uint64_t)n_comp * n_tokens * sizeof(float);
         const uint64_t selected_bytes = (uint64_t)top_k * n_tokens * sizeof(uint32_t);
@@ -19331,6 +19336,10 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         }
         if (causal_ratio && (sort_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)nth ||
             (causal_start + 1u) / causal_ratio <= (uint32_t)nth / 2u)) return 0;
+        if (decode_k512 && nth >= 32 && !getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE")) {   /* else the shared-memory network */
+            id<MTLComputePipelineState> sp = ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_shuffle");
+            if (sp && sp.maxTotalThreadsPerThreadgroup >= (NSUInteger)nth) sort_pipeline = sp;
+        }
         const int32_t npr = (int32_t)((n_comp + (uint32_t)nth - 1u) / (uint32_t)nth);
         const int32_t block_top_k = (int32_t)(top_k < (uint32_t)nth ? top_k : (uint32_t)nth);
         int32_t work_width = (int32_t)top_k;
