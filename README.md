@@ -88,7 +88,9 @@ composed run with it (window W10) is pending.
 
 The 8K row is a composed run of this branch. A composed run at depth (64K and
 beyond) on this branch is still pending. Windows, arms and per-run numbers are
-in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
+in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md). How the campaign got
+here, including what was tried and dropped, is in
+[V41-1017-HISTORY.md](docs/V41-1017-HISTORY.md).
 
 ### Prepare the model
 
