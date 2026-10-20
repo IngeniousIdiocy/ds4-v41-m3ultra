@@ -465,6 +465,8 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1;
+/* The same pair at the V4.1 Flash shape with that shape as literals (nil: the static pipeline above serves it). */
+static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_tp_static_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_tp_full_rows_static_pipeline_nsg1;
@@ -8335,6 +8337,9 @@ int ds4_gpu_init(void) {
         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 =
             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
                 "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32", 1);
+        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 =
+            ds4_gpu_new_mul_mv_tg_multiple_pipeline(
+                "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32", 1);
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1 =
             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
                 "kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32", 1);
@@ -11910,6 +11915,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 = nil;
+        g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_tp_static_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_tp_full_rows_static_pipeline_nsg1 = nil;
@@ -41942,6 +41948,16 @@ int ds4_gpu_routed_moe_one_tensor(
                 pair_swiglu_nsg = 1;
             }
         }
+        /* The static-trip pair on the V4.1 Flash shape takes the literal-shape entry; every literal it assumes is
+         * proven here. Same NSG 1, grid, buffers and memory (opt-out read per call). */
+        if (pair_swiglu_pipeline == g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_pipeline_nsg1 &&
+            use_mxfp4_moe_decode_static_trip_pair && pair_swiglu_nsg == 1 &&
+            gate_args.ne00 == 5120 && gate_args.ne01 == 2304 && gate_args.ne02 == 384 && gate_args.nb01 == 2720 &&
+            gate_args.nb02 == 2304ull * 2720ull && gate_args.ne0 == 2304 && gate_args.nei0 == 6 && gate_args.nei1 == 1 &&
+            gate_args.ne11 == 1 && gate_args.tp_world == 1 && gate_args.tp_expert_base == 0 &&
+            g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 != nil &&
+            getenv("DS4_METAL_DISABLE_V41_GU_ENTRY") == NULL)
+            pair_swiglu_pipeline = g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1;
         const bool use_iq2_pair_pack2 =
             gate_type == DS4_METAL_TENSOR_IQ2_XXS && n_tokens == 1 &&
             n_expert == 6 && n_total_expert == 256 &&

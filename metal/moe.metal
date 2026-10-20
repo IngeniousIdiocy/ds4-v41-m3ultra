@@ -5262,6 +5262,55 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32(
     (void)tiitg;
 }
 
+/* kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32 at the DeepSeek V4.1 Flash shape only (the one-token
+ * fixed-route pair-SwiGLU of the single-host decode): the 160-block static helper called with every shape and stride the
+ * host has proven as literals (expert_in_dim 5120, expert_mid_dim 2304, 384 experts, gate/up row bytes 2720, expert
+ * bytes 6,266,880, six selected experts, one token, mid and weight strides), and without the 4096-wide and generic
+ * bodies. The same NSG (1), N_R0_MXFP4 rows, lane mapping, LUT, accumulation order, clamp and outputs; act's
+ * clamp_value stays a runtime value; args stays bound but unread. */
+kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        device const char *ids,
+        device const char *weights,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint64_t V41_ROWS = 2304, V41_EXPERT_BYTES = 2304ull * 2720ull;
+    (void)args;
+    ds4_metal_args_mul_mv_id sa = {};
+    sa.nei0 = 6; sa.nei1 = 1; sa.nbi1 = 24;
+    sa.ne00 = 5120; sa.ne01 = 2304; sa.ne02 = 384;
+    sa.nb00 = 136; sa.nb01 = 2720; sa.nb02 = V41_EXPERT_BYTES;
+    sa.ne10 = 5120; sa.ne11 = 1; sa.ne12 = 1; sa.ne13 = 1;
+    sa.nb10 = 4; sa.nb11 = 20480; sa.nb12 = 20480;
+    sa.ne0 = 2304; sa.ne1 = 6; sa.nb1 = 9216; sa.nr0 = N_R0_MXFP4;
+    sa.tp_rank = 0; sa.tp_world = 1; sa.tp_addend = 0; sa.tp_expert_base = 0;
+    const int idx = (int)tgpig.z;
+    const int32_t expert = ((device const int32_t *)ids)[idx];
+    const uint64_t pair_row = (uint64_t)idx;
+    device const float *route = (device const float *)(weights + pair_row * sizeof(float));
+    device char *gate_cur = dst_gate + pair_row * V41_ROWS * sizeof(float);
+    device char *up_cur = dst_up + pair_row * V41_ROWS * sizeof(float);
+    device char *mid_cur = dst_mid + pair_row * V41_ROWS * sizeof(float);
+    device const char *gate_expert = src0_gate + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
+    device const char *up_expert = src0_up + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
+    tgpig.z = 0;
+    kernel_mul_mv_mxfp4_pair_swiglu_static_impl<thread ds4_metal_args_mul_mv_id &,
+        DS4_MXFP4_PAIR_STATIC_NB_V41, DS4_MXFP4_PAIR_STATIC_NB_V41>(
+        sa, act, gate_expert, up_expert, src1, gate_cur, up_cur, mid_cur,
+        route[0], shmem, tgpig, tiisg, sgitg);
+    (void)tiitg;
+}
+
 /* TP-safe exact-shape sibling. The resident model view starts at this rank's
  * first expert, while IDs remain global, so preserve the ownership test and
  * rebase before entering the same compile-time-unrolled implementation. */
