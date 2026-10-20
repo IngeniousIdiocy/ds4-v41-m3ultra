@@ -1292,18 +1292,23 @@ static int check_general_topk(void) {
 }
 
 /* The radix-select path against the merge ladder: same values by rank, same
- * ids and order when the selected values are unique, ties by ascending id. */
+ * ids and order when the selected values are unique, ties by ascending id.
+ * The 512-wide winners' sort (default for k <= 512) must give the 2048-wide
+ * sort's ids bit for bit (DS4_METAL_DISABLE_V41_TOPK_SORT512). */
 static int check_topk_select(void) {
-    const uint32_t widths[] = {16384, 65536, 131072, 262144};
-    const uint32_t counts[] = {1, 512, 2048};
+    const uint32_t widths[] = {16384, 20007, 65536, 131072, 262144};
+    const uint32_t counts[] = {1, 300, 512, 2048};
+    CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SORT512") == 0);
     for (size_t wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
         const uint32_t width = widths[wi], rows = 2;
         ds4_gpu_tensor *scores = upload(NULL, (size_t)width * rows * 4);
         ds4_gpu_tensor *fast = upload(NULL, (size_t)2048 * rows * 4);
         ds4_gpu_tensor *slow = upload(NULL, (size_t)2048 * rows * 4);
+        ds4_gpu_tensor *alt = upload(NULL, (size_t)2048 * rows * 4);
         topk_entry *reference = malloc((size_t)width * rows * sizeof(*reference));
         bool *seen = calloc(width, sizeof(*seen));
-        CHECK(scores && fast && slow && reference && seen);
+        uint32_t variants = 0;
+        CHECK(scores && fast && slow && alt && reference && seen);
         float *s = ds4_gpu_tensor_contents(scores);
         for (uint32_t pattern = 0; pattern < 4; pattern++) {
             for (uint32_t t = 0; t < rows; t++) {
@@ -1342,10 +1347,18 @@ static int check_topk_select(void) {
                     if (pattern == 1 || pattern == 2)
                         CHECK(!memcmp(a + t * k, b + t * k, k * sizeof(*a)));
                 }
+                CHECK(setenv("DS4_METAL_DISABLE_V41_TOPK_SORT512", "1", 1) == 0);
+                CHECK(ds4_gpu_indexer_topk_tensor(alt, scores, width, rows, k));
+                CHECK(unsetenv("DS4_METAL_DISABLE_V41_TOPK_SORT512") == 0);
+                CHECK(ds4_gpu_synchronize());
+                CHECK(!memcmp(ds4_gpu_tensor_contents(alt), a, (size_t)rows * k * sizeof(*a)));
+                variants++;
             }
         }
-        fprintf(stderr, "V4.1 radix top-k width=%u: values by rank, unique-ID and tie-order oracle PASS\n", width);
+        fprintf(stderr, "V4.1 radix top-k width=%u: values by rank, unique-ID and tie-order oracle PASS; "
+                "512-wide and 2048-wide winners' sorts identical (%u calls)\n", width, variants);
         ds4_gpu_tensor_free(scores); ds4_gpu_tensor_free(fast); ds4_gpu_tensor_free(slow);
+        ds4_gpu_tensor_free(alt);
         free(reference); free(seen);
     }
     return 1;

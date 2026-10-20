@@ -591,3 +591,41 @@ kernel void kernel_topk_select_sort(
     }
     for (uint i = tid; i < args.top_k; i += 1024u) out[i] = (int)ids[i];
 }
+
+// kernel_topk_select_sort for top_k <= 512: one key per thread, 512 threads,
+// SIMD shuffles below a distance of 32.  Score descending, ties by ascending
+// id is a total order on the winners, so the result equals the 2048-wide
+// sort's.  map != 0: winners are candidate positions, written back as key ids
+// list[p / 8] * 8 + p % 8 (kernel_dsv41_candidate_ids folded in).
+kernel void kernel_topk_select_sort512(
+        constant ds4_metal_args_topk_select & args,
+        device const float * scores,
+        device int * selected,
+        device const uint * list,
+        constant uint & map,
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint tk[512], ti[512];
+    device const float * s = scores + (ulong)row * args.n;
+    device int * out = selected + (ulong)row * args.top_k;
+    uint key = 0u, id = 0xffffffffu;
+    if (tid < args.top_k) { id = (uint)out[tid]; key = ds4_topk_key(s[id]); }
+    for (uint k = 2u; k <= 512u; k <<= 1) {
+        for (uint j = k >> 1; j > 0u; j >>= 1) {
+            uint pk, pi;
+            if (j < 32u) {
+                pk = simd_shuffle_xor(key, (ushort)j);
+                pi = simd_shuffle_xor(id, (ushort)j);
+            } else {
+                tk[tid] = key; ti[tid] = id;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                pk = tk[tid ^ j]; pi = ti[tid ^ j];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            const bool mine_first = key > pk || (key == pk && id < pi);
+            const bool keep_first = ((tid & j) == 0u) == ((tid & k) == 0u);
+            if (mine_first != keep_first) { key = pk; id = pi; }
+        }
+    }
+    if (tid < args.top_k) out[tid] = map ? (int)(list[id >> 3] * 8u + (id & 7u)) : (int)id;
+}
