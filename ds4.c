@@ -42150,23 +42150,41 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_PACKED_INDEX");
     if (packed && !ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q,
         g->index_cache[owner], n_comp, count)) return false;
+    /* on the exact rows path a few rows pick as decode steps do (the same
+     * ids in the same order) */
+    const bool batch_topk = count > 1u && !getenv("DS4_METAL_DISABLE_V41_BATCH_TOPK") &&
+        !(count <= DS4_TP_BATCH_MAX_ROWS && ds41_rows_attention_on());
+#ifdef __APPLE__
+    const ds4_gpu_tensor *view = !packed && g->index_bf16_ok && !ds41_index_bf16_off() ? g->index_bf16[owner] : NULL;
+#endif
     for (uint32_t off = 0; off < count; off += DS41_INDEX_BATCH) {
         const uint32_t rows = count - off < DS41_INDEX_BATCH ? count - off : DS41_INDEX_BATCH;
         const uint64_t q_bytes = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         const uint64_t w_bytes = DS4_N_INDEXER_HEAD * sizeof(float);
         ds4_gpu_tensor *q = ds4_gpu_tensor_view(b->index_q, off * q_bytes, rows * q_bytes);
         ds4_gpu_tensor *weights = ds4_gpu_tensor_view(b->index_weights, off * w_bytes, rows * w_bytes);
-        bool ok = q && weights && (packed ?
+        bool scored = false;
+#ifdef __APPLE__
+        /* Verify rows score the bf16 view. Past layer 20 the candidate filter
+         * below drops what the rows' layer-20 masks drop, so those blocks
+         * need no scores. */
+        if (q && weights && view && DS4_N_INDEXER_HEAD == 32u) {
+            const uint32_t mask_width = (g->ctx + 7u) / 8u;
+            const uint32_t skip = start + off + 1u < 16385u * ratio ? 16385u * ratio - start - off - 1u : 0u;
+            ds4_gpu_tensor *mask = batch_topk && il > 20u && skip < rows ? ds4_gpu_tensor_view(g->batch.block_mask,
+                (uint64_t)off * mask_width * sizeof(float), (uint64_t)rows * mask_width * sizeof(float)) : NULL;
+            scored = ds4_gpu_dsv41_indexer_scores_rows_bf16(g->index_scores, q, weights, view, mask,
+                mask_width, skip, n_comp, rows, start + off, ratio);
+            ds4_gpu_tensor_free(mask);
+        }
+#endif
+        bool ok = q && weights && (scored || (packed ?
             ds4_gpu_dsv41_indexer_scores_packed(g->index_scores, q, weights,
                 g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
             ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
-                q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio));
+                q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio)));
         ds4_gpu_tensor_free(weights);
         ds4_gpu_tensor_free(q);
-        /* on the exact rows path a few rows pick as decode steps do (the same
-         * ids in the same order) */
-        const bool batch_topk = count > 1u && !getenv("DS4_METAL_DISABLE_V41_BATCH_TOPK") &&
-            !(count <= DS4_TP_BATCH_MAX_ROWS && ds41_rows_attention_on());
         if (ok && batch_topk && il >= 20u)
             ok = ds41_candidates_batch(g, il, n_comp, start + off, off, rows);
         for (uint32_t t = 0; ok && !batch_topk && t < rows; t++) {

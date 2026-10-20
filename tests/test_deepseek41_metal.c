@@ -1911,6 +1911,108 @@ static int check_index_score_bf16(void) {
     return 1;
 }
 
+/* 2-7 verify rows over the bf16 view against the tiled f32 kernel the batch
+ * scorer takes for them: the same bits, except -inf in blocks a masked row's
+ * mask drops (which the candidate filter drops anyway). */
+static int check_verify_index_bf16(void) {
+    enum { HEADS = 32, DIM = 128, MAXR = 7 };
+    const uint32_t counts[] = {9, 1031, 17011, 70001};
+    const uint32_t max_keys = 70001, mask_width = (max_keys + 7) / 8;
+    ds4_gpu_tensor *qt = upload(NULL, (size_t)MAXR * HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *wt = upload(NULL, (size_t)MAXR * HEADS * sizeof(float));
+    ds4_gpu_tensor *kt = upload(NULL, (size_t)max_keys * DIM * sizeof(float));
+    ds4_gpu_tensor *vt = upload(NULL, (size_t)max_keys * DIM * sizeof(uint16_t));
+    ds4_gpu_tensor *mt = upload(NULL, (size_t)MAXR * mask_width * sizeof(float));
+    ds4_gpu_tensor *sr = upload(NULL, ((size_t)MAXR * max_keys + 1) * sizeof(float));
+    ds4_gpu_tensor *sv = upload(NULL, ((size_t)MAXR * max_keys + 1) * sizeof(float));
+    CHECK(qt && wt && kt && vt && mt && sr && sv);
+    float *q = ds4_gpu_tensor_contents(qt), *w = ds4_gpu_tensor_contents(wt);
+    float *k = ds4_gpu_tensor_contents(kt), *mask = ds4_gpu_tensor_contents(mt);
+    float *ref = ds4_gpu_tensor_contents(sr), *got = ds4_gpu_tensor_contents(sv);
+    CHECK(q && w && k && mask && ref && got);
+    ds4_gpu_dsv41_verify_rows(1);
+    uint64_t skipped = 0;
+    for (int dist = 0; dist < 3; dist++) {
+        int block = 0;
+        for (size_t i = 0; i < (size_t)MAXR * HEADS * DIM; i++) {
+            if (dist == 2 && i % DIM == 0) { (void)random_value(); block = (int)(seed % 5u) - 2; }
+            q[i] = dist == 0 ? ldexpf(random_value(), (int)((i / 32) % 41) - 20) :
+                   dist == 1 ? ldexpf(random_value(), (int)((i / 32 * 7) % 13) - 6) :
+                               ldexpf(gaussian_value(), block);
+        }
+        for (size_t i = 0; i < (size_t)MAXR * HEADS; i++)
+            w[i] = bf16(dist == 2 ? gaussian_value() * 0.18f : random_value());
+        for (size_t i = 0; i < (size_t)max_keys * DIM; i++) {
+            if (dist == 2 && i % 32 == 0) { (void)random_value(); block = (int)(seed % 4u) - 1; }
+            k[i] = dist == 0 ? ldexpf(random_value(), (int)((i / 32) % 41) - 20) :
+                   dist == 1 ? ldexpf(random_value(), (int)((i / 32 * 5 + i / DIM) % 13) - 6) :
+                               ldexpf(gaussian_value(), block);
+        }
+        CHECK(ds4_gpu_dsv41_quantize(qt, DIM, MAXR * HEADS, DS4_V41_FP4_E8M0));
+        CHECK(ds4_gpu_dsv41_quantize(kt, DIM, max_keys, DS4_V41_FP4_E8M0));
+        CHECK(ds4_gpu_dsv41_index_keys_bf16(vt, kt, 0, max_keys, NULL));
+        for (size_t i = 0; i < (size_t)MAXR * mask_width; i++) {   /* one block in ten kept */
+            (void)random_value();
+            mask[i] = seed % 10u == 0 ? 0.0f : -INFINITY;
+        }
+        for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+            const uint32_t n = counts[ci];
+            for (uint32_t ratio = 1; ratio <= 2; ratio++) {
+                for (uint32_t rows = 2; rows <= MAXR; rows++) {
+                    for (uint32_t early = 0; early <= 1; early++) {
+                        const uint32_t start = early ? 0 : n * ratio - rows;
+                        for (uint32_t mode = 0; mode < 3; mode++) {
+                            const uint32_t first = mode == 0 ? rows : mode == 1 ? 0 : rows / 2;
+                            ds4_gpu_tensor *qv = ds4_gpu_tensor_view(qt, 0, (uint64_t)rows * HEADS * DIM * 4u);
+                            ds4_gpu_tensor *wv = ds4_gpu_tensor_view(wt, 0, (uint64_t)rows * HEADS * 4u);
+                            CHECK(qv && wv);
+                            ref[(size_t)rows * n] = 12345; got[(size_t)rows * n] = 12345;
+                            CHECK(ds4_gpu_dsv41_indexer_scores_batch(sr, qv, wv, kt, n, rows, start, ratio));
+                            CHECK(ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qv, wv, vt, mode ? mt : NULL,
+                                mask_width, first, n, rows, start, ratio));
+                            CHECK(ds4_gpu_synchronize());
+                            ds4_gpu_tensor_free(qv); ds4_gpu_tensor_free(wv);
+                            CHECK(ref[(size_t)rows * n] == 12345 && got[(size_t)rows * n] == 12345);
+                            for (uint32_t t = 0; t < rows; t++) {
+                                for (uint32_t j = 0; j < n; j++) {
+                                    const float r = ref[(size_t)t * n + j], v = got[(size_t)t * n + j];
+                                    const bool same = !memcmp(&r, &v, sizeof(r));
+                                    const bool dropped = mode && t >= first && mask[(size_t)t * mask_width + j / 8] != 0.0f;
+                                    if (!same && !(dropped && v == -INFINITY)) {
+                                        fprintf(stderr, "verify index bf16 dist=%d n=%u ratio=%u rows=%u start=%u mode=%u "
+                                                "row=%u key=%u ref=%a got=%a\n", dist, n, ratio, rows, start, mode, t, j, r, v);
+                                        CHECK(0);
+                                    }
+                                    skipped += !same;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CHECK(skipped > 0);
+    /* declines where the batch scorer would not take the tiled kernel */
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 1, 1030, 1));
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 8, 1023, 1));
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 2, 1030, 1));
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 2, 0, 3));
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, mt, 128, 0, 1031, 2, 0, 1));
+    setenv("DS4_METAL_DISABLE_V41_VERIFY_INDEX_BF16", "1", 1);
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 2, 0, 1));
+    unsetenv("DS4_METAL_DISABLE_V41_VERIFY_INDEX_BF16");
+    CHECK(ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 2, 0, 1));
+    ds4_gpu_dsv41_verify_rows(0);
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 2, 0, 1));
+    CHECK(ds4_gpu_synchronize());
+    ds4_gpu_tensor_free(sv); ds4_gpu_tensor_free(sr); ds4_gpu_tensor_free(mt); ds4_gpu_tensor_free(vt);
+    ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(qt);
+    fprintf(stderr, "V4.1 verify rows bf16 index scores == tiled f32 bits PASS (%llu masked-block entries skipped)\n",
+            (unsigned long long)skipped);
+    return 1;
+}
+
 /* Candidate-only index rows against the wide row they replace (wide scores,
  * candidate filter, radix top-512): the same ids in the same order, with
  * realistic and wide FP4 block scales, partial newest blocks and ties. */
@@ -2220,6 +2322,7 @@ static int check_blend(void) {
 #else
 static int check_index_score_wide(void) { return 1; }
 static int check_index_score_bf16(void) { return 1; }
+static int check_verify_index_bf16(void) { return 1; }
 static int check_index_candidates(void) { return 1; }
 static int check_engram_decode(void) { return 1; }
 static int check_blend(void) { return 1; }
@@ -2440,6 +2543,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--verify-index-bf16")) {
+        const int ok = ds4_gpu_init() && check_verify_index_bf16();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--index-candidates")) {
         const int ok = ds4_gpu_init() && check_index_candidates();
         ds4_gpu_cleanup();
@@ -2514,7 +2622,7 @@ int main(int argc, char **argv) {
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_candidates_batch(16449, 17, 16400) &&
              check_candidates_batch(17017, 17, 17000) && check_sparse_gather() && check_indexer_batch() && check_index_score_wide() && check_index_score_bf16() &&
-             check_index_candidates() && check_engram_decode() && check_blend() &&
+             check_verify_index_bf16() && check_index_candidates() && check_engram_decode() && check_blend() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_topk_select() && check_causal_topk() && check_decode_topk() && check_split_collapse() && check_fused_merge() && check_indexer_all() && check_compact_carry() && check_rope_tab() && check_heads_once() && check_literal_shapes() && check_attention_output(false) &&
              check_tp_attention();
     ds4_gpu_cleanup();

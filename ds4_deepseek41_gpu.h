@@ -143,6 +143,13 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                      const ds4_gpu_tensor *keys,
                                      uint32_t source_rows, uint32_t rows,
                                      uint32_t start, uint32_t ratio);
+/* The same for 2-7 verify rows over the keys' bf16 view (the same bits); rows
+ * from mask_first on may leave -inf where their block-mask row (mask_stride
+ * floats) drops a block. 0, scoring nothing, where unavailable (Metal only). */
+int ds4_gpu_dsv41_indexer_scores_rows_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *view, const ds4_gpu_tensor *mask,
+        uint32_t mask_stride, uint32_t mask_first, uint32_t source_rows, uint32_t rows,
+        uint32_t start, uint32_t ratio);
 /* The top-k of a row filtered by a block mask of more than 2048 blocks, from
  * the scores of its 2048 candidate blocks only: the same ids in the same order
  * (Metal only). Returns 0, leaving the full row to the caller, where unavailable. */
