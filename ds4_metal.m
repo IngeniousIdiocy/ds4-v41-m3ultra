@@ -22514,6 +22514,60 @@ int ds4_gpu_matmul_f32_tensor(
     return 1;
 }
 
+int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                      uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                      const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || (in_dim % 4u) != 0) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!xbuf || !outbuf || ds4_gpu_tensor_bytes(x) < in_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < out_dim * sizeof(float)) return 0;
+        const uint64_t row_bytes = in_dim * sizeof(uint16_t);
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        /* The F32 router's one-row dispatch with BF16 row strides. */
+        ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
+        mv_args.nb00 = sizeof(uint16_t);
+        mv_args.nb01 = row_bytes;
+        mv_args.nb02 = mv_args.nb03 = weight_bytes;
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
+        if (ds4_gpu_plain_mv_single_row(out_dim)) {
+            mv_dispatch.nr0 = 1;
+            mv_dispatch.smem = 32u * sizeof(float);
+        }
+        mv_args.nr0 = mv_dispatch.nr0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_bf16_f32_4", mv_dispatch.nsg);
+        if (!pipeline) return 0;
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: V4.1 decode router reads BF16 (nsg=%d nr0=%d)\n",
+                    (int)mv_dispatch.nsg, (int)mv_dispatch.nr0);
+        }
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        if (mv_dispatch.smem) [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "BF16 router matvec");
+    }
+}
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,

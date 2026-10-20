@@ -40271,6 +40271,8 @@ typedef struct {
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
     bool tp_gate_fused, shared_done, hc_attn_deferred, hc_ffn_deferred, scalar_decode, kv_stored;
+    bool router_bf16;                      /* this decode step's router reads the BF16 sidecar */
+    const struct ds4_model *router_model;  /* that sidecar */
     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;   /* verify-block row partials, two slots per layer */
@@ -40789,6 +40791,7 @@ static bool ds41_rope_store(ds4_gpu_tensor *x, ds4_gpu_tensor *cache, uint64_t o
 static bool ds41_queued_head_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_QUEUED_HEAD", &c); }
 static bool ds41_short_sweep_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_SHORT_SWEEP", &c); }
 static bool ds41_capture_in_head_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_CAPTURE_IN_HEAD", &c); }
+static bool ds41_router_bf16_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ROUTER_BF16", &c); }
 
 /* One block's HC input: the mixer projection, then split, weighted sum with
  * the previous block's pre weights and norm; each half fused where the fused
@@ -41143,9 +41146,18 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN] : sum;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The same matvec geometry and F32 reduction over the released BF16
+     * gates; schedule guards still see the F32 tensor. */
+    if (g->router_bf16 && l->ffn_gate_inp_bf16) {
+        if (!ds4_gpu_matmul_bf16_router_tensor(g->route_logits, g->router_model->map, g->router_model->size,
+                l->ffn_gate_inp_bf16->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, g->norm))
+            return false;
+    } else
+#endif
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
 #ifdef __APPLE__
-    const bool routed_one = !getenv("DS4_METAL_DISABLE_V41_ROUTER_ONE") &&
+    const bool routed_one =!getenv("DS4_METAL_DISABLE_V41_ROUTER_ONE") &&
         ds4_gpu_dsv41_router_one(g->selected, g->route_weights, g->route_probs, g->route_logits,
             m->map, m->size, bias->abs_offset, DS4_N_EXPERT, DS4_N_EXPERT_USED,
             DS4_EXPERT_WEIGHT_SCALE);
@@ -42311,6 +42323,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         g->draft->mh_rows = 1;
     }
     g->scalar_decode = true;
+    g->router_model = w->router_bf16_model;
+    g->router_bf16 = g->router_model && g->tp_world == 1 && !g->streaming && !g->quality &&
+        !ds41_router_bf16_off();
     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     /* With the head queued, the drafter's capture of this token is encoded after
@@ -42359,6 +42374,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_flush_commands() != 0;
     }
     g->scalar_decode = false;
+    g->router_bf16 = false;
     g->tp_gate_fused = false;
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */

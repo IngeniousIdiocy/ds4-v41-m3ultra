@@ -1105,6 +1105,12 @@ int ds4_gpu_matmul_f32_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* One-row router matvec over BF16 weights [out_dim][in_dim]: the F32 matvec's
+ * geometry and reduction with each weight widened from BF16. */
+int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                      uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                      const ds4_gpu_tensor *x);
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,

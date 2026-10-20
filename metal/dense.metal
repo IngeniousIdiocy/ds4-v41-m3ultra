@@ -2261,7 +2261,7 @@ void kernel_mul_mv_t_t_4_impl(
 
     for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
         for (short row = 0; row < NR0; row++) {
-            sumf[row] += ax[row][i] * y[i];
+            sumf[row] += float(ax[row][i]) * y[i];
         }
     }
 
@@ -2307,6 +2307,8 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 // Host-visible vectorized dense matvec variants for F32 and F16 weights.
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
+/* The V4.1 decode router reading the released BF16 gates. */
+template [[host_name("kernel_mul_mv_bf16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, float, float4>;
 
 // The same matvec with its output rounded to bf16.
 template<typename T0, typename T04, typename T1, typename T14>
