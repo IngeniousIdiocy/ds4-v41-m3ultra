@@ -1645,11 +1645,12 @@ static int check_index_candidates(void) {
             CHECK(ds4_gpu_glm_indexer_score_one_tensor(plain, qt, wt, kt, n, HEADS, DIM, 1.0f / 64.0f, false));
             CHECK(ds4_gpu_end_commands());
             for (int round = 0; round < ROUNDS; round++) {
-                /* path 0 full row; 1 candidates (list_ready ignored without ONCE: a zeroed list is rebuilt);
-                 * 2 DS4_V41_IDX_CAND_ONCE=1 building the zeroed list; 3 ONCE reusing path 2's list */
+                /* path 0 full row; 1 candidates under DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE=1 (list_ready ignored: a
+                 * zeroed list is rebuilt); 2 the default once-per-token path building the zeroed list; 3 reusing
+                 * path 2's list */
                 for (int path = 0; path < 4; path++) {
                     if (path == 1 || path == 2) memset(list_w, 0, 2048 * sizeof(*list_w));
-                    if (path >= 2) CHECK(setenv("DS4_V41_IDX_CAND_ONCE", "1", 1) == 0);
+                    if (path < 2) CHECK(setenv("DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE", "1", 1) == 0);
                     const double t0 = monotonic_seconds();
                     CHECK(ds4_gpu_begin_commands());
                     if (path) {
@@ -1662,7 +1663,7 @@ static int check_index_candidates(void) {
                     }
                     CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
                     if (round) seconds[path] += monotonic_seconds() - t0;
-                    CHECK(unsetenv("DS4_V41_IDX_CAND_ONCE") == 0);
+                    CHECK(unsetenv("DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE") == 0);
                     if (path) CHECK(!memcmp(a, b, TOP * sizeof(*a)));
                 }
             }

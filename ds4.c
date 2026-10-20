@@ -40317,7 +40317,7 @@ typedef struct {
     ds4_gpu_tensor *rope_tab;
     bool rope_tab_on;
     uint32_t rope_tab_pos;
-    /* DS4_V41_IDX_CAND_ONCE: pos + 1 once block_list holds the candidates of block_mask as layer 20 wrote it for
+    /* candidate list once per token: pos + 1 once block_list holds the candidates of block_mask as layer 20 wrote it for
      * pos (set by a candidate-only index row, cleared when layer 20 writes the mask); 0 = not ready. */
     uint32_t block_list_pos;
     /* The decode reduce wrote this layer's heads already inverse-roped and bf16-rounded (heads_once_arm); the next

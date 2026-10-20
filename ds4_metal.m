@@ -50449,9 +50449,9 @@ int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     static id<MTLComputePipelineState> list_pipeline, score_pipeline, ids_pipeline;
     static int env = -1;
     if (env < 0) env = !getenv("DS4_METAL_DISABLE_V41_INDEX_CANDIDATES");
-    /* DS4_V41_IDX_CAND_ONCE=1 (read per call): reuse a ready list; ids mapped in the winners' sort */
-    const char *once_env = getenv("DS4_V41_IDX_CAND_ONCE");
-    const bool once = once_env && !strcmp(once_env, "1");
+    /* default (DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE=1 opts out, read per call): reuse a ready list; ids mapped
+     * in the winners' sort */
+    const bool once = !getenv("DS4_METAL_DISABLE_V41_INDEX_CAND_ONCE");
     const uint32_t blocks = n_comp <= (1u << 23) ? (n_comp + 7u) / 8u : 0u;
     const uint32_t count = 16384u - (blocks * 8u - n_comp);
     /* only where the masked wide scorer and the radix select would have run */
