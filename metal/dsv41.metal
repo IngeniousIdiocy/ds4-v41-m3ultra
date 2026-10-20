@@ -511,14 +511,21 @@ kernel void kernel_dsv41_engram_add(
             gate * dsv41_bf16(kv[value_offset + i]));
 }
 
+/* A single product, rounded as written: fast math may not reassociate it into a neighbouring product. */
+static inline float dsv41_engram_mul(float a, float b) {
+#pragma METAL fp math_mode(safe)
+    return a * b;
+}
+
 /* The decode Engram gate with one 256-thread group per stream instead of one 32-lane SIMD group, with
- * kernel_dsv41_engram_add's bits. The 32-lane kernel is latency-bound: each of its 160 iterations per lane waits
- * for that iteration's device loads. Here simdgroup 0 runs exactly its arithmetic: lane l accumulates elements
- * l, l + 32, l + 64, ... in that order into h2, k2 and dot, as the fused multiply-adds the 32-lane kernel's
- * `h2 += h * h; k2 += k * k; dot += h * (q * w) * k` compile to under fast math (written out explicitly, so a
- * different kernel structure cannot contract them differently), then the same simd_sums, norms, gate and BF16
- * boundaries. All 256 threads only stage the inputs into threadgroup memory, 1024 elements at a time, and apply
- * the per-element residual update. Host: width % 1024 == 0, 16 KB of threadgroup memory. */
+ * kernel_dsv41_engram_add's bits. Lane l of the 32-lane kernel accumulates elements l, l + 32, ..., l + 32 * 159
+ * (j = 0..159) in that order. Under fast math its `h2 += h * h; k2 += k * k; dot += h * (q * w) * k` compiles
+ * to fma(h, h, h2), fma(k, k, k2) and fma((h * q) * w, k, dot) (each product rounded), and its residual update
+ * to fma(gate, v, h); they are written out here so the different structure cannot change them. Simdgroup s loads segment j = 20 s .. 20 s + 19 of every
+ * lane's chain into registers (all loads issued up front), and the segments run in order: simdgroup s takes the
+ * three accumulators from s - 1 through threadgroup memory, adds its 20 steps per lane, and hands them on.
+ * Simdgroup 7 then does the same simd_sums, norms and gate; every thread updates its own 20 elements of the
+ * residual from registers. Width 5120 only, 512 bytes of threadgroup memory. */
 kernel void kernel_dsv41_engram_add_tg256(
         constant ds4_metal_args_dsv41_engram &args,
         device float *residual,
@@ -528,50 +535,48 @@ kernel void kernel_dsv41_engram_add_tg256(
         device const uchar *mask,
         threadgroup float *sh [[threadgroup(0)]],
         uint2 group [[threadgroup_position_in_grid]],
-        uint tid [[thread_index_in_threadgroup]],
         uint lane [[thread_index_in_simdgroup]],
         uint sg [[simdgroup_index_in_threadgroup]]) {
     if (args.masked && !mask[group.x]) return;
-    const ulong offset = ((ulong)group.x * 4u + group.y) * args.width;
-    const ulong key_offset = ((ulong)group.x * 5u + group.y) * args.width;
-    const ulong value_offset = ((ulong)group.x * 5u + 4u) * args.width;
-    device float4 *h4 = (device float4 *)(residual + offset);
-    device const float4 *k4 = (device const float4 *)(kv + key_offset);
-    device const float4 *v4 = (device const float4 *)(kv + value_offset);
-    device const float4 *qw4 = (device const float4 *)(q_weight + (ulong)group.y * args.width);
-    device const float4 *kw4 = (device const float4 *)(k_weight + (ulong)group.y * args.width);
-    threadgroup float4 *sh4 = (threadgroup float4 *)sh;
-    threadgroup const float *sh_h = sh, *sh_k = sh + 1024u, *sh_q = sh + 2048u, *sh_w = sh + 3072u;
-    float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
-    for (uint base = 0; base < args.width; base += 1024u) {
-        const uint i4 = base / 4u + tid;
-        sh4[tid] = h4[i4];
-        sh4[256u + tid] = dsv41_bf16(k4[i4]);
-        sh4[512u + tid] = qw4[i4];
-        sh4[768u + tid] = kw4[i4];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0u) {
-            for (uint j = lane; j < 1024u; j += 32u) {
-                const float h = sh_h[j], k = sh_k[j];
-                h2 = fma(h, h, h2);
-                k2 = fma(k, k, k2);
-                dot = fma(h * (sh_q[j] * sh_w[j]), k, dot);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr uint W = 5120u, J = W / 256u;
+    const uint e0 = sg * 32u * J + lane;
+    device float *hp = residual + ((ulong)group.x * 4u + group.y) * W + e0;
+    device const float *kp = kv + ((ulong)group.x * 5u + group.y) * W + e0;
+    device const float *vp = kv + ((ulong)group.x * 5u + 4u) * W + e0;
+    device const float *qp = q_weight + (ulong)group.y * W + e0;
+    device const float *wp = k_weight + (ulong)group.y * W + e0;
+    float h[J], k[J], p[J], v[J];
+    for (uint j = 0; j < J; j++) {
+        h[j] = hp[32u * j];
+        k[j] = dsv41_bf16(kp[32u * j]);
+        p[j] = dsv41_engram_mul(dsv41_engram_mul(h[j], qp[32u * j]), wp[32u * j]);
+        v[j] = vp[32u * j];
     }
-    if (sg == 0u) {
+    float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
+    for (uint s = 0; s < 8u; s++) {
+        if (sg == s) {
+            if (s) { h2 = sh[lane]; k2 = sh[32u + lane]; dot = sh[64u + lane]; }
+            for (uint j = 0; j < J; j++) {
+                h2 = fma(h[j], h[j], h2);
+                k2 = fma(k[j], k[j], k2);
+                dot = fma(p[j], k[j], dot);
+            }
+            if (s < 7u) { sh[lane] = h2; sh[32u + lane] = k2; sh[64u + lane] = dot; }
+        }
+        if (s < 7u) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg == 7u) {
         h2 = simd_sum(h2);
         k2 = simd_sum(k2);
         dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
               rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
         const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
-        if (lane == 0u) sh[0] = gate;
+        if (lane == 0u) sh[96] = gate;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float gate = sh[0];
-    for (uint i = tid; i < args.width / 4u; i += 256u)
-        h4[i] = dsv41_bf16(h4[i] + gate * dsv41_bf16(v4[i]));
+    const float gate = sh[96];
+    for (uint j = 0; j < J; j++)
+        hp[32u * j] = dsv41_bf16(fma(gate, dsv41_bf16(v[j]), h[j]));
 }
 
 struct ds4_metal_args_dsv41_pool {
