@@ -485,6 +485,10 @@ uint64_t ds4_sampler_gpu_encoded_count(void);
 void ds4_preencode_stats(uint64_t *out, int n);
 /* The finite GPU bridge behind each pre-encoded V4.1 decode head (Metal): committed, retired, failed. */
 void ds4_decode_bridge_stats(uint64_t out[3]);
+/* V4.1 decode blend-reader dispatches by family (router, Engram, indexer q_b) and fused index-query rope +
+ * quantization dispatches (Metal). */
+void ds4_blend_counts(uint64_t out[3]);
+uint64_t ds4_irq_table_count(void);
 /* V4.1 decode Engram gates that ran with one 256-thread group per stream (Metal). */
 uint64_t ds4_engram_add_tg_count(void);
 #ifdef DS4_TEST_HOOKS

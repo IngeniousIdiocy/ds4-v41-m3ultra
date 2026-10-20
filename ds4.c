@@ -79332,6 +79332,22 @@ void ds4_decode_bridge_stats(uint64_t out[3]) {
     for (int i = 0; i < 3; i++) out[i] = 0;
 #endif
 }
+/* decode blend-reader dispatches by family: router, Engram, indexer q_b */
+void ds4_blend_counts(uint64_t out[3]) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_dsv41_blend_counts(out);
+#else
+    for (int i = 0; i < 3; i++) out[i] = 0;
+#endif
+}
+/* decode index-query rope + quantization dispatches fused with the RoPE table */
+uint64_t ds4_irq_table_count(void) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    return ds4_gpu_irq_count();
+#else
+    return 0;
+#endif
+}
 /* decode Engram gates that ran in the 256-thread form */
 uint64_t ds4_engram_add_tg_count(void) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
