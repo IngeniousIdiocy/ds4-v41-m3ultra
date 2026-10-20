@@ -37600,21 +37600,15 @@ int ds4_gpu_dsv41_indexer_score_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tenso
         return 0;
     @autoreleasepool {
         /* below 65536 rows (too few threadgroups for one lane per key pair) S lanes share each key, four below
-         * 10240 rows and two above (measured): the same bits. DS4_METAL_DISABLE_V41_SCORE_SPLIT=1 opts out;
-         * DS4_METAL_V41_SCORE_SPLIT=2|4, _SPLIT_TG and _SPLIT_BELOW override the choice (read per call). */
-        const char *split_env = getenv("DS4_METAL_V41_SCORE_SPLIT");
-        const char *below_env = getenv("DS4_METAL_V41_SCORE_SPLIT_BELOW");
-        const uint32_t split = getenv("DS4_METAL_DISABLE_V41_SCORE_SPLIT") ? 0u :
-            split_env ? (uint32_t)atoi(split_env) : rows < 10240u ? 4u : 2u;
-        const uint32_t below = below_env ? (uint32_t)atoi(below_env) : 65536u;
-        const uint32_t split_tg = getenv("DS4_METAL_V41_SCORE_SPLIT_TG") ? (uint32_t)atoi(getenv("DS4_METAL_V41_SCORE_SPLIT_TG")) : 256u;
+         * 10240 rows and two above, 256 threads (measured): the same bits. DS4_METAL_DISABLE_V41_SCORE_SPLIT=1
+         * opts out (read per call). */
         id<MTLComputePipelineState> pipeline = nil;
         NSUInteger tg = 256, keys_per_tg = 512;
-        if ((split == 2u || split == 4u) && rows < below && (split_tg == 128u || split_tg == 256u || split_tg == 512u)) {
+        if (rows < 65536u && !getenv("DS4_METAL_DISABLE_V41_SCORE_SPLIT")) {
+            const NSUInteger split = rows < 10240u ? 4u : 2u;
             pipeline = ds4_gpu_get_pipeline(split == 2u ? "kernel_dsv41_indexer_score_rows_split2_bf16" :
                                                           "kernel_dsv41_indexer_score_rows_split4_bf16");
-            tg = split_tg;
-            keys_per_tg = 2u * split_tg / split;
+            keys_per_tg = 2u * tg / split;
         }
         if (!pipeline) {
             /* two keys per thread: 512 threads below 98304 rows, 128 from there (measured: 300000 rows 277 -> 246 us,
