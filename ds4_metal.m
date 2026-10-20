@@ -9347,15 +9347,24 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return obj.bytes;
 }
 
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *);
+
+void *ds4_gpu_autorelease_push(void) { return objc_autoreleasePoolPush(); }
+void ds4_gpu_autorelease_pop(void *pool) { if (pool) objc_autoreleasePoolPop(pool); }
+
+/* CPU access from C: anything -contents autoreleases must not outlive the call (see ds4_gpu.h). */
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
-    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
-    return (uint8_t *)[obj.buffer contents] + obj.offset;
+    @autoreleasepool {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        return (uint8_t *)[obj.buffer contents] + obj.offset;
+    }
 }
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > ds4_gpu_tensor_bytes(tensor) / sizeof(float)) return 0;
-    float *p = ds4_gpu_tensor_contents(tensor);
+    float *p = ds4_gpu_tensor_contents(tensor);   /* pooled there */
     if (!p && count != 0) return 0;
     for (uint64_t i = 0; i < count; i++) p[i] = value;
     return 1;
@@ -9366,7 +9375,9 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *da
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
     if (bytes != 0) {
-        memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
+        @autoreleasepool {
+            memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
+        }
     }
     return 1;
 }
@@ -9376,7 +9387,9 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
     if (bytes != 0) {
-        memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
+        @autoreleasepool {
+            memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
+        }
     }
     return 1;
 }

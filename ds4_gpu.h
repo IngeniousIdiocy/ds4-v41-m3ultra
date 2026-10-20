@@ -44,6 +44,13 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+#ifdef __APPLE__
+/* Autorelease pool for C callers: objects Metal autoreleases on a thread without a pool go to the thread's
+ * implicit pool, which a C program's main or worker thread never drains (W2 a1: freed session buffers stayed
+ * in the footprint). ds4.c opens one around every public engine/session entry point (DS4_POOL_SCOPE). */
+void *ds4_gpu_autorelease_push(void);
+void ds4_gpu_autorelease_pop(void *pool);
+#endif
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
