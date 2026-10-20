@@ -320,11 +320,11 @@ static int check_hc_scaled(void) {
 
 static int check_engram(void) {
     enum { D = 5120, ROWS = 5, N = ROWS * 4 * D };
-    float *x = malloc(N * sizeof(float)), *actual = malloc(N * sizeof(float));
+    float *x = malloc(N * sizeof(float)), *actual = malloc(N * sizeof(float)), *unmasked = malloc(N * sizeof(float));
     float *kv = malloc(ROWS * 5 * D * sizeof(float));
     float *qw = malloc(4 * D * sizeof(float)), *kw = malloc(4 * D * sizeof(float));
     uint8_t mask[] = {1, 1, 0, 1, 0};
-    CHECK(x && actual && kv && qw && kw);
+    CHECK(x && actual && unmasked && kv && qw && kw);
     for (int i = 0; i < N; i++) x[i] = bf16(random_value());
     for (int i = 0; i < ROWS * 5 * D; i++) kv[i] = bf16(random_value());
     for (int i = 0; i < 4 * D; i++) { qw[i] = random_value(); kw[i] = random_value(); }
@@ -348,6 +348,8 @@ static int check_engram(void) {
         CHECK(ds4_gpu_engram_add_tg_count() - tg0 == (uint64_t)tg);   /* the form that ran */
         ds4_gpu_set_engram_add_tg(0);
         CHECK(ds4_gpu_tensor_read(xt, 0, actual, N * sizeof(float)));
+        if (pass == 0) memcpy(unmasked, actual, N * sizeof(float));
+        if (tg) CHECK(!memcmp(actual, unmasked, N * sizeof(float)));   /* the 256-thread form gives the 32-lane bits */
         for (int row = 0; row < ROWS; row++) for (int h = 0; h < 4; h++) {
             double dot = 0, h2 = 0, k2 = 0;
             for (int i = 0; i < D; i++) {
@@ -377,7 +379,64 @@ static int check_engram(void) {
     CHECK(!ds4_gpu_dsv41_engram_add(xt, kt, qwt, kwt, mt, D, ROWS + 1, 1e-20f));
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(qwt);
     ds4_gpu_tensor_free(kwt); ds4_gpu_tensor_free(mt);
-    free(x); free(actual); free(kv); free(qw); free(kw);
+    free(x); free(actual); free(unmasked); free(kv); free(qw); free(kw);
+    return 1;
+}
+
+/* --engram-add-exact: the decode step's 256-thread Engram gate against the 32-lane kernel it replaces, bit for bit,
+ * through the engine entry point (ds4_gpu_set_engram_add_tg 0 / 1) at the production width 5120. Every set is new
+ * random data: ROWS rows x 4 streams of residual (BF16, as the stream), keys and values (f32), and the stream weights,
+ * with full-mantissa values and a scale drawn per row over 2^-11..2^11; each set also has a zero-residual row and a
+ * zero-key row (the dot = 0 path). Counts are distinct streams and values, never repeats. 3 / streams bounds the
+ * per-stream difference rate at 95% when none differ. */
+static uint64_t exact_rng = 0x9e3779b97f4a7c15ull;
+static float exact_uniform(void) {   /* [-1, 1) with a full 24-bit mantissa range */
+    exact_rng ^= exact_rng << 13; exact_rng ^= exact_rng >> 7; exact_rng ^= exact_rng << 17;
+    return (float)((int64_t)(exact_rng >> 39) - (1 << 24)) / (float)(1 << 24);
+}
+
+static int check_engram_add_exact(int sets) {
+    enum { D = 5120, ROWS = 1024 };
+    const size_t nres = (size_t)ROWS * 4 * D, nkv = (size_t)ROWS * 5 * D;
+    float *x = malloc(nres * sizeof(float)), *kv = malloc(nkv * sizeof(float));
+    float *qw = malloc(4 * D * sizeof(float)), *kw = malloc(4 * D * sizeof(float));
+    uint32_t *out[2] = {malloc(nres * 4), malloc(nres * 4)};
+    CHECK(x && kv && qw && kw && out[0] && out[1]);
+    ds4_gpu_tensor *xt = upload(NULL, nres * 4), *kt = upload(NULL, nkv * 4), *qwt = upload(NULL, 4 * D * 4), *kwt = upload(NULL, 4 * D * 4);
+    CHECK(xt && kt && qwt && kwt);
+    uint64_t values = 0, streams = 0, diff_values = 0, diff_streams = 0;
+    for (int set = 0; set < sets; set++) {
+        for (int row = 0; row < ROWS; row++) {
+            const float sx = ldexpf(1.0f, (int)(exact_uniform() * 12.0f)), sk = ldexpf(1.0f, (int)(exact_uniform() * 12.0f));
+            for (int i = 0; i < 4 * D; i++) x[(size_t)row * 4 * D + i] = row == 1 ? 0.0f : bf16(sx * exact_uniform());
+            for (int i = 0; i < 5 * D; i++) kv[(size_t)row * 5 * D + i] = row == 2 && i < 4 * D ? 0.0f : sk * exact_uniform();
+        }
+        for (int i = 0; i < 4 * D; i++) { qw[i] = 1.0f + 0.5f * exact_uniform(); kw[i] = 1.0f + 0.5f * exact_uniform(); }
+        CHECK(ds4_gpu_tensor_write(kt, 0, kv, nkv * 4));
+        CHECK(ds4_gpu_tensor_write(qwt, 0, qw, 4 * D * 4));
+        CHECK(ds4_gpu_tensor_write(kwt, 0, kw, 4 * D * 4));
+        for (int tg = 0; tg < 2; tg++) {
+            ds4_gpu_set_engram_add_tg(tg);
+            const uint64_t tg0 = ds4_gpu_engram_add_tg_count();
+            CHECK(ds4_gpu_tensor_write(xt, 0, x, nres * 4));
+            CHECK(ds4_gpu_dsv41_engram_add(xt, kt, qwt, kwt, NULL, D, ROWS, 1e-6f));
+            CHECK(ds4_gpu_engram_add_tg_count() - tg0 == (uint64_t)tg);   /* the form that ran */
+            ds4_gpu_set_engram_add_tg(0);
+            CHECK(ds4_gpu_tensor_read(xt, 0, out[tg], nres * 4));
+        }
+        for (size_t st = 0; st < (size_t)ROWS * 4; st++) {
+            uint64_t d = 0;
+            for (size_t i = 0; i < D; i++) d += out[0][st * D + i] != out[1][st * D + i];
+            diff_values += d; diff_streams += d != 0;
+        }
+        values += nres; streams += (uint64_t)ROWS * 4;
+    }
+    fprintf(stderr, "V4.1 Engram gate, 256-thread vs 32-lane, bitwise: %llu of %llu streams and %llu of %llu values differ "
+            "(%d sets of fresh data, width %d)\n", (unsigned long long)diff_streams, (unsigned long long)streams,
+            (unsigned long long)diff_values, (unsigned long long)values, sets, D);
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(qwt); ds4_gpu_tensor_free(kwt);
+    free(x); free(kv); free(qw); free(kw); free(out[0]); free(out[1]);
+    CHECK(diff_values == 0);
     return 1;
 }
 
@@ -2104,6 +2163,11 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "--index-candidates")) {
         const int ok = ds4_gpu_init() && check_index_candidates();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--engram-add-exact")) {
+        const int ok = ds4_gpu_init() && check_engram_add_exact(argc == 3 ? atoi(argv[2]) : 75);
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

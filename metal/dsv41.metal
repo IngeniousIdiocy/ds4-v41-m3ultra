@@ -646,11 +646,14 @@ kernel void kernel_dsv41_engram_add(
             gate * dsv41_bf16(kv[value_offset + i]));
 }
 
-/* The decode Engram gate with one 256-thread group per stream instead of one 32-lane SIMD group.
- * Every input element, both RMS norms, the per-element (h * (q*k)) * k product, the gate expression and
- * every BF16 boundary are those of kernel_dsv41_engram_add; the three reductions run as float4 lanes -> SIMD sums
- * -> an 8-way threadgroup sum in a fixed order (a different, numerically equivalent summation order), and the
- * residual update runs over all 256 threads. Host: width % 1024 == 0, unmasked. */
+/* The decode Engram gate with one 256-thread group per stream instead of one 32-lane SIMD group, with
+ * kernel_dsv41_engram_add's bits. The 32-lane kernel is latency-bound: each of its 160 iterations per lane waits
+ * for that iteration's device loads. Here simdgroup 0 runs exactly its arithmetic: lane l accumulates elements
+ * l, l + 32, l + 64, ... in that order into h2, k2 and dot, as the fused multiply-adds the 32-lane kernel's
+ * `h2 += h * h; k2 += k * k; dot += h * (q * w) * k` compile to under fast math (written out explicitly, so a
+ * different kernel structure cannot contract them differently), then the same simd_sums, norms, gate and BF16
+ * boundaries. All 256 threads only stage the inputs into threadgroup memory, 1024 elements at a time, and apply
+ * the per-element residual update. Host: width % 1024 == 0, 16 KB of threadgroup memory. */
 kernel void kernel_dsv41_engram_add_tg256(
         constant ds4_metal_args_dsv41_engram &args,
         device float *residual,
@@ -658,7 +661,7 @@ kernel void kernel_dsv41_engram_add_tg256(
         device const float *q_weight,
         device const float *k_weight,
         device const uchar *mask,
-        threadgroup float *red [[threadgroup(0)]],
+        threadgroup float *sh [[threadgroup(0)]],
         uint2 group [[threadgroup_position_in_grid]],
         uint tid [[thread_index_in_threadgroup]],
         uint lane [[thread_index_in_simdgroup]],
@@ -672,26 +675,37 @@ kernel void kernel_dsv41_engram_add_tg256(
     device const float4 *v4 = (device const float4 *)(kv + value_offset);
     device const float4 *qw4 = (device const float4 *)(q_weight + (ulong)group.y * args.width);
     device const float4 *kw4 = (device const float4 *)(k_weight + (ulong)group.y * args.width);
-    const uint n4 = args.width / 4u;
-    float4 h2 = 0.0f, k2 = 0.0f, dt = 0.0f;
-    for (uint i = tid; i < n4; i += 256u) {
-        const float4 h = h4[i];
-        const float4 k = dsv41_bf16(k4[i]);
-        h2 += h * h;
-        k2 += k * k;
-        dt += h * (qw4[i] * kw4[i]) * k;
+    threadgroup float4 *sh4 = (threadgroup float4 *)sh;
+    threadgroup const float *sh_h = sh, *sh_k = sh + 1024u, *sh_q = sh + 2048u, *sh_w = sh + 3072u;
+    float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
+    for (uint base = 0; base < args.width; base += 1024u) {
+        const uint i4 = base / 4u + tid;
+        sh4[tid] = h4[i4];
+        sh4[256u + tid] = dsv41_bf16(k4[i4]);
+        sh4[512u + tid] = qw4[i4];
+        sh4[768u + tid] = kw4[i4];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            for (uint j = lane; j < 1024u; j += 32u) {
+                const float h = sh_h[j], k = sh_k[j];
+                h2 = fma(h, h, h2);
+                k2 = fma(k, k, k2);
+                dot = fma(h * (sh_q[j] * sh_w[j]), k, dot);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const float s0 = simd_sum((h2.x + h2.y) + (h2.z + h2.w));
-    const float s1 = simd_sum((k2.x + k2.y) + (k2.z + k2.w));
-    const float s2 = simd_sum((dt.x + dt.y) + (dt.z + dt.w));
-    if (lane == 0u) { red[sg] = s0; red[8u + sg] = s1; red[16u + sg] = s2; }
+    if (sg == 0u) {
+        h2 = simd_sum(h2);
+        k2 = simd_sum(k2);
+        dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
+              rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
+        const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
+        if (lane == 0u) sh[0] = gate;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float hs = 0.0f, ks = 0.0f, ds = 0.0f;
-    for (uint j = 0; j < 8u; j++) { hs += red[j]; ks += red[8u + j]; ds += red[16u + j]; }
-    const float dot = ds * rsqrt(hs / args.width + args.eps) *
-          rsqrt(ks / args.width + args.eps) * rsqrt(float(args.width));
-    const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
-    for (uint i = tid; i < n4; i += 256u)
+    const float gate = sh[0];
+    for (uint i = tid; i < args.width / 4u; i += 256u)
         h4[i] = dsv41_bf16(h4[i] + gate * dsv41_bf16(v4[i]));
 }
 

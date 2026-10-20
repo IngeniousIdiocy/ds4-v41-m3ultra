@@ -42784,7 +42784,7 @@ static void ds41_step_prologue(ds41_gpu_graph *g, const ds4_model *m, const ds4_
     /* The GPU top-p selector only on the queued-head decode step (logits, one host, resident, not quality), so
      * prefill, verify, TP and streaming never encode it. */
     g->sel_gpu = queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() && !ds41_sampler_gpu_off();
-    /* The Engram gate with one 256-thread group per stream on this decode step (numerical: a different summation order); prefill,
+    /* The Engram gate with one 256-thread group per stream on this decode step (the 32-lane kernel's bits); prefill,
      * verify, TP, streaming and quality keep the 32-lane form. */
     ds4_gpu_set_engram_add_tg(logits && g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
 #else

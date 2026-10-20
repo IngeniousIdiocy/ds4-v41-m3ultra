@@ -50380,7 +50380,7 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
         for (NSUInteger i = 0; i < 5; i++)
             [enc setBuffer:ds4_gpu_tensor_buffer(inputs[i])
                     offset:ds4_gpu_tensor_offset(inputs[i]) atIndex:i + 1];
-        if (tg) [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        if (tg) [enc setThreadgroupMemoryLength:4096u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(rows, 4, 1)
              threadsPerThreadgroup:MTLSizeMake(tg ? 256 : 32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
