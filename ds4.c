@@ -88834,6 +88834,14 @@ int ds4_session_prefill_cap(ds4_session *s) {
 /* Test the actual compressor frontiers, not just a short continuation whose
  * raw attention window can hide a stale speculative prefix. */
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt) {
+    /* This drives the DeepSeek V4 graph's speculative frontiers. A V4.1 session
+     * has no such graph: it verifies drafts through ds41_draft_verify, which the
+     * rest of the verify-depth test checks. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        fprintf(stderr, "ds4-test: dspark prefix capture skipped: V4 graph check "
+                "(V4.1 verifies through ds41_draft_verify)\n");
+        return true;
+    }
     ds4_session *ref = NULL, *spec = NULL;
     const int ctx = prompt->len + 16;
     bool ok = ds4_session_create(&ref, engine, ctx) == 0 &&
