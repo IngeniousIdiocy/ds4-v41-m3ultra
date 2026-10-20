@@ -37532,10 +37532,13 @@ int ds4_gpu_dsv41_index_keys_bf16(ds4_gpu_tensor *view, const ds4_gpu_tensor *ca
     }
 }
 
-/* The wide scorer's bits over the bf16 key view (32 heads x 128). */
+/* The wide scorer's bits over the bf16 key view (32 heads x 128); 0 when
+ * the wide scorer is disabled or forced off, so callers score the f32 cache. */
 int ds4_gpu_dsv41_indexer_score_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights, const ds4_gpu_tensor *view, uint32_t rows) {
-    if (!rows || !scores || !q || !weights || !view) return 0;
+    /* declines (0) where the wide kernel would not run, as the masked scorer does */
+    if (ds4_gpu_v41_index_score_wide_off() || g_glm_indexer_score_one_wide_force == 0 ||
+        !rows || !scores || !q || !weights || !view) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (ds4_gpu_tensor_bytes(scores) < (uint64_t)rows * 4u || ds4_gpu_tensor_bytes(q) < 4096u * 4u ||
         ds4_gpu_tensor_bytes(weights) < 32u * 4u || ds4_gpu_tensor_bytes(view) < (uint64_t)rows * 128u * 2u)

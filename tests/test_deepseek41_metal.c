@@ -1823,6 +1823,42 @@ static int check_index_score_bf16(void) {
             CHECK(differing == 0 && positive > keys / 16 && (ci != 0 || rounded > 0));
         }
     }
+    /* the engine's decode row: the view where the wide scorer runs, the f32
+     * keys below it, a restore that rebuilds the view, and the f32 fallback
+     * when a restore brings a key that is not bf16-exact */
+    const uint32_t row_keys = 131077;
+    const int view_path = getenv("DS4_METAL_DISABLE_V41_INDEX_BF16") ? 1 : 2;   /* the opt-out scores f32 */
+    ds4_gpu_glm_indexer_score_one_force_wide(1);
+    CHECK(ds4_gpu_glm_indexer_score_one_tensor(sw, qt, wt, kt, row_keys, HEADS, DIM, 1.0f / 64.0f, false));
+    ds4_gpu_glm_indexer_score_one_force_wide(-1);
+    CHECK(ds4_gpu_synchronize());
+    memset(fast, 0xff, (size_t)row_keys * sizeof(float));
+    CHECK(ds4_test_v41_index_score_row(sb, qt, wt, kt, vt, ft, row_keys, 0) == view_path);
+    CHECK(ds4_gpu_synchronize());
+    CHECK(!memcmp(wide, fast, (size_t)row_keys * sizeof(float)));
+    memset(ds4_gpu_tensor_contents(vt), 0xa5, (size_t)row_keys * DIM * sizeof(uint16_t));
+    memset(fast, 0xff, (size_t)row_keys * sizeof(float));
+    CHECK(ds4_test_v41_index_score_row(sb, qt, wt, kt, vt, ft, row_keys, 1) == view_path);
+    CHECK(ds4_gpu_synchronize());
+    CHECK(!memcmp(wide, fast, (size_t)row_keys * sizeof(float)));
+    CHECK(ds4_test_v41_index_score_row(sb, qt, wt, kt, vt, ft, 4096, 0) == 1);
+    {
+        uint32_t low;
+        memcpy(&low, &k[(size_t)99999 * DIM + 3], 4);
+        low |= 1u;
+        memcpy(&k[(size_t)99999 * DIM + 3], &low, 4);
+        ds4_gpu_glm_indexer_score_one_force_wide(1);
+        CHECK(ds4_gpu_glm_indexer_score_one_tensor(sw, qt, wt, kt, row_keys, HEADS, DIM, 1.0f / 64.0f, false));
+        ds4_gpu_glm_indexer_score_one_force_wide(-1);
+        CHECK(ds4_gpu_synchronize());
+        memset(fast, 0xff, (size_t)row_keys * sizeof(float));
+        CHECK(ds4_test_v41_index_score_row(sb, qt, wt, kt, vt, ft, row_keys, 1) == 1);
+        CHECK(ds4_gpu_synchronize());
+        CHECK(!memcmp(wide, fast, (size_t)row_keys * sizeof(float)));
+        low &= ~1u;
+        memcpy(&k[(size_t)99999 * DIM + 3], &low, 4);
+    }
+    fprintf(stderr, "V4.1 decode index row: bf16 view, restore rebuild, f32 below 8192 and after an inexact restore PASS\n");
     /* the flag: one key with a low bit, in the second piece only */
     uint32_t bits;
     memcpy(&bits, &k[(size_t)123456 * DIM + 77], 4);

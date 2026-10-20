@@ -160,6 +160,12 @@ int ds4_test_v41_candidates_row(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores
                                 ds4_gpu_tensor *q, ds4_gpu_tensor *weights, ds4_gpu_tensor *keys,
                                 ds4_gpu_tensor *mask, uint32_t n_comp, uint32_t pos,
                                 uint32_t *list_pos, const ds4_gpu_tensor **list_mask);
+/* Test entry implemented by the engine (ds4.c, Metal builds): the decode graph's full index row for owner 0 over
+ * keys and their bf16 view, after a restore of n_comp rows when restore is set. 0 failed, 1 scored the f32 keys,
+ * 2 scored the view. */
+int ds4_test_v41_index_score_row(ds4_gpu_tensor *scores, ds4_gpu_tensor *q, ds4_gpu_tensor *weights,
+                                 ds4_gpu_tensor *keys, ds4_gpu_tensor *view, ds4_gpu_tensor *flag,
+                                 uint32_t n_comp, int restore);
 int ds4_gpu_dsv41_tensor_ops_available(void);
 /* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
  * casts retain the F32 arithmetic for the affected tile. */
