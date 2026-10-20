@@ -73007,6 +73007,13 @@ static int engine_install_gpu_placement(ds4_engine *e) {
     if (engine_install_per_device_caches(e) != 0) return -1;
     return 0;
 }
+#else
+/* The V4.1 decode sidecars feed GPU decode paths only: a CPU build takes none. */
+bool ds4_v41_sidecar_add(const char *list[DS4_V41_SIDECAR_MAX], const char *path) {
+    (void)list;
+    fprintf(stderr, "ds4: --v41-sidecar %s: V4.1 decode sidecars need a GPU build\n", path);
+    return false;
+}
 #endif /* !DS4_NO_GPU */
 
 #ifdef DS4_TEST_HOOKS
