@@ -37617,8 +37617,11 @@ int ds4_gpu_dsv41_indexer_score_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tenso
             keys_per_tg = 2u * split_tg / split;
         }
         if (!pipeline) {
+            /* two keys per thread: 512 threads below 98304 rows, 128 from there (measured: 300000 rows 277 -> 246 us,
+             * 150000 rows 148 -> 137 us) */
             pipeline = ds4_gpu_hot_pipeline(g_dsv41_indexer_score_bf16_pipeline, "kernel_dsv41_indexer_score_bf16");
-            tg = 256; keys_per_tg = 512;
+            tg = rows >= 98304u ? 128 : 512;
+            keys_per_tg = 2u * tg;
         }
         if (!pipeline) return 0;
         ds4_gpu_glm_indexer_score_one_args args = {rows, 32u, 128u, 0u, 1.0f / 64.0f};
