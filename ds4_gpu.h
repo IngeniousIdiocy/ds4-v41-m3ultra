@@ -212,6 +212,23 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Metal: the next decode token's first command buffer, pre-encoded during this token's terminal wait (S40 W72).
+ * end_commands_commit / _wait split ds4_gpu_end_commands around the slot's encoding; pe_begin opens the slot as the
+ * batch (only between those two), pe_end closes it, pe_commit writes the token word and commits it as the token's
+ * first buffer. Any other command buffer drops a held slot first. pe_embed_word: the embed encoded next reads the
+ * token from the slot's word. Stats: prepared, used, pending, then drops by reason. */
+enum { DS4_PE_DROP_FOREIGN, DS4_PE_DROP_POS, DS4_PE_DROP_LATCH, DS4_PE_DROP_STATE, DS4_PE_DROP_ERROR, DS4_PE_DROP_PREPARE,
+       DS4_PE_DROP_OFF, DS4_PE_DROP_INVALID, DS4_PE_DROP_STEPFAIL, DS4_PE_DROP_RELEASE, DS4_PE_DROP_N };
+int ds4_gpu_pe_supported(void);
+int ds4_gpu_pe_pending(void);
+int ds4_gpu_pe_begin(void);
+void ds4_gpu_pe_embed_word(int on);
+int ds4_gpu_pe_end(int ok);
+int ds4_gpu_pe_commit(int32_t token);
+void ds4_gpu_pe_drop_slot(int reason);
+void ds4_gpu_pe_stats(uint64_t *out, int n);
+int ds4_gpu_end_commands_commit(void);
+int ds4_gpu_end_commands_wait(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

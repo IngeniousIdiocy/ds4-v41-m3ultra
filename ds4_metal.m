@@ -58,6 +58,12 @@ static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static BOOL g_batch_encoder_concurrent;
 static BOOL g_batch_has_work;
+/* The pre-encoded next-token slot (code at the end of this file): the next decode token's first command buffer,
+ * encoded and closed but not committed; the token id its embed reads, written at commit. */
+static id<MTLCommandBuffer> g_pe_cb;
+static id<MTLBuffer> g_pe_tokword;
+static int g_pe_preparing, g_pe_exempt, g_pe_failed, g_pe_embed_word, g_pe_retained;
+static void ds4_gpu_pe_drop(int reason);
 
 /* ---- Encoder timeline diagnostic (DS4_METAL_ENCODER_TIMELINE=<file>) ----
  * Gives every batch dispatch group its own compute pass with stage-boundary
@@ -1348,6 +1354,7 @@ static uint64_t g_gpu_busy_cbs;
  * buffers that another in-flight command buffer might still reference; bound
  * resources remain retained by their command buffers/transient list. */
 static void ds4_gpu_invalidate_completion_counters(void) {
+    if (g_pe_cb) ds4_gpu_pe_drop(DS4_PE_DROP_ERROR);   /* the slot bound the dropped counters */
     [g_dsv4_completion_cache removeAllObjects];
     g_dsv4_hc_producer_last_mix_buffer = nil;
     g_dsv4_hc_producer_last_mix_offset = 0;
@@ -1394,7 +1401,13 @@ static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
     static int use_unretained;
     if (!initialized) {
         use_unretained = getenv("DS4_METAL_UNRETAINED_COMMAND_BUFFERS") != NULL;
+        g_pe_retained = use_unretained ? 0 : 1;
         initialized = 1;
+    }
+    /* nothing may be encoded after the pre-encoded slot and committed before it */
+    if (!g_pe_exempt) {
+        if (g_pe_preparing) { g_pe_failed = 1; return nil; }
+        if (g_pe_cb) ds4_gpu_pe_drop(DS4_PE_DROP_FOREIGN);
     }
     if (use_unretained) {
         return [g_queue commandBufferWithUnretainedReferences];
@@ -1575,6 +1588,7 @@ static void ds4_gpu_queue_keepalive_start(void);
 static void ds4_gpu_queue_keepalive_stop_thread(void);
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
+    if (g_pe_preparing) { g_pe_failed = 1; return 0; }   /* never commit while the slot is encoded */
 
     const double t_commit = ds4_gpu_now_ms();
     [cb commit];
@@ -9494,6 +9508,7 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *da
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+    if (g_pe_preparing) { g_pe_failed = 1; return 0; }   /* the current token may still read it */
     if (bytes != 0) {
         @autoreleasepool {
             memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
@@ -9707,6 +9722,7 @@ int ds4_gpu_flush_encoder(void) {
 
 int ds4_gpu_flush_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_pe_preparing) { g_pe_failed = 1; return 0; }
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
 
@@ -10373,6 +10389,7 @@ int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
 
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_pe_preparing) { g_pe_failed = 1; return 0; }
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb || event_value == 0) return 0;
 
@@ -11715,6 +11732,7 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
 
 static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_pe_preparing) { g_pe_failed = 1; return 0; }
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
 
@@ -11777,6 +11795,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
 }
 
 int ds4_gpu_end_commands(void) {
+    if (g_pe_preparing) { g_pe_failed = 1; return 0; }
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         return 0;
@@ -11855,9 +11874,11 @@ static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
 
 static void ds4_gpu_selector_release(void);
+static void ds4_gpu_pe_release(void);
 
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
+    ds4_gpu_pe_release();
     ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {
@@ -12868,7 +12889,8 @@ int ds4_gpu_embed_token_hc_tensor(
         [enc setComputePipelineState:g_get_rows_f16_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-        [enc setBytes:&token_i32 length:sizeof(token_i32) atIndex:2];
+        if (g_pe_embed_word) [enc setBuffer:g_pe_tokword offset:0 atIndex:2];   /* the slot reads the token word */
+        else [enc setBytes:&token_i32 length:sizeof(token_i32) atIndex:2];
         [enc setBuffer:g_embed_rows_buffer offset:0 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(nw0, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
@@ -53381,4 +53403,228 @@ static void ds4_gpu_selector_release(void) {
     for (int k = 0; k < 3; k++) g_sel_pipe[k] = nil;
     for (int j = 0; j < 8; j++) g_sel_buf[j] = nil;
     g_sel_ready = 0;
+}
+
+/* ==== The next decode token's first command buffer, pre-encoded (S40 W72) ====
+ * ds4.c encodes token N+1's embed (its token id read from g_pe_tokword), RoPE-table producer, layer-0 capture and
+ * layer 0 into a second command buffer (the slot) after token N's final buffer was committed and before it is waited
+ * on. The slot is closed and never committed until ds4_gpu_pe_commit, which writes the token word and commits it as
+ * that token's first "flush" buffer. Any other command buffer created while the slot is held drops it first
+ * (ds4_gpu_new_command_buffer), restoring the encode-time state the slot advanced, so nothing is ever encoded after
+ * the slot and committed before it. Dispatch counters the slot advanced are withdrawn at ds4_gpu_pe_end and added
+ * back only at its commit, so a dropped slot leaves no count. Refused with unretained command buffers. */
+static NSMutableArray<id<MTLBuffer>> *g_pe_transients;        /* the slot's transient buffers */
+static NSMutableArray<id<MTLBuffer>> *g_pe_saved_transients;  /* the live list while the slot is encoded */
+static id<MTLCommandBuffer> g_pe_final_cb;                    /* ds4_gpu_end_commands_commit -> _wait */
+static uint64_t g_pe_stat[3 + DS4_PE_DROP_N];                 /* prepared, used, (pending), dropped by reason */
+/* encode-time state the slot may advance; restored when it is dropped */
+static uint32_t g_pe_sv_topk_parity;
+static const ds4_gpu_tensor *g_pe_sv_heads_tab;
+static NSUInteger g_pe_sv_heads_off;
+static int g_pe_sv_heads_used;
+static int g_pe_sv_rope_fuse, g_pe_sv_rope_fuse_used;
+static ds4_gpu_rope_affine_pair_args g_pe_sv_rope_args;
+static id<MTLBuffer> g_pe_sv_hcp_mix;
+static NSUInteger g_pe_sv_hcp_off;
+static id<MTLBuffer> g_pe_sv_hcp_completion;
+static bool g_pe_sv_head_rms;
+static uint32_t g_pe_sv_override_n;
+
+/* the encode-time dispatch counters */
+#define DS4_PE_CTR_SCALARS(X) \
+    X(g_blend_counts[0]) X(g_blend_counts[1]) X(g_blend_counts[2]) X(g_irq_count) X(g_engram_add_tg_calls) \
+    X(g_model_wrap_count) X(g_sel_encoded)
+#define DS4_PE_CTR_ONE(x) + 1
+enum { DS4_PE_NCTR = 0 DS4_PE_CTR_SCALARS(DS4_PE_CTR_ONE) };
+typedef struct { uint64_t v[DS4_PE_NCTR]; } ds4_pe_ctr;
+static ds4_pe_ctr g_pe_ctr0, g_pe_delta;
+
+static void ds4_pe_ctr_read(ds4_pe_ctr *c) {
+    int i = 0;
+#define DS4_PE_CTR_RD(x) c->v[i++] = (x);
+    DS4_PE_CTR_SCALARS(DS4_PE_CTR_RD)
+#undef DS4_PE_CTR_RD
+}
+static void ds4_pe_ctr_write(const ds4_pe_ctr *c) {
+    int i = 0;
+#define DS4_PE_CTR_WR(x) (x) = c->v[i++];
+    DS4_PE_CTR_SCALARS(DS4_PE_CTR_WR)
+#undef DS4_PE_CTR_WR
+}
+
+static void ds4_gpu_pe_save_state(void) {
+    g_pe_sv_topk_parity = g_topk_select_parity;
+    g_pe_sv_heads_tab = g_heads_once_tab;
+    g_pe_sv_heads_off = g_heads_once_tab_off;
+    g_pe_sv_heads_used = g_heads_once_used;
+    g_pe_sv_rope_fuse = g_decode_attn_rope_fuse;
+    g_pe_sv_rope_fuse_used = g_decode_attn_rope_fuse_used;
+    g_pe_sv_rope_args = g_decode_attn_rope_args;
+    g_pe_sv_hcp_mix = g_dsv4_hc_producer_last_mix_buffer;
+    g_pe_sv_hcp_off = g_dsv4_hc_producer_last_mix_offset;
+    g_pe_sv_hcp_completion = g_dsv4_hc_producer_last_completion;
+    g_pe_sv_head_rms = g_use_dsv4_head_rms_norm_rope_tail_pipeline;
+    g_pe_sv_override_n = g_routed_moe_selected_override_n;
+}
+static void ds4_gpu_pe_restore_state(void) {
+    g_topk_select_parity = g_pe_sv_topk_parity;
+    g_heads_once_tab = g_pe_sv_heads_tab;
+    g_heads_once_tab_off = g_pe_sv_heads_off;
+    g_heads_once_used = g_pe_sv_heads_used;
+    g_decode_attn_rope_fuse = g_pe_sv_rope_fuse;
+    g_decode_attn_rope_fuse_used = g_pe_sv_rope_fuse_used;
+    g_decode_attn_rope_args = g_pe_sv_rope_args;
+    g_dsv4_hc_producer_last_mix_buffer = g_pe_sv_hcp_mix;
+    g_dsv4_hc_producer_last_mix_offset = g_pe_sv_hcp_off;
+    g_dsv4_hc_producer_last_completion = g_pe_sv_hcp_completion;
+    g_use_dsv4_head_rms_norm_rope_tail_pipeline = g_pe_sv_head_rms;
+    g_routed_moe_selected_override_n = g_pe_sv_override_n;
+    g_batch_encoder_concurrent = NO;
+}
+
+static void ds4_gpu_pe_drop(int reason) {
+    if (!g_pe_cb) return;
+    ds4_gpu_pe_restore_state();
+    g_pe_cb = nil;   /* never committed: released with its references */
+    g_pe_transients = nil;
+    memset(&g_pe_delta, 0, sizeof(g_pe_delta));
+    if (reason >= 0 && reason < DS4_PE_DROP_N) g_pe_stat[3 + reason]++;
+}
+
+void ds4_gpu_pe_drop_slot(int reason) { ds4_gpu_pe_drop(reason); }
+int ds4_gpu_pe_pending(void) { return g_pe_cb != nil; }
+int ds4_gpu_pe_supported(void) { return g_initialized && g_pe_retained > 0; }
+void ds4_gpu_pe_embed_word(int on) { g_pe_embed_word = on && g_pe_preparing; }
+
+void ds4_gpu_pe_stats(uint64_t *out, int n) {
+    for (int i = 0; i < n; i++) out[i] = i < (int)(3 + DS4_PE_DROP_N) ? g_pe_stat[i] : 0;
+    if (n > 2) out[2] = g_pe_cb != nil;
+}
+
+/* Open the slot as the command batch. Token N's final buffer must already be committed (no open batch). */
+int ds4_gpu_pe_begin(void) {
+    if (!ds4_gpu_pe_supported() || g_batch_cb || g_pe_preparing || g_pe_final_cb == nil) return 0;
+    if (g_pe_cb) ds4_gpu_pe_drop(DS4_PE_DROP_FOREIGN);
+    if (!g_pe_tokword) {
+        g_pe_tokword = [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        if (!g_pe_tokword) return 0;
+        memset([g_pe_tokword contents], 0, 16);
+        g_pe_tokword.label = @"ds4_pe_token_word";
+    }
+    ds4_gpu_pe_save_state();
+    ds4_pe_ctr_read(&g_pe_ctr0);
+    g_pe_saved_transients = g_transient_buffers;
+    g_transient_buffers = [NSMutableArray array];
+    g_pe_preparing = 1;
+    g_pe_failed = 0;
+    g_pe_exempt = 1;
+    const int ok = ds4_gpu_begin_commands();
+    g_pe_exempt = 0;
+    if (!ok) {
+        (void)ds4_gpu_pe_end(0);
+        return 0;
+    }
+    return 1;
+}
+
+/* Close the slot (never committed here). Returns 1 when a slot is held. */
+int ds4_gpu_pe_end(int ok) {
+    if (!g_pe_preparing) return 0;
+    ok = ok && !g_pe_failed && g_batch_cb != nil;
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    NSMutableArray<id<MTLBuffer>> *tr = g_transient_buffers;
+    g_transient_buffers = g_pe_saved_transients ? g_pe_saved_transients : [NSMutableArray array];
+    g_pe_saved_transients = nil;
+    ds4_pe_ctr now;
+    ds4_pe_ctr_read(&now);
+    for (int i = 0; i < DS4_PE_NCTR; i++) g_pe_delta.v[i] = now.v[i] - g_pe_ctr0.v[i];
+    ds4_pe_ctr_write(&g_pe_ctr0);   /* withdrawn until the slot is committed */
+    g_pe_preparing = 0;
+    g_pe_embed_word = 0;
+    g_pe_cb = cb;
+    g_pe_transients = tr;
+    if (!ok || !cb) {
+        ds4_gpu_pe_drop(DS4_PE_DROP_PREPARE);
+        return 0;
+    }
+    g_pe_stat[0]++;
+    return 1;
+}
+
+/* Commit the slot as the token's first buffer (the "flush" after layer 0) and open the next batch buffer. */
+int ds4_gpu_pe_commit(int32_t token) {
+    if (!g_pe_cb || g_batch_cb || g_pe_preparing) return 0;
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    *(int32_t *)[g_pe_tokword contents] = token;
+    if (g_pe_transients) [g_transient_buffers addObjectsFromArray:g_pe_transients];
+    g_pe_transients = nil;
+    ds4_pe_ctr c;
+    ds4_pe_ctr_read(&c);
+    for (int i = 0; i < DS4_PE_NCTR; i++) c.v[i] += g_pe_delta.v[i];
+    ds4_pe_ctr_write(&c);
+    memset(&g_pe_delta, 0, sizeof(g_pe_delta));
+    id<MTLCommandBuffer> cb = g_pe_cb;
+    g_pe_cb = nil;
+    g_batch_has_work = NO;
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    ds4_gpu_stream_expert_cache_note_batch_committed();
+    g_pe_stat[1]++;
+    g_pe_exempt = 1;
+    g_batch_cb = ds4_gpu_new_command_buffer();
+    g_pe_exempt = 0;
+    g_batch_has_work = NO;
+    if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+    ds4_gpu_timeline_attach(g_batch_cb);
+    if (!g_batch_cb) {
+        (void)ds4_gpu_wait_pending_command_buffers("command batch");
+        [g_transient_buffers removeAllObjects];
+        return 0;
+    }
+    return 1;
+}
+
+/* ds4_gpu_end_commands split around the slot: commit the final buffer, then (after the slot is encoded) wait. */
+int ds4_gpu_end_commands_commit(void) {
+    if (g_pe_preparing || g_pe_final_cb) return 0;
+    if (!g_batch_cb) {
+        ds4_gpu_parallel_ffn_reset_state(YES);
+        return 0;
+    }
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
+    g_stream_expert_cache_batch_seq = 0;
+    [cb commit];
+    g_pe_final_cb = cb;
+    return 1;
+}
+
+static void ds4_gpu_pe_release(void) {
+    ds4_gpu_pe_drop(DS4_PE_DROP_RELEASE);
+    g_pe_final_cb = nil;
+    g_pe_tokword = nil;
+}
+
+int ds4_gpu_end_commands_wait(void) {
+    id<MTLCommandBuffer> cb = g_pe_final_cb;
+    g_pe_final_cb = nil;
+    if (!cb || g_pe_preparing) return 0;
+    int ok = ds4_gpu_wait_pending_command_buffers("command batch");
+    if (!ds4_gpu_wait_command_buffer(cb, "command batch")) {
+        ok = 0;
+        ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
+    }
+    ds4_gpu_stream_expert_cache_note_owned_completed();
+    [g_transient_buffers removeAllObjects];
+    ds4_gpu_model_buffer_cache_maybe_evict("command batch");
+    if (!ok) ds4_gpu_pe_drop(DS4_PE_DROP_ERROR);
+    return ok;
 }

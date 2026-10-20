@@ -40372,6 +40372,9 @@ static void ds41_engram_carry_drop(ds41_gpu_graph *g);
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_pe_drop_slot(DS4_PE_DROP_RELEASE);   /* a held pre-encoded buffer never outlives its graph */
+#endif
     ds41_engram_carry_drop(g);
     free(g->engram_carry.ids);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42727,8 +42730,361 @@ static uint32_t ds41_decode_flush_layers(void) {
     return (uint32_t)cached;
 }
 
+/* The decode step's per-token host latches, set before layer 0 (with the RoPE table producer encoded into the open
+ * batch). check: encode nothing; the table counts as produced at this position when it exists (the pre-encoded
+ * slot's producer ran), so the latches can be compared with the slot's. */
+static void ds41_step_prologue(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, bool logits,
+                               bool queued_head, bool layer_resident, bool ok, bool check) {
+    if (g->draft) {
+        g->draft->mh_pos0 = g->pos;
+        g->draft->mh_rows = 1;
+    }
+    g->scalar_decode = true;
+    g->sel_gpu = false;
+    g->sel_done = false;
+    g->sel_gen = 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The GPU top-p selector only on the queued-head decode step (logits, one host, resident, not quality), so
+     * prefill, verify, TP and streaming never encode it. */
+    g->sel_gpu = queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() && !ds41_sampler_gpu_off();
+    /* The Engram gate with one 256-thread group per stream on this decode step (numerical, S40 EADD); prefill,
+     * verify, TP, streaming and quality keep the 32-lane form. */
+    ds4_gpu_set_engram_add_tg(logits && g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
+#else
+    (void)queued_head;
+#endif
+    /* each family: its sidecar when loaded, else the copy built at load */
+    g->router_model = w->router_bf16_model;
+    g->router_bf16 = (g->router_model || ds41_narrow_router(m, 0)) && g->tp_world == 1 && !g->streaming && !g->quality &&
+        !ds41_router_bf16_off();
+    g->engram_model = w->engram_fp8_model;
+    g->engram_fp8 = logits && (g->engram_model || ds41_narrow_engram(m, 0)) && g->tp_world == 1 && !g->streaming &&
+        !g->quality && !ds41_engram_fp8_off();
+    g->indexer_model = w->indexer_fp8_model;
+    g->indexer_fp8 = logits && (g->indexer_model || ds41_narrow_indexer(m, 2)) && g->tp_world == 1 && !g->streaming &&
+        !g->quality && !ds41_indexer_fp8_off();
+    /* One RoPE coefficient table per decode step, in this step's command stream before layer 0, read by the
+     * step's low projections in place of per-lane sincos; a failed producer leaves the lows on their own trig. */
+    g->rope_tab_on = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (logits && g->rope_tab && g->tp_world == 1 && !g->streaming && !g->quality && !layer_resident &&
+        (check || (ok && ds4_gpu_commands_active())) && !ds41_rope_tab_off()) {
+        g->rope_tab_pos = g->pos;
+        g->rope_tab_on = check || ds4_gpu_dsv41_rope_coeff_table(g->rope_tab, g->pos) != 0;
+    }
+#else
+    (void)layer_resident; (void)ok; (void)check;
+#endif
+    g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+}
+
+/* the decode step's host resets after its layers */
+static void ds41_step_tail_reset(ds41_gpu_graph *g) {
+    g->scalar_decode = false;
+    g->router_bf16 = false;
+    g->engram_fp8 = false;
+    g->indexer_fp8 = false;
+    g->rope_tab_on = false;   /* the table never outlives its step */
+    g->heads_once = false;
+    g->sel_gpu = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_set_engram_add_tg(0);
+#endif
+    g->tp_gate_fused = false;
+}
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static DS4_MAYBE_UNUSED bool ds41_preencode_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_PREENCODE", &c); }
+
+/* ==== The next token's first command buffer, pre-encoded (S40 W72) ====
+ * The next token's first command buffer (embed, RoPE-table producer, layer-0 capture, layer 0 at pos + 1) is encoded
+ * during this token's terminal wait, after its final buffer was committed, into the Metal slot, and committed after
+ * the next selection (the token id is read from a device word written at commit). The Engram hash and row reads
+ * then start after that commit, and each table's rows join just before the commit of the buffer that holds its
+ * layer. Same kernels, same order, same command buffers as the step below.
+ * Host state: the slot is encoded from this step's tail state (the tail's resets applied first, P0) and the
+ * prologue at pos + 1; the host fields that the prologue and layer 0 set (S1) are restored afterwards and installed
+ * at commit, after checking that the graph, position, generation and every saved field are still P0 and the latches
+ * read at the next step equal the slot's. Anything else (another command buffer, a mismatch, a failure, the
+ * switch off) drops it. */
+typedef struct {
+    bool scalar_decode, sel_gpu, sel_done;
+    uint64_t sel_gen;
+    const struct ds4_model *router_model;
+    bool router_bf16;
+    const struct ds4_model *engram_model;
+    bool engram_fp8;
+    const struct ds4_model *indexer_model;
+    bool indexer_fp8;
+    bool rope_tab_on;
+    uint32_t rope_tab_pos;
+    bool tp_gate_fused;
+    bool shared_done, hc_attn_deferred, hc_ffn_deferred, kv_stored, heads_once;
+    uint32_t mh_pos0, mh_rows;
+    int add_tg;
+} ds41_pe_host;
+
+static struct {
+    const ds41_gpu_graph *g;
+    uint32_t pos;
+    uint64_t gen;
+    ds41_pe_host P0, S1;
+    uint64_t reader_delta[3][3];   /* the opt-in reader counts the slot's layer 0 made, added back at commit */
+    uint32_t noted;                /* drop reasons already reported on stderr */
+} g_ds41_pe;
+
+static void ds41_pe_save(const ds41_gpu_graph *g, ds41_pe_host *h) {
+    memset(h, 0, sizeof(*h));
+    h->scalar_decode = g->scalar_decode; h->sel_gpu = g->sel_gpu; h->sel_done = g->sel_done; h->sel_gen = g->sel_gen;
+    h->router_model = g->router_model; h->router_bf16 = g->router_bf16;
+    h->engram_model = g->engram_model; h->engram_fp8 = g->engram_fp8;
+    h->indexer_model = g->indexer_model; h->indexer_fp8 = g->indexer_fp8;
+    h->rope_tab_on = g->rope_tab_on; h->rope_tab_pos = g->rope_tab_pos;
+    h->tp_gate_fused = g->tp_gate_fused;
+    h->shared_done = g->shared_done; h->hc_attn_deferred = g->hc_attn_deferred; h->hc_ffn_deferred = g->hc_ffn_deferred;
+    h->kv_stored = g->kv_stored; h->heads_once = g->heads_once;
+    if (g->draft) { h->mh_pos0 = g->draft->mh_pos0; h->mh_rows = g->draft->mh_rows; }
+    h->add_tg = ds4_gpu_get_engram_add_tg();
+}
+
+static void ds41_pe_load(ds41_gpu_graph *g, const ds41_pe_host *h) {
+    g->scalar_decode = h->scalar_decode; g->sel_gpu = h->sel_gpu; g->sel_done = h->sel_done; g->sel_gen = h->sel_gen;
+    g->router_model = h->router_model; g->router_bf16 = h->router_bf16;
+    g->engram_model = h->engram_model; g->engram_fp8 = h->engram_fp8;
+    g->indexer_model = h->indexer_model; g->indexer_fp8 = h->indexer_fp8;
+    g->rope_tab_on = h->rope_tab_on; g->rope_tab_pos = h->rope_tab_pos;
+    g->tp_gate_fused = h->tp_gate_fused;
+    g->shared_done = h->shared_done; g->hc_attn_deferred = h->hc_attn_deferred; g->hc_ffn_deferred = h->hc_ffn_deferred;
+    g->kv_stored = h->kv_stored; g->heads_once = h->heads_once;
+    if (g->draft) { g->draft->mh_pos0 = h->mh_pos0; g->draft->mh_rows = h->mh_rows; }
+    ds4_gpu_set_engram_add_tg(h->add_tg);
+}
+
+/* the first differing field, or NULL; which 1: the prologue's latches; 2: every field but the selector generation */
+static const char *ds41_pe_diff(const ds41_pe_host *a, const ds41_pe_host *b, int which) {
+#define DS41_PE_D(f) if (a->f != b->f) return #f;
+    DS41_PE_D(scalar_decode) DS41_PE_D(sel_gpu) DS41_PE_D(router_model) DS41_PE_D(router_bf16)
+    DS41_PE_D(engram_model) DS41_PE_D(engram_fp8) DS41_PE_D(indexer_model) DS41_PE_D(indexer_fp8)
+    DS41_PE_D(rope_tab_on) DS41_PE_D(rope_tab_pos) DS41_PE_D(tp_gate_fused)
+    DS41_PE_D(mh_pos0) DS41_PE_D(mh_rows) DS41_PE_D(add_tg)
+    if (which == 2) {
+        DS41_PE_D(shared_done) DS41_PE_D(hc_attn_deferred) DS41_PE_D(hc_ffn_deferred) DS41_PE_D(kv_stored)
+        DS41_PE_D(heads_once)
+    }
+#undef DS41_PE_D
+    return NULL;
+}
+
+/* the configuration the slot supports: a resident TP-1 decode step with logits, the queued head, layer flushes,
+ * no images / imatrix / quality, the routed-one router (layer 0 never reads the token), and with a draft the
+ * capture inside the head (nothing is encoded after the final drain) */
+static bool ds41_pe_eligible(const ds41_gpu_graph *g, const float *logits, bool queued_head, bool layer_resident) {
+    return g && logits && g->tp_world == 1 && !g->streaming && !g->quality && !g->imatrix && !g->image_count &&
+        !layer_resident && queued_head && ds41_decode_flush_layers() != 0 && ds4_gpu_pe_supported() &&
+        !getenv("DS4_METAL_DISABLE_V41_ROUTER_ONE") && !(g->draft && ds41_capture_in_head_off());
+}
+
+static void ds41_pe_note_drop(int reason, const char *why) {
+    if (reason < 0 || reason >= 32 || (g_ds41_pe.noted & (1u << reason))) return;
+    g_ds41_pe.noted |= 1u << reason;
+    fprintf(stderr, "ds4: V4.1 pre-encoded buffer dropped (reason %d: %s); further drops of this reason are counted only\n",
+            reason, why ? why : "-");
+}
+
+/* the slot for the step at pos + 1, encoded between this step's final commit and its wait */
+static void ds41_pe_prepare(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                            bool queued_head, bool layer_resident) {
+    if (g->pos + 1u >= g->ctx || ds4_gpu_pe_pending()) return;
+    const uint32_t pos = g->pos;
+    ds41_pe_host saved;
+    ds41_pe_save(g, &saved);
+    ds41_step_tail_reset(g);
+    ds41_pe_save(g, &g_ds41_pe.P0);
+    uint64_t rc0[3][3];
+    memcpy(rc0, g_ds41_reader_counts, sizeof(rc0));
+    g->pos = pos + 1u;
+    bool ok = ds4_gpu_pe_begin() != 0;
+    if (ok) {
+        ds4_gpu_pe_embed_word(1);
+        ok = ds41_embed(g, m, w, g->residual, g->x, 0, g->pos);
+        ds4_gpu_pe_embed_word(0);
+        ds41_step_prologue(g, m, w, true, queued_head, layer_resident, ok, false);
+        if (ok && g->draft) ok = ds41_draft_capture(g, 0, g->residual, g->pos, 1);
+        if (ok) ok = ds41_graph_layer(g, m, &w->layer[0], 0, 0);
+        ds41_pe_save(g, &g_ds41_pe.S1);
+        ok = ds4_gpu_pe_end(ok) != 0;
+        if (!ok) ds41_pe_note_drop(DS4_PE_DROP_PREPARE, "encode failed");
+    }
+    for (uint32_t f = 0; f < 3; f++)   /* withdrawn until the slot is committed */
+        for (uint32_t s = 0; s < 3; s++) {
+            g_ds41_pe.reader_delta[f][s] = ok ? g_ds41_reader_counts[f][s] - rc0[f][s] : 0;
+            g_ds41_reader_counts[f][s] = rc0[f][s];
+        }
+    ds41_pe_load(g, &saved);
+    g->pos = pos;
+    g_ds41_pe.g = ok ? g : NULL;
+    g_ds41_pe.pos = pos + 1u;
+    g_ds41_pe.gen = g->state_generation;
+}
+
+static bool ds41_pe_join(ds41_gpu_graph *g, ds4_engram_prefetch **rows, uint32_t i, bool ok) {
+    const bool read = ds4_engram_read_batch_finish(rows[i]);
+    rows[i] = NULL;
+    if (ok && !(read && ds4_gpu_tensor_write(i == 0 ? g->engram_rows : g->engram_rows_b, 0,
+                                            g->rows[i], sizeof(g->rows[i])))) ok = false;
+    return ok;
+}
+
+/* ds41_graph_step for the eligible configuration: -1 not taken (the caller runs the step below, any slot dropped),
+ * 0 failed, 1 done */
+static int ds41_graph_step_pe(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, int token, float *logits) {
+    const bool layer_resident = g && g->streaming && g->quality;
+    const bool queue_layers = g && !g->imatrix && !layer_resident &&
+        !getenv(g->tp_world == 2 ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE" : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
+    const bool queued_head = queue_layers && !layer_resident && logits && g->tp_world == 1 && !ds41_queued_head_off();
+    if (ds41_preencode_off() || !ds41_pe_eligible(g, logits, queued_head, layer_resident)) {
+        if (ds4_gpu_pe_pending()) {
+            ds41_pe_note_drop(DS4_PE_DROP_OFF, "switch off or configuration not eligible");
+            ds4_gpu_pe_drop_slot(DS4_PE_DROP_OFF);
+        }
+        return -1;
+    }
+    if (!g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) {
+        if (ds4_gpu_pe_pending()) ds4_gpu_pe_drop_slot(DS4_PE_DROP_INVALID);
+        return 0;
+    }
+    if (g->draft) g->draft->rewind_valid = false;
+    bool use = false;
+    if (ds4_gpu_pe_pending()) {
+        int reason = DS4_PE_DROP_POS;
+        const char *why = "graph / position / generation";
+        ds41_pe_host cur;
+        ds41_pe_save(g, &cur);
+        if (g_ds41_pe.g == g && g_ds41_pe.pos == g->pos && g_ds41_pe.gen == g->state_generation) {
+            reason = DS4_PE_DROP_STATE;
+            why = ds41_pe_diff(&cur, &g_ds41_pe.P0, 2);
+            if (!why) {
+                ds41_pe_host chk;
+                ds41_step_prologue(g, m, w, logits != NULL, queued_head, layer_resident, true, true);
+                ds41_pe_save(g, &chk);
+                ds41_pe_load(g, &cur);
+                reason = DS4_PE_DROP_LATCH;
+                why = ds41_pe_diff(&chk, &g_ds41_pe.S1, 1);
+                use = why == NULL;
+            }
+        }
+        if (!use) {
+            ds41_pe_note_drop(reason, why);
+            ds4_gpu_pe_drop_slot(reason);
+        }
+    }
+    uint32_t ids[2][DS4_ENGRAM_COLS];
+    ds4_engram_history next_history = g->history;
+    ds4_engram_prefetch *rows[2] = {NULL, NULL};
+    const float initial_pre[] = {1, 0, 0, 0};
+    bool ok;
+    if (use) {
+        ds41_pe_load(g, &g_ds41_pe.S1);   /* the host state as the slot's layer 0 left it */
+        g_ds41_pe.g = NULL;
+        ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) != 0;
+        if (!ok) ds4_gpu_pe_drop_slot(DS4_PE_DROP_STEPFAIL);
+        else ok = ds4_gpu_pe_commit(token) != 0;
+        if (ok)
+            for (uint32_t f = 0; f < 3; f++)
+                for (uint32_t s = 0; s < 3; s++) g_ds41_reader_counts[f][s] += g_ds41_pe.reader_delta[f][s];
+        /* the Engram reads start after the commit; the rows are needed only at layer 1's (14's) buffer */
+        if (ok && !ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) ok = false;
+        for (uint32_t i = 0; ok && i < 2; i++) {
+            rows[i] = ds4_engram_read_batch_start(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]);
+            if (!rows[i]) ok = false;
+        }
+        if (!ok) {   /* the token's first buffer may already run: the step fails as a whole */
+            for (uint32_t i = 0; i < 2; i++) if (rows[i]) ds4_engram_read_batch_finish(rows[i]);
+            if (ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
+            ds41_step_tail_reset(g);
+            fprintf(stderr, "ds4: V4.1 pre-encoded step failed at position %u\n", g->pos);
+            g->valid = false;
+            return 0;
+        }
+    } else {
+        if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return 0;
+        for (uint32_t i = 0; i < 2; i++) {
+            rows[i] = ds4_engram_read_batch_start(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]);
+            if (!rows[i]) {
+                if (i) ds4_engram_read_batch_finish(rows[0]);
+                return 0;
+            }
+        }
+        ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
+            ds4_gpu_begin_commands() && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
+        ds41_step_prologue(g, m, w, logits != NULL, queued_head, layer_resident, ok, false);
+    }
+    const bool capture_in_head = g->draft != NULL;   /* eligibility: the capture rides the head */
+    const uint32_t flush_layers = ds41_decode_flush_layers();
+    bool join_due[2] = {false, false};
+    bool sel_enc = false;
+    for (uint32_t il = use ? 1u : 0u; ok && il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (ok && g->draft) ok = ds41_draft_capture(g, il, g->residual, g->pos, 1);
+        for (uint32_t i = 0; (il == 1u || il == 14u) && i < 2; i++)   /* each table is due at its layer */
+            if (rows[i] && il == (i == 0 ? 1u : 14u)) join_due[i] = true;
+        if (ok) ok = ds41_graph_layer(g, m, l, il, token);
+        const bool drain = il + 1u == DS4_N_LAYER;
+        if (ok && drain) ok = ds41_graph_encode_logits(g, m, w);
+        if (ok && g->sel_gpu && drain) {   /* the selector after the head, in the final buffer */
+            g->sel_gen = ds41_sel_gen_begin(&g_sel_gen);   /* invalidate before anything can overwrite */
+            sel_enc = true;
+            ok = ds4_gpu_selector_encode(g->logits) != 0;
+        }
+        if (ok && capture_in_head && drain) ok = ds41_draft_pending(g) && ds41_draft_commit(g, 1);
+        bool flush = ok && !drain && (il == 0 || (il + 1u) % flush_layers == 0);
+        if (drain || flush) {   /* the rows join before the commit of their layer's buffer */
+            for (uint32_t i = 0; i < 2; i++) {
+                if (!join_due[i]) continue;
+                join_due[i] = false;
+                ok = ds41_pe_join(g, rows, i, ok);
+            }
+            flush = flush && ok;
+        }
+        if (drain) {   /* commit the final buffer; encode the next token's first buffer; then wait */
+            if (!ds4_gpu_end_commands_commit()) ok = false;
+            else {
+                if (ok) ds41_pe_prepare(g, m, w, queued_head, layer_resident);
+                if (!ds4_gpu_end_commands_wait()) ok = false;
+            }
+        }
+        if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
+        if (ok && flush) ok = ds4_gpu_flush_commands() != 0;
+    }
+    ds41_step_tail_reset(g);
+    for (uint32_t i = 0; i < 2; i++)
+        if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before the join */
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok) ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    if (sel_enc && !ok) ds4_gpu_selector_reset();   /* R1 may not have cleared H1 */
+    g->sel_done = ok && sel_enc;
+    if (g->sel_done) ds41_sel_gen_complete(&g_sel_gen, g->sel_gen, g);
+    else if (sel_enc) ds41_sel_gen_fail(&g_sel_gen);
+    if (!ok) {
+        if (ds4_gpu_pe_pending()) ds4_gpu_pe_drop_slot(DS4_PE_DROP_STEPFAIL);
+        g->valid = false;
+        return 0;
+    }
+    g->history = next_history;
+    g->pos++;
+    return 1;
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    {   /* the pre-encoded path takes the eligible decode steps; otherwise a held slot is dropped */
+        const int r = ds41_graph_step_pe(g, m, w, token, logits);
+        if (r >= 0) return r != 0;
+    }
+#endif
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     if (g->draft) g->draft->rewind_valid = false;
     uint32_t ids[2][DS4_ENGRAM_COLS];
@@ -42757,45 +43113,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         !getenv(g->tp_world == 2 ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"
                                  : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
     const bool queued_head = queue_layers && !layer_resident && logits && g->tp_world == 1 && !ds41_queued_head_off();
-    if (g->draft) {
-        g->draft->mh_pos0 = g->pos;
-        g->draft->mh_rows = 1;
-    }
-    g->scalar_decode = true;
-    g->sel_gpu = false;
-    g->sel_done = false;
-    g->sel_gen = 0;
     bool sel_enc = false;
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    /* The GPU top-p selector only on the queued-head decode step (logits, one host, resident, not quality), so
-     * prefill, verify, TP and streaming never encode it. */
-    g->sel_gpu = queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() && !ds41_sampler_gpu_off();
-    /* The Engram gate with one 256-thread group per stream on this decode step (numerical, S40 EADD); prefill,
-     * verify, TP, streaming and quality keep the 32-lane form. */
-    ds4_gpu_set_engram_add_tg(logits && g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
-#endif
-    /* each family: its sidecar when loaded, else the copy built at load */
-    g->router_model = w->router_bf16_model;
-    g->router_bf16 = (g->router_model || ds41_narrow_router(m, 0)) && g->tp_world == 1 && !g->streaming && !g->quality &&
-        !ds41_router_bf16_off();
-    g->engram_model = w->engram_fp8_model;
-    g->engram_fp8 = logits && (g->engram_model || ds41_narrow_engram(m, 0)) && g->tp_world == 1 && !g->streaming &&
-        !g->quality && !ds41_engram_fp8_off();
-    g->indexer_model = w->indexer_fp8_model;
-    g->indexer_fp8 = logits && (g->indexer_model || ds41_narrow_indexer(m, 2)) && g->tp_world == 1 && !g->streaming &&
-        !g->quality && !ds41_indexer_fp8_off();
-    /* One RoPE coefficient table per decode step, in this step's command stream before layer 0, read by the
-     * step's low projections in place of per-lane sincos; a failed producer leaves the lows on their own trig. */
-    g->rope_tab_on = false;
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (ok && logits && g->rope_tab && g->tp_world == 1 && !g->streaming && !g->quality && !layer_resident &&
-        ds4_gpu_commands_active() && !ds41_rope_tab_off()) {
-        g->rope_tab_pos = g->pos;
-        g->rope_tab_on = ds4_gpu_dsv41_rope_coeff_table(g->rope_tab, g->pos) != 0;
-    }
-#endif
-    g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+    ds41_step_prologue(g, m, w, logits != NULL, queued_head, layer_resident, ok, false);
     /* With the head queued, the drafter's capture of this token is encoded after
      * the head inside the final waited buffer instead of in a buffer of its own
      * after the drain: the same work, one wait less. */
@@ -42848,17 +43167,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             (il == 0 || (il + 1u) % flush_layers == 0))
             ok = ds4_gpu_flush_commands() != 0;
     }
-    g->scalar_decode = false;
-    g->router_bf16 = false;
-    g->engram_fp8 = false;
-    g->indexer_fp8 = false;
-    g->rope_tab_on = false;   /* the table never outlives its step */
-    g->heads_once = false;
-    g->sel_gpu = false;
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    ds4_gpu_set_engram_add_tg(0);
-#endif
-    g->tp_gate_fused = false;
+    ds41_step_tail_reset(g);
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -78985,6 +79294,14 @@ uint64_t ds4_sampler_gpu_encoded_count(void) {
     return ds4_gpu_selector_encoded_count();
 #else
     return 0;
+#endif
+}
+/* the pre-encoded decode slot: prepared, used, pending, then drops by reason (DS4_PE_DROP_*) */
+void ds4_preencode_stats(uint64_t *out, int n) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_pe_stats(out, n);
+#else
+    for (int i = 0; i < n; i++) out[i] = 0;
 #endif
 }
 /* decode Engram gates that ran in the 256-thread form */
