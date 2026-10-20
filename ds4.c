@@ -42797,6 +42797,24 @@ static void ds41_step_tail_reset(ds41_gpu_graph *g) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 static DS4_MAYBE_UNUSED bool ds41_preencode_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_PREENCODE", &c); }
 
+/* The finite GPU bridge's ALU iterations behind each pre-encoded decode head (S40 W71b): 17591 (M3 Ultra, measured),
+ * DS4_METAL_V41_GPU_BRIDGE_ITERS=N (0..4194304) to retune, 0 or DS4_METAL_DISABLE_V41_GPU_BRIDGE=1 for none. */
+static uint32_t ds41_bridge_iters(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_METAL_V41_GPU_BRIDGE_ITERS");
+        char *end = NULL;
+        const unsigned long v = env && *env ? strtoul(env, &end, 10) : 17591ul;
+        cached = 17591;
+        if (env && *env && (!end || *end || v > 4194304ul))
+            fprintf(stderr, "ds4: DS4_METAL_V41_GPU_BRIDGE_ITERS=%s refused (want 0..4194304); keeping 17591\n", env);
+        else
+            cached = (int)v;
+        if (getenv("DS4_METAL_DISABLE_V41_GPU_BRIDGE")) cached = 0;
+    }
+    return (uint32_t)cached;
+}
+
 /* ==== The next token's first command buffer, pre-encoded (S40 W72) ====
  * The next token's first command buffer (embed, RoPE-table producer, layer-0 capture, layer 0 at pos + 1) is encoded
  * during this token's terminal wait, after its final buffer was committed, into the Metal slot, and committed after
@@ -43048,7 +43066,8 @@ static int ds41_graph_step_pe(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
             flush = flush && ok;
         }
         if (drain) {   /* commit the final buffer; encode the next token's first buffer; then wait */
-            if (!ds4_gpu_end_commands_commit()) ok = false;
+            const uint32_t bridge = ds41_bridge_iters();
+            if (!(bridge ? ds4_gpu_end_commands_commit_bridged(bridge) : ds4_gpu_end_commands_commit())) ok = false;
             else {
                 if (ok) ds41_pe_prepare(g, m, w, queued_head, layer_resident);
                 if (!ds4_gpu_end_commands_wait()) ok = false;
@@ -79302,6 +79321,14 @@ void ds4_preencode_stats(uint64_t *out, int n) {
     ds4_gpu_pe_stats(out, n);
 #else
     for (int i = 0; i < n; i++) out[i] = 0;
+#endif
+}
+/* the finite GPU bridge behind the pre-encoded decode head: committed, retired, failed */
+void ds4_decode_bridge_stats(uint64_t out[3]) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_bridge_counts(out);
+#else
+    for (int i = 0; i < 3; i++) out[i] = 0;
 #endif
 }
 /* decode Engram gates that ran in the 256-thread form */

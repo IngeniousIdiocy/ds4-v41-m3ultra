@@ -53607,10 +53607,93 @@ int ds4_gpu_end_commands_commit(void) {
     return 1;
 }
 
+/* ==== The finite GPU bridge behind the decode head (S40 W71b) ====
+ * Right after the decode step's final (head) buffer is committed, and before the next token's pre-encoded slot is
+ * encoded, one finite ALU kernel (kernel_dsv4_tp_keepalive, 1 x 256 threads, N iterations) is committed on the same
+ * queue, writing only a private 1 KiB scratch of its own: no model data, nothing the decode reads. It keeps the GPU
+ * busy across the CPU handoff (sampling, the slot's commit). GPU-side order: the head buffer ends with
+ * encodeSignalEvent(g_bridge_event, s) and the bridge buffer starts with encodeWaitForEvent(g_bridge_event, s), so
+ * the bridge never runs concurrently with the head; the CPU never touches the event. Nothing waits on the bridge
+ * this token; the previous one is retired just before the next is committed. The bridge buffer comes from
+ * [g_queue commandBuffer], never ds4_gpu_new_command_buffer, so it is never a foreign buffer to the slot.
+ * Counts: committed, retired, failed (a failure leaves decode unchanged). */
+static id<MTLCommandBuffer> g_bridge_cb;
+static id<MTLBuffer> g_bridge_scratch;
+static id<MTLComputePipelineState> g_bridge_pipeline;
+static id<MTLEvent> g_bridge_event;
+static uint64_t g_bridge_seq;   /* the value the current head signals and its bridge waits for */
+static uint64_t g_bridge_n[3];
+
+static void ds4_gpu_bridge_retire(void) {
+    id<MTLCommandBuffer> b = g_bridge_cb;
+    if (!b) return;
+    g_bridge_cb = nil;
+    [b waitUntilCompleted];
+    if (b.status != MTLCommandBufferStatusCompleted || b.error) g_bridge_n[2]++;
+    else g_bridge_n[1]++;
+}
+
+static int ds4_gpu_bridge_commit(uint32_t iters) {
+    ds4_gpu_bridge_retire();
+    if (!g_bridge_pipeline) g_bridge_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    if (!g_bridge_scratch)
+        g_bridge_scratch = [g_device newBufferWithLength:256u * sizeof(float) options:MTLResourceStorageModePrivate];
+    if (!g_bridge_pipeline || !g_bridge_scratch || !g_bridge_event || iters == 0) { g_bridge_n[2]++; return 0; }
+    @autoreleasepool {
+        id<MTLCommandBuffer> b = [g_queue commandBuffer];
+        if (!b) { g_bridge_n[2]++; return 0; }
+        [b encodeWaitForEvent:g_bridge_event value:g_bridge_seq];   /* start only after the head has ended */
+        id<MTLComputeCommandEncoder> enc = [b computeCommandEncoder];
+        [enc setComputePipelineState:g_bridge_pipeline];
+        [enc setBuffer:g_bridge_scratch offset:0 atIndex:0];
+        [enc setBytes:&iters length:sizeof(iters) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [b commit];
+        g_bridge_cb = b;
+    }
+    g_bridge_n[0]++;
+    return 1;
+}
+
+void ds4_gpu_bridge_counts(uint64_t out[3]) {
+    for (int i = 0; i < 3; i++) out[i] = g_bridge_n[i];
+}
+
+/* ds4_gpu_end_commands_commit with the bridge committed behind the head (this final buffer). 1 committed (the
+ * bridge's own failure is only counted), 0 not committed. */
+int ds4_gpu_end_commands_commit_bridged(uint32_t bridge_iters) {
+    if (g_pe_preparing || g_pe_final_cb) return 0;
+    if (!g_batch_cb) {
+        ds4_gpu_parallel_ffn_reset_state(YES);
+        return 0;
+    }
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    ds4_gpu_close_batch_encoder();
+    if (!g_bridge_event) g_bridge_event = [g_device newEvent];
+    if (g_bridge_event) [g_batch_cb encodeSignalEvent:g_bridge_event value:++g_bridge_seq];   /* after the head's last encoder */
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
+    g_stream_expert_cache_batch_seq = 0;
+    [cb commit];
+    if (!ds4_gpu_bridge_commit(bridge_iters)) {
+        static int noted;
+        if (!noted) { noted = 1; fprintf(stderr, "ds4: V4.1 GPU bridge unavailable; decode continues without it\n"); }
+    }
+    g_pe_final_cb = cb;
+    return 1;
+}
+
 static void ds4_gpu_pe_release(void) {
     ds4_gpu_pe_drop(DS4_PE_DROP_RELEASE);
     g_pe_final_cb = nil;
     g_pe_tokword = nil;
+    ds4_gpu_bridge_retire();
+    g_bridge_scratch = nil;
+    g_bridge_pipeline = nil;
+    g_bridge_event = nil;
 }
 
 int ds4_gpu_end_commands_wait(void) {

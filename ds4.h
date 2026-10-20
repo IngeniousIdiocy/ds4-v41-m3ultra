@@ -483,6 +483,8 @@ uint64_t ds4_sampler_gpu_encoded_count(void);
 /* The V4.1 pre-encoded next-token buffer (Metal): out[0] prepared, [1] used, [2] pending now, [3..] drops by reason
  * (foreign command buffer, position, latch, state, error, prepare, off, invalid, step failure, release). */
 void ds4_preencode_stats(uint64_t *out, int n);
+/* The finite GPU bridge behind each pre-encoded V4.1 decode head (Metal): committed, retired, failed. */
+void ds4_decode_bridge_stats(uint64_t out[3]);
 /* V4.1 decode Engram gates that ran with one 256-thread group per stream (Metal). */
 uint64_t ds4_engram_add_tg_count(void);
 #ifdef DS4_TEST_HOOKS

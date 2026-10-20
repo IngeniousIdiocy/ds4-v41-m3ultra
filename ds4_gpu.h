@@ -229,6 +229,10 @@ void ds4_gpu_pe_drop_slot(int reason);
 void ds4_gpu_pe_stats(uint64_t *out, int n);
 int ds4_gpu_end_commands_commit(void);
 int ds4_gpu_end_commands_wait(void);
+/* ds4_gpu_end_commands_commit with a finite GPU bridge (bridge_iters ALU iterations) committed behind the head, so the
+ * GPU stays busy across the CPU handoff (S40 W71b); counts: committed, retired, failed. */
+int ds4_gpu_end_commands_commit_bridged(uint32_t bridge_iters);
+void ds4_gpu_bridge_counts(uint64_t out[3]);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
