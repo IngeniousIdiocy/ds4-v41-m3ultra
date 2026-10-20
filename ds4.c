@@ -73244,6 +73244,7 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 #endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    DS4_POOL_SCOPE();
     return ds4_engine_open_internal(out, opt, NULL);
 }
 
