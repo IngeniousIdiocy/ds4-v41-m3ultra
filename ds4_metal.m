@@ -21782,6 +21782,15 @@ int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *out, const void *model_map, u
  * each bit-identical to the reader it replaces. One switch for all three: they ship as a unit, since Engram alone slows
  * the router matvec beside it. DS4_METAL_DISABLE_V41_BLEND=1 (read per call) restores the default readers. */
 static int ds4_blend_on(void) { return getenv("DS4_METAL_DISABLE_V41_BLEND") == NULL; }
+/* Each blend dispatch, by reader family (0 router, 1 Engram, 2 indexer q_b): counted for
+ * ds4_gpu_dsv41_blend_counts, and one stderr line per family on its first one, so a run's log shows which ran. */
+static uint64_t g_blend_counts[3];
+static void ds4_blend_note(int family) {
+    static const char *const name[3] = {"router", "Engram", "indexer q_b"};
+    if (!g_blend_counts[family]++)
+        fprintf(stderr, "ds4: V4.1 decode %s reads through the blend kernel\n", name[family]);
+}
+void ds4_gpu_dsv41_blend_counts(uint64_t out[3]) { for (int i = 0; i < 3; i++) out[i] = g_blend_counts[i]; }
 
 /* ds4_gpu_dsv41_project_f16_bf16's single-token dispatch (ds4_gpu_matmul_f16_tensor_impl with n_tok 1 and
  * round_bf16: the same args, NSG, NR0 rules, threadgroup memory and grid) with the weight read as E4M3 codes
@@ -21819,7 +21828,7 @@ static int ds4_gpu_dsv41_project_fp8_dispatch(ds4_gpu_tensor *out, id<MTLBuffer>
         /* blend: only the simdgroups that own a 32-column block (at most one per lane), two rows */
         const int16_t xnsg = (int16_t)((in_dim / 32u + 15u) / 16u);
         const int xblend = mv_dispatch.nr0 == 2 && xnsg <= mv_dispatch.nsg && ds4_blend_on();
-        if (xblend) mv_dispatch.nsg = xnsg;
+        if (xblend) { mv_dispatch.nsg = xnsg; ds4_blend_note(2); }
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
             xblend ? "kernel_indexer_blend_r2" : "kernel_mul_mv_fp8_f32_4_bf16", mv_dispatch.nsg);
         if (!pipeline) return 0;
@@ -22747,6 +22756,7 @@ static int ds4_gpu_bf16_router_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> wbuf,
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
         /* blend: 16-byte weight loads, one row per threadgroup */
         const int rblend = (in_dim % 32u) == 0 && (inner_offset % 16u) == 0 && ds4_blend_on();
+        if (rblend) ds4_blend_note(0);
         if (rblend || ds4_gpu_plain_mv_single_row(out_dim)) {
             mv_dispatch.nr0 = 1;
             mv_dispatch.smem = 32u * sizeof(float);
@@ -22841,6 +22851,7 @@ static int ds4_gpu_engram_fp8_dispatch(ds4_gpu_tensor *out, id<MTLBuffer> cbuf, 
             g_engram_decode_shift = v && !strcmp(v, "shift");
         }
         const int blend = (code_inner % 16u) == 0 && ds4_blend_on();   /* 16-byte code loads; exact for any E8M0 byte */
+        if (blend) ds4_blend_note(1);
         const int shift = !blend && (g_engram_decode_shift || !table_ok);
         const int table = !blend && !shift;
         if (table && !g_engram_lut_buf) {

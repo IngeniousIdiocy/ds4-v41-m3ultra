@@ -1720,13 +1720,26 @@ static int check_engram_decode(void) {
     return 1;
 }
 
+/* Exactly one blend dispatch of this family (0 router, 1 Engram, 2 indexer q_b) since the previous call: the pair's
+ * blend call took the blend kernel and its opt-out call did not, so the comparison is not of a reader with itself. */
+static int blend_fired(int family) {
+    static uint64_t last[3];
+    uint64_t now[3];
+    ds4_gpu_dsv41_blend_counts(now);
+    const int ok = now[family] == last[family] + 1u;
+    for (int i = 0; i < 3; i++) last[i] = now[i];
+    return ok;
+}
+
 /* The blend readers give the default readers' bits: Engram (table and F16-pattern fallback, E8M0 109..119), the FP8
  * indexer q_b at K 1280 and the BF16 router at K 5120, against the same calls with DS4_METAL_DISABLE_V41_BLEND set. */
 static int check_blend(void) {
-    {   /* Engram 6144 -> 256 and indexer q_b 1280 -> 256: E4M3 codes with E8M0 32x32 block bytes */
-        const uint32_t ins[2] = {6144, 1280}, out = 256;
+    (void)blend_fired(0);   /* the baseline */
+    {   /* Engram 6144 -> 256 and indexer q_b 1280 -> 4096 (its production size: smaller outputs can take one row
+         * per threadgroup, where the blend reader does not apply): E4M3 codes with E8M0 32x32 block bytes */
+        const uint32_t ins[2] = {6144, 1280}, outs[2] = {256, 4096};
         for (int which = 0; which < 2; which++) {
-            const uint32_t in = ins[which];
+            const uint32_t in = ins[which], out = outs[which];
             unsigned char *codes = malloc((size_t)in * out), *scales = malloc((size_t)(in / 32) * (out / 32));
             CHECK(codes && scales);
             for (size_t i = 0; i < (size_t)(in / 32) * (out / 32); i++) { (void)random_value(); scales[i] = (unsigned char)(109u + seed % 11u); }
@@ -1743,12 +1756,15 @@ static int check_blend(void) {
             ds4_gpu_tensor *xt = upload(x, (size_t)in * 4), *o = upload(NULL, out * 4);
             CHECK(ct && st && xt && o);
             if (which == 0) {
-                for (int table_ok = 0; table_ok < 2; table_ok++)
+                for (int table_ok = 0; table_ok < 2; table_ok++) {
                     LITERAL_PAIR("DS4_METAL_DISABLE_V41_BLEND", o, out * 4,
                                  ds4_gpu_matmul_engram_fp8_weights(o, ct, st, in, out, xt, table_ok));
+                    CHECK(blend_fired(1));
+                }
             } else {
                 LITERAL_PAIR("DS4_METAL_DISABLE_V41_BLEND", o, out * 4,
                              ds4_gpu_dsv41_project_fp8_bf16_weights(o, ct, st, in, out, xt));
+                CHECK(blend_fired(2));
             }
             ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(st); ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o);
             free(codes); free(scales); free(x);
@@ -1769,6 +1785,7 @@ static int check_blend(void) {
         ds4_gpu_tensor *wt = upload(w, (size_t)in * out * 2), *xt = upload(x, (size_t)in * 4), *o = upload(NULL, out * 4);
         CHECK(wt && xt && o);
         LITERAL_PAIR("DS4_METAL_DISABLE_V41_BLEND", o, out * 4, ds4_gpu_matmul_bf16_router_weights(o, wt, in, out, xt));
+        CHECK(blend_fired(0));
         ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(o);
         free(w); free(x);
     }

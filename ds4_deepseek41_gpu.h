@@ -232,6 +232,8 @@ int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *out, const void *model_map, u
 int ds4_gpu_dsv41_project_fp8_bf16(ds4_gpu_tensor *out, const void *fp8_map, uint64_t fp8_size,
                                    uint64_t codes_off, uint64_t scales_off, uint32_t in_dim, uint32_t out_dim,
                                    const ds4_gpu_tensor *x);
+/* Blend-kernel dispatches so far, by decode reader family: router, Engram, indexer q_b (Metal only). */
+void ds4_gpu_dsv41_blend_counts(uint64_t out[3]);
 /* The same with the codes and E8M0 bytes in tensors (copies built at load). */
 int ds4_gpu_dsv41_project_fp8_bf16_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
                                            uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);

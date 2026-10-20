@@ -41217,20 +41217,58 @@ static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
 #endif
 }
 
+/* Opt-in diagnostic, DS4_METAL_V41_READER_COUNTS=1: one exit line of the decode readers' dispatch counts per family
+ * (router, Engram, indexer q_b) by source (sidecar, copy built at load, wide GGUF tensor), with the blend kernel's
+ * share, so a run can prove which reader ran. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+enum { DS41_RD_ROUTER, DS41_RD_ENGRAM, DS41_RD_INDEXER };
+enum { DS41_RD_SIDECAR, DS41_RD_BUILT, DS41_RD_WIDE };
+static uint64_t g_ds41_reader_counts[3][3];
+static void ds41_reader_counts_exit(void) {
+    uint64_t blend[3];
+    ds4_gpu_dsv41_blend_counts(blend);
+    static const char *const name[3] = {"router", "Engram", "indexer q_b"};
+    fprintf(stderr, "ds4: V4.1 decode readers:");
+    for (int f = 0; f < 3; f++)
+        fprintf(stderr, "%s %s sidecar %llu built %llu wide %llu (blend %llu)", f ? ";" : "", name[f],
+                (unsigned long long)g_ds41_reader_counts[f][DS41_RD_SIDECAR],
+                (unsigned long long)g_ds41_reader_counts[f][DS41_RD_BUILT],
+                (unsigned long long)g_ds41_reader_counts[f][DS41_RD_WIDE], (unsigned long long)blend[f]);
+    fprintf(stderr, "\n");
+}
+static void ds41_reader_count(int family, int source) {
+    static int armed = -1;
+    if (armed < 0) {
+        armed = getenv("DS4_METAL_V41_READER_COUNTS") != NULL;
+        if (armed) atexit(ds41_reader_counts_exit);
+    }
+    g_ds41_reader_counts[family][source]++;
+}
+#define DS41_READER_COUNT(family, source) ds41_reader_count(DS41_RD_##family, DS41_RD_##source)
+#else
+#define DS41_READER_COUNT(family, source) ((void)0)
+#endif
+
 /* The index-source q projection (BF16-rounded): from the FP8 sidecar or the copy built at load while the
  * step reads FP8 (the F16 path's single-token dispatch), else the F16 tensor. */
 static bool ds41_indexer_q(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const uint32_t in_dim = (uint32_t)l->indexer_attn_q_b->dim[0], out_dim = (uint32_t)l->indexer_attn_q_b->dim[1];
-    if (g->indexer_fp8 && l->indexer_attn_q_b_fp8)
+    if (g->indexer_fp8 && l->indexer_attn_q_b_fp8) {
+        DS41_READER_COUNT(INDEXER, SIDECAR);
         return ds4_gpu_dsv41_project_fp8_bf16(g->index_q, g->indexer_model->map, g->indexer_model->size,
                                               l->indexer_attn_q_b_fp8->abs_offset, l->indexer_attn_q_b_e8m0->abs_offset,
                                               in_dim, out_dim, g->qr) != 0;
+    }
     const ds41_fp8_copy *c = g->indexer_fp8 ? ds41_narrow_indexer(m, il) : NULL;
-    if (c) return ds4_gpu_dsv41_project_fp8_bf16_weights(g->index_q, c->codes, c->e8m0, in_dim, out_dim, g->qr) != 0;
+    if (c) {
+        DS41_READER_COUNT(INDEXER, BUILT);
+        return ds4_gpu_dsv41_project_fp8_bf16_weights(g->index_q, c->codes, c->e8m0, in_dim, out_dim, g->qr) != 0;
+    }
 #else
     (void)il;
 #endif
+    DS41_READER_COUNT(INDEXER, WIDE);
     return ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true);
 }
 
@@ -41434,15 +41472,20 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
      * gates; schedule guards still see the F32 tensor. */
     const ds4_gpu_tensor *router_copy = g->router_bf16 && !l->ffn_gate_inp_bf16 ? ds41_narrow_router(m, il) : NULL;
     if (g->router_bf16 && l->ffn_gate_inp_bf16) {
+        DS41_READER_COUNT(ROUTER, SIDECAR);
         if (!ds4_gpu_matmul_bf16_router_tensor(g->route_logits, g->router_model->map, g->router_model->size,
                 l->ffn_gate_inp_bf16->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, g->norm))
             return false;
     } else if (router_copy) {
+        DS41_READER_COUNT(ROUTER, BUILT);
         if (!ds4_gpu_matmul_bf16_router_weights(g->route_logits, router_copy, DS4_N_EMBD, DS4_N_EXPERT, g->norm))
             return false;
     } else
 #endif
-    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
+    {
+        DS41_READER_COUNT(ROUTER, WIDE);
+        if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
+    }
 #ifdef __APPLE__
     const bool routed_one =!getenv("DS4_METAL_DISABLE_V41_ROUTER_ONE") &&
         ds4_gpu_dsv41_router_one(g->selected, g->route_weights, g->route_probs, g->route_logits,
@@ -41608,6 +41651,7 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
          * geometry, with the same BF16 output. */
         const ds41_fp8_copy *c = g->engram_fp8 && !l->engram_kv_fp8 ? ds41_narrow_engram(m, i) : NULL;
         const bool fp8 = g->engram_fp8 && (l->engram_kv_fp8 || c);
+        ds41_reader_count(DS41_RD_ENGRAM, !fp8 ? DS41_RD_WIDE : l->engram_kv_fp8 ? DS41_RD_SIDECAR : DS41_RD_BUILT);
         if (fp8 && l->engram_kv_fp8 && !ds4_gpu_matmul_engram_fp8_tensor(g->engram_kv, g->engram_model->map, g->engram_model->size,
                 l->engram_kv_fp8->abs_offset, l->engram_kv_e8m0->abs_offset,
                 (uint32_t)l->engram_kv->dim[0], (uint32_t)l->engram_kv->dim[1], rows))
