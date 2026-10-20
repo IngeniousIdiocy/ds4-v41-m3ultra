@@ -40788,6 +40788,7 @@ static bool ds41_rope_store(ds4_gpu_tensor *x, ds4_gpu_tensor *cache, uint64_t o
 
 static bool ds41_queued_head_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_QUEUED_HEAD", &c); }
 static bool ds41_short_sweep_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_SHORT_SWEEP", &c); }
+static bool ds41_capture_in_head_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_CAPTURE_IN_HEAD", &c); }
 
 /* One block's HC input: the mixer projection, then split, weighted sum with
  * the previous block's pre weights and norm; each half fused where the fused
@@ -42312,6 +42313,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->scalar_decode = true;
     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+    /* With the head queued, the drafter's capture of this token is encoded after
+     * the head inside the final waited buffer instead of in a buffer of its own
+     * after the drain: the same work, one wait less. */
+    const bool capture_in_head = g->draft && queued_head && !ds41_capture_in_head_off();
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -42337,6 +42342,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             il + 1u == DS4_N_LAYER;
         /* the head only needs the last layer: encode it before the drain */
         if (ok && queued_head && il + 1u == DS4_N_LAYER) ok = ds41_graph_encode_logits(g, m, w);
+        if (ok && capture_in_head && il + 1u == DS4_N_LAYER)
+            ok = ds41_draft_pending(g) && ds41_draft_commit(g, 1);
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -42358,7 +42365,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
-    if (ok && g->draft) {
+    if (ok && g->draft && !capture_in_head) {
         ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) && ds41_draft_commit(g, 1);
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     }
