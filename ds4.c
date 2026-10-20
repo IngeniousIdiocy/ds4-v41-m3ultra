@@ -36,6 +36,7 @@
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
+#include <CommonCrypto/CommonDigest.h>   /* the indexer FP8 sidecar's identity (SHA-256) */
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -4662,6 +4663,7 @@ typedef struct {
     ds4_tensor *ffn_up;
     ds4_tensor *ffn_down;
     ds4_tensor *ffn_gate_inp;
+    const ds4_tensor *ffn_gate_inp_bf16;   /* V4.1 BF16 router sidecar */
     ds4_tensor *ffn_exp_probs_b;
     ds4_tensor *ffn_exp_probs_vl;
     ds4_tensor *ffn_gate_exps;
@@ -4675,6 +4677,10 @@ typedef struct {
     ds4_tensor *nextn_hnorm;
     ds4_tensor *nextn_shared_head_norm;
     ds4_tensor *engram_kv;
+    const ds4_tensor *engram_kv_fp8;    /* V4.1 FP8 Engram sidecar: E4M3 codes + E8M0 32x32 scales */
+    const ds4_tensor *engram_kv_e8m0;
+    /* V4.1 FP8 indexer sidecar: E4M3 codes [4096][1280] + E8M0 32x32 scales of indexer.attn_q_b */
+    const ds4_tensor *indexer_attn_q_b_fp8, *indexer_attn_q_b_e8m0;
     ds4_tensor *engram_q_norm;
     ds4_tensor *engram_k_norm;
     /* Qwen3.8-Flash-Next */
@@ -4726,6 +4732,9 @@ typedef struct {
     ds4_tensor *output_hc_down;
     ds4_tensor *output_hc_up;
     ds4_tensor *ple_embd;
+    const struct ds4_model *router_bf16_model;   /* holds ffn_gate_inp_bf16 */
+    const struct ds4_model *engram_fp8_model;    /* holds engram_kv_fp8/e8m0 */
+    const struct ds4_model *indexer_fp8_model;   /* holds indexer.attn_q_b.{fp8,e8m0} of the index-source layers */
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 
@@ -43536,6 +43545,9 @@ struct ds4_engine {
     uint64_t ds41_session_bytes;
     ds4_model model;
     ds4_model mtp_model;
+    ds4_model router_model;      /* DS4_V41_ROUTER_BF16_SIDECAR */
+    ds4_model engram_fp8_model;  /* DS4_V41_ENGRAM_FP8_SIDECAR */
+    ds4_model indexer_fp8_model; /* DS4_V41_INDEXER_FP8_SIDECAR */
     ds4_model vision_model;
     ds4_vocab vocab;
     ds4_weights weights;
@@ -71083,6 +71095,164 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     return 0;
 }
 
+/* Bind and audit an opened FP8 Engram sidecar: for each Engram layer the I8 codes
+ * [in_dim, out_dim] and E8M0 scales [in_dim/32, out_dim/32]; every code must be
+ * a finite E4M3 value (no 0x7f/0xff) and every scale byte within 109..119, and
+ * the sidecar's tensors must be exactly these four. Logs the audit. */
+static int engram_fp8_sidecar_bind(const ds4_model *sm, uint64_t in_dim, uint64_t out_dim,
+                                   const ds4_tensor *codes[DS4_MAX_LAYER],
+                                   const ds4_tensor *scales[DS4_MAX_LAYER]) {
+    uint32_t consumed = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds41_engram_layer(il)) continue;   /* the two Engram layers, 1 and 14 */
+        char name[64];
+        snprintf(name, sizeof(name), "blk.%u.engram_kv.fp8", il);
+        const ds4_tensor *c = model_find_tensor(sm, name);
+        snprintf(name, sizeof(name), "blk.%u.engram_kv.e8m0", il);
+        const ds4_tensor *sc = model_find_tensor(sm, name);
+        if (!c || !sc || c->type != DS4_TENSOR_I8 || sc->type != DS4_TENSOR_I8 ||
+            c->ndim != 2 || sc->ndim != 2 || c->dim[0] != in_dim || c->dim[1] != out_dim ||
+            in_dim % 32 || out_dim % 32 || sc->dim[0] != in_dim / 32 || sc->dim[1] != out_dim / 32) {
+            fprintf(stderr, "ds4: FP8 Engram sidecar lacks layer %u codes/scales matching engram_kv\n", il);
+            return -1;
+        }
+        const uint8_t *code = (const uint8_t *)sm->map + c->abs_offset;
+        const uint8_t *scale = (const uint8_t *)sm->map + sc->abs_offset;
+        const uint64_t nc = c->dim[0] * c->dim[1], ns = sc->dim[0] * sc->dim[1];
+        uint64_t nan = 0;
+        uint8_t lo = 255, hi = 0;
+        for (uint64_t i = 0; i < nc; i++) nan += (code[i] & 0x7f) == 0x7f;
+        for (uint64_t i = 0; i < ns; i++) {
+            if (scale[i] < lo) lo = scale[i];
+            if (scale[i] > hi) hi = scale[i];
+        }
+        fprintf(stderr, "ds4: FP8 Engram audit layer %u: %llu codes, %llu NaN; %llu E8M0 scales in %u..%u (allowed 109..119)\n",
+                il, (unsigned long long)nc, (unsigned long long)nan, (unsigned long long)ns, lo, hi);
+        if (nan || lo < 109 || hi > 119) {
+            fprintf(stderr, "ds4: FP8 Engram sidecar is outside the audited domain; refusing it\n");
+            return -1;
+        }
+        codes[il] = c;
+        scales[il] = sc;
+        consumed += 2;
+    }
+    /* each of the sidecar's tensors (codes + scales per Engram layer) used exactly once */
+    if (consumed != 4 || sm->n_tensors != consumed) {
+        fprintf(stderr, "ds4: FP8 Engram sidecar holds %llu tensors, %u consumed (expected 4)\n",
+                (unsigned long long)sm->n_tensors, consumed);
+        return -1;
+    }
+    return 0;
+}
+
+#ifdef DS4_TEST_HOOKS
+/* CPU check of the sidecar binding and audit, without a main model. */
+int ds4_test_engram_fp8_sidecar(const char *path, uint64_t in_dim, uint64_t out_dim) {
+    ds4_model sm = {0};
+    model_open(&sm, path, true, false);
+    ds4_str arch = {0};
+    const ds4_tensor *codes[DS4_MAX_LAYER] = {0}, *scales[DS4_MAX_LAYER] = {0};
+    int rc = !model_get_string(&sm, "general.architecture", &arch) ||
+             !ds4_streq(arch, "deepseek41-engram-fp8") ? -1 :
+             engram_fp8_sidecar_bind(&sm, in_dim, out_dim, codes, scales);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++)
+        if (codes[il]) fprintf(stderr, "ds4: bound layer %u codes @%llu scales @%llu\n", il,
+                               (unsigned long long)codes[il]->abs_offset, (unsigned long long)scales[il]->abs_offset);
+    model_close(&sm);
+    return rc;
+}
+#endif
+
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+/* Bind and audit an opened indexer FP8 sidecar (gguf-tools/deepseek41_indexer_fp8_sidecar.py): per index-source
+ * layer the I8 codes indexer.attn_q_b.fp8 [1280, 4096] with E8M0 indexer.attn_q_b.e8m0 [40, 128]; every code a
+ * finite E4M3 value, every scale byte in 1..246 (the kernel folds 2^8 into the scale), exactly 2 x 8 tensors. Logs
+ * the audit and the blocks below E8M0 112 (there the F16 tensor holds rounded weights, so the FP8 path is a numerical
+ * change rather than bitwise equal). offs (test hooks, may be NULL): codes/scales offsets. */
+static int indexer_fp8_sidecar_bind(const ds4_model *sm, uint32_t n_layer, ds4_layer_weights *layers, uint64_t *offs) {
+    static const char *nm[2] = {"indexer.attn_q_b.fp8", "indexer.attn_q_b.e8m0"};
+    static const uint64_t d0[2] = {1280, 1280 / 32}, d1[2] = {4096, 4096 / 32};
+    uint64_t nan = 0, ncodes = 0, low = 0; uint8_t lo = 255, hi = 0; uint32_t consumed = 0, nsrc = 0;
+    for (uint32_t il = 0; il < n_layer; il++) {
+        if (!ds41_index_source(il)) continue;
+        const ds4_tensor *x[2];
+        for (int k = 0; k < 2; k++) {
+            char name[64];
+            snprintf(name, sizeof(name), "blk.%u.%s", il, nm[k]);
+            x[k] = model_find_tensor(sm, name);
+            if (!x[k] || x[k]->type != DS4_TENSOR_I8 || x[k]->ndim != 2 || x[k]->dim[0] != d0[k] || x[k]->dim[1] != d1[k]) {
+                fprintf(stderr, "ds4: indexer FP8 sidecar lacks %s with shape [%llu, %llu]\n", name,
+                        (unsigned long long)d0[k], (unsigned long long)d1[k]);
+                return -1;
+            }
+            const uint8_t *b = (const uint8_t *)sm->map + x[k]->abs_offset;
+            const uint64_t n = d0[k] * d1[k];
+            if (k == 0) { for (uint64_t i = 0; i < n; i++) nan += (b[i] & 0x7f) == 0x7f; ncodes += n; }
+            else for (uint64_t i = 0; i < n; i++) { if (b[i] < lo) lo = b[i]; if (b[i] > hi) hi = b[i]; low += b[i] < 112; }
+            if (offs) offs[2u * nsrc + (uint32_t)k] = x[k]->abs_offset;
+            consumed++;
+        }
+        if (layers) { layers[il].indexer_attn_q_b_fp8 = x[0]; layers[il].indexer_attn_q_b_e8m0 = x[1]; }
+        nsrc++;
+    }
+    fprintf(stderr, "ds4: indexer FP8 audit: %u index-source layers, %llu codes, %llu NaN; E8M0 scales in %u..%u "
+            "(allowed 1..246), %llu blocks below 112\n", nsrc, (unsigned long long)ncodes, (unsigned long long)nan, lo, hi,
+            (unsigned long long)low);
+    if (nan || lo < 1 || hi > 246 || nsrc != 8u) {
+        fprintf(stderr, "ds4: indexer FP8 sidecar is outside the audited domain; refusing it\n"); return -1; }
+    if (sm->n_tensors != consumed) {
+        fprintf(stderr, "ds4: indexer FP8 sidecar holds %llu tensors, %u consumed (expected %u)\n",
+                (unsigned long long)sm->n_tensors, consumed, 2u * nsrc);
+        return -1;
+    }
+    return 0;
+}
+
+/* The screened indexer sidecar's identity (checkpoint 1bae0e10): its size and SHA-256. */
+#define DS4_V41_INDEXER_FP8_BYTES 42090496ull
+static const char ds4_v41_indexer_fp8_sha256[] = "22f2e3a776b649c92d23d8abfc4e75fb906e30a63ecef27f34140cf3ad326f6a";
+static int indexer_fp8_sidecar_identity(const ds4_model *sm) {
+#ifdef __APPLE__
+    if (sm->size != DS4_V41_INDEXER_FP8_BYTES) {
+        fprintf(stderr, "ds4: indexer FP8 sidecar is %llu bytes, expected %llu; refusing it\n",
+                (unsigned long long)sm->size, DS4_V41_INDEXER_FP8_BYTES);
+        return -1;
+    }
+    unsigned char md[CC_SHA256_DIGEST_LENGTH]; char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    CC_SHA256_CTX c; CC_SHA256_Init(&c);
+    for (uint64_t o = 0; o < sm->size; o += 1u << 30) {
+        const uint64_t n = sm->size - o < (1u << 30) ? sm->size - o : (1u << 30);
+        CC_SHA256_Update(&c, (const uint8_t *)sm->map + o, (CC_LONG)n);
+    }
+    CC_SHA256_Final(md, &c);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+    if (strcmp(hex, ds4_v41_indexer_fp8_sha256) != 0) {
+        fprintf(stderr, "ds4: indexer FP8 sidecar sha256 %s, expected %s; refusing it\n", hex, ds4_v41_indexer_fp8_sha256);
+        return -1;
+    }
+    return 0;
+#else
+    (void)sm;
+    fprintf(stderr, "ds4: the indexer FP8 sidecar identity check is Apple-only\n");
+    return -1;
+#endif
+}
+
+#ifdef DS4_TEST_HOOKS
+/* CPU check of the indexer sidecar identity, binding and audit, without a main model; offs as the bind. */
+int ds4_test_indexer_fp8_sidecar(const char *path, int check_identity, uint64_t *offs) {
+    ds4_model sm = {0};
+    model_open(&sm, path, true, false);
+    ds4_str arch = {0};
+    int rc = !model_get_string(&sm, "general.architecture", &arch) || !ds4_streq(arch, "deepseek41-indexer-fp8") ? -1 :
+             check_identity && indexer_fp8_sidecar_identity(&sm) != 0 ? -1 :
+             indexer_fp8_sidecar_bind(&sm, DS4_N_LAYER, NULL, offs);
+    model_close(&sm);
+    return rc;
+}
+#endif
+#endif
+
 #ifndef DS4_NO_GPU
 static int engine_append_device_cache_span(
         ds4_tensor_range **per_dev_ranges,
@@ -71377,6 +71547,146 @@ static void engine_print_layout(const ds4_engine *e) {
  *      caches.
  *
  * Returns 0 on success. */
+/* V4.1 decode sidecars. Each is a small GGUF written from the original DeepSeek safetensors by its
+ * gguf-tools/deepseek41_*_sidecar.py, named by an environment variable at engine open and mapped once as an extra
+ * model range; the main model's tensors stay mapped and every non-decode path keeps reading them. The identity
+ * check binds a sidecar to the main model's general.source.revision; the binders audit every tensor they use. */
+
+/* DS4_V41_ROUTER_BF16_SIDECAR=<gguf>: the original BF16 router gates (deepseek41_router_bf16_sidecar.py). */
+static int engine_load_router_bf16_sidecar(ds4_engine *e) {
+    const char *path = getenv("DS4_V41_ROUTER_BF16_SIDECAR");
+    if (!path || !path[0]) return 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend != DS4_BACKEND_METAL || e->ssd_streaming) {
+        fprintf(stderr, "ds4: the BF16 router sidecar needs resident DeepSeek V4.1 on Metal\n");
+        return -1;
+    }
+    model_open(&e->router_model, path, true, false);
+    ds4_str arch = {0}, rev = {0}, main_rev = {0};
+    if (!model_get_string(&e->router_model, "general.architecture", &arch) ||
+        !ds4_streq(arch, "deepseek41-router-bf16") ||
+        !model_get_string(&e->router_model, "general.source.revision", &rev) ||
+        !model_get_string(&e->model, "general.source.revision", &main_rev) ||
+        rev.len != main_rev.len || memcmp(rev.ptr, main_rev.ptr, rev.len) != 0) {
+        fprintf(stderr, "ds4: %s is not a BF16 router sidecar for this checkpoint revision\n", path);
+        return -1;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char name[64];
+        snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", il);
+        const ds4_tensor *t = model_find_tensor(&e->router_model, name);
+        if (!t || t->type != DS4_TENSOR_BF16 || t->ndim != 2 ||
+            t->dim[0] != DS4_N_EMBD || t->dim[1] != DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: BF16 router sidecar lacks a BF16 %u x %u %s\n",
+                    (unsigned)DS4_N_EMBD, (unsigned)DS4_N_EXPERT, name);
+            return -1;
+        }
+        e->weights.layer[il].ffn_gate_inp_bf16 = t;
+    }
+    if (!ds4_gpu_set_model_map_range(e->router_model.map, e->router_model.size,
+                                     e->router_model.tensor_data_pos,
+                                     e->router_model.size - e->router_model.tensor_data_pos,
+                                     e->router_model.max_tensor_bytes)) {
+        fprintf(stderr, "ds4: failed to map the BF16 router sidecar\n");
+        return -1;
+    }
+    e->weights.router_bf16_model = &e->router_model;
+    fprintf(stderr, "ds4: BF16 router sidecar mapped (%s)\n", path);
+    return 0;
+#else
+    (void)e;
+    fprintf(stderr, "ds4: DS4_V41_ROUTER_BF16_SIDECAR is Metal-only\n");
+    return -1;
+#endif
+}
+
+/* DS4_V41_INDEXER_FP8_SIDECAR=<gguf>: the original E4M3 codes and E8M0 32x32 scales of indexer.attn_q_b for the 8
+ * index-source layers (deepseek41_indexer_fp8_sidecar.py). Identity: architecture, source revision, the screened size
+ * and SHA-256; coverage: both tensors of every index-source layer, audited. Any mismatch refuses the session. */
+static int engine_load_indexer_fp8_sidecar(ds4_engine *e) {
+    const char *path = getenv("DS4_V41_INDEXER_FP8_SIDECAR");
+    if (!path || !path[0]) return 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend != DS4_BACKEND_METAL || e->ssd_streaming) {
+        fprintf(stderr, "ds4: the indexer FP8 sidecar needs resident DeepSeek V4.1 on Metal\n");
+        return -1;
+    }
+    model_open(&e->indexer_fp8_model, path, true, false);
+    ds4_str arch = {0}, rev = {0}, main_rev = {0};
+    if (!model_get_string(&e->indexer_fp8_model, "general.architecture", &arch) ||
+        !ds4_streq(arch, "deepseek41-indexer-fp8") ||
+        !model_get_string(&e->indexer_fp8_model, "general.source.revision", &rev) ||
+        !model_get_string(&e->model, "general.source.revision", &main_rev) ||
+        rev.len != main_rev.len || memcmp(rev.ptr, main_rev.ptr, rev.len) != 0) {
+        fprintf(stderr, "ds4: %s is not an indexer FP8 sidecar for this checkpoint revision\n", path);
+        return -1;
+    }
+    if (indexer_fp8_sidecar_identity(&e->indexer_fp8_model) != 0) return -1;
+    if (indexer_fp8_sidecar_bind(&e->indexer_fp8_model, DS4_N_LAYER, e->weights.layer, NULL) != 0) return -1;
+    if (!ds4_gpu_set_model_map_range(e->indexer_fp8_model.map, e->indexer_fp8_model.size,
+                                     e->indexer_fp8_model.tensor_data_pos,
+                                     e->indexer_fp8_model.size - e->indexer_fp8_model.tensor_data_pos,
+                                     e->indexer_fp8_model.max_tensor_bytes)) {
+        fprintf(stderr, "ds4: failed to map the indexer FP8 sidecar\n");
+        return -1;
+    }
+    e->weights.indexer_fp8_model = &e->indexer_fp8_model;
+    fprintf(stderr, "ds4: indexer FP8 sidecar mapped (%s)\n", path);
+    return 0;
+#else
+    (void)e;
+    fprintf(stderr, "ds4: DS4_V41_INDEXER_FP8_SIDECAR is Metal-only\n");
+    return -1;
+#endif
+}
+
+/* DS4_V41_ENGRAM_FP8_SIDECAR=<gguf>: the original E4M3 codes and E8M0 32x32 block scales of both Engram KV
+ * projections (deepseek41_engram_fp8_sidecar.py); the public F16 conversion lost values these hold. The load audits
+ * every code (no E4M3 NaN, 0x7f/0xff) and every scale byte (109..119, the recorded range) and refuses otherwise. */
+static int engine_load_engram_fp8_sidecar(ds4_engine *e) {
+    const char *path = getenv("DS4_V41_ENGRAM_FP8_SIDECAR");
+    if (!path || !path[0]) return 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend != DS4_BACKEND_METAL || e->ssd_streaming) {
+        fprintf(stderr, "ds4: the FP8 Engram sidecar needs resident DeepSeek V4.1 on Metal\n");
+        return -1;
+    }
+    model_open(&e->engram_fp8_model, path, true, false);
+    ds4_str arch = {0}, rev = {0}, main_rev = {0};
+    if (!model_get_string(&e->engram_fp8_model, "general.architecture", &arch) ||
+        !ds4_streq(arch, "deepseek41-engram-fp8") ||
+        !model_get_string(&e->engram_fp8_model, "general.source.revision", &rev) ||
+        !model_get_string(&e->model, "general.source.revision", &main_rev) ||
+        rev.len != main_rev.len || memcmp(rev.ptr, main_rev.ptr, rev.len) != 0) {
+        fprintf(stderr, "ds4: %s is not an FP8 Engram sidecar for this checkpoint revision\n", path);
+        return -1;
+    }
+    const ds4_tensor *f16_1 = e->weights.layer[1].engram_kv, *f16_14 = e->weights.layer[14].engram_kv;
+    const ds4_tensor *codes[DS4_MAX_LAYER] = {0}, *scales[DS4_MAX_LAYER] = {0};
+    if (!f16_1 || !f16_14 || f16_1->dim[0] != f16_14->dim[0] || f16_1->dim[1] != f16_14->dim[1] ||
+        engram_fp8_sidecar_bind(&e->engram_fp8_model, f16_1->dim[0], f16_1->dim[1], codes, scales) != 0)
+        return -1;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        e->weights.layer[il].engram_kv_fp8 = codes[il];
+        e->weights.layer[il].engram_kv_e8m0 = scales[il];
+    }
+    if (!ds4_gpu_set_model_map_range(e->engram_fp8_model.map, e->engram_fp8_model.size,
+                                     e->engram_fp8_model.tensor_data_pos,
+                                     e->engram_fp8_model.size - e->engram_fp8_model.tensor_data_pos,
+                                     e->engram_fp8_model.max_tensor_bytes)) {
+        fprintf(stderr, "ds4: failed to map the FP8 Engram sidecar\n");
+        return -1;
+    }
+    e->weights.engram_fp8_model = &e->engram_fp8_model;
+    fprintf(stderr, "ds4: FP8 Engram sidecar mapped (%s)\n", path);
+    return 0;
+#else
+    (void)e;
+    fprintf(stderr, "ds4: DS4_V41_ENGRAM_FP8_SIDECAR is Metal-only\n");
+    return -1;
+#endif
+}
+
 /* Install the DSpark support model's tensors on one executor tier: the
  * TP partner of the output-head tier when decode TP is active (it has the
  * output-head copy from output TP and plenty of free VRAM), otherwise the
@@ -73158,6 +73468,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        if (engine_load_router_bf16_sidecar(e) != 0 || engine_load_engram_fp8_sidecar(e) != 0 ||
+            engine_load_indexer_fp8_sidecar(e) != 0) {
+            free(load_offsets);
+            free(load_sizes);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if (!ds4_engine_preload_pro_q4_expert_tables(e,
                                                      load_slice,
                                                      load_layer_start,
@@ -74139,6 +74457,9 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
+    if (e->router_model.map) model_close(&e->router_model);
+    if (e->engram_fp8_model.map) model_close(&e->engram_fp8_model);
+    if (e->indexer_fp8_model.map) model_close(&e->indexer_fp8_model);
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
