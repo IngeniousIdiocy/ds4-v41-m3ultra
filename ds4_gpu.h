@@ -1111,6 +1111,13 @@ int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map
                                       uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
                                       const ds4_gpu_tensor *x);
 
+/* One-row Engram projection over E4M3 codes [out_dim][in_dim] and E8M0 32x32
+ * block scales [out_dim/32][in_dim/32]: the F16 matvec's geometry and
+ * reduction, output rounded to BF16 like the F16 projection. */
+int ds4_gpu_matmul_engram_fp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                     uint64_t code_offset, uint64_t scale_offset,
+                                     uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,

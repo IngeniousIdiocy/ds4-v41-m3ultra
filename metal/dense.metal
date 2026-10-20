@@ -4022,3 +4022,87 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+
+/* The V4.1 decode Engram projection over the released E4M3 codes [rows][k]
+ * and E8M0 32x32 block scales [rows/32][k/32]. Each weight is read from a
+ * host-built value table (code x 2^(e-127) in float, index (e - 109) * 256 +
+ * code, the audited range 109..119) copied into threadgroup memory, inside the
+ * F16 matvec geometry of kernel_mul_mv_t_t_4_impl: the same lane/simdgroup K
+ * walk (16 weights per lane per 32-column block, blocks strided by NSG * 16),
+ * the same float4 dot grouping and per-lane accumulation, and the same
+ * helper_mv_reduce_and_write reduction and BF16 output. */
+#define DS4_ENGRAM_LUT_N 2816
+template<short NR0>
+kernel void kernel_engram_fp8_mv(
+        constant ds4_metal_args_mul_mv & args,
+        device const uchar * codes  [[buffer(1)]],
+        device const char  * src1   [[buffer(2)]],
+        device       char  * dst    [[buffer(3)]],
+        device const uchar * scales [[buffer(4)]],
+        device const char  * table  [[buffer(5)]],
+        threadgroup  char  * shmem  [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    threadgroup float * t32 = (threadgroup float *) (shmem + NR0*NW*sizeof(float));
+    for (int i = sgitg*NW + tiisg; i < DS4_ENGRAM_LUT_N; i += NSG*NW) {
+        t32[i] = ((device const float *) table)[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int nb = args.ne00/NB;
+    const int r0 = tgpig.x*NR0;
+
+    device const float4 * y4 = (device const float4 *) src1;
+
+    device const uchar4 * ax4[NR0];
+    device const uchar  * sx [NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax4[row] = (device const uchar4 *) (codes + (uint64_t)(r0 + row)*args.ne00);
+        sx [row] = scales + (uint64_t)((r0 + row)/32)*nb;
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sgitg*NF + ix;
+
+    float4 yl4[NF4];
+
+    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const uchar4 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+            const int b = (int(sx[row][ib]) - 109)*256;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                const uchar4 c = xb4[i];
+                const float4 w = float4(t32[b + c.x], t32[b + c.y], t32[b + c.z], t32[b + c.w]);
+                sumq += dot(w, float4(yl4[i]));
+            }
+
+            sumf[row] += sumq;
+        }
+
+        yb4 += NSG*NF*NW/4;
+    }
+
+    helper_mv_reduce_and_write<NR0, true>((device float *) dst, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+typedef decltype(kernel_engram_fp8_mv<2>) engram_fp8_mv_t;
+template [[host_name("kernel_engram_fp8_mv_bf16")]] kernel engram_fp8_mv_t kernel_engram_fp8_mv<2>;

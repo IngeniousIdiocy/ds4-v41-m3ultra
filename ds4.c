@@ -40273,6 +40273,10 @@ typedef struct {
     bool tp_gate_fused, shared_done, hc_attn_deferred, hc_ffn_deferred, scalar_decode, kv_stored;
     bool router_bf16;                      /* this decode step's router reads the BF16 sidecar */
     const struct ds4_model *router_model;  /* that sidecar */
+    /* This decode step reads the FP8 Engram sidecar. Only a step with logits
+     * sets it; prefix steps and prefill keep the F16 projection. */
+    bool engram_fp8;
+    const struct ds4_model *engram_model;
     ds4_gpu_tensor *tp_logits_half, *selected_half, *route_weights_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;   /* verify-block row partials, two slots per layer */
@@ -40792,6 +40796,7 @@ static bool ds41_queued_head_off(void) { static int c = -1; return ds41_env_flag
 static bool ds41_short_sweep_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_SHORT_SWEEP", &c); }
 static bool ds41_capture_in_head_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_CAPTURE_IN_HEAD", &c); }
 static bool ds41_router_bf16_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ROUTER_BF16", &c); }
+static bool ds41_engram_fp8_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ENGRAM_FP8", &c); }
 
 /* One block's HC input: the mixer projection, then split, weighted sum with
  * the previous block's pre weights and norm; each half fused where the fused
@@ -41315,7 +41320,19 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, i == 0 ? g->engram_rows : g->engram_rows_b, true) ||
+        const ds4_gpu_tensor *rows = i == 0 ? g->engram_rows : g->engram_rows_b;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* The released E4M3 codes and E8M0 scales in the F16 projection's matvec
+         * geometry, with the same BF16 output. */
+        const bool fp8 = g->engram_fp8 && l->engram_kv_fp8;
+        if (fp8 && !ds4_gpu_matmul_engram_fp8_tensor(g->engram_kv, g->engram_model->map, g->engram_model->size,
+                l->engram_kv_fp8->abs_offset, l->engram_kv_e8m0->abs_offset,
+                (uint32_t)l->engram_kv->dim[0], (uint32_t)l->engram_kv->dim[1], rows))
+            return false;
+#else
+        const bool fp8 = false;
+#endif
+        if ((!fp8 && !ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true)) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
@@ -42326,6 +42343,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->router_model = w->router_bf16_model;
     g->router_bf16 = g->router_model && g->tp_world == 1 && !g->streaming && !g->quality &&
         !ds41_router_bf16_off();
+    g->engram_model = w->engram_fp8_model;
+    g->engram_fp8 = logits && g->engram_model && g->tp_world == 1 && !g->streaming && !g->quality &&
+        !ds41_engram_fp8_off();
     g->tp_gate_fused = g->tp_world == 2 && !ds41_tp_gate_expand_off() &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     /* With the head queued, the drafter's capture of this token is encoded after
@@ -42375,6 +42395,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     }
     g->scalar_decode = false;
     g->router_bf16 = false;
+    g->engram_fp8 = false;
     g->tp_gate_fused = false;
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */

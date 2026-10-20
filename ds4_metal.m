@@ -22568,6 +22568,85 @@ int ds4_gpu_matmul_bf16_router_tensor(ds4_gpu_tensor *out, const void *model_map
     }
 }
 
+/* The Engram reader's value table, index (e - 109) * 256 + code over the E8M0
+ * range 109..119 the sidecar audit admits: each E4M3 code times 2^(e - 127),
+ * exact in float. NaN codes (0x7f/0xff), which the audit rejects, hold a quiet NaN. */
+#define DS4_ENGRAM_LUT_N 2816u
+static float g_engram_lut[DS4_ENGRAM_LUT_N];
+static id<MTLBuffer> g_engram_lut_buf;
+
+static void ds4_engram_lut_build(void) {
+    for (uint32_t e = 109; e <= 119; e++)
+        for (uint32_t c = 0; c < 256; c++) {
+            const uint32_t i = (e - 109u) * 256u + c, a = c & 0x7fu;
+            float v;
+            if (a == 0) v = (c & 0x80u) ? -0.0f : 0.0f;
+            else if (a == 0x7fu) { const uint32_t qnan = 0x7fc00000u; memcpy(&v, &qnan, 4); }
+            else {
+                const uint32_t ex = (c >> 3) & 0x0fu, mm = c & 7u;
+                v = ex == 0 ? ldexpf((float)mm, -9) : ldexpf(1.0f + (float)mm / 8.0f, (int)ex - 7);
+                if (c & 0x80u) v = -v;
+            }
+            g_engram_lut[i] = v * ldexpf(1.0f, (int)e - 127);
+        }
+}
+
+int ds4_gpu_matmul_engram_fp8_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                     uint64_t code_offset, uint64_t scale_offset,
+                                     uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t nr0 = 2;
+    if (!in_dim || (in_dim % 32u) != 0 || (out_dim % 32u) != 0) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!xbuf || !outbuf || ds4_gpu_tensor_bytes(x) < (uint64_t)in_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < (uint64_t)out_dim * sizeof(float)) return 0;
+        const uint64_t code_bytes = (uint64_t)in_dim * out_dim;
+        const uint64_t scale_bytes = (uint64_t)(in_dim / 32u) * (out_dim / 32u);
+        if (code_offset > model_size || code_bytes > model_size - code_offset ||
+            scale_offset > model_size || scale_bytes > model_size - scale_offset) return 0;
+        uint64_t code_inner = 0, scale_inner = 0;
+        id<MTLBuffer> cbuf = ds4_gpu_wrap_model_range(model_map, model_size, code_offset, code_bytes, &code_inner);
+        id<MTLBuffer> sbuf = ds4_gpu_wrap_model_range(model_map, model_size, scale_offset, scale_bytes, &scale_inner);
+        if (!cbuf || !sbuf) return 0;
+        if (!g_engram_lut_buf) {
+            ds4_engram_lut_build();
+            g_engram_lut_buf = [g_device newBufferWithBytes:g_engram_lut length:sizeof(g_engram_lut)
+                                                    options:MTLResourceStorageModeShared];
+            if (!g_engram_lut_buf) return 0;
+        }
+        const ds4_gpu_mv_dispatch base = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);   /* the F16 matvec's nsg */
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_engram_fp8_mv_bf16", base.nsg);
+        if (!pipeline) return 0;
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: V4.1 Engram reads FP8 (E4M3 + E8M0 through a value table, F16 matvec geometry, nsg %d)\n",
+                    (int)base.nsg);
+        }
+        ds4_gpu_f16_matvec_args args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+        args.nr0 = (int32_t)nr0;
+        const NSUInteger smem = (NSUInteger)nr0 * 32u * sizeof(float) + (NSUInteger)DS4_ENGRAM_LUT_N * sizeof(float);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:cbuf offset:(NSUInteger)code_inner atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setBuffer:sbuf offset:(NSUInteger)scale_inner atIndex:4];
+        [enc setBuffer:g_engram_lut_buf offset:0 atIndex:5];
+        [enc setThreadgroupMemoryLength:(smem + 15u) & ~(NSUInteger)15u atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / nr0, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)base.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "Engram FP8 matvec");
+    }
+}
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,
