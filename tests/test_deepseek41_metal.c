@@ -1911,11 +1911,11 @@ static int check_index_score_bf16(void) {
     return 1;
 }
 
-/* 2-7 verify rows over the bf16 view against the tiled f32 kernel the batch
- * scorer takes for them: the same bits, except -inf in blocks a masked row's
+/* Verify rows over the bf16 view against the kernel the batch scorer takes
+ * for them (tiled f32 for 2-7 rows, scores_mma from 8): the same bits, except -inf in blocks a masked row's
  * mask drops (which the candidate filter drops anyway). */
 static int check_verify_index_bf16(void) {
-    enum { HEADS = 32, DIM = 128, MAXR = 7 };
+    enum { HEADS = 32, DIM = 128, MAXR = 17 };
     const uint32_t counts[] = {9, 1031, 17011, 70001};
     const uint32_t max_keys = 70001, mask_width = (max_keys + 7) / 8;
     ds4_gpu_tensor *qt = upload(NULL, (size_t)MAXR * HEADS * DIM * sizeof(float));
@@ -1958,7 +1958,7 @@ static int check_verify_index_bf16(void) {
         for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
             const uint32_t n = counts[ci];
             for (uint32_t ratio = 1; ratio <= 2; ratio++) {
-                for (uint32_t rows = 2; rows <= MAXR; rows++) {
+                for (uint32_t rows = 2; rows <= MAXR && rows <= n * ratio; rows++) {
                     for (uint32_t early = 0; early <= 1; early++) {
                         const uint32_t start = early ? 0 : n * ratio - rows;
                         for (uint32_t mode = 0; mode < 3; mode++) {
@@ -1995,7 +1995,6 @@ static int check_verify_index_bf16(void) {
     CHECK(skipped > 0);
     /* declines where the batch scorer would not take the tiled kernel */
     CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 1, 1030, 1));
-    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 8, 1023, 1));
     CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 2, 1030, 1));
     CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 2, 0, 3));
     CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, mt, 128, 0, 1031, 2, 0, 1));
@@ -2008,7 +2007,7 @@ static int check_verify_index_bf16(void) {
     CHECK(ds4_gpu_synchronize());
     ds4_gpu_tensor_free(sv); ds4_gpu_tensor_free(sr); ds4_gpu_tensor_free(mt); ds4_gpu_tensor_free(vt);
     ds4_gpu_tensor_free(kt); ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(qt);
-    fprintf(stderr, "V4.1 verify rows bf16 index scores == tiled f32 bits PASS (%llu masked-block entries skipped)\n",
+    fprintf(stderr, "V4.1 verify rows bf16 index scores == batch scorer bits (tiled f32, scores_mma) PASS (%llu masked-block entries skipped)\n",
             (unsigned long long)skipped);
     return 1;
 }

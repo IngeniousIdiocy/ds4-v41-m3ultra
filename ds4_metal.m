@@ -37909,9 +37909,10 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
         keys, source_rows, rows, start, ratio, 32, 128, 1.0f / 64.0f, false, true);
 }
 
-/* 2-7 verify rows over the bf16 key view: the bits of the tiled f32 kernel
+/* Verify rows over the bf16 key view: the bits of the tiled f32 kernel (2-7
+ * rows) or kernel_dsv41_indexer_scores_mma (8 and more, the same bits)
  * ds4_gpu_dsv41_indexer_scores_batch takes for them, without padding the rows
- * to its 8-row tile and with half the key bytes. Rows from mask_first on skip
+ * to an 8-row tile and with half the key bytes. Rows from mask_first on skip
  * the 8-key blocks their mask row drops (-inf, as the candidate filter that
  * follows leaves them). 0 where that kernel would not run, so the caller
  * scores the f32 keys; DS4_METAL_DISABLE_V41_VERIFY_INDEX_BF16=1 (read per
@@ -37920,7 +37921,7 @@ int ds4_gpu_dsv41_indexer_scores_rows_bf16(ds4_gpu_tensor *scores, const ds4_gpu
         const ds4_gpu_tensor *weights, const ds4_gpu_tensor *view, const ds4_gpu_tensor *mask,
         uint32_t mask_stride, uint32_t mask_first, uint32_t source_rows, uint32_t rows,
         uint32_t start, uint32_t ratio) {
-    if (rows < 2u || rows > 7u || !g_v41_verify_rows || g_quality_mode || !ds4_gpu_v41_verify_tiled() ||
+    if (rows < 2u || !g_v41_verify_rows || g_quality_mode || (rows < 8u && !ds4_gpu_v41_verify_tiled()) ||
         getenv("DS4_METAL_DISABLE_V41_VERIFY_INDEX_BF16") || (ratio != 1u && ratio != 2u) ||
         !source_rows || source_rows > INT32_MAX || rows > UINT32_MAX - start ||
         (start + rows) / ratio > source_rows || !scores || !q || !weights || !view) return 0;
