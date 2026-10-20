@@ -338,9 +338,15 @@ static int check_engram(void) {
     CHECK(xt && kt && qwt && kwt && mt);
     size_t rounded_differently = 0;
     double error2 = 0, norm2 = 0;
-    for (int masked = 0; masked < 2; masked++) {
+    /* passes: unmasked, masked, and the decode step's 256-thread form (unmasked; width % 1024 == 0) */
+    for (int pass = 0; pass < 3; pass++) {
+        const int masked = pass == 1, tg = pass == 2;
+        ds4_gpu_set_engram_add_tg(tg);
+        const uint64_t tg0 = ds4_gpu_engram_add_tg_count();
         CHECK(ds4_gpu_tensor_write(xt, 0, x, N * sizeof(float)));
         CHECK(ds4_gpu_dsv41_engram_add(xt, kt, qwt, kwt, masked ? mt : NULL, D, ROWS, 1e-20f));
+        CHECK(ds4_gpu_engram_add_tg_count() - tg0 == (uint64_t)tg);   /* the form that ran */
+        ds4_gpu_set_engram_add_tg(0);
         CHECK(ds4_gpu_tensor_read(xt, 0, actual, N * sizeof(float)));
         for (int row = 0; row < ROWS; row++) for (int h = 0; h < 4; h++) {
             double dot = 0, h2 = 0, k2 = 0;
@@ -364,7 +370,7 @@ static int check_engram(void) {
             }
         }
     }
-    CHECK(rounded_differently < N / 1000);
+    CHECK(rounded_differently < 3 * (N / 2000));
     CHECK(sqrt(error2 / norm2) < 1e-4);
     fprintf(stderr, "V4.1 Engram gate: %zu BF16 boundary differences, relative RMS %.8g\n",
             rounded_differently, sqrt(error2 / norm2));

@@ -480,6 +480,8 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
  * 8 stale (paths 1-8 fell back to the CPU sampler); and the decode steps that encoded it. */
 void ds4_sampler_gpu_counts(uint64_t out[9]);
 uint64_t ds4_sampler_gpu_encoded_count(void);
+/* V4.1 decode Engram gates that ran with one 256-thread group per stream (Metal). */
+uint64_t ds4_engram_add_tg_count(void);
 #ifdef DS4_TEST_HOOKS
 /* the selector's reference and production consumers on one summary (HDR: 64-byte header, P: 505 partials,
  * CAND: 2048 {float logit; uint32_t id}); the summary they leave is {int id; float logit, prob}[2048] */

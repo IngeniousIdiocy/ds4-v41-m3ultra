@@ -50154,6 +50154,13 @@ int ds4_gpu_dsv41_rope_quantize(const ds4_gpu_tensor *x, ds4_gpu_tensor *dst, ui
     }
 }
 
+/* The decode step's Engram gate form (S40 EADD): set by the V4.1 decode step for its own duration only. */
+static int g_engram_add_tg;
+static uint64_t g_engram_add_tg_calls;
+void ds4_gpu_set_engram_add_tg(int on) { g_engram_add_tg = on != 0; }
+int ds4_gpu_get_engram_add_tg(void) { return g_engram_add_tg; }
+uint64_t ds4_gpu_engram_add_tg_count(void) { return g_engram_add_tg_calls; }
+
 int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            const ds4_gpu_tensor *kv,
                            const ds4_gpu_tensor *q_weight,
@@ -50169,8 +50176,17 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
         (mask && ds4_gpu_tensor_bytes(mask) < rows)) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_engram_add");
+        const bool tg = g_engram_add_tg && !mask && (width % 1024u) == 0;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+            tg ? "kernel_dsv41_engram_add_tg256" : "kernel_dsv41_engram_add");
         if (!pipeline) return 0;
+        if (tg) {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr, "ds4: V4.1 decode Engram gate uses one 256-thread group per stream (width %u)\n", width);
+            }
+        }
         const struct { uint32_t width, rows; float eps; uint32_t masked; } args =
             {width, rows, eps, mask != NULL};
         int owned = 0;
@@ -50183,9 +50199,11 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
         for (NSUInteger i = 0; i < 5; i++)
             [enc setBuffer:ds4_gpu_tensor_buffer(inputs[i])
                     offset:ds4_gpu_tensor_offset(inputs[i]) atIndex:i + 1];
+        if (tg) [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(rows, 4, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(tg ? 256 : 32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        if (tg) g_engram_add_tg_calls++;
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 Engram gate");
     }
 }

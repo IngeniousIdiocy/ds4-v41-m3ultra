@@ -40853,6 +40853,7 @@ static bool ds41_engram_fp8_off(void) { static int c = -1; return ds41_env_flag(
 static bool ds41_indexer_fp8_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_INDEXER_FP8", &c); }
 static DS4_MAYBE_UNUSED bool ds41_rope_tab_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ROPE_TAB", &c); }
 static DS4_MAYBE_UNUSED bool ds41_heads_once_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_HEADS_ONCE", &c); }
+static DS4_MAYBE_UNUSED bool ds41_engram_add_tg_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG", &c); }
 static DS4_MAYBE_UNUSED bool ds41_sampler_gpu_off(void) { static int c = -1; return ds41_env_flag("DS4_METAL_DISABLE_V41_SAMPLER_GPU", &c); }
 
 /* One block's HC input: the mixer projection, then split, weighted sum with
@@ -42747,6 +42748,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     /* The GPU top-p selector only on the queued-head decode step (logits, one host, resident, not quality), so
      * prefill, verify, TP and streaming never encode it. */
     g->sel_gpu = queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() && !ds41_sampler_gpu_off();
+    /* The Engram gate with one 256-thread group per stream on this decode step (numerical, S40 EADD); prefill,
+     * verify, TP, streaming and quality keep the 32-lane form. */
+    ds4_gpu_set_engram_add_tg(logits && g->tp_world == 1 && !g->streaming && !g->quality && !ds41_engram_add_tg_off());
 #endif
     /* each family: its sidecar when loaded, else the copy built at load */
     g->router_model = w->router_bf16_model;
@@ -42829,6 +42833,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g->rope_tab_on = false;   /* the table never outlives its step */
     g->heads_once = false;
     g->sel_gpu = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_set_engram_add_tg(0);
+#endif
     g->tp_gate_fused = false;
     for (uint32_t i = 0; i < 2; i++)
         if (rows[i]) ds4_engram_read_batch_finish(rows[i]);   /* a failure before layer 1 */
@@ -78954,6 +78961,14 @@ void ds4_sampler_gpu_counts(uint64_t out[9]) { for (int i = 0; i < 9; i++) out[i
 uint64_t ds4_sampler_gpu_encoded_count(void) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     return ds4_gpu_selector_encoded_count();
+#else
+    return 0;
+#endif
+}
+/* decode Engram gates that ran in the 256-thread form */
+uint64_t ds4_engram_add_tg_count(void) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    return ds4_gpu_engram_add_tg_count();
 #else
     return 0;
 #endif

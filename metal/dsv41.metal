@@ -469,6 +469,55 @@ kernel void kernel_dsv41_engram_add(
             gate * dsv41_bf16(kv[value_offset + i]));
 }
 
+/* The decode Engram gate with one 256-thread group per stream instead of one 32-lane SIMD group (S40 EADD,
+ * D025-C). Every input element, both RMS norms, the per-element (h * (q*k)) * k product, the gate expression and
+ * every BF16 boundary are those of kernel_dsv41_engram_add; the three reductions run as float4 lanes -> SIMD sums
+ * -> an 8-way threadgroup sum in a fixed order (a different, numerically equivalent summation order), and the
+ * residual update runs over all 256 threads. Host: width % 1024 == 0, unmasked. */
+kernel void kernel_dsv41_engram_add_tg256(
+        constant ds4_metal_args_dsv41_engram &args,
+        device float *residual,
+        device const float *kv,
+        device const float *q_weight,
+        device const float *k_weight,
+        device const uchar *mask,
+        threadgroup float *red [[threadgroup(0)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.masked && !mask[group.x]) return;
+    const ulong offset = ((ulong)group.x * 4u + group.y) * args.width;
+    const ulong key_offset = ((ulong)group.x * 5u + group.y) * args.width;
+    const ulong value_offset = ((ulong)group.x * 5u + 4u) * args.width;
+    device float4 *h4 = (device float4 *)(residual + offset);
+    device const float4 *k4 = (device const float4 *)(kv + key_offset);
+    device const float4 *v4 = (device const float4 *)(kv + value_offset);
+    device const float4 *qw4 = (device const float4 *)(q_weight + (ulong)group.y * args.width);
+    device const float4 *kw4 = (device const float4 *)(k_weight + (ulong)group.y * args.width);
+    const uint n4 = args.width / 4u;
+    float4 h2 = 0.0f, k2 = 0.0f, dt = 0.0f;
+    for (uint i = tid; i < n4; i += 256u) {
+        const float4 h = h4[i];
+        const float4 k = dsv41_bf16(k4[i]);
+        h2 += h * h;
+        k2 += k * k;
+        dt += h * (qw4[i] * kw4[i]) * k;
+    }
+    const float s0 = simd_sum((h2.x + h2.y) + (h2.z + h2.w));
+    const float s1 = simd_sum((k2.x + k2.y) + (k2.z + k2.w));
+    const float s2 = simd_sum((dt.x + dt.y) + (dt.z + dt.w));
+    if (lane == 0u) { red[sg] = s0; red[8u + sg] = s1; red[16u + sg] = s2; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float hs = 0.0f, ks = 0.0f, ds = 0.0f;
+    for (uint j = 0; j < 8u; j++) { hs += red[j]; ks += red[8u + j]; ds += red[16u + j]; }
+    const float dot = ds * rsqrt(hs / args.width + args.eps) *
+          rsqrt(ks / args.width + args.eps) * rsqrt(float(args.width));
+    const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
+    for (uint i = tid; i < n4; i += 256u)
+        h4[i] = dsv41_bf16(h4[i] + gate * dsv41_bf16(v4[i]));
+}
+
 struct ds4_metal_args_dsv41_pool {
     uint width;
     uint pairs;
