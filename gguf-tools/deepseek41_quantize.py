@@ -57,8 +57,10 @@ def validate_scales(tensors):
             raise ValueError(f"{name}: expected E8M0 scales {expected}")
 
 
-def build_plan(db, config, quant="q2", dspark="none"):
-    """The main plan, and separately the DSpark stages when dspark is "separate"."""
+def build_plan(db, config, quant="q2", dspark="none", trunk=True):
+    """The main plan, and separately the DSpark stages when dspark is "separate".
+
+    With trunk=False only the mtp.* source tensors are needed (drafter-only runs)."""
     if quant not in QUANTIZATION:
         raise ValueError(f"unknown quantization recipe: {quant}")
     if dspark not in ("separate", "none"):
@@ -125,10 +127,11 @@ def build_plan(db, config, quant="q2", dspark="none"):
                                    expert_qtype(qt), "experts", source=pattern, expert_layer=layer,
                                    expert_part=part, expert_count=n_exp))
 
-    regular("token_embd.weight", "embed.weight", (vocab, dim), QTYPE_F16, "embedding")
-    regular("output_norm.weight", "norm.weight", (dim,), QTYPE_F32, "norm")
-    regular("output.weight", "head.weight", (vocab, dim), QTYPE_Q8_0, "output")
-    for layer in range(c["num_hidden_layers"]):
+    if trunk:
+        regular("token_embd.weight", "embed.weight", (vocab, dim), QTYPE_F16, "embedding")
+        regular("output_norm.weight", "norm.weight", (dim,), QTYPE_F32, "norm")
+        regular("output.weight", "head.weight", (vocab, dim), QTYPE_Q8_0, "output")
+    for layer in range(c["num_hidden_layers"] if trunk else 0):
         src, dst = f"layers.{layer}", f"blk.{layer}"
 
         def middle(src=src, dst=dst, layer=layer):
@@ -181,6 +184,8 @@ def build_plan(db, config, quant="q2", dspark="none"):
     omitted = {name for name in db.tensors if name.startswith(("vision.", "aligner.", "image_"))}
     if not stages:
         omitted |= {name for name in db.tensors if name.startswith("mtp.")}
+    if not trunk:
+        omitted |= {name for name in db.tensors if not name.startswith("mtp.")}
     if consumed | omitted != set(db.tensors):
         raise ValueError(f"unclaimed source tensors: {sorted(set(db.tensors) - consumed - omitted)[:10]}")
     main = plan + disk
@@ -385,7 +390,7 @@ def main():
     config, records = metadata(args.hf, args.source_revision)
     db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
     try:
-        plan, draft = build_plan(db, config, args.quant, dspark)
+        plan, draft = build_plan(db, config, args.quant, dspark, trunk=bool(args.out))
         quantization = [kv_string("deepseek41.quantization", QUANTIZATION[args.quant]),
                         kv_string("deepseek41.calibration", "imatrix" if args.imatrix else "weight-energy bootstrap")]
         if args.imatrix:
@@ -394,7 +399,8 @@ def main():
         support = [kv_string("general.architecture", "deepseek41-dspark"),
                    kv_string("general.name", "DeepSeek V4.1 Flash DSpark"),
                    kv_string("general.source.revision", args.source_revision),
-                   kv_u32("general.alignment", GGUF_ALIGNMENT)] + dspark_records(config) + quantization
+                   kv_u32("general.alignment", GGUF_ALIGNMENT),
+                   kv_string("dspark.target_architecture", "deepseek41")] + dspark_records(config) + quantization
         outputs = ([(args.out, plan, records)] if args.out else []) + \
                   ([(args.dspark_out, draft, support)] if args.dspark_out else [])
         for out, items, kv in outputs:
