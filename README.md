@@ -233,8 +233,7 @@ Scope and caveats:
   measured that; see "Restart and the disk cache" below.
 
 The receipts give the ranges, answer lengths and the corrections to the
-window's first summary. Source: W8's summary
-(`ux-compare/runs/w8-a1/summary.txt`, not published).
+window's first summary. Source: W8's summary (not published).
 
 ### Restart and the disk cache
 
