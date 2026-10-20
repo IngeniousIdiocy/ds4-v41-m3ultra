@@ -138,8 +138,8 @@ gate keeps the 32-lane kernel's arithmetic and spreads only the loads:
 
 It is bit-identical to the 32-lane kernel: 0 of 3,072,000 fresh streams
 (15.7G values) differ. In a micro at the decode shape, a call takes 18.6 µs
-against 122.5 µs. Its gain in the composed stack at 8K comes from the next
-composed window, and the README will give it.
+against 122.5 µs. A later register form brought it to 7.5 µs with the same
+bits (see "The last steps" below).
 
 The campaign first reached 40 with an earlier 256-thread form that summed in
 a different order. That form is under "What did not work".
@@ -160,9 +160,10 @@ The last 0.1 to 0.2 ms came from the time between tokens:
 24.942 ms per token, **40.129 / 40.093 tok/s**, every treatment run above
 40. That build used the earlier, inexact Engram gate; every other lever
 in it was bit-exact against its control. This branch ships the staged exact
-gate instead, so the campaign result is not this branch's number. This
-branch's 8K number is in the README, from a composed window still pending.
-Release quality qualification of the whole stack is also still open.
+gate instead, so the campaign result is not this branch's number. With the
+exact gate, the branch makes no numerical change to the engine's output:
+every change reproduces its control's bits, in kernel tests and in
+end-to-end digests. The release's own numbers are under "The last steps".
 
 ## What did not work
 
@@ -224,10 +225,30 @@ After the 8K milestone, the work moved to depth, serving and a public build:
   canary and a payload hash. A 300K conversation that took 391.6 s to first
   token cold resumes in 11.2 s after a restart. A restart test found an
   older bug that deleted a checkpoint on shutdown; it is fixed.
-- **Comparison against Ivan Fioravanti's performance branch:** see the
-  README (pending).
 - **DSpark:** 57.70 tok/s on a code answer, against 52.61 on the production
   build.
+
+### The last steps
+
+The final work went to depth, the Engram gate and the disk cache. At depth
+the sparse indexer's scoring grew with the number of keys, so the scorers
+now read the index keys through a BF16 view (the keys are exact BF16 values
+stored as F32), candidate rows are scored with two lanes per key, a one-row
+top-k finishes from one gathered pass, and DSpark's verify rows use the same
+BF16 scorer. Each kernel gives the bits of the one it replaces. The exact
+Engram gate was rewritten to load each lane's terms into registers in eight
+segments and hand the running sums from one SIMD group to the next, so every
+lane still adds its 160 terms in the same order: 7.5 µs per call instead of
+about 18, with 0 of 3,072,000 test streams differing; a reordered form about
+1.8 µs faster was not exact and is not used. Last, a restart test of the
+release candidate showed that a request which restored a short prefix from
+disk and extended it never saved the longer prefix, so every later request
+restored only the short one. The server now stores the extended prefix
+(08d79dd0). On the release, decode runs at 40.86 to 40.91 tok/s at 8K and
+39.47 at 300K, with the same tokens, logits and state digests as the
+previous October build; going from 64K to 300K costs 0.53 to 0.62 ms per
+token, down from 1.00 to 1.06. The receipts give the windows (r1bench-a3,
+rcv-a1, codeds-a1, r1cc-a5).
 
 ## Credits
 

@@ -7,9 +7,6 @@ several commits.
 
 Glossary for the labels in this page and in the commit messages:
 
-- **Worker A to worker D**: the parallel implementation agents of the serial
-  40 tok/s campaign that produced this branch.
-- **Codex**: the reviewing architect model.
 - **Window labels** such as `fp8pf-a5`, `irqres-a1`, `w1-a2`, `W5` or `W72`:
   measurement windows, each a protected run on the M3 Ultra. This page
   summarises their evidence.
@@ -19,6 +16,225 @@ Glossary for the labels in this page and in the commit messages:
 
 Unless stated otherwise: one M3 Ultra (512 GB), the 1017 MXFP4 target
 weights, decode at concurrency 1, and the campaign's prose and code fixtures.
+
+The October release is e8d23bb6. Its numbers come from four windows,
+summarised first: r1bench-a3 (decode at every context), rcv-a1 (the release
+itself: decode, the DwarfStar comparison and restart), codeds-a1 (DSpark on
+code) and r1cc-a5 (the README's steps on a clean clone). The sections after
+them are the earlier evidence for individual commits.
+
+## Exactness of the default build
+
+With the exact Engram gate (3ea32856, in its register form since 0004c5cf),
+the default build makes no numerical change to the engine's output. Every
+change reproduces its control's bits. The evidence:
+
+- **Kernel tests:** bit-for-bit comparisons over fresh random inputs at the
+  production shapes, in `tests/test_deepseek41_metal` (see GPU tests below).
+  The Engram gate's test, `--engram-add-exact 750`, found 0 of 3,072,000
+  streams and 0 of 15,728,640,000 values differing.
+- **End-to-end digests:** decoded tokens, frontier prefix, final logits and
+  session state, equal to the previous October build at 8K to 300K, greedy
+  and sampled (r1bench-a3 below).
+- **Narrow copies:** lossless by construction. `ds41_fp8_copy_build` keeps
+  an E4M3 copy only if every block is exact, and the BF16 copies are kept
+  only if every value is exact BF16. Otherwise the wide path is used.
+
+Limits:
+
+- End-to-end identity is shown on the pinned fixtures. Beyond them it rests
+  on the kernel tests.
+- The statement covers decode without drafting. DSpark's batched verify is
+  not bitwise equal to one-token decode, by the engine's design.
+
+## Release decode numbers (r1bench-a3)
+
+Setup:
+
+- Control: ece7746a, the previous October build. Candidate: d35a9315. The
+  release adds two commits on top of d35a9315, a server change (08d79dd0)
+  and a CPU-build link fix (e8d23bb6); rcv-a1 B below reruns the candidate's
+  greedy cells on the release.
+- `ds4-bench`, one engine per process. Every context was prefilled once in
+  window W10-a3 and saved; each process loads the same saves (8K prose, 8K
+  code, and prose at 65,536, 131,072 and 300,000 tokens). The loaded frontier
+  logits were identical in every process.
+- G is greedy, 128 tokens, seed 1. S is sampled, 512 tokens, seed 1017, temp
+  1, top_p 0.95.
+- Four processes, mirrored: control, candidate, candidate, control. Each
+  cell has three runs per arm; the tables give the median.
+
+Every cell was IDENTICAL: the control and the candidate gave the same token
+ids, logits and state digests in every run.
+
+| Cell | Control ms/token | Candidate ms/token | Candidate tok/s | Δ ms |
+| --- | ---: | ---: | ---: | ---: |
+| G prose 8K | 24.630 | 24.472 | 40.862 | −0.158 |
+| S prose 8K | 24.615 | 24.454 | 40.892 | −0.160 |
+| G code 8K | 24.752 | 24.442 | 40.914 | −0.310 |
+| S code 8K | 24.853 | 24.548 | 40.736 | −0.305 |
+| G prose 64K | 25.182 | 24.718 | 40.457 | −0.464 |
+| S prose 64K | 25.157 | 24.765 | 40.379 | −0.392 |
+| G prose 131K | 25.493 | 24.953 | 40.075 | −0.541 |
+| S prose 131K | 25.474 | 24.940 | 40.096 | −0.534 |
+| G prose 300K | 26.242 | 25.335 | 39.471 | −0.906 |
+| S prose 300K | 26.152 | 25.294 | 39.535 | −0.858 |
+
+Depth slope, 64K to 300K (prose): greedy +1.060 ms on the control against
++0.618 on the candidate; sampled +0.995 against +0.529. The candidate's
+processes never logged "not bf16-exact", so every index key took the BF16
+view.
+
+Opt-outs, each in its own process, against the control's numbers:
+
+- po6 set the six switches new since the control
+  (`DS4_METAL_DISABLE_V41_INDEX_BF16`, `_CAND_SPLIT`, `_CAND_SELECT_ONE`,
+  `_TOPK_GATHER`, `_SCORE_SPLIT`, `_VERIFY_INDEX_BF16`). Its digests equal
+  the control's at 8K and 300K, greedy and sampled, at the control's speed
+  (+0.024 to +0.069 ms/token).
+- po9 set those six plus `_SPLIT_COLLAPSE`, `_TOPK_FUSED_MERGE` and
+  `_ENGRAM_ADD_TG`. Its digests also equal the control's, at +0.32 to +0.53
+  ms/token.
+
+Cold prefill at 64K (65,536 tokens) on the candidate, four processes: 890.2
+and 890.5 tok/s by default, 845.0 and 845.0 with
+`DS4_METAL_DISABLE_V41_INDEX_MMA=1` (×1.054).
+
+`tests/test_deepseek41_graph` from the candidate tree: `MODEL --memory-plan`
+and `--batch-admission` pass.
+
+All processes exited 0 and were valid; teardown was proven.
+
+## Release validation (rcv-a1)
+
+Trees and binaries:
+
+- P: the release, e8d23bb6, `ds4-server` sha256 `510c3c8e…`. The restart
+  cells that force a canary failure used its test build
+  (`ds4-server-testhooks`, `6600a9b4…`).
+- U: DwarfStar, antirez/ds4 main at 5379c1c9, `ds4-server` sha256
+  `3bc56f9b…`.
+- The servers loaded the MXFP4 GGUF and drafter that the README's Prepare
+  step wrote (window prep-a1). U's DSpark arm loaded a copy of that drafter
+  with its two Markov-head tensors renamed to `markov_w1` / `markov_w2`;
+  DwarfStar's loader reported `missing=0 invalid=0` for it. With the
+  unrenamed drafter, DwarfStar refused to start ("invalid V4.1 DSpark
+  weights", window r1srv-a4).
+- Server flags: the README's Run launch, with DSpark on or off as named, on a
+  test port and a per-window cache directory.
+
+**B, the release's decode against d35a9315.** `ds4-bench`, greedy 128 tokens
+from the W10-a3 saves, three runs. Every cell IDENTICAL to the r1bench-a3
+candidate's runs (one token, logits and state digest per cell):
+
+| Context | Release tok/s | d35a9315 tok/s (r1bench-a3) |
+| ---: | ---: | ---: |
+| 8K | 40.95 | 40.86 |
+| 64K | 40.39 | 40.46 |
+| 131K | 40.09 | 40.08 |
+| 300K | 39.51 | 39.47 |
+
+**Decode against DwarfStar.** One document's prefixes (2,054 / 8,252 /
+33,575 / 67,324 tokens), thinking off, 256 tokens each, one request at a
+time. Rates are the client's; the server log agrees to within 0.1 tok/s.
+
+| Context | U | U + DSpark | P | P + DSpark |
+| ---: | ---: | ---: | ---: | ---: |
+| 2K | 19.68 | 19.90 | 41.45 | 39.99 |
+| 8K | 19.54 | 20.75 | 41.23 | 39.94 |
+| 32K | 19.23 | 19.97 | 40.91 | 39.74 |
+| 64K | 18.78 | 19.75 | 40.74 | 39.56 |
+
+- U, U + DSpark and P + DSpark restored each prompt from disk-cache entries
+  saved in window r1srv-a4 (2,054 / 8,192 / 32,768 / 65,536 tokens cached).
+  P without DSpark prefilled each prompt cold in this window, and its decode
+  followed that prefill.
+- One run per cell.
+
+**Cold prefill against DwarfStar** (time to first token, thinking off):
+
+| Context | U | P |
+| ---: | ---: | ---: |
+| 2K | 6.15 s | 4.90 s |
+| 8K | 13.62 s | 11.64 s |
+| 32K | 48.13 s | 41.45 s |
+| 64K | 96.56 s | 80.73 s |
+
+- P is rcv-a1's cold arm above, one run on the release.
+- U is window r1srv-a4: the same build, model and prompts, three server
+  lifetimes, median of six runs at 2K and 8K and of three at 32K and 64K.
+  r1srv-a4 also ran d35a9315 the same way: 4.88 / 11.93 / 41.71 / 81.50 s.
+
+**S, extending a restored prompt** (P with DSpark):
+
+- Life 1: an 8K prompt (8,242 tokens) prefilled cold, 11.94 s, and stored
+  its 8,192-token checkpoint. A 64K prompt (67,314 tokens) that extends it
+  restored 8,192 tokens, prefilled the rest (72.17 s to first token), and
+  logged "kv cache extends restored prefix cached=8192 store=65536
+  prompt=67314". It stored a 65,536-token checkpoint.
+- Life 2, after a restart: the same 64K prompt restored 65,536 of 67,314
+  tokens, 5.61 s to first token, with the same output digest as life 1.
+- A cold 8K prose request in life 2 gave the same digest as an earlier run of
+  the release candidate.
+
+**K, restart and the disk cache** (P with DSpark, nine server lifetimes on
+one cache directory). Every cell passed:
+
+| Cell | Result |
+| --- | --- |
+| k0 | Cold: a 303,912-token conversation, 388.49 s to first token; an 8K one, 16.39 s. Identity `19b0e9b36b25d909`, canary `772938c1f52ab041`; the canary took 7.08 s idle, and the cache came on 13.11 s after launch. |
+| k1 | 8K resend right after a restart: 9.10 s to first token, 8,105 of 8,600 cached. A fresh 11-token prompt at the same point: 7.31 s. |
+| k2 | 300K resend right after a restart: 303,944 of 304,463 cached, prompt done in 3.19 s, 11.04 s to first token. |
+| k3 | 300K, 8K and an 11-token request sent together during the canary: answered in that order, at 10.88 / 14.53 / 15.28 s. |
+| k4 | SIGTERM 2 s after listen, with the 300K request queued: exit 0 in 6.18 s, every cache entry kept (8 before and after), and the queued request answered 503. |
+| k5 | Next restart: the 300K conversation restored 303,944 of 304,472 tokens, 10.82 s to first token. |
+| k6 | Canary forced to fail: "KV disk cache stays off", no stores, entries unchanged; an 8K request prefilled cold, 19.97 s. |
+| k7 | Relaunched with a 1,024 MiB budget over the cache plus 26 entries seeded under an earlier build's canary: 35 entries evicted as disk-cache-full, including all 26 seeded ones. |
+
+The canary itself took 7.04 to 7.18 s in each lifetime of rcv-a1, codeds-a1
+and r1cc-a5.
+
+## DSpark on code (codeds-a1)
+
+The release with the README's Run launch, against the same launch without
+`--mtp-model … --dspark --mtp-exact-sampling`. Three code-writing prompts
+(an LRU cache in C, an asyncio rate limiter in Python, a trie in Rust),
+thinking off, temperature 0, 512 tokens each, one run per arm. Rates from
+the server log:
+
+| Prompt | DSpark on | DSpark off | On / off |
+| --- | ---: | ---: | ---: |
+| LRU cache, C | 50.10 | 41.64 | ×1.203 |
+| Rate limiter, Python | 48.81 | 41.66 | ×1.172 |
+| Trie, Rust | 46.65 | 41.72 | ×1.118 |
+
+The DSpark arm's counters over its lifetime: 612 tokens proposed, 552
+accepted (90.20%). All six answers ran to 512 tokens and were sane code.
+
+## Clean-checkout run of the release (r1cc-a5)
+
+A fresh clone of e8d23bb6, following the README's Prepare, Run and Test
+steps. Deviations: the downloads and the prepare step were skipped because
+window prep-a1 had already written the files, so the steps point at that
+output; the server used a test port and its own cache directory.
+
+- **v01:** `deepseek41_prepare.py --verify` on those files: main OK, DSpark
+  OK.
+- **s01:** `make`, then the Run launch. It listened, built the narrow copies
+  at load (101.8 ms, 490.3 MiB), and turned the cache on after its canary
+  (7.10 s). A chat request, a 600-token code answer (40.76 tok/s, DSpark
+  77.0% accepted) and a short reasoning request all succeeded. SIGTERM exited
+  in 1.0 s.
+- **t01:** `./ds4_test --server`: pass.
+- **t02:** `./tests/test_deepseek41_metal`: pass (150 PASS lines).
+- **t03:** `./ds4_test` with `DS4_TEST_MODEL`: 19 OK, 0 errors. Skipped by
+  design: the V4 Flash 0731 fixtures, `--dspark-verify-depth` (needs
+  `DS4_TEST_DSPARK`), and tests for other models or opt-in modes.
+- **t04:** `./ds4_test --dspark-verify-depth` with both models: pass. Its
+  V4-only prefix-capture check is skipped on V4.1, which verifies through its
+  own path.
+
+Every process was valid, and teardown was proven.
 
 ## Composed run of this branch at 8K (fp8pf-a5 d01, P25)
 
@@ -49,10 +265,12 @@ Caveats:
   leaving 0.283818 / 0.285929 ms to the 25 ms (40 tok/s) line. The run-to-run
   ranges were 0.027327 / 0.054748 ms. Two harness dry runs started during d01.
   The contention check aborted both at once, and no bits were affected, but
-  they may have added CPU noise. A clean repeat is planned.
+  they may have added CPU noise. r1bench-a3 (above) is the clean repeat, on
+  the release candidate.
 - The window did not pass as a whole. In the same d01 process, the optional
   `DS4_V41_S1TG` arm (`cn`) failed the exactness gate, which stopped the
-  window. Rows d02 and d03 (the sidecar and builder-off decode arms) and a01
+  window. (`DS4_V41_S1TG` was a letter list of single-group kernels; it was
+  removed in ece7746a, see the single-group kernels section.) Rows d02 and d03 (the sidecar and builder-off decode arms) and a01
   did not run. The window's verdict was INVALID, with its rows kept for
   adjudication and no speed verdict. P25 accepted the d01 default-arm rows on
   their digests.
@@ -60,8 +278,8 @@ Caveats:
 The same window ran the `DS4_V41_S1TG` arms. Their result, and the later
 default for `c` and `k`, are in the single-group kernels section below.
 
-The depth rows of the README (64K, 131K, 300K) are still W5 on the
-state-depth tree. A composed depth run on this branch is pending.
+The depth rows measured before the release (64K, 131K, 300K) were W5 on the
+state-depth tree. The composed depth run of the release is r1bench-a3, above.
 
 ## DwarfStar main reference (W8, P29)
 
@@ -161,8 +379,8 @@ unchanged):
 - Prompt tokens / TTFT is a user-visible rate, not the prefill kernel's rate.
 
 Scope: this result does not isolate individual optimizations or establish
-quality equivalence. It does not replace the composed 131K/300K checks or
-the pinned-profile checks.
+quality equivalence. The release's own comparison with DwarfStar main is
+rcv-a1, above.
 
 ## Disk KV cache v2 and saved checkpoints (W6, W7; P24, P27)
 
@@ -266,7 +484,8 @@ e2136edd fixes both. An interrupted prefill keeps the entry and logs "kv cache
 kept reason=prefill-interrupted". During shutdown, an interrupted prefill and
 a job taken off the queue are both answered 503 "server is shutting down".
 The server unit test `test_shutdown_prefill_keeps_kv_and_answers` covers this
-(`ds4_test --server`); the cell itself has not been re-run in a window.
+(`ds4_test --server`). rcv-a1 re-ran the restart cells on the release, and
+k4 passed there: every entry kept and the queued request answered 503.
 
 ## Public 1017 weights: download and header check
 
@@ -501,7 +720,10 @@ These were measured and are not in the branch:
   general-set NLL was +0.00256 nats/token (SE 0.00137). It was replaced
   because it was not bit-exact. The staged form gives the 32-lane
   bits and keeps about 90% of the gain (micro: 18.6 against 8.25 µs per call,
-  32 lanes 122.5).
+  32 lanes 122.5). Its register form (0004c5cf) keeps the same bits and
+  takes 7.5 to 7.6 µs per call at 1 to 6 rows. A reordered 320-thread form
+  was about 1.8 µs faster per call and differed in 2,426 of 40,960 micro
+  streams; it is not used.
 - **EADD fused into the Engram tail (fusion micro):** exact, but 236.3 µs
   (value rows first) or 271.7 µs (in order) against 227.8 separate.
 
@@ -510,15 +732,17 @@ contention; the A/B order repeated.
 
 ## Single-group latency kernels (f45f4e8, 77eea27; default since 7f2ba58)
 
-`DS4_V41_S1TG` letters, read per call:
+Two decode kernels, measured as letters of the former `DS4_V41_S1TG` list:
 
 - `c`: the split HC collapse, two dispatches over 32 + 10 groups in place of
   one 1024-thread group (80 calls per token).
 - `k`: the decode top-k merge ladder, staged in threadgroup memory and
   finished in one 1024-thread group (8 calls per token).
 
-Both are on by default. When `DS4_V41_S1TG` is set, it names exactly the
-letters to use, and `none` (or empty) restores the original kernels.
+Both are on by default. Since ece7746a each has its own opt-out, read per
+call: `DS4_METAL_DISABLE_V41_SPLIT_COLLAPSE=1` restores the single-group
+collapse and `DS4_METAL_DISABLE_V41_TOPK_FUSED_MERGE=1` the per-level merge
+ladder. `DS4_V41_S1TG` no longer exists.
 
 Exactness of `c` and `k`:
 
@@ -533,7 +757,9 @@ Exactness of `c` and `k`:
     form. The merge only compares and moves pairs; it does no float
     arithmetic.
 - **Model-free, in the test suite.** `tests/test_deepseek41_metal --s1tg`
-  runs each call with and without `DS4_V41_S1TG`.
+  ran each call with and without `DS4_V41_S1TG`; since ece7746a the same
+  checks are `--split-collapse` and `--fused-merge`, each against its
+  opt-out.
   - `c`: 200 fresh calls, 0 of 2,048,000 values differ.
   - `k`: widths 1024 to 65536, covering one level, fused only, and staged
     levels first. Random, tied, `-inf`-tailed, signed-zero, NaN and
@@ -544,7 +770,9 @@ Exactness of `c` and `k`:
     −0.105 (prose / code). The base's digests equal the irqres-a1 T arm.
   - Window W10-a2, `c` and `k` together: bitwise equal to the base, with
     logits digests `ed3ca952` (prose) and `c1c571c0` (code).
-- The depth and server evidence comes from the release window R1.
+- **At depth and with the Engram gate, on the release candidate:**
+  r1bench-a3's po9 process set both opt-outs (with seven others) and gave
+  the control's digests at 8K and 300K.
 
 Removed letters:
 
@@ -612,3 +840,12 @@ windows:
 | e7ab260, 82923a2 | `--index-candidates` |
 | 80c86de | no flag (`check_engram` in the full run) |
 | 9ab435c | `--rope-tab` |
+| 3ea32856, 0004c5cf, 45a2152c | `--engram-add-exact` |
+| ece7746a | `--split-collapse`, `--fused-merge` |
+| 19da258b, 435249bd, e2cf602b | `--index-score-bf16` |
+| e9a34b33 | `--index-candidates` |
+| 197979ee | `--topk-select` |
+| a2271493, d35a9315 | `--verify-index-bf16` |
+
+The full run of `tests/test_deepseek41_metal` on the release passed in
+r1cc-a5.
