@@ -5788,6 +5788,19 @@ static bool test_logprob_vector_case_disabled(const char *path,
            !strcmp(vc->id, "long_memory_archive");
 }
 
+/* The flash-0731 and flash-pre-0731 fixtures are DeepSeek V4 Flash. Against
+ * another model they are an invalid pairing, not a quality result
+ * (tests/test-vectors/README.md). */
+static bool test_vector_fixture_mismatch(ds4_engine *engine, const char *path) {
+    if (strncmp(path, "tests/test-vectors/flash-0731/", 30) &&
+        strncmp(path, "tests/test-vectors/flash-pre-0731/", 34)) return false;
+    const char *model = ds4_engine_model_name(engine);
+    if (model && !strcmp(model, "DeepSeek V4 Flash")) return false;
+    fprintf(stderr, "ds4-test: fixture %s is DeepSeek V4 Flash; this model is %s: invalid pairing, "
+            "skipped (tests/test-vectors/README.md)\n", path, model ? model : "unknown");
+    return true;
+}
+
 static void test_official_logprob_vectors_run(const char *case_filter) {
     const char *path = getenv("DS4_TEST_VECTOR_FILE");
     if (!path || !path[0]) {
@@ -5818,7 +5831,8 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
 
     test_vec_case vc;
     int ran = 0;
-    while (test_read_vector_case(fp, &vc)) {
+    const bool skip = test_vector_fixture_mismatch(engine, path);
+    while (!skip && test_read_vector_case(fp, &vc)) {
         if (!test_fill_vector_case(fp, &vc)) break;
         if (case_filter && case_filter[0] && strcmp(vc.id, case_filter)) {
             continue;
@@ -5832,7 +5846,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
         test_logprob_vector_case(engine, &vc);
         ran++;
     }
-    TEST_ASSERT(!case_filter || !case_filter[0] || ran == 1);
+    TEST_ASSERT(skip || !case_filter || !case_filter[0] || ran == 1);
     ds4_engine_close(engine);
     test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
     test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
@@ -6096,7 +6110,8 @@ static void test_local_golden_vectors(void) {
     }
 
     test_local_golden_case tc;
-    while (test_read_local_golden_case(fp, &tc)) {
+    const bool skip = test_vector_fixture_mismatch(engine, path);
+    while (!skip && test_read_local_golden_case(fp, &tc)) {
         if (!test_fill_local_golden_case(fp, &tc)) break;
         test_local_golden_case_run(engine, &tc);
     }
