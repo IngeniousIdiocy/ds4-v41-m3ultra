@@ -5776,8 +5776,9 @@ static long long wall_ms(void) {
 static bool send_all(int fd, const void *p, size_t n) {
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+    /* No shutdown check here: the drain must still answer its requests. A
+     * stalled peer is bounded by the deadline, so shutdown cannot hang on it. */
     while (n) {
-        if (g_stop_requested) return false;
         ssize_t w = send(fd, s, n, 0);
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -11411,9 +11412,24 @@ static void kv_cache_slot_restore_suppressed(server_slot *slot,
     }
 }
 
+/* A prefill that started from a disk entry did not finish. Only a genuine
+ * failure evicts the entry (it may be what breaks the prefill, and it would
+ * otherwise be reloaded by every request). A prefill interrupted by shutdown
+ * or by the client says nothing about the entry: it stays on disk. Either way
+ * the session's partial state is dropped. */
 static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
-                                                const char *path) {
+                                                const char *path, int sync_rc) {
     if (!s || !slot || !path) return;
+    if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache kept reason=prefill-interrupted (%s) file=%s",
+                   g_stop_requested ? "shutdown" : "client disconnected", path);
+        slot->continued_last_store_tokens = 0;
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        return;
+    }
     pthread_mutex_lock(&s->kv_mu);
     if (unlink(path) == 0) {
         server_log(DS4_LOG_KVCACHE,
@@ -12699,10 +12715,14 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
 }
 
+/* sync_rc DS4_SESSION_SYNC_INTERRUPTED during shutdown answers 503 (retry
+ * after the restart); every other failure 500. */
 static void send_prefill_failure_response(server *s, const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
-                                          const char *err) {
+                                          const char *err, int sync_rc) {
+    const bool stopping = sync_rc == DS4_SESSION_SYNC_INTERRUPTED && g_stop_requested;
+    if (stopping) err = "server is shutting down";
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
@@ -12720,7 +12740,7 @@ static void send_prefill_failure_response(server *s, const job *j,
         }
         return;
     }
-    http_error(j->fd, s->enable_cors, 500, err);
+    http_error(j->fd, s->enable_cors, stopping ? 503 : 500, err);
 }
 
 /* The bytes render_qwen_chat_prompt_text() appends after this turn's
@@ -13630,14 +13650,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        const int cold_sync_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
+        if (cold_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path, cold_sync_rc);
             free(disk_cache_path);
             if (job_cancelled(j)) {
                 request_live_state_clear(s, slot);
@@ -13645,7 +13666,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 return;
             }
             trace_event(s, trace_id, "prefill failed: %s", err);
-            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err, cold_sync_rc);
             return;
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
@@ -13671,7 +13692,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path, prompt_sync_rc);
         free(disk_cache_path);
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
@@ -13679,7 +13700,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             return;
         }
         trace_event(s, trace_id, "prefill failed: %s", err);
-        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err, prompt_sync_rc);
         return;
     }
     free(disk_cache_path);
@@ -14655,13 +14676,25 @@ decode_again:
 /* Keep cancellation installed for the entire request, including every early
  * return in the large protocol/generation path. The callback is cleared before
  * the client thread can destroy its stack-owned job. */
+/* A queued job that a worker takes after shutdown was requested: its prefill
+ * could not run (the sync stops at once), and loading a disk entry for it would
+ * be wasted. Answer 503 so the client retries after the restart. */
+static void server_refuse_stopping(server *s, const job *j) {
+    server_log(DS4_LOG_DEFAULT, "ds4-server: %s request refused: server is shutting down",
+               j->req.kind == REQ_CHAT ? "chat" : "completion");
+    http_error(j->fd, s->enable_cors, 503, "server is shutting down");
+}
+
 static void generate_job(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->model_mu);
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
 
     ds4_session_set_cancel(slot->session, job_cancelled, j);
-    if (!job_cancelled(j)) generate_job_inner(s, slot, j);
+    if (!job_cancelled(j)) {
+        if (g_stop_requested) server_refuse_stopping(s, j);
+        else generate_job_inner(s, slot, j);
+    }
     ds4_session_set_cancel(slot->session, NULL, NULL);
 
     pthread_mutex_lock(&s->model_mu);
@@ -16643,6 +16676,78 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+/* Shutdown during a disk-cache-hit prefill: the interrupted prefill keeps the
+ * entry (only a genuine failure evicts it), and the drain still answers, with
+ * 503, both a request whose prefill was interrupted and one it never started. */
+static void test_shutdown_prefill_keeps_kv_and_answers(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.kv_mu, NULL);
+    pthread_mutex_init(&s.inference_mu, NULL);
+    server_slot slot;
+    test_server_bind_slot(&s, &slot);
+
+    char path[] = "/tmp/ds4-test-kvkeep-XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd >= 0) close(fd);
+
+    g_stop_requested = 1;
+    slot.continued_last_store_tokens = 4096;
+    kv_cache_discard_failed_disk_entry(&s, &slot, path, DS4_SESSION_SYNC_INTERRUPTED);
+    TEST_ASSERT(access(path, F_OK) == 0);   /* kept */
+    TEST_ASSERT(slot.continued_last_store_tokens == 0);
+
+    job j;
+    memset(&j, 0, sizeof(j));
+    request_init(&j.req, REQ_CHAT, 128);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {   /* interrupted prefill: 503, sent during shutdown */
+        j.fd = sv[0];
+        send_prefill_failure_response(&s, &j, NULL, "0..1:1", "", "interrupted",
+                                      DS4_SESSION_SYNC_INTERRUPTED);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 503") != NULL);
+        TEST_ASSERT(strstr(out, "server is shutting down") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {   /* a queued job taken after shutdown: 503 */
+        j.fd = sv[0];
+        server_refuse_stopping(&s, &j);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 503") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    g_stop_requested = 0;
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {   /* a genuine failure outside shutdown: 500 */
+        j.fd = sv[0];
+        send_prefill_failure_response(&s, &j, NULL, "0..1:1", "", "prefill made no progress", 1);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    request_free(&j.req);
+
+    kv_cache_discard_failed_disk_entry(&s, &slot, path, 1);
+    TEST_ASSERT(access(path, F_OK) != 0);   /* a genuine failure evicts */
+    if (access(path, F_OK) == 0) unlink(path);
+    pthread_mutex_destroy(&s.kv_mu);
+    pthread_mutex_destroy(&s.inference_mu);
 }
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
@@ -22865,6 +22970,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
+    test_shutdown_prefill_keeps_kv_and_answers();
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
