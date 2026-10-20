@@ -65000,6 +65000,39 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #endif
 }
 
+/* 64-bit FNV-1a of a GGUF's header region [0, tensor data): metadata (tokenizer,
+ * templates, hyperparameters) and the tensor table (names, types, shapes,
+ * offsets). which: 0 main model, 1 drafter. 0 when absent. Binds state to the
+ * model layout without hashing hundreds of GB. */
+uint64_t ds4_engine_model_fingerprint(ds4_engine *e, int which) {
+    if (!e) return 0;
+    const ds4_model *m = which == 0 ? &e->model : which == 1 ? &e->mtp_model : NULL;
+    if (!m || !m->map || !m->tensor_data_pos || m->tensor_data_pos > m->file_size) return 0;
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0; i < m->tensor_data_pos; i++) { h ^= m->map[i]; h *= UINT64_C(1099511628211); }
+    h ^= m->file_size;
+    h *= UINT64_C(1099511628211);
+    return h ? h : 1;
+}
+
+/* The weight representation the prefill path consumes, family by family:
+ * "v41pf1 engram=<E> indexer=<I> router=<R>". Decode-only sidecars (BF16
+ * router, FP8 Engram/indexer/output) never shape a prefix, so this branch has
+ * one prefill arithmetic: the GGUF F16 Engram/indexer and F32 router copies. A
+ * prefill consumer of another representation must report it here, so state
+ * persisted under the old one is refused. */
+const char *ds4_engine_prefill_repr(ds4_engine *e) {
+    (void)e;
+    return "v41pf1 engram=f16-gguf indexer=f16-gguf router=f32-gguf";
+}
+
+/* Value source of any narrow copy read by prefill: "none" (no narrow copy),
+ * "public" (derived from the bound model GGUF) or "src:<sha256-16>" (supplement). */
+const char *ds4_engine_prefill_values(ds4_engine *e) {
+    (void)e;
+    return "none";
+}
+
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen) {
     if (!payload || !payload->path || !fp) {
