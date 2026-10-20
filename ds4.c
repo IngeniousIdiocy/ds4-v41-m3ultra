@@ -72490,13 +72490,53 @@ static void engine_print_layout(const ds4_engine *e) {
  *
  * Returns 0 on success. */
 /* V4.1 decode sidecars. Each is a small GGUF written from the original DeepSeek safetensors by its
- * gguf-tools/deepseek41_*_sidecar.py, named by an environment variable at engine open and mapped once as an extra
- * model range; the main model's tensors stay mapped and every non-decode path keeps reading them. The identity
+ * gguf-tools/deepseek41_*_sidecar.py, named by --v41-sidecar FILE (or, as a diagnostic, its environment variable) at
+ * engine open and mapped once as an extra model range; the main model's tensors stay mapped and every non-decode path keeps reading them. The identity
  * check binds a sidecar to the main model's general.source.revision; the binders audit every tensor they use. */
 
-/* DS4_V41_ROUTER_BF16_SIDECAR=<gguf>: the original BF16 router gates (deepseek41_router_bf16_sidecar.py). */
-static int engine_load_router_bf16_sidecar(ds4_engine *e) {
-    const char *path = getenv("DS4_V41_ROUTER_BF16_SIDECAR");
+bool ds4_v41_sidecar_add(const char *list[DS4_V41_SIDECAR_MAX], const char *path) {
+    for (int i = 0; i < DS4_V41_SIDECAR_MAX; i++)
+        if (!list[i]) { list[i] = path; return true; }
+    return false;
+}
+
+/* The family of a --v41-sidecar file by its general.architecture: 0 router BF16, 1 Engram FP8, 2 indexer FP8,
+ * -1 not a V4.1 sidecar. */
+static int v41_sidecar_family(const char *path) {
+    static const char *const arch_name[3] = {"deepseek41-router-bf16", "deepseek41-engram-fp8", "deepseek41-indexer-fp8"};
+    ds4_model sm;
+    model_open(&sm, path, false, false);
+    ds4_str arch = {0};
+    int family = -1;
+    if (model_get_string(&sm, "general.architecture", &arch))
+        for (int i = 0; i < 3 && family < 0; i++) if (ds4_streq(arch, arch_name[i])) family = i;
+    model_close(&sm);
+    return family;
+}
+
+/* The sidecar paths by family: --v41-sidecar files first, then the diagnostic environment variables. */
+static int engine_v41_sidecar_paths(const ds4_engine_options *opt, const char *path[3]) {
+    static const char *const env_name[3] = {"DS4_V41_ROUTER_BF16_SIDECAR", "DS4_V41_ENGRAM_FP8_SIDECAR",
+                                            "DS4_V41_INDEXER_FP8_SIDECAR"};
+    for (int i = 0; i < 3; i++) path[i] = NULL;
+    for (int i = 0; i < DS4_V41_SIDECAR_MAX && opt->v41_sidecar[i]; i++) {
+        const int family = v41_sidecar_family(opt->v41_sidecar[i]);
+        if (family < 0 || path[family]) {
+            fprintf(stderr, "ds4: --v41-sidecar %s is %s\n", opt->v41_sidecar[i],
+                    family < 0 ? "not a DeepSeek V4.1 router/Engram/indexer sidecar" : "a second sidecar of one family");
+            return -1;
+        }
+        path[family] = opt->v41_sidecar[i];
+    }
+    for (int i = 0; i < 3; i++) {
+        const char *v = path[i] ? NULL : getenv(env_name[i]);
+        if (v && v[0]) path[i] = v;
+    }
+    return 0;
+}
+
+/* The original BF16 router gates (deepseek41_router_bf16_sidecar.py). */
+static int engine_load_router_bf16_sidecar(ds4_engine *e, const char *path) {
     if (!path || !path[0]) return 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend != DS4_BACKEND_METAL || e->ssd_streaming) {
@@ -72537,16 +72577,15 @@ static int engine_load_router_bf16_sidecar(ds4_engine *e) {
     return 0;
 #else
     (void)e;
-    fprintf(stderr, "ds4: DS4_V41_ROUTER_BF16_SIDECAR is Metal-only\n");
+    fprintf(stderr, "ds4: the BF16 router sidecar is Metal-only\n");
     return -1;
 #endif
 }
 
-/* DS4_V41_INDEXER_FP8_SIDECAR=<gguf>: the original E4M3 codes and E8M0 32x32 scales of indexer.attn_q_b for the 8
+/* The original E4M3 codes and E8M0 32x32 scales of indexer.attn_q_b for the 8
  * index-source layers (deepseek41_indexer_fp8_sidecar.py). Identity: architecture, source revision, the screened size
  * and SHA-256; coverage: both tensors of every index-source layer, audited. Any mismatch refuses the session. */
-static int engine_load_indexer_fp8_sidecar(ds4_engine *e) {
-    const char *path = getenv("DS4_V41_INDEXER_FP8_SIDECAR");
+static int engine_load_indexer_fp8_sidecar(ds4_engine *e, const char *path) {
     if (!path || !path[0]) return 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend != DS4_BACKEND_METAL || e->ssd_streaming) {
@@ -72577,16 +72616,15 @@ static int engine_load_indexer_fp8_sidecar(ds4_engine *e) {
     return 0;
 #else
     (void)e;
-    fprintf(stderr, "ds4: DS4_V41_INDEXER_FP8_SIDECAR is Metal-only\n");
+    fprintf(stderr, "ds4: the indexer FP8 sidecar is Metal-only\n");
     return -1;
 #endif
 }
 
-/* DS4_V41_ENGRAM_FP8_SIDECAR=<gguf>: the original E4M3 codes and E8M0 32x32 block scales of both Engram KV
+/* The original E4M3 codes and E8M0 32x32 block scales of both Engram KV
  * projections (deepseek41_engram_fp8_sidecar.py); the public F16 conversion lost values these hold. The load audits
  * every code (no E4M3 NaN, 0x7f/0xff) and every scale byte (109..119, the recorded range) and refuses otherwise. */
-static int engine_load_engram_fp8_sidecar(ds4_engine *e) {
-    const char *path = getenv("DS4_V41_ENGRAM_FP8_SIDECAR");
+static int engine_load_engram_fp8_sidecar(ds4_engine *e, const char *path) {
     if (!path || !path[0]) return 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend != DS4_BACKEND_METAL || e->ssd_streaming) {
@@ -72624,7 +72662,7 @@ static int engine_load_engram_fp8_sidecar(ds4_engine *e) {
     return 0;
 #else
     (void)e;
-    fprintf(stderr, "ds4: DS4_V41_ENGRAM_FP8_SIDECAR is Metal-only\n");
+    fprintf(stderr, "ds4: the FP8 Engram sidecar is Metal-only\n");
     return -1;
 #endif
 }
@@ -74416,8 +74454,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (engine_load_router_bf16_sidecar(e) != 0 || engine_load_engram_fp8_sidecar(e) != 0 ||
-            engine_load_indexer_fp8_sidecar(e) != 0) {
+        const char *sidecar[3];
+        if (engine_v41_sidecar_paths(opt, sidecar) != 0 ||
+            engine_load_router_bf16_sidecar(e, sidecar[0]) != 0 || engine_load_engram_fp8_sidecar(e, sidecar[1]) != 0 ||
+            engine_load_indexer_fp8_sidecar(e, sidecar[2]) != 0) {
             free(load_offsets);
             free(load_sizes);
             ds4_engine_close(e);
