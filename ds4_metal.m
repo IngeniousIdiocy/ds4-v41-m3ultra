@@ -49744,9 +49744,13 @@ int ds4_gpu_dsv41_attention_low_ex(ds4_gpu_tensor *low, const void *model_map, u
             .nr0 = 2,
         };
         const ds4_gpu_mv_rope_args rope = ds4_gpu_dsv41_mv_rope_args(512u, pos, compressed, true);
+        /* the decode shape (4096, 1024, 8) takes the table kernel with that shape's literals (opt-out read per call) */
+        const bool low_static = rope_tab && group_dim == 4096u && rank == 1024u && n_groups == 8u &&
+                                !getenv("DS4_METAL_DISABLE_V41_LOW_STATIC");
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(rope_tab ? "kernel_dsv4_attn_out_low_q8_0_f32_rope_tab"
-                                                 : "kernel_dsv4_attn_out_low_q8_0_f32_rope", 4);
+            ds4_gpu_get_mul_mv_pipeline(low_static ? "kernel_dsv4_attn_out_low_q8_0_f32_rope_tab_static"
+                                        : rope_tab ? "kernel_dsv4_attn_out_low_q8_0_f32_rope_tab"
+                                                   : "kernel_dsv4_attn_out_low_q8_0_f32_rope", 4);
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);

@@ -634,8 +634,9 @@ static int check_rope_tab(void) {
     float *h = malloc(hb);
     CHECK(h);
     for (uint64_t i = 0; i < hb / 4; i++) h[i] = random_value();
-    ds4_gpu_tensor *heads = upload(h, hb), *a = upload(NULL, lb), *b = upload(NULL, lb), *tab = upload(NULL, 512);
-    CHECK(heads && a && b && tab && ds4_gpu_set_model_map(model, a_bytes));
+    ds4_gpu_tensor *heads = upload(h, hb), *a = upload(NULL, lb), *b = upload(NULL, lb), *c = upload(NULL, lb);
+    ds4_gpu_tensor *tab = upload(NULL, 512);
+    CHECK(heads && a && b && c && tab && ds4_gpu_set_model_map(model, a_bytes));
     const uint32_t positions[] = {0, 1, 2, 7, 511, 4095, 8191, 65535, 131071, 300000, 1048575};
     for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) {
         for (int compressed = 0; compressed < 2; compressed++) {
@@ -645,12 +646,20 @@ static int check_rope_tab(void) {
             CHECK(ds4_gpu_end_commands() && ds4_gpu_tensor_write(heads, 0, h, hb) && ds4_gpu_begin_commands());
             CHECK(ds4_gpu_dsv41_rope_coeff_table(tab, pos));
             CHECK(ds4_gpu_dsv41_attention_low_ex(b, model, a_bytes, 0, GROUP, RANK, GROUPS, heads, pos, compressed, tab));
+            CHECK(ds4_gpu_end_commands() && ds4_gpu_tensor_write(heads, 0, h, hb));
+            /* the table kernel without the shape literals (static low off) */
+            CHECK(setenv("DS4_METAL_DISABLE_V41_LOW_STATIC", "1", 1) == 0 && ds4_gpu_begin_commands());
+            const int ok = ds4_gpu_dsv41_attention_low_ex(c, model, a_bytes, 0, GROUP, RANK, GROUPS, heads, pos, compressed, tab);
+            CHECK(unsetenv("DS4_METAL_DISABLE_V41_LOW_STATIC") == 0 && ok);
             CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
             CHECK(!memcmp(ds4_gpu_tensor_contents(a), ds4_gpu_tensor_contents(b), lb));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(a), ds4_gpu_tensor_contents(c), lb));
         }
-        fprintf(stderr, "V4.1 attention low pos=%u: RoPE table == inline sincos, raw and compressed PASS\n", positions[pi]);
+        fprintf(stderr, "V4.1 attention low pos=%u: RoPE table (static and generic) == inline sincos, raw and compressed PASS\n",
+                positions[pi]);
     }
-    ds4_gpu_tensor_free(heads); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(tab);
+    ds4_gpu_tensor_free(heads); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(c);
+    ds4_gpu_tensor_free(tab);
     free(h); free(model);
     return 1;
 }
