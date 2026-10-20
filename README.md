@@ -1,39 +1,51 @@
 ## DeepSeek V4.1 Flash 1017 on M3 Ultra — October update
 
-This branch is our own DwarfStar implementation of DeepSeek V4.1 Flash for Apple
-Silicon. It is built on [antirez's DwarfStar](https://github.com/antirez/ds4) engine
-and on kernelpool's V4.1 Metal work by Tarjei Mandt. The October update
-targets the 1017 checkpoint. It makes serial decode exceed 40 tokens/s on one
-M3 Ultra, with output that is bit-identical to the September engine except for
-the one numerical change named below.
+This branch is our own implementation of DeepSeek V4.1 Flash for Apple
+Silicon, written on [antirez's DwarfStar](https://github.com/antirez/ds4)
+engine. The October update targets the 1017 checkpoint. On one M3 Ultra it
+takes serial decode past 40 tokens/s. Its output is bit-identical to the
+September engine except for one numerical change, named below.
 
-It builds on others' work:
+We incorporated specific pieces of others' work, and their commits keep their
+authorship:
 
-- **Ivan Fioravanti:** the E4M3 shift decode that the blended readers adapt,
-  the literal-shape dispatch mechanism, the narrow decode copies built at load,
-  and the exact prefill indexer MMA. His commits keep his authorship.
-- **Tarjei Mandt (kernelpool):** the V4.1 Metal base, candidate-block index
-  scoring and the radix top-k this branch's 512-wide sort finishes.
+- **Ivan Fioravanti:**
+  - the E4M3 shift decode that the blended readers adapt;
+  - the literal-shape dispatch mechanism;
+  - the narrow decode copies built at load;
+  - the exact prefill indexer MMA.
+- **Tarjei Mandt (kernelpool):**
+  - candidate-block index scoring (9b9dfee);
+  - the radix top-k select (af7c02b), which this branch's 512-wide winners'
+    sort extends.
 - **antirez:** DwarfStar itself.
+
+[THIRD_PARTY-V41.md](THIRD_PARTY-V41.md) lists the other attributed work.
 
 ### Headline numbers
 
-One M3 Ultra (512 GB), 1017 MXFP4 weights, concurrency 1, greedy decode of 128
-tokens after a saved prefix. Each number is tokens/s on Ivan Fioravanti's
-steady metric (wall time of tokens 2..N) and ours (first sampling to last
-evaluation, per token). Where both were recorded, they agree to within 0.05.
+One M3 Ultra (512 GB), 1017 MXFP4 weights, concurrency 1. Each row was
+measured in its own window, with the method named in that row:
 
-| Context | Decode | Run |
+| Context | Decode tok/s | Window and method |
 | ---: | ---: | --- |
-| 2K | 40.60 | q2k-a1, campaign stack |
-| 8K | 40.52 (prose) / 40.52 (code) | blend-a2, campaign stack + blended readers |
-| 64K | 39.70 | W5, candidate scoring + sort512 + candidate list once |
-| 131K | 39.07 | W5 |
-| 300K | 38.02 | W5 |
+| 2K | 40.60 | q2k-a1: campaign stack, greedy 128, Ivan Fioravanti's steady metric (wall time of tokens 2..N); ours read the same |
+| 8K | 40.52 (prose) / 40.52 (code) | blend-a2: campaign stack plus the blended readers, campaign fixtures, 512 tokens, our metric (first sampling to last evaluation) |
+| 64K | 39.70 | W5: candidate scoring + sort512 + candidate list once, greedy 128 on saved snapshots, eval-interval metric |
+| 131K | 39.07 | W5, as above |
+| 300K | 38.02 | W5, as above |
 
-Under the same bench, upstream Ivan main (a74d62a5) runs 38.08 at 2K and 37.22
-at 8K. Cold prefill at 64K is 889 tokens/s with Ivan's indexer MMA (+5.7%,
-bit-exact).
+Window w1-a2 recorded both metrics for the same runs. At 8K, greedy 128, Ivan's
+steady metric gave 40.130 and ours 40.087.
+
+In that window, the same `ds4-bench` sweep run on Ivan Fioravanti's main
+branch (a74d62a5) measured 38.08 tok/s at 2K and 37.22 at 8K on his steady
+metric (w1-a2 `p05-sweep-ivanmain.csv`).
+
+Cold prefill at 64K was 889 tok/s, against 841 without Ivan's indexer MMA
+(+5.7%, bit-exact; window w1-a2). That was measured on the campaign tree with
+his commit applied. The same path (feed660) is on by default on this branch;
+`DS4_METAL_DISABLE_V41_INDEX_MMA=1` turns it off.
 
 Exactness method:
 
@@ -44,10 +56,8 @@ Exactness method:
   reduction, is on by default and can be turned off with
   `DS4_METAL_DISABLE_V41_ENGRAM_ADD_TG=1`.
 
-The rows come from separate windows: the depth rows were measured before the
-blended readers landed. A single composed run of this branch is pending.
-Windows, arms and per-run numbers are in
-[RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
+A single composed run of this branch is pending. Windows, arms and per-run
+numbers are in [RECEIPTS-V41-1017.md](docs/RECEIPTS-V41-1017.md).
 
 ### Prepare the model
 
