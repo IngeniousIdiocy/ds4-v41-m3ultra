@@ -2415,6 +2415,58 @@ template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul
 /* The V4.1 decode router reading the released BF16 gates. */
 template [[host_name("kernel_mul_mv_bf16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, float, float4>;
 
+/* The blend router (DS4_V41_BLEND has r): kernel_mul_mv_bf16_f32_4 (kernel_mul_mv_t_t_4_impl<bfloat, ...>) with the lane's
+ * 16 BF16 weights loaded as two 16-byte words and widened by integer shifts (the same floats), one row per threadgroup; the
+ * K walk, float4 dot grouping, per-lane sums and helper_mv_reduce_and_write are the BF16 router's, so the output is
+ * bit-identical. ne00 must be a multiple of 32 (no tail loop); rows 16-byte aligned. */
+kernel void kernel_router_blend_r1(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device       char * dst  [[buffer(3)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+    const int r0 = tgpig.x;
+
+    device const float4 * y4  = (device const float4 *) src1;
+    device const uint4  * ax4 = (device const uint4 *) (src0 + (uint64_t)r0*args.nb01);
+
+    float sumf[1] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+
+    float4 yl4[NF4];
+    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+        const uint4 a = ax4[ib*4 + il*2];
+        const uint4 b = ax4[ib*4 + il*2 + 1];
+        float sumq = 0.f;
+        sumq += dot(as_type<float4>(uint4(a.x << 16, a.x & 0xffff0000u, a.y << 16, a.y & 0xffff0000u)), yl4[0]);
+        sumq += dot(as_type<float4>(uint4(a.z << 16, a.z & 0xffff0000u, a.w << 16, a.w & 0xffff0000u)), yl4[1]);
+        sumq += dot(as_type<float4>(uint4(b.x << 16, b.x & 0xffff0000u, b.y << 16, b.y & 0xffff0000u)), yl4[2]);
+        sumq += dot(as_type<float4>(uint4(b.z << 16, b.z & 0xffff0000u, b.w << 16, b.w & 0xffff0000u)), yl4[3]);
+        sumf[0] += sumq;
+        yb4 += NSG*NF*NW/4;
+    }
+
+    helper_mv_reduce_and_write<1, false>((device float *) dst, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 // The same matvec with its output rounded to bf16.
 template<typename T0, typename T04, typename T1, typename T14>
 kernel void kernel_mul_mv_t_t_4_bf16(
@@ -2538,6 +2590,69 @@ kernel void kernel_mul_mv_fp8_f32_4_bf16(
         case 2: kernel_mul_mv_fp8_f32_4_bf16_impl<2>(args, codes, src1, dst, scales, shmem, tgpig, tiisg, sgitg); break;
         case 4: kernel_mul_mv_fp8_f32_4_bf16_impl<4>(args, codes, src1, dst, scales, shmem, tgpig, tiisg, sgitg); break;
     };
+}
+
+/* E4M3 codes in bytes 0..3 -> (c0, c1, c2, c3) as value / 256 (the F16 bit-pattern decode, exact, subnormals included),
+ * two codes per half2 lane pair. */
+static inline float4 ds4_blend_dec4(uint w) {
+    const half2 a = as_type<half2>(((w << 7) & 0x3f803f80u) | ((w << 8) & 0x80008000u));   /* c0, c2 */
+    const half2 b = as_type<half2>(((w >> 1) & 0x3f803f80u) | (w & 0x80008000u));         /* c1, c3 */
+    return float4(float(a.x), float(b.x), float(a.y), float(b.y));
+}
+
+/* The blend indexer q_b (DS4_V41_BLEND has x): kernel_mul_mv_fp8_f32_4_bf16<2> where every lane owns at most one 32-column
+ * block (ne00 <= 16 x the production simdgroup count), dispatched with only the ceil(ne00 / 512) simdgroups that own blocks:
+ * the production simdgroups beyond them hold sumf = +0 and add only +0 to the reduction, so it sees the same values. The
+ * lane's single 16-code partial is dotted unscaled and multiplied by the block's 2^(e-119) once (exact: a power of two on a
+ * single partial), and the two rows (one 32-row scale block) share one E8M0 load. */
+kernel void kernel_indexer_blend_r2(
+        constant ds4_metal_args_mul_mv & args [[buffer(0)]],
+        device const uchar * codes  [[buffer(1)]],
+        device const char  * src1   [[buffer(2)]],
+        device       char  * dst    [[buffer(3)]],
+        device const uchar * scales [[buffer(4)]],
+        threadgroup  char  * shmem  [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+
+    const int nb  = args.ne00/NB;
+    const int k16 = args.ne00/16;
+    const int r0  = tgpig.x*NR0;
+
+    device const float4 * y4  = (device const float4 *) src1;
+    device const uint4  * ax4 = (device const uint4 *) (codes + (uint64_t)r0*args.ne00);
+    device const uchar  * sx  = scales + (uint64_t)(r0/32)*nb;
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib = sgitg*NF + ix;
+
+    if (ib < nb) {
+        device const float4 * yb4 = y4 + (ib*NB + il*NF)/4;
+        float4 yl4[4];
+        for (short i = 0; i < 4; ++i) {
+            yl4[i] = yb4[i];
+        }
+        const float s = as_type<float>((uint)(sx[ib] + 8u) << 23);   /* 2^(e-119) */
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            const uint4 w = ax4[row*k16 + ib*2 + il];
+            float sumq = 0.f;
+            sumq += dot(ds4_blend_dec4(w.x), yl4[0]);
+            sumq += dot(ds4_blend_dec4(w.y), yl4[1]);
+            sumq += dot(ds4_blend_dec4(w.z), yl4[2]);
+            sumq += dot(ds4_blend_dec4(w.w), yl4[3]);
+            sumf[row] += sumq * s;
+        }
+    }
+
+    helper_mv_reduce_and_write<NR0, true>((device float *) dst, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 /* The rows form of the vectorized dense matvec: one simdgroup group per
@@ -4318,6 +4433,67 @@ kernel void kernel_engram_fp8_mv(
 
 typedef decltype(kernel_engram_fp8_mv<2>) engram_fp8_mv_t;
 template [[host_name("kernel_engram_fp8_mv_bf16")]] kernel engram_fp8_mv_t kernel_engram_fp8_mv<2>;
+
+/* The blend Engram reader (DS4_V41_BLEND has e): kernel_engram_fp8_mv<2> without the value table. Each code is decoded as
+ * an F16 bit pattern (value / 256, ds4_blend_dec4), widened and multiplied by the block's 2^(e-119), which is the table's
+ * float code x 2^(e-127) exactly (a power-of-two scaling, no underflow or overflow for any finite code and E8M0 byte
+ * <= 246), and dotted in the table reader's float4 grouping; the K walk, per-lane sums and helper_mv_reduce_and_write are
+ * the table reader's, so the output is bit-identical. The codes load as one 16-byte word per lane per row; the two rows
+ * (one 32-row scale block) share one E8M0 load. The scale stays inside the dot: with two blocks per lane, factoring it
+ * out of the lane's partial is not bit-exact. */
+kernel void kernel_engram_blend_r2_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const uchar * codes  [[buffer(1)]],
+        device const char  * src1   [[buffer(2)]],
+        device       char  * dst    [[buffer(3)]],
+        device const uchar * scales [[buffer(4)]],
+        threadgroup  char  * shmem  [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb  = args.ne00/NB;
+    const int k16 = args.ne00/16;
+    const int r0  = tgpig.x*NR0;
+
+    device const float4 * y4  = (device const float4 *) src1;
+    device const uint4  * ax4 = (device const uint4 *) (codes + (uint64_t)r0*args.ne00);
+    device const uchar  * sx  = scales + (uint64_t)(r0/32)*nb;
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+    const int ib0 = sgitg*NF + ix;
+
+    float4 yl4[NF4];
+    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        for (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+        const float s = as_type<float>((uint)(sx[ib] + 8u) << 23);   /* 2^(e-119) */
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            const uint4 w = ax4[row*k16 + ib*2 + il];
+            float sumq = 0.f;
+            sumq += dot(ds4_blend_dec4(w.x) * s, yl4[0]);
+            sumq += dot(ds4_blend_dec4(w.y) * s, yl4[1]);
+            sumq += dot(ds4_blend_dec4(w.z) * s, yl4[2]);
+            sumq += dot(ds4_blend_dec4(w.w) * s, yl4[3]);
+            sumf[row] += sumq;
+        }
+        yb4 += NSG*NF*NW/4;
+    }
+
+    helper_mv_reduce_and_write<NR0, true>((device float *) dst, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
 
 // The same codes as F16 bit patterns, sign to bit 15 and exponent/mantissa
 // shifted under the F16 exponent: exactly the E4M3 value / 256, subnormals
