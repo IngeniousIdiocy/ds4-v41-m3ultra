@@ -674,7 +674,7 @@ static int check_encoder(const char *path, const char *prompt_path) {
     fprintf(stderr, "V4.1 encoder load: %.3fs\n", now_sec() - start);
     ds4_gpu_print_memory_report("encoder resident");
     REQUIRE(ds41_graph_prefill(&candidate->ds41_graph, &engine->model, &engine->weights,
-                              tokens.v + 257, 768, NULL, NULL, 1025, NULL, NULL));
+                              tokens.v + 257, 768, NULL, NULL, 1025, NULL, NULL, NULL, 0));
     REQUIRE(ds41_graph_logits(&candidate->ds41_graph, &engine->model,
                              &engine->weights, candidate->logits));
     REQUIRE(memcmp(control->logits, candidate->logits, DS4_N_VOCAB * 4u) == 0);
@@ -876,21 +876,21 @@ static int check_wide_prefill(const char *path, const char *prompt_path,
         if (control_env) {
             setenv(control_env, "1", 1);
             REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights, tokens.v + start,
-                count, NULL, NULL, (int)(start + count), NULL, NULL));
+                count, NULL, NULL, (int)(start + count), NULL, NULL, NULL, 0));
             unsetenv(control_env);
         } else {
             for (uint32_t off = 0; off < count; off += a->prefill_cap) {
                 const uint32_t rows = count - off < a->prefill_cap ? count - off : a->prefill_cap;
                 REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
                     tokens.v + start + off, rows, NULL, NULL,
-                (int)(start + count), NULL, NULL));
+                (int)(start + count), NULL, NULL, NULL, 0));
             }
         }
         const double reference_seconds = now_sec() - t0;
         session_progress progress = {0};
         t0 = now_sec();
         REQUIRE(ds41_graph_prefill(b, &engine->model, &engine->weights,
-            tokens.v + start, count, note_progress, &progress, (int)(start + count), NULL, NULL));
+            tokens.v + start, count, note_progress, &progress, (int)(start + count), NULL, NULL, NULL, 0));
         const double candidate_seconds = now_sec() - t0;
         REQUIRE(progress.current == (int)(start + count));
         const uint32_t chunk = ds41_encoder_chunk_cap(b, count);
@@ -963,7 +963,7 @@ static int check_wide_prefill(const char *path, const char *prompt_path,
             const int saved = b->table[table].fd;
             b->table[table].fd = -1;
             const bool failed = !ds41_graph_prefill(b, &engine->model, &engine->weights,
-                tokens.v, 4096, NULL, NULL, 4096, NULL, NULL);
+                tokens.v, 4096, NULL, NULL, 4096, NULL, NULL, NULL, 0);
             b->table[table].fd = saved;
             REQUIRE(failed && !b->valid);
         }
@@ -1018,9 +1018,9 @@ static int check_prefill_alias_fallback(const char *path, const char *prompt_pat
         for (uint32_t pass = 0; pass < 2; pass++) {
             const uint32_t start = a->pos, count = pass ? 29 : 19;
             REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
-                tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
+                tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL, NULL, 0));
             REQUIRE(ds41_graph_prefill(b, &engine->model, &engine->weights,
-                tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
+                tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL, NULL, 0));
             ds41_state_span sa[64], sb[64];
             const uint32_t n = ds41_state_spans(a, a->pos, sa);
             REQUIRE(a->pos == b->pos && n == ds41_state_spans(b, b->pos, sb));
@@ -1293,12 +1293,12 @@ static int check_decoder_suffix(const char *path, const char *prompt_path) {
         setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
         double t0 = now_sec();
         REQUIRE(ds41_graph_prefill(a, &engine->model, &engine->weights,
-            tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
+            tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL, NULL, 0));
         const double reference = now_sec() - t0;
         unsetenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
         t0 = now_sec();
         REQUIRE(ds41_graph_prefill(b, &engine->model, &engine->weights,
-            tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL));
+            tokens.v + start, count, NULL, NULL, (int)(start + count), NULL, NULL, NULL, 0));
         const double candidate_time = now_sec() - t0;
         ds41_state_span sa[64], sb[64];
         const uint32_t n = ds41_state_spans(a, a->pos, sa);
