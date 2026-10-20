@@ -13931,10 +13931,11 @@ decode_again:
         const int block_start = ds4_session_pos(slot->session);
         /* The alternative admission policy keeps reasoning serial;
          * --serial-reasoning does so for every V4.1 reasoning span. */
-        if (!s->batched_mode && !slot->utility &&
-            !(thinking.inside &&
-              ((s->serial_reasoning && ds4_engine_is_deepseek41(s->engine)) ||
-               ds4_session_ds41_dspark_adaptive_stats(slot->session, NULL, NULL))) &&
+        const bool serial_span = thinking.inside &&
+            ((s->serial_reasoning && ds4_engine_is_deepseek41(s->engine)) ||
+             ds4_session_ds41_dspark_adaptive_stats(slot->session, NULL, NULL));
+        ds4_session_ds41_dspark_serial_span(slot->session, serial_span);
+        if (!s->batched_mode && !slot->utility && !serial_span &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -14216,6 +14217,7 @@ decode_again:
         }
         if (stop_decode) break;
     }
+    ds4_session_ds41_dspark_serial_span(slot->session, false);
     server_generation_leave(s);
 
     if (job_cancelled(j)) {

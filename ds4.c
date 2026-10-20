@@ -40267,6 +40267,9 @@ typedef struct {
     ds4_gpu_tensor *mh;              /* [window][n_target * dim] */
     ds4_gpu_tensor *pending;         /* [n_stage][window][512] */
     ds4_gpu_tensor *ring;            /* [n_stage][window][512] */
+    ds4_gpu_tensor *stash;           /* [window][n_target * dim] deferred decode captures, slot = pos % window */
+    uint32_t stash_end, stash_rows;  /* positions [stash_end - stash_rows, stash_end) wait in the stash */
+    bool serial_span;                /* the server's serial-reasoning gate is closed: decode steps defer */
     ds4_gpu_tensor *raw;             /* [window + block][512] one stage's keys */
     ds4_gpu_tensor *conf_proj;       /* [dim + rank] */
     ds4_gpu_tensor *tokens, *conf, *parts, *logits, *x, *xn;
@@ -40277,7 +40280,7 @@ typedef struct {
 
 static void ds41_draft_free(ds41_draft *d) {
     if (!d) return;
-    ds4_gpu_tensor *tensors[] = {d->mh, d->pending, d->ring, d->raw, d->conf_proj, d->tokens, d->conf,
+    ds4_gpu_tensor *tensors[] = {d->mh, d->pending, d->ring, d->stash, d->raw, d->conf_proj, d->tokens, d->conf,
         d->parts, d->logits, d->x, d->xn, d->saved, d->pool_kv, d->pool_score, d->rows_logits, d->rows_x,
         d->rows_tmp, d->rewind_mh, d->rewind_pending, d->rewind_ring, d->rewind_pool};
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
@@ -40483,7 +40486,7 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->valid = true;
     g->index_bf16_ok = true;   /* every row is rewritten through its producer */
-    if (g->draft) { g->draft->mh_rows = 0; g->draft->rewind_valid = false; }
+    if (g->draft) { g->draft->mh_rows = 0; g->draft->stash_rows = 0; g->draft->rewind_valid = false; }
     ds4_engram_history_reset(&g->history);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
@@ -42588,13 +42591,13 @@ static bool ds41_draft_capture(ds41_gpu_graph *g, uint32_t il, const ds4_gpu_ten
     return true;
 }
 
-/* main_kv for the captured positions, into the pending rows of every stage. */
-static bool ds41_draft_pending(ds41_gpu_graph *g) {
+/* main_kv for `n` captured rows of `src` from row `row0` (positions pos0 ..), into the pending rows of every stage. */
+static bool ds41_draft_main_kv(ds41_gpu_graph *g, ds4_gpu_tensor *src, uint32_t row0, uint32_t n, uint32_t pos0) {
     ds41_draft *d = g->draft;
     const ds4_dspark_weights *dw = d->w;
-    const uint32_t n = d->mh_rows, dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
-    if (!n) return true;
-    ds4_gpu_tensor *mh = ds4_gpu_tensor_view(d->mh, 0, (uint64_t)n * d->n_target * dim * sizeof(float));
+    const uint32_t dim = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
+    const uint64_t width = (uint64_t)d->n_target * dim * sizeof(float);
+    ds4_gpu_tensor *mh = ds4_gpu_tensor_view(src, row0 * width, n * width);
     ds4_gpu_tensor *mx = ds4_gpu_tensor_view(d->rows_x, 0, (uint64_t)n * dim * sizeof(float));
     ds4_gpu_tensor *tmp = ds4_gpu_tensor_view(d->rows_tmp, 0, (uint64_t)n * dim * sizeof(float));
     bool ok = mh && mx && tmp &&
@@ -42608,7 +42611,7 @@ static bool ds41_draft_pending(ds41_gpu_graph *g) {
         ok = v && ds41_matmul_batch(v, d->m, l->attn_kv, mx, n, false) &&
             ds4_gpu_rms_norm_weight_rows_tensor(v, v, d->m->map, d->m->size,
                 l->attn_kv_a_norm->abs_offset, hd, n, DS4_RMS_EPS) &&
-            ds4_gpu_dsv41_rope(v, hd, 1, n, d->mh_pos0, false, false);
+            ds4_gpu_dsv41_rope(v, hd, 1, n, pos0, false, false);
         ds4_gpu_tensor_free(v);
     }
     ds4_gpu_tensor_free(tmp);
@@ -42617,16 +42620,21 @@ static bool ds41_draft_pending(ds41_gpu_graph *g) {
     return ok;
 }
 
-/* The first `rows` pending positions into the rings (slot = pos % window). */
-static bool ds41_draft_commit(ds41_gpu_graph *g, uint32_t rows) {
+/* main_kv for the captured positions, into the pending rows of every stage. */
+static bool ds41_draft_pending(ds41_gpu_graph *g) {
+    ds41_draft *d = g->draft;
+    return !d->mh_rows || ds41_draft_main_kv(g, d->mh, 0, d->mh_rows, d->mh_pos0);
+}
+
+/* The first `rows` pending positions, positions pos0 .., into the rings (slot = pos % window). */
+static bool ds41_draft_commit_at(ds41_gpu_graph *g, uint32_t pos0, uint32_t rows) {
     ds41_draft *d = g->draft;
     const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
-    if (rows > d->mh_rows) return false;
     const uint32_t first = rows > DS41_DRAFT_WINDOW ? rows - DS41_DRAFT_WINDOW : 0u;
     for (uint32_t st = 0; st < d->n_stage; st++) {
         const uint64_t base = (uint64_t)st * DS41_DRAFT_WINDOW * row;
         for (uint32_t r = first; r < rows;) {
-            const uint32_t slot = (d->mh_pos0 + r) % DS41_DRAFT_WINDOW;
+            const uint32_t slot = (pos0 + r) % DS41_DRAFT_WINDOW;
             uint32_t run = DS41_DRAFT_WINDOW - slot;
             if (run > rows - r) run = rows - r;
             if (!ds4_gpu_tensor_copy(d->ring, base + slot * row, d->pending, base + r * row, run * row))
@@ -42635,6 +42643,62 @@ static bool ds41_draft_commit(ds41_gpu_graph *g, uint32_t rows) {
         }
     }
     return true;
+}
+
+static bool ds41_draft_commit(ds41_gpu_graph *g, uint32_t rows) {
+    return rows <= g->draft->mh_rows && ds41_draft_commit_at(g, g->draft->mh_pos0, rows);
+}
+
+/* No step drafts while the server's serial-reasoning gate is closed, and a reasoning span is usually far longer
+ * than the drafter's window.  There a decode step on local Metal only copies its capture into the stash, and the
+ * first proposal after the span (or a session save) commits the deferred positions its window can see; main_kv
+ * (the stage-0 projection reads 84 MB) is never run for the older ones.  Elsewhere the admission backoff is no
+ * longer than the window, so every step commits eagerly.  DS4_METAL_DISABLE_V41_DSPARK_DEFER=1: always eager. */
+static bool ds41_draft_defer(const ds41_gpu_graph *g) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    static int c = -1;
+    return g->draft && g->draft->serial_span && g->tp_world == 1 && !g->streaming &&
+        !ds41_env_flag("DS4_METAL_DISABLE_V41_DSPARK_DEFER", &c);
+#else
+    (void)g;
+    return false;
+#endif
+}
+
+/* The deferred positions inside the window ending at the frontier, one row at a time on the path an eager
+ * decode step takes (main_kv of one row, its ring slots), so the rings hold the same bits.  An older position's
+ * slot belongs to a later one; a position at or past the frontier was rolled back.  Encodes into the open batch. */
+static bool ds41_draft_catch_up(ds41_gpu_graph *g) {
+    ds41_draft *d = g->draft;
+    const uint32_t end = d->stash_end < g->pos ? d->stash_end : g->pos;
+    uint32_t p = d->stash_end - d->stash_rows;
+    if (g->pos > DS41_DRAFT_WINDOW && p < g->pos - DS41_DRAFT_WINDOW) p = g->pos - DS41_DRAFT_WINDOW;
+    bool ok = true;
+    for (; ok && p < end; p++)
+        ok = ds41_draft_main_kv(g, d->stash, p % DS41_DRAFT_WINDOW, 1, p) && ds41_draft_commit_at(g, p, 1);
+    d->stash_rows = 0;
+    return ok;
+}
+
+/* The end of a decode step's drafter work, inside its last command buffer: main_kv and the rings, or deferred,
+ * the capture into its stash slot (a pass that committed nothing between two deferred steps flushes first). */
+static bool ds41_draft_settle(ds41_gpu_graph *g) {
+    ds41_draft *d = g->draft;
+    if (!ds41_draft_defer(g)) return ds41_draft_pending(g) && ds41_draft_commit(g, 1);
+    if (d->stash_rows && d->stash_end != g->pos && !ds41_draft_catch_up(g)) return false;
+    const uint64_t width = (uint64_t)d->n_target * DS4_N_EMBD * sizeof(float);
+    if (!ds4_gpu_tensor_copy(d->stash, (g->pos % DS41_DRAFT_WINDOW) * width, d->mh, 0, width)) return false;
+    d->stash_end = g->pos + 1u;
+    if (d->stash_rows < DS41_DRAFT_WINDOW) d->stash_rows++;
+    return true;
+}
+
+/* catch-up in a command batch of its own (before the rings are saved) */
+static bool ds41_draft_flush(ds41_gpu_graph *g) {
+    if (!g->draft || !g->draft->stash_rows) return true;
+    bool ok = ds4_gpu_begin_commands() && ds41_draft_catch_up(g);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    return ok;
 }
 
 /* A draft stage's attention: keys are the stage's ring at positions <= P and the block's
@@ -42734,7 +42798,7 @@ static bool ds41_draft_propose(ds41_gpu_graph *g, const ds4_model *m, const ds4_
 #ifdef __APPLE__
     ds4_gpu_tp_full_expert_bind(world == 2);
 #endif
-    bool ok = ds4_gpu_begin_commands() != 0;
+    bool ok = ds4_gpu_begin_commands() != 0 && ds41_draft_catch_up(g);
 #define DS41_DRAFT_VIEW(name, width) \
     if (ok) ok = (active.name = ds4_gpu_tensor_view(b->name, 0, (uint64_t)B * (width) * sizeof(float))) != NULL;
     DS41_PREFILL_ROWS(DS41_DRAFT_VIEW)
@@ -42834,6 +42898,7 @@ static bool ds41_draft_init(ds41_gpu_graph *g, const ds4_dspark_weights *dw, con
         !(d->mh = ds4_gpu_tensor_alloc(win * d->n_target * dim * sizeof(float))) ||
         !(d->pending = ds4_gpu_tensor_alloc(d->n_stage * win * hd * sizeof(float))) ||
         !(d->ring = ds4_gpu_tensor_alloc(d->n_stage * win * hd * sizeof(float))) ||
+        !(d->stash = ds4_gpu_tensor_alloc(win * d->n_target * dim * sizeof(float))) ||
         !(d->raw = ds4_gpu_tensor_alloc((win + B) * hd * sizeof(float))) ||
         !(d->conf_proj = ds4_gpu_tensor_alloc(proj_bytes)) ||
         !(d->tokens = ds4_gpu_tensor_alloc_managed((B + 1u) * sizeof(int32_t))) ||
@@ -43193,7 +43258,7 @@ static int ds41_graph_step_pe(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
             sel_enc = true;
             ok = ds4_gpu_selector_encode(g->logits) != 0;
         }
-        if (ok && capture_in_head && drain) ok = ds41_draft_pending(g) && ds41_draft_commit(g, 1);
+        if (ok && capture_in_head && drain) ok = ds41_draft_settle(g);
         bool flush = ok && !drain && (il == 0 || (il + 1u) % flush_layers == 0);
         if (drain || flush) {   /* the rows join before the commit of their layer's buffer */
             for (uint32_t i = 0; i < 2; i++) {
@@ -43309,7 +43374,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         }
 #endif
         if (ok && capture_in_head && il + 1u == DS4_N_LAYER)
-            ok = ds41_draft_pending(g) && ds41_draft_commit(g, 1);
+            ok = ds41_draft_settle(g);
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -43331,7 +43396,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && g->draft && !capture_in_head) {
-        ok = ds4_gpu_begin_commands() && ds41_draft_pending(g) && ds41_draft_commit(g, 1);
+        ok = ds4_gpu_begin_commands() && ds41_draft_settle(g);
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     }
     if (ok && logits) ok = queued_head ?
@@ -62979,8 +63044,17 @@ void ds4_session_ds41_dspark_request_begin(ds4_session *s) {
         d->control_end = UINT32_MAX;
         d->admission_busy = false;
     }
+    ds4_session_ds41_dspark_serial_span(s, false);
 #else
     (void)s;
+#endif
+}
+
+void ds4_session_ds41_dspark_serial_span(ds4_session *s, bool closed) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s && s->ds41_graph_ready && s->ds41_graph.draft) s->ds41_graph.draft->serial_span = closed;
+#else
+    (void)s; (void)closed;
 #endif
 }
 
@@ -63198,6 +63272,7 @@ static void ds4_session_dspark_scheduler_note(
 
 #ifdef DS4_NO_GPU
 void ds4_session_ds41_dspark_request_begin(ds4_session *s) { (void)s; }
+void ds4_session_ds41_dspark_serial_span(ds4_session *s, bool closed) { (void)s; (void)closed; }
 int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[7], double ms[3]) {
     (void)s;
     if (out) memset(out, 0, 7 * sizeof(out[0]));
@@ -64928,6 +65003,11 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (!s->ds41_graph_ready || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
         !ds4_gpu_synchronize()) {
         payload_set_err(err, errlen, "V4.1 graph has no complete frontier to save");
+        return 1;
+    }
+    /* the deferred decode rows join the rings first: the file holds what eager commits leave */
+    if (draft && !ds41_draft_flush(g)) {
+        payload_set_err(err, errlen, "V4.1 drafter rings could not be completed before the save");
         return 1;
     }
     const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
@@ -88862,6 +88942,7 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     d->mh_pos0 = d->rewind_pos;
     d->mh_rows = d->rewind_rows;
+    d->stash_rows = 0;   /* the rings are the verify's snapshot; a replacement step past it is undone */
     g->pos = d->rewind_pos + d->rewind_rows;
     if (ok) ok = ds41_draft_rollback(g, d->rewind_tokens, d->rewind_rows, kept, d->rewind_history) &&
         ds4_gpu_tensor_read(d->rows_logits, (uint64_t)(kept - 1u) * DS4_N_VOCAB * sizeof(float),

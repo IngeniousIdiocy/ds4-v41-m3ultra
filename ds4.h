@@ -547,6 +547,8 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 void ds4_session_gpu_warmup(ds4_session *s);
 /* Reset the V4.1 admission ledger at a served request boundary. */
 void ds4_session_ds41_dspark_request_begin(ds4_session *s);
+/* The server's serial-reasoning gate: while closed no step drafts, so V4.1 decode steps defer the drafter's upkeep. */
+void ds4_session_ds41_dspark_serial_span(ds4_session *s, bool closed);
 int ds4_session_ds41_dspark_adaptive_stats(const ds4_session *s, uint64_t out[7], double ms[3]);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 
