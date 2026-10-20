@@ -758,6 +758,21 @@ static int check_literal_shapes(void) {
         free(h); free(model);
         fprintf(stderr, "V4.1 literal output-B HC consumer == generic PASS\n");
     }
+    {   /* the serial FFN join: shared + routed into the HC streams, one token, bf16 rounding */
+        ds4_gpu_tensor *blk = upload(NULL, 5120 * 4), *add = upload(NULL, 5120 * 4), *res = upload(NULL, 4 * 5120 * 4);
+        ds4_gpu_tensor *split = upload(NULL, 24 * 4), *out = upload(NULL, 4 * 5120 * 4);
+        CHECK(blk && add && res && split && out);
+        float *b = ds4_gpu_tensor_contents(blk), *a = ds4_gpu_tensor_contents(add);
+        float *r = ds4_gpu_tensor_contents(res), *sp = ds4_gpu_tensor_contents(split);
+        for (int i = 0; i < 5120; i++) { b[i] = random_value(); a[i] = random_value(); }
+        for (int i = 0; i < 4 * 5120; i++) r[i] = random_value();
+        for (int i = 0; i < 24; i++) sp[i] = random_value() / 4.0f;
+        LITERAL_PAIR("DS4_METAL_DISABLE_V41_HC_JOIN_LITERAL", out, 4 * 5120 * 4,
+                     ds4_gpu_hc_expand_split_add_bf16_tensor(out, blk, add, res, split, 5120, 4));
+        ds4_gpu_tensor_free(blk); ds4_gpu_tensor_free(add); ds4_gpu_tensor_free(res);
+        ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(out);
+        fprintf(stderr, "V4.1 literal serial HC join == generic PASS\n");
+    }
     return 1;
 }
 #else

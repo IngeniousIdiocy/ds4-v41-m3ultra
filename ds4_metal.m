@@ -47450,7 +47450,14 @@ static int ds4_gpu_hc_expand_split_impl(
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
-        if (n_hc == 4) {
+        /* The single-host one-token join with an add and bf16 rounding (the V4.1 decode FFN join) takes the
+         * literal-shape kernel; every other shape keeps expand4 (opt-out read per call). */
+        const bool literal = n_hc == 4 && n_embd == 5120 && n_tokens64 == 1 && block_add && round_bf16 &&
+            !ds4_gpu_tp_world_is_two() && getenv("DS4_METAL_DISABLE_V41_HC_JOIN_LITERAL") == NULL;
+        if (literal) {
+            expand_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_serial_add_bf16");
+            n_elem = (uint64_t)n_embd;
+        } else if (n_hc == 4) {
             expand_pipeline = ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
                                                       "kernel_dsv4_hc_expand4");
             n_elem = (uint64_t)n_embd * n_tokens64;
