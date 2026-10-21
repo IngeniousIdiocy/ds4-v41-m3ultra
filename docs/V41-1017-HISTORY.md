@@ -244,11 +244,13 @@ about 18, with 0 of 3,072,000 test streams differing; a reordered form about
 release candidate showed that a request which restored a short prefix from
 disk and extended it never saved the longer prefix, so every later request
 restored only the short one. The server now stores the extended prefix
-(08d79dd0). On the release, decode runs at 40.86 to 40.91 tok/s at 8K and
-39.47 at 300K, with the same tokens, logits and state digests as the
-previous October build; going from 64K to 300K costs 0.53 to 0.62 ms per
-token, down from 1.00 to 1.06. The receipts give the windows (r1bench-a3,
-rcv-a1, codeds-a1, r1cc-a5).
+(08d79dd0). On the resident benchmark the release gives the same tokens,
+logits and state digests as the previous October build at every depth, and
+going from 64K to 300K costs 0.53 to 0.62 ms per token, down from 1.00 to
+1.06. On the server, against DwarfStar main and with every cell the median of
+three runs, it decodes at 41.51 tok/s at 8K and 40.03 at 300K (the README's
+table). The receipts give the windows (r1bench-a3,
+rcv-a1, r1cc-a5, w192-onemethod, w193-dspark).
 
 ## Credits
 

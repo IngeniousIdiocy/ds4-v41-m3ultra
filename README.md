@@ -2,65 +2,62 @@
 
 This branch is our Metal implementation of DeepSeek V4.1 Flash, built on
 [antirez's DwarfStar](https://github.com/antirez/ds4) engine and tuned for one
-512 GB M3 Ultra. On the 1017 checkpoint it decodes a single stream at **41 tok/s**
-and still does **39.5 tok/s at 300K context**. That is more than twice upstream's
-speed, and every optimization in it is bit-exact against the kernel it replaces. With DSpark
+512 GB M3 Ultra. On the 1017 checkpoint it decodes a single stream at **41.5 tok/s**
+at 8K context and still does **40.0 tok/s at 300K**, where upstream falls to 16.2.
+That is more than twice upstream's speed at every depth, and every optimization in it
+is bit-exact against the kernel it replaces. With DSpark
 drafting, code answers run at **47–50 tok/s**.
 
 Same machine, same prepared public 1017 MXFP4 weights, same prompts, one request
-at a time. The upstream column is DwarfStar main at `5379c1c9`:
+at a time. The upstream column is DwarfStar main at `5379c1c9`. Every number is the
+median of three runs, with the two engines' server lifetimes interleaved in one window:
 
 | measurement | DwarfStar main | this branch |
 |---|---:|---:|
-| serial decode, 2K context | 19.68 t/s | **41.45 t/s** |
-| serial decode, 8K context | 19.54 t/s | **41.23 t/s** |
-| serial decode, 32K context | 19.23 t/s | **40.91 t/s** |
-| serial decode, 64K context | 18.78 t/s | **40.74 t/s** |
-| serial decode, code answers (3 prompts, 512 tokens) | 20.0–20.3 t/s | **41.6–41.7 t/s** |
-| DSpark, the same code answers | 29.0–31.4 t/s | **46.7–50.1 t/s** |
-| prefill, 8K prompt (cold) | 606 t/s | **692 t/s** |
-| prefill, 64K prompt (cold) | 697 t/s | **826 t/s** |
+| serial decode, 8K context | 20.00 t/s | **41.51 t/s** |
+| serial decode, 64K context | 19.07 t/s | **40.90 t/s** |
+| serial decode, 131K context | 18.14 t/s | **40.63 t/s** |
+| serial decode, 300K context | 16.21 t/s | **40.03 t/s** |
+| prefill, 8K prompt (cold) | 611 t/s | **705 t/s** |
+| prefill, 64K prompt (cold) | 700 t/s | **835 t/s** |
 
-Decode rows: the 256 tokens after the prompt, thinking off, temperature 0;
-only decode is timed. Prefill rows: prompt tokens divided by the cold time to
-first token, median of three server runs per engine, interleaved in one window.
-DwarfStar's V4.1 loader expects the drafter's two Markov-head tensors under
-other names (`markov_w1` / `markov_w2`) than the checkpoint's (`embed` /
-`head`), which our prepare command keeps; its DSpark row ran on a copy of our
-drafter with only those two names changed.
-
-At depth, from saved states in our resident benchmark (greedy, 128 tokens,
-median of three):
-
-| context | 8K | 64K | 131K | 300K |
-|---|---:|---:|---:|---:|
-| serial decode | **40.95 t/s** | **40.39 t/s** | **40.09 t/s** | **39.51 t/s** |
-| ms per token | 24.42 | 24.76 | 24.94 | 25.31 |
-
-Going from 64K to 300K costs 0.55 ms per token. Our September 18 release
-decoded at 35.8 t/s at 8K.
+Decode rows: the 256 tokens after the prompt, thinking off, temperature 0, each
+prompt restored from its disk checkpoint, so only decode is timed. Prefill rows:
+prompt tokens divided by the cold time to first token. Every prompt is a prefix of
+one long document. Going from 64K to 300K costs this branch 0.53 ms per token, and
+DwarfStar main 9.25 ms.
 
 ### DSpark
 
 DSpark drafts tokens with the checkpoint's own multi-token-prediction stages,
 and the target verifies them in one batched step. On code, where the drafter
-is usually right, it pays well. The three code-writing requests above (an LRU
-cache in C, an asyncio rate limiter in Python, a trie in Rust) decoded at 50.1,
-48.8 and 46.7 t/s with DSpark, against 41.6–41.7 t/s without it, with 90.2% of
-drafted tokens accepted.
+is usually right, it pays well. Three code-writing requests, 512 tokens each,
+thinking off, temperature 0, median of three runs per cell, all four arms in
+one window:
+
+| request | DwarfStar main | DwarfStar + DSpark | this branch | this branch + DSpark |
+|---|---:|---:|---:|---:|
+| LRU cache in C | 20.03 t/s | 30.77 t/s | 41.86 t/s | **50.41 t/s** |
+| asyncio rate limiter in Python | 20.04 t/s | 31.35 t/s | 41.86 t/s | **49.38 t/s** |
+| trie in Rust | 20.07 t/s | 28.95 t/s | 41.84 t/s | **47.09 t/s** |
+
+This branch accepted 90.9% of drafted tokens, DwarfStar 86.4%. DwarfStar's V4.1
+loader expects the drafter's two Markov-head tensors under other names
+(`markov_w1` / `markov_w2`) than the checkpoint's (`embed` / `head`), which our
+prepare command keeps; its DSpark arm ran on a copy of our drafter with only
+those two names changed.
 
 On prose the drafter is usually wrong. The admission controller probes,
-loses, and backs off, and DSpark costs about 3% there (39.6–40.0 against
-40.7–41.5 t/s). `--serial-reasoning` keeps reasoning out of drafting
-altogether: reasoning is decoded one token at a time, and answers and tool
-calls are drafted.
+loses, and backs off, and DSpark costs about 4% there: 39.57 against 41.31 t/s
+at 8K and 39.30 against 40.75 at 64K, in the same window. `--serial-reasoning`
+keeps reasoning out of drafting altogether: reasoning is decoded one token at a
+time, and answers and tool calls are drafted.
 
 ### What makes it fast
 
 Every change executes the same model, the same work, with the same
-arithmetic. A token on this branch takes 24.4 ms at 8K, against about
-28.5 ms on our September release and about 51 ms on upstream main. The
-largest pieces:
+arithmetic. A token on this branch takes 24.1 ms at 8K, against 50.0 ms on
+upstream main. The largest pieces:
 
 - **Fixed shapes and once-per-step work.** V4.1's shapes are fixed, so the
   hot kernels have literal-shape entries: the output projection with RoPE

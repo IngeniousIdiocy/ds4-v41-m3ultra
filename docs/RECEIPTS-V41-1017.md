@@ -23,6 +23,169 @@ itself: decode, the DwarfStar comparison and restart), codeds-a1 (DSpark on
 code) and r1cc-a5 (the README's steps on a clean clone). The sections after
 them are the earlier evidence for individual commits.
 
+## README numbers: one-method comparison against DwarfStar (w192-onemethod)
+
+Window w192-onemethod, Oct 20 2026, 22:19–23:03 EDT. It replaces the README's mixed
+sources (server single runs, resident-benchmark medians, and a prefill row from two
+windows) with one method. Every cell is the median of three runs.
+
+Engines:
+
+- U: DwarfStar, antirez/ds4 main at 5379c1c9, the tree rcv-a1 used
+  `ds4-server` sha256 `3bc56f9b…`.
+- P: this branch, 9e6012b3. Its `ds4-server` was built
+  from 8664da6d, which differs from 9e6012b3 only in README.md. sha256 `f1b8e62a…`.
+- Each binary ran with its own tree as the working directory.
+
+Model: both engines loaded the GGUF that the README's Prepare step wrote (window
+prep-a1).
+That is the file rcv-a1 gave U. DSpark was off for both.
+
+Server launch: the README's Run line without `--mtp-model`, `--dspark` and
+`--mtp-exact-sampling`, on port 8297, with this window's cache directory (one per
+engine). U does not have `--default-top-p`, `--default-min-p`, `--utility-ctx` or
+`--serial-reasoning`, so its line drops those four, as in rcv-a1. Every request is
+temperature 0 with thinking off, so none of the four changes the work.
+
+Prompts: every prompt is a prefix of one document, *I promessi sposi*
+(`promessi_sposi.txt`, 419,509 tokens). Each one starts with "Summarize the following
+text in a few paragraphs." and then holds the first 8K, 64K, 131K or 300K tokens of the
+book: 8,242, 67,314, 132,966 and 303,912 prompt tokens.
+
+**Seeding** (not reported). Each engine filled its cache once, in its own lifetime:
+
+- DwarfStar stores a checkpoint only for a prompt it prefilled from zero. U therefore
+  prefilled each depth cold, longest first: 300K, 131K, 64K, 8K.
+- P walked 8K → 64K → 131K → 300K. Each step restored the previous checkpoint and stored
+  its own depth ("kv cache extends restored prefix").
+- Both engines ended with checkpoints at 8,192, 65,536, 131,072 and 303,104 tokens.
+
+**Measurement.** Six server lifetimes in the order U P U P U P. Each lifetime ran:
+
+1. One untimed warm-up: a 2K prose request, 16 tokens.
+2. The cold prefills, 8K then 64K. Each opens with a tag line naming its lifetime, so
+   nothing is restored (cached 0 in every run).
+3. The decode runs at 8K, 64K, 131K and 300K, in that order: 256 tokens each. Every run
+   restored its depth's checkpoint from disk (cached 8,192 / 65,536 / 131,072 / 303,104).
+
+Rates:
+
+- Decode rate is the client's: tokens 2..256 over their streaming wall time. The
+  server's own average agrees to within 0.05 tok/s.
+- Prefill rate is prompt tokens divided by the client's time to first token. That time
+  includes, for both engines, the cold-checkpoint store and, before 64K, storing the
+  previous 8K session (61 MiB).
+
+**Decode, 256 tokens after the prompt** (tok/s, median of three; min–max):
+
+| Context | DwarfStar main | this branch |
+| ---: | ---: | ---: |
+| 8K | 20.00 (19.98–21.20) | **41.51** (41.46–41.61) |
+| 64K | 19.07 (19.03–20.17) | **40.90** (40.89–41.01) |
+| 131K | 18.14 (18.10–19.10) | **40.63** (40.60–40.71) |
+| 300K | 16.21 (16.18–17.04) | **40.03** (40.01–40.09) |
+
+DwarfStar's first measurement lifetime decoded about 5% faster than its other two at
+every depth. The other two agree within 0.05 tok/s. The median is from the agreeing
+pair, and the maximum is the first lifetime.
+
+**Cold prefill** (prompt tokens / time to first token, median of three; min–max):
+
+| Prompt | DwarfStar main | this branch |
+| ---: | ---: | ---: |
+| 8K (8,251 tokens) | 13.51 s, 611 t/s (607–611) | **11.70 s, 705 t/s** (704–706) |
+| 64K (67,323 tokens) | 96.11 s, 700 t/s (691–701) | **80.59 s, 835 t/s** (832–836) |
+
+Not measured in this window: 2K and 32K decode, and DSpark (the window had no room for
+them in its 45-minute budget).
+
+Memory guard (memwatch v3, 64/16 GiB) never tripped. Jetsam events before and after: 1
+and 1. Raw rows: `rows.jsonl`. Server logs: `life1-server.log` … `life8-server.log`.
+Driver: `tools/w192_driver.py`.
+
+## DSpark on the same method (w193-dspark)
+
+Window w193-dspark, Oct 21 2026, 05:27–05:45 EDT. It puts the code-answer and DSpark rows on
+the method of w192-onemethod: same harness, model file, port and server lines.
+
+Engines:
+
+- U: DwarfStar, antirez/ds4 main at 5379c1c9, `ds4-server` sha256 `3bc56f9b…`.
+- P: this branch at 9e6012b3, `ds4-server` sha256 `f1b8e62a…`.
+
+Model: both loaded the GGUF and drafter that the README's Prepare step wrote (window
+prep-a1). DwarfStar's DSpark arm loaded a copy of that drafter with only its two
+Markov-head tensors renamed (`markov_w1` / `markov_w2`). It cannot load the drafter
+under the checkpoint's names.
+
+Server launch:
+
+- P-on is the README's Run line exactly (`--mtp-model … --dspark --mtp-exact-sampling`),
+  on a test port with a per-window cache directory.
+- P-off is that line without the three DSpark flags.
+- U-off and U-on drop the four flags DwarfStar does not have (`--default-top-p`,
+  `--default-min-p`, `--utility-ctx`, `--serial-reasoning`). U-on adds the same three
+  DSpark flags with the renamed drafter.
+- The DSpark arms ran with `DS4_DSPARK_STATS=1`, which only counts, so the accept rate
+  could be read at shutdown.
+
+Lifetimes, in this order: U-off, P-off, U-on, P-on code, P-on prose. Each began with an
+untimed 2K prose warm-up (16 tokens).
+
+- **Code answers:** in each arm's lifetime, the three code prompts (an LRU cache in C,
+  an asyncio token-bucket rate limiter in Python, a trie in Rust) ran three times,
+  round-robin. Each run was 512 tokens, temperature 0, thinking off.
+- **Prose cost:** P-off, and a second P-on lifetime, decoded the w192 prose prefixes at
+  8K and 64K (8,242 and 67,314 prompt tokens) three times each, 256 tokens. Every run
+  restored 8,192 or 65,536 tokens from the disk cache.
+- **Why P-on prose had its own lifetime:** the DSpark counters print once, at shutdown,
+  so this kept the code lifetime's accept rate free of prose.
+
+The rate is the client's: tokens 2..N over their streaming wall time, as in w192. The
+server's own average agrees to within 0.2 tok/s.
+
+**Code answers, 512 tokens** (tok/s, median of three; min–max):
+
+| Prompt | DwarfStar | DwarfStar + DSpark | this branch | this branch + DSpark |
+| --- | ---: | ---: | ---: | ---: |
+| LRU cache, C | 20.03 (19.99–20.11) | 30.77 (30.74–30.79) | 41.86 (41.86–41.86) | **50.41** (50.40–50.43) |
+| rate limiter, Python | 20.04 (19.97–20.41) | 31.35 (31.35–31.41) | 41.86 (41.84–41.87) | **49.38** (49.34–49.44) |
+| trie, Rust | 20.07 (19.99–20.26) | 28.95 (28.93–28.99) | 41.84 (41.72–41.86) | **47.09** (46.92–53.73) |
+
+DSpark accept rate (drafted tokens accepted, per lifetime, all nine code runs):
+
+- DwarfStar: 86.4% (3,527 of 4,082).
+- This branch: 90.9% (1,760 of 1,936).
+
+The counters cover a whole lifetime. Neither engine reports them per request, and
+DwarfStar has no per-cycle log, so a per-run rate would have needed a lifetime per run.
+
+Answers at temperature 0 were the same text in all three runs of every cell but one. In
+the trie prompt with DSpark on, this branch's third run gave a different answer: the
+same text as its serial runs, at 53.73 tok/s. Its first two runs agreed, at 47.09 and
+46.92. DSpark's batched verify is not bitwise equal to one-token decode, which the server
+states at startup, so the answer can change.
+
+**Prose, 256 tokens after a restored prompt** (this branch, tok/s, median of three;
+min–max):
+
+| Context | without DSpark | with DSpark |
+| ---: | ---: | ---: |
+| 8K | 41.31 (41.30–41.32) | 39.57 (39.52–39.57) |
+| 64K | 40.75 (40.74–40.75) | 39.30 (39.29–39.31) |
+
+On prose the admission controller drafted rarely (45 tokens proposed over 1,546 cycles,
+6 accepted). DSpark costs 4.2% at 8K and 3.6% at 64K.
+
+The DSpark-on server did not accept w192's cache entries for the prose prompts. Its
+cache identity includes the drafter: `19b0e9b3…` with DSpark against `b0998615…`
+without, same canary. The P-on prose lifetime therefore restored copies of the DSpark-on
+checkpoints of the same two prompts, stored in window rcv-a1 under the same identity and
+canary. Its 64K answers have the same digest as rcv-a1's (`fa6a74e0…`).
+
+Memory guard never tripped. Raw rows: `rows.jsonl`. Per-lifetime counters: `lives.json`.
+Server logs: `life1-server.log` … `life5-server.log`. Driver: `tools/w193_driver.py`.
+
 ## Exactness of the default build
 
 With the exact Engram gate (3ea32856, in its register form since 0004c5cf),
