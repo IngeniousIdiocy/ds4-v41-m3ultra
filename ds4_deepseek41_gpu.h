@@ -96,6 +96,12 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* CONCURRENT_FFN: ds4_gpu_parallel_ffn_start with the shared expert's bf16 boundaries (gate and up rounded before
+ * the SwiGLU, the down projection bf16 in and out). */
+int ds4_gpu_parallel_ffn_start_bf16(ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+                                    ds4_gpu_tensor *shared_out, const void *model_map, uint64_t model_size,
+                                    uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                    uint32_t model_dim, uint32_t shared_dim, const ds4_gpu_tensor *x, float clamp);
 /* SHARED_EXPERT: the shared expert's mid (gate and up rounded to bf16, then the SwiGLU) for up to 65535 rows. */
 int ds4_gpu_dsv41_shared_swiglu(ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
                                 uint64_t gate_offset, uint64_t up_offset, uint32_t in_dim, uint32_t out_dim,

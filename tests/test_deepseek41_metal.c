@@ -1892,10 +1892,69 @@ static int check_shared_expert(void) {
     return 1;
 }
 
+/* CONCURRENT_FFN: the concurrent encoder's shared expert, started for V4.1 and joined by a decode routed MoE (six of
+ * 384 MXFP4 experts at the V4.1 shapes), against the bf16 shared expert and the routed MoE run one after the other,
+ * bit for bit. */
+static int check_concurrent_ffn(void) {
+    enum { D = 5120, FF = 2304, NE = 384, NU = 6, MXFP4 = 39 /* the tensor type */ };
+    const uint64_t q8_row = D / 32 * 34, mx_gate_row = D / 32 * 17, mx_down_row = FF / 32 * 17;
+    const uint64_t gate_o = 0, up_o = gate_o + FF * q8_row, down_o = up_o + FF * q8_row,
+                   eg_o = down_o + (uint64_t)D * (FF / 32 * 34), eu_o = eg_o + (uint64_t)NE * FF * mx_gate_row,
+                   ed_o = eu_o + (uint64_t)NE * FF * mx_gate_row, wb = ed_o + (uint64_t)NE * D * mx_down_row;
+    uint8_t *map = NULL;
+    CHECK(posix_memalign((void **)&map, getpagesize(), wb) == 0);
+    for (uint64_t b = 0; b < eg_o / 34; b++) {   /* Q8_0 blocks: f16 scale, 32 int8 */
+        const uint16_t d = (uint16_t)(0x2000u + random_bits() % 0x1800u);
+        memcpy(map + b * 34, &d, 2);
+        for (int j = 0; j < 32; j++) map[b * 34 + 2 + j] = (uint8_t)random_bits();
+    }
+    for (uint64_t b = eg_o; b < wb; b += 17) {   /* MXFP4 blocks: e8m0 scale, 16 bytes of nibbles */
+        map[b] = (uint8_t)(118u + random_bits() % 8u);
+        for (int j = 1; j < 17; j++) map[b + j] = (uint8_t)random_bits();
+    }
+    CHECK(ds4_gpu_set_model_map(map, wb));
+    ds4_gpu_tensor *x = upload(NULL, D * 4), *sg = upload(NULL, FF * 4), *su = upload(NULL, FF * 4);
+    ds4_gpu_tensor *mid[2] = {upload(NULL, FF * 4), upload(NULL, FF * 4)}, *shared[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *routed[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *gate = upload(NULL, NU * FF * 4), *up = upload(NULL, NU * FF * 4), *emid = upload(NULL, NU * FF * 4);
+    ds4_gpu_tensor *experts = upload(NULL, NU * D * 4), *sel = upload(NULL, NU * 4), *weights = upload(NULL, NU * 4);
+    CHECK(x && sg && su && mid[0] && mid[1] && shared[0] && shared[1] && routed[0] && routed[1] && gate && up &&
+          emid && experts && sel && weights);
+    for (int i = 0; i < D; i++) ((float *)ds4_gpu_tensor_contents(x))[i] = bf16(random_value());
+    for (int i = 0; i < NU; i++) {
+        ((int32_t *)ds4_gpu_tensor_contents(sel))[i] = (int32_t)(i * 61 + 7);
+        ((float *)ds4_gpu_tensor_contents(weights))[i] = fabsf(random_value()) / 4;
+    }
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t runs = ds4_gpu_test_kernel_runs("ds4_gpu_parallel_ffn_start_bf16");
+    for (int concurrent = 0; concurrent < 2; concurrent++) {
+        const int c = concurrent;
+        CHECK(ds4_gpu_begin_commands());
+        if (c) CHECK(ds4_gpu_parallel_ffn_start_bf16(sg, su, mid[c], shared[c], map, wb, gate_o, up_o, down_o, D, FF,
+                                                     x, 10.0f));
+        else CHECK(ds4_gpu_dsv41_shared_swiglu(mid[c], map, wb, gate_o, up_o, D, FF, x, 10.0f, 1) &&
+                   ds4_gpu_matmul_q8_0_bf16io_tensor(shared[c], map, wb, down_o, FF, D, mid[c]));
+        CHECK(ds4_gpu_routed_moe_one_tensor(routed[c], gate, up, emid, experts, map, wb, eg_o, eu_o, ed_o,
+                  MXFP4, MXFP4, mx_gate_row * FF, mx_gate_row, mx_down_row * D, mx_down_row,
+                  D, FF, D, sel, weights, NE, NU, 10.0f, x, NULL, 3, 1));
+        CHECK(!c || ds4_gpu_parallel_ffn_finish());
+        CHECK(ds4_gpu_end_commands() && ds4_gpu_synchronize());
+    }
+    CHECK(ds4_gpu_test_kernel_runs("ds4_gpu_parallel_ffn_start_bf16") == runs + 1);
+    ds4_gpu_test_set_flags(0);
+    CHECK(same_bits(shared[0], shared[1], D) && same_bits(routed[0], routed[1], D));
+    ds4_gpu_tensor *tensors[] = {x, sg, su, mid[0], mid[1], shared[0], shared[1], routed[0], routed[1], gate, up, emid,
+                                 experts, sel, weights};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    /* the model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 concurrent FFN: shared expert beside the routed MoE == one after the other\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
-        check_shared_expert();
+        check_shared_expert() && check_concurrent_ffn();
 }
 #else
 static int check_v41_groups(void) { return 1; }

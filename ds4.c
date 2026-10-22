@@ -41007,8 +41007,11 @@ typedef struct {
     /* Metal: rope_tab holds the RoPE coefficients of position rope_tab_pos - 1 while that decode step runs (0: none) */
     uint32_t rope_tab_pos;
     /* Metal, HC_FUSION: decode_step while ds41_graph_step runs its layers, hc_attn_deferred while the attention
-     * block's HC mix waits for the query kernel, kv_stored when that kernel stored the layer's KV row */
-    bool decode_step, hc_attn_deferred, kv_stored;
+     * block's HC mix waits for the query kernel (hc_ffn_deferred: the FFN block's, for the concurrent FFN encoder),
+     * kv_stored when that kernel stored the layer's KV row */
+    bool decode_step, hc_attn_deferred, hc_ffn_deferred, kv_stored;
+    /* Metal, CONCURRENT_FFN: the last ds41_moe_partial left the whole shared expert in `shared` */
+    bool shared_done;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -42000,6 +42003,15 @@ static bool ds41_balance_shared(const ds41_gpu_graph *g, const ds4_layer_weights
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_shared_balance_enabled();
 }
 
+/* CONCURRENT_FFN, one host: the shared expert (MXFP4 routed experts, Q8 shared expert) runs in the routed experts'
+ * concurrent encoder, its gate and up beside their pair kernel, its down beside their sum. */
+static DS4_MAYBE_UNUSED bool ds41_concurrent_ffn(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
+    return g->tp_world != 2 && !g->streaming && !g->quality && ds41_on(DS4_GPU_V41_CONCURRENT_FFN) &&
+        l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
+}
+
 /* SHARED_EXPERT: the shared expert's mid for `count` rows of `norm` in one dispatch (a few rows at most). */
 static bool ds41_shared_swiglu(ds4_gpu_tensor *mid, const ds4_model *m, const ds4_layer_weights *l,
                                const ds4_gpu_tensor *norm, uint32_t count) {
@@ -42086,6 +42098,23 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         if (shared_queued && balance_shared) shared_here = true;
     }
 #endif
+#ifdef __APPLE__
+    const bool concurrent = shared_here && ds41_concurrent_ffn(g, l) &&
+        ds4_gpu_parallel_ffn_start_bf16(g->shared_gate, g->shared_up, g->shared_mid, g->shared, m->map, m->size,
+            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset, l->ffn_down_shexp->abs_offset,
+            DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP);
+    if (concurrent) shared_queued = true;
+    if (g->hc_ffn_deferred) {   /* HC_FUSION: the block's HC mix beside the shared expert; its norm goes to dead scratch */
+        g->hc_ffn_deferred = false;
+        if (!ds4_gpu_dsv41_hc_block_input(g->mix, g->x, g->flat_norm, g->ffn_split, g->after_attn, g->attn_split,
+                m->map, m->size, l->hc_ffn_fn->abs_offset, l->hc_ffn_scale->abs_offset, l->hc_ffn_base->abs_offset,
+                l->ffn_norm->abs_offset, DS4_N_HC * DS4_N_EMBD, 24u, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+                DS4_HC_EPS, DS4_RMS_EPS)) {
+            if (concurrent) ds4_gpu_parallel_ffn_abort();
+            return false;
+        }
+    }
+#endif
     if (shared_here && !shared_queued && !ds41_shared_expert(g, m, l, shared_down)) return false;
     bool routed_ok;
 #ifndef __APPLE__
@@ -42108,6 +42137,15 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             !g->streaming);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
+#endif
+#ifdef __APPLE__
+    /* the routed kernels may not have taken the shared expert into their encoder: then it runs here */
+    if (concurrent && !routed_ok) ds4_gpu_parallel_ffn_abort();
+    g->shared_done = concurrent && routed_ok;
+    if (g->shared_done && !ds4_gpu_parallel_ffn_finish()) {
+        g->shared_done = false;
+        if (!ds41_shared_expert(g, m, l, shared_down)) return false;
+    }
 #endif
     if (!routed_ok) return false;
     /* The balanced path writes zero on the non-owning rank. Keep the shared
@@ -42148,13 +42186,16 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 #ifdef __APPLE__
-/* HC_FUSION on the decode step: the attention block's mix waits for the query projection, which runs it in the same
- * dispatch, and only the collapse and its norm run now. The query kernel repeats the plain matvec's geometry, so a
- * geometry override keeps the separate path. */
-static bool ds41_hc_defer(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
-    return g->decode_step && g->tp_world != 2 && !g->quality && !g->streaming && !g->imatrix &&
-        l->hc_attn_fn->type == DS4_TENSOR_F16 && l->attn_norm->type == DS4_TENSOR_F32 &&
-        l->attn_q_b->type == DS4_TENSOR_Q8_0 && l->attn_q_b->dim[0] == 1280 && l->attn_q_b->dim[1] == 32768 &&
+/* HC_FUSION on the decode step: a block's mix waits for the next dispatch that can run it beside other work (the
+ * attention query projection, which runs it in the same dispatch, or the FFN's concurrent encoder), and only the
+ * collapse and its norm run now. The query kernel repeats the plain matvec's geometry, so a geometry override keeps
+ * the separate path. */
+static bool ds41_hc_defer(const ds41_gpu_graph *g, const ds4_layer_weights *l, bool ffn) {
+    if (!g->decode_step || g->tp_world == 2 || g->quality || g->streaming || g->imatrix ||
+        (ffn ? l->hc_ffn_fn : l->hc_attn_fn)->type != DS4_TENSOR_F16 ||
+        (ffn ? l->ffn_norm : l->attn_norm)->type != DS4_TENSOR_F32) return false;
+    if (ffn) return ds41_concurrent_ffn(g, l);
+    return l->attn_q_b->type == DS4_TENSOR_Q8_0 && l->attn_q_b->dim[0] == 1280 && l->attn_q_b->dim[1] == 32768 &&
         !getenv("DS4_METAL_Q8_MV_NSG");
 }
 #endif
@@ -42170,10 +42211,11 @@ static bool ds41_hc_input(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
     if (ds41_on(DS4_GPU_V41_HC_FUSION)) {
-        if (!ffn && ds41_hc_defer(g, l) &&
+        if (ds41_hc_defer(g, l, ffn) &&
             ds4_gpu_dsv41_deferred_collapse(g->x, g->norm, residual, pre, m->map, m->size, norm->abs_offset,
                                             DS4_RMS_EPS)) {
-            g->hc_attn_deferred = true;
+            if (ffn) g->hc_ffn_deferred = true;
+            else g->hc_attn_deferred = true;
             return true;
         }
         if (fn->type == DS4_TENSOR_F16 &&
@@ -42539,7 +42581,7 @@ static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
         /* HC_FUSION: the shared expert's down projection joins the routed sum and expands the block itself */
         const bool expand = l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_on(DS4_GPU_V41_HC_FUSION);
         return ds41_moe_partial(g, m, l, il, (uint32_t)token, !expand) &&
-            (expand ?
+            (expand && !g->shared_done ?
                 ds4_gpu_dsv41_matmul_expand(g->residual, m->map, m->size, l->ffn_down_shexp->abs_offset,
                     (uint32_t)l->ffn_down_shexp->dim[0], (uint32_t)l->ffn_down_shexp->dim[1], g->shared_mid,
                     g->routed, g->after_attn, g->ffn_split, DS4_N_HC) :
@@ -42765,7 +42807,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_flush_commands() != 0;
     }
     g->rope_tab_pos = 0;   /* the table never outlives its step */
-    g->decode_step = g->hc_attn_deferred = false;
+    g->decode_step = g->hc_attn_deferred = g->hc_ffn_deferred = false;
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
