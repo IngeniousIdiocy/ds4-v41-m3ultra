@@ -88,6 +88,7 @@ typedef struct {
 #define DS4_GPU_V41_TP_PREFILL_ROWS8 (1ull << 40)   /* on two Macs the attention output's K-slice rows run in one dispatch, eight output rows per group on the M3 Ultra */
 #define DS4_GPU_V41_VERIFY_INDEXED (1ull << 41)   /* a DSpark verify block attends like a short prefill: index top-k and indexed attention as batches */
 #define DS4_GPU_V41_ENGRAM_READERS (1ull << 42)   /* a prefill sweep reads its Engram rows from disk with 32 concurrent readers instead of 16 */
+#define DS4_GPU_V41_SHORT_MMA (1ull << 43)   /* Q8_0 matmuls of eight rows outside a DSpark block on simdgroup matrices, at the row kernels' bits */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

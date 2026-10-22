@@ -3535,6 +3535,27 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_mma_rows8(
     kernel_mul_mv_q8_0_f32_mma_rows_impl<false, false, false, 8, thread ds4_metal_args_mul_mv &>(
         args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
 }
+/* SHORT_MMA: eight tokens of one group through the exact tiles, with kernel_dsv4_attn_out_low_q8_0_f32_rows's bits:
+ * grid z is the group. */
+kernel void kernel_dsv4_attn_out_low_q8_0_f32_mma8_exact(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int idx = tgpig.z;
+    const int r0 = (int)tgpig.x * 8;
+    simdgroup_float8x8 P[4][4];
+    ds4_q8_exact8_walk<false>(src0s + idx*args.nb02 + (uint64_t)r0 * args.nb01, args.nb01, args.ne00 / QK8_0,
+                              (device const float *)(src1 + idx*args.nb11), args.nb12 / sizeof(float),
+                              tiisg, sgitg, P);
+    const float tot = ds4_q8_exact8_reduce(P, (threadgroup float *)shmem, tiisg, sgitg);
+    if (tiisg < 8)
+        ((device float *)dst)[(uint64_t)idx * args.ne0 + (uint64_t)tiisg * args.ne1 * args.ne0 + r0 + sgitg] = tot;
+}
 /* kernel_dsv4_attn_out_low_q8_0_f32 at the V4.1 decode shape (4096, 1024, 8) as literals. */
 kernel void kernel_dsv4_attn_out_low_q8_0_f32_static(
         constant ds4_metal_args_mul_mv_id & args,

@@ -489,6 +489,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_TP_PREFILL_ROWS8",
             "DS4_METAL_DISABLE_V41_VERIFY_INDEXED",
             "DS4_METAL_DISABLE_V41_ENGRAM_READERS",
+            "DS4_METAL_DISABLE_V41_SHORT_MMA",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -507,6 +508,15 @@ static int g_v41_dspark_rows;
 void ds4_gpu_dsv41_dspark_rows(int on) { g_v41_dspark_rows = on; }
 /* ROWS_MMA: only a DSpark block's rows (the drafter's and the verify block's); any other batch keeps the row kernels */
 static inline int ds4_gpu_v41_rows_mma(void) { return g_v41_dspark_rows && ds4_gpu_v41_on(DS4_GPU_V41_ROWS_MMA); }
+/* SHORT_MMA: eight rows outside a DSpark block (a short prefill) on simdgroup matrices with the row kernels' bits; the
+ * bits rest on the M1-M4 simdgroup matrices (checked on the M3 Ultra), so M5's matrix units keep the row kernels */
+static inline int ds4_gpu_v41_short_mma(uint32_t n_rows) {
+    return !g_v41_dspark_rows && n_rows == 8u && ds4_gpu_v41_on(DS4_GPU_V41_SHORT_MMA) &&
+        ds4_gpu_device_is_pre_m5_apple_silicon();
+}
+/* SHORT_MMA's threadgroup: two simdgroups per simdgroup of the row kernel, and their 2 KiB of half sums */
+#define DS4_SHORT_MMA_SG 8u
+#define DS4_SHORT_MMA_SMEM (512u * sizeof(float))
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
 static id<MTLComputePipelineState> g_unary_sigmoid_pipeline;
 static id<MTLComputePipelineState> g_unary_silu_pipeline;
@@ -20387,13 +20397,18 @@ static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
         const char *mma_name = mma == 8 ?
             (round_bf16 ? "kernel_mul_mv_q8_0_f32_bf16_mma_rows8" : "kernel_mul_mv_q8_0_f32_mma_rows8") :
             (round_bf16 ? "kernel_mul_mv_q8_0_f32_bf16_mma_rows" : "kernel_mul_mv_q8_0_f32_mma_rows");
+        /* SHORT_MMA: eight rows outside a DSpark block, the row kernels' four simdgroups' bits on simdgroup matrices */
+        const bool exact_kernel = rows_kernel && !mma_kernel && ds4_gpu_v41_short_mma(n_rows) && dispatch.nsg == 4 &&
+            (out_dim % 8u) == 0;
+        const char *exact_name = round_bf16 ? "kernel_mul_mv_q8_0_f32_bf16_mma8_exact" : "kernel_mul_mv_q8_0_f32_mma8_exact";
         if (rows_kernel) {
             dispatch.nr0 = 4;
             args.nr0 = 4;
-            DS4_TEST_NOTE(mma_kernel ? mma_name : rows_name);
+            DS4_TEST_NOTE(mma_kernel ? mma_name : exact_kernel ? exact_name : rows_name);
         }
 
         id<MTLComputePipelineState> pipeline = mma_kernel ? ds4_gpu_get_pipeline(mma_name) :
+            exact_kernel ? ds4_gpu_get_pipeline(exact_name) :
             ds4_gpu_get_mul_mv_pipeline(rows_kernel ? rows_name : dispatch.function_name, dispatch.nsg);
         if (!pipeline) return 0;
 
@@ -20413,6 +20428,13 @@ static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mma, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 decode-row matmul");
+        }
+        if (exact_kernel) {
+            [enc setThreadgroupMemoryLength:DS4_SHORT_MMA_SMEM atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / 8u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, DS4_SHORT_MMA_SG, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 exact short-prefill matmul");
         }
         [enc setThreadgroupMemoryLength:(rows_kernel ? 32u * 4u * sizeof(float) : dispatch.smem) atIndex:0];
         [enc dispatchThreadgroups:
@@ -21134,11 +21156,16 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         /* ROWS_MMA: 3-8 rows of the bf16 form on simdgroup matrices */
         const bool mma_kernel = store_gate_up == 2 && rows >= 3u && rows <= 8u && (in_dim % 256u) == 0 &&
             (out_dim % 8u) == 0 && ds4_gpu_v41_on(DS4_GPU_V41_ROW_MATMULS) && ds4_gpu_v41_rows_mma();
+        /* SHORT_MMA: eight rows outside a DSpark block with the rows kernel's bits */
+        const bool exact_kernel = store_gate_up == 2 && !mma_kernel && ds4_gpu_v41_short_mma(rows) &&
+            mv_dispatch.nsg == 4 && (out_dim % 8u) == 0 && ds4_gpu_v41_on(DS4_GPU_V41_ROW_MATMULS);
         if (store_gate_up == 2)
             DS4_TEST_NOTE(mma_kernel ? "kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma_rows8" :
+                          exact_kernel ? "kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma8_exact" :
                                        "kernel_dsv4_shared_mid_swiglu_q8_0_bf16");
         id<MTLComputePipelineState> pipeline = mma_kernel ?
             ds4_gpu_get_pipeline("kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma_rows8") :
+            exact_kernel ? ds4_gpu_get_pipeline("kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma8_exact") :
             ds4_gpu_get_mul_mv_pipeline(fn_name, mv_dispatch.nsg);
         if (!pipeline) return 0;
 
@@ -21166,6 +21193,13 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(cb, owned, "shared expert matrix rows");
+        }
+        if (exact_kernel) {
+            [enc setThreadgroupMemoryLength:DS4_SHORT_MMA_SMEM atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / 8u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, DS4_SHORT_MMA_SG, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "shared expert exact short-prefill rows");
         }
         [enc setThreadgroupMemoryLength:2u * mv_dispatch.smem atIndex:0];
         const NSUInteger groups = ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0;
@@ -28225,11 +28259,16 @@ int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
             /* ROWS_MMA: from three rows on simdgroup matrices */
             const bool mma_kernel = rows_kernel && n_rows >= 3u && (group_dim % 256u) == 0 && (rank % 8u) == 0 &&
                 ds4_gpu_v41_rows_mma();
+            /* SHORT_MMA: eight rows outside a DSpark block with the rows kernel's bits */
+            const bool exact_kernel = rows_kernel && !mma_kernel && ds4_gpu_v41_short_mma(n_rows) && (rank % 8u) == 0;
             if (mma_kernel) { args.nr0 = 8; args.ne12 = (int32_t)n_rows; }
+            if (exact_kernel) args.nr0 = 8;
             if (rows_kernel) DS4_TEST_NOTE(mma_kernel ? "kernel_dsv4_attn_out_low_q8_0_f32_mma_rows8" :
+                                           exact_kernel ? "kernel_dsv4_attn_out_low_q8_0_f32_mma8_exact" :
                                            "kernel_dsv4_attn_out_low_q8_0_f32_rows");
             id<MTLComputePipelineState> pipeline = mma_kernel ?
                 ds4_gpu_get_pipeline("kernel_dsv4_attn_out_low_q8_0_f32_mma_rows8") :
+                exact_kernel ? ds4_gpu_get_pipeline("kernel_dsv4_attn_out_low_q8_0_f32_mma8_exact") :
                 ds4_gpu_get_mul_mv_pipeline(rows_kernel ?
                 "kernel_dsv4_attn_out_low_q8_0_f32_rows" : "kernel_dsv4_attn_out_low_q8_0_f32", 4);
             ok = pipeline && ds4_gpu_encode_attn_out_low_q8_direct(cb, pipeline, &args,
@@ -28237,8 +28276,9 @@ int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
                     ds4_gpu_tensor_buffer(heads),
                     ds4_gpu_tensor_offset(heads) + (NSUInteger)group0 * group_dim * sizeof(float),
                     ds4_gpu_tensor_buffer(low), ds4_gpu_tensor_offset(low),
-                    mma_kernel ? (8u * 2u * 8u * 32u + 8u * 64u) * sizeof(float) : 32u * 2u * sizeof(float) * groups,
-                    mma_kernel ? 8u : 4u * groups, true) != 0;
+                    mma_kernel ? (8u * 2u * 8u * 32u + 8u * 64u) * sizeof(float) :
+                    exact_kernel ? DS4_SHORT_MMA_SMEM : 32u * 2u * sizeof(float) * groups,
+                    mma_kernel ? 8u : exact_kernel ? DS4_SHORT_MMA_SG : 4u * groups, true) != 0;
         }
         if (!had_batch) ok = ds4_gpu_end_commands() != 0 && ok;
         return ok ? 1 : 0;
@@ -50056,10 +50096,14 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
         const int mma = in_dim >= 4096u ? 8 : 4;
         const bool mma_kernel = rows >= (in_dim >= 8192u ? 4u : 3u) &&
             (in_dim % (mma == 8 ? 256u : 128u)) == 0 && (out_dim % 8u) == 0 && ds4_gpu_v41_rows_mma();
+        /* SHORT_MMA: eight rows outside a DSpark block with the rows kernel's bits */
+        const bool exact_kernel = !mma_kernel && ds4_gpu_v41_short_mma(rows) && dispatch.nsg == 4 && (out_dim % 8u) == 0;
         const char *fn = mma_kernel ? (mma == 8 ? "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows8" :
                                        "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows") :
+            exact_kernel ? "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma8_exact" :
             "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows_seq4";
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(fn, dispatch.nsg);
+        id<MTLComputePipelineState> pipeline = exact_kernel ? ds4_gpu_get_pipeline(fn) :
+            ds4_gpu_get_mul_mv_pipeline(fn, dispatch.nsg);
         if (!pipeline) return 0;
         DS4_TEST_NOTE(fn);
         int owned = 0;
@@ -50077,10 +50121,11 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
         [enc setBuffer:ds4_gpu_tensor_buffer(split) offset:split_offset + n_hc * sizeof(float) atIndex:7];
         [enc setBuffer:ds4_gpu_tensor_buffer(split) offset:split_offset + 2u * n_hc * sizeof(float) atIndex:8];
         [enc setThreadgroupMemoryLength:(mma_kernel ? (NSUInteger)mma * (2u * 8u * 32u + 64u) * sizeof(float) :
-                                         32u * sizeof(float) * 4u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(mma_kernel ? (NSUInteger)out_dim / 8u :
+                                         exact_kernel ? DS4_SHORT_MMA_SMEM : 32u * sizeof(float) * 4u) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(mma_kernel || exact_kernel ? (NSUInteger)out_dim / 8u :
                                               ((NSUInteger)out_dim + (NSUInteger)dispatch.nr0 - 1u) / (NSUInteger)dispatch.nr0, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, mma_kernel ? (NSUInteger)mma : (NSUInteger)dispatch.nsg, 1)];
+             threadsPerThreadgroup:MTLSizeMake(32, mma_kernel ? (NSUInteger)mma : exact_kernel ? DS4_SHORT_MMA_SG :
+                                                   (NSUInteger)dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 projection rows with HC expand");
     }
