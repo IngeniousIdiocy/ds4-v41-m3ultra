@@ -41295,6 +41295,8 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         outputs != DS4_N_VOCAB &&
 #endif
         weight->type == DS4_TENSOR_Q8_0) {
+        if (round && ds4_gpu_dsv41_matmul_q8_0_bf16_rows(out, m->map, m->size, weight->abs_offset, width, outputs,
+                                                         in, count)) return true;
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {

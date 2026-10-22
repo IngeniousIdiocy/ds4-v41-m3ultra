@@ -462,6 +462,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_DECODE_ATTENTION",
             "DS4_METAL_DISABLE_V41_FIXED_SHAPES",
             "DS4_METAL_DISABLE_V41_SAMPLER_SCAN",
+            "DS4_METAL_DISABLE_V41_ROW_MATMULS",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -20201,7 +20202,7 @@ int ds4_gpu_dsv41_project_pair_q8(ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
     }
 }
 
-int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
         ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
@@ -20209,7 +20210,8 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
-        uint32_t              n_rows) {
+        uint32_t              n_rows,
+        int                   round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !x || !model_map || n_rows == 0 ||
         n_rows > INT32_MAX || in_dim == 0 || out_dim == 0 ||
@@ -20254,9 +20256,18 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.nb13 = args.nb12;
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
+        /* ROW_MATMULS: the rows one after another on the single-row layout, four outputs per simdgroup */
+        const bool rows_kernel = n_rows >= 2u && n_rows <= 8u && ds4_gpu_v41_on(DS4_GPU_V41_ROW_MATMULS);
+        if (!rows_kernel && round_bf16) return 0;
+        const char *rows_name = round_bf16 ? "kernel_mul_mv_q8_0_f32_bf16_rows_seq4" : "kernel_mul_mv_q8_0_f32_rows_seq4";
+        if (rows_kernel) {
+            dispatch.nr0 = 4;
+            args.nr0 = 4;
+            DS4_TEST_NOTE(rows_name);
+        }
 
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
+            ds4_gpu_get_mul_mv_pipeline(rows_kernel ? rows_name : dispatch.function_name, dispatch.nsg);
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -20268,12 +20279,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
+        [enc setThreadgroupMemoryLength:(rows_kernel ? 32u * 4u * sizeof(float) : dispatch.smem) atIndex:0];
         [enc dispatchThreadgroups:
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)n_rows,
+                            rows_kernel ? 1u : (NSUInteger)n_rows,
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
@@ -20282,6 +20293,29 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         return ds4_gpu_finish_command_buffer(
                 cb, owned, "Q8_0 exact decode-row matvec");
     }
+}
+
+int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    return ds4_gpu_matmul_q8_0_rows_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x,
+                                                n_rows, 0);
+}
+
+/* ROW_MATMULS with FUSED_ROUNDING: 2-8 rows with the outputs rounded to bf16 as they store. Returns 0, encoding
+ * nothing, when either group is off or the row count is outside 2-8. */
+int ds4_gpu_dsv41_matmul_q8_0_bf16_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                       uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+                                       const ds4_gpu_tensor *x, uint32_t n_rows) {
+    if (!ds4_gpu_v41_on(DS4_GPU_V41_FUSED_ROUNDING)) return 0;
+    return ds4_gpu_matmul_q8_0_rows_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x,
+                                                n_rows, 1);
 }
 
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
@@ -21595,25 +21629,40 @@ static int ds4_gpu_matmul_f16_tensor_impl(
             }
             mv_args.nr0 = mv_dispatch.nr0;
             if (round_bf16) DS4_TEST_NOTE("kernel_mul_mv_f16_f32_4_bf16");
+            /* ROW_MATMULS: a few rows share the weight pass, one simdgroup group per row and at most 32 simdgroups
+             * per threadgroup, so more rows go in chunks */
+            const uint32_t chunk = mv_dispatch.smem && (in_dim % 4u) == 0 && mv_dispatch.nsg >= 1 &&
+                mv_dispatch.nsg <= 16 ? 32u / (uint32_t)mv_dispatch.nsg : 1u;
+            const bool rows_kernel = n_tok >= 2 && n_tok <= 8 && chunk >= 2u &&
+                !strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4") &&
+                ds4_gpu_v41_on(DS4_GPU_V41_ROW_MATMULS);
+            if (rows_kernel) DS4_TEST_NOTE("kernel_mul_mv_f16_f32_4_rows");
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(round_bf16 ? "kernel_mul_mv_f16_f32_4_bf16" : mv_dispatch.function_name,
+                ds4_gpu_get_mul_mv_pipeline(rows_kernel ? "kernel_mul_mv_f16_f32_4_rows" :
+                                            round_bf16 ? "kernel_mul_mv_f16_f32_4_bf16" : mv_dispatch.function_name,
                                             mv_dispatch.nsg);
             if (!pipeline) return 0;
 
-            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:pipeline];
-            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
-            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            if (mv_dispatch.smem) {
-                [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+            for (uint64_t r = 0; r < n_tok; r += rows_kernel ? chunk : n_tok) {
+                const NSUInteger groups = rows_kernel ? (NSUInteger)(n_tok - r < chunk ? n_tok - r : chunk) : 1u;
+                if (rows_kernel) mv_args.ne11 = mv_args.ne1 = (int32_t)groups;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:pipeline];
+                [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) + (NSUInteger)(r * in_dim * sizeof(float)) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) + (NSUInteger)(r * out_dim * sizeof(float))
+                       atIndex:3];
+                if (mv_dispatch.smem) {
+                    [enc setThreadgroupMemoryLength:mv_dispatch.smem * groups atIndex:0];
+                }
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                                      (NSUInteger)mv_dispatch.nr0,
+                                                      rows_kernel ? 1u : (NSUInteger)n_tok,
+                                                      1)
+                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg * groups, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  (NSUInteger)n_tok,
-                                                  1)
-                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
-            ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 tensor matvec")) return 0;
             return 1;

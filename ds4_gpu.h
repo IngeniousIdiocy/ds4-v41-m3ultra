@@ -66,6 +66,7 @@ typedef struct {
 #define DS4_GPU_V41_DECODE_ATTENTION (1ull << 18)   /* decode attention stages its selected rows straight from the cache */
 #define DS4_GPU_V41_FIXED_SHAPES (1ull << 19)   /* decode kernels built for V4.1's exact shapes */
 #define DS4_GPU_V41_SAMPLER_SCAN (1ull << 20)   /* the sampler's first pass over the logits in 16 NEON lanes (any model) */
+#define DS4_GPU_V41_ROW_MATMULS (1ull << 21)   /* Q8_0 and F16 matmuls of 2-8 rows share one weight pass (any model) */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

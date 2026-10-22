@@ -2277,12 +2277,64 @@ static int check_sampler_scan(void) {
     return 1;
 }
 
+/* ROW_MATMULS: Q8_0 and F16 matmuls of 2-8 rows with the switch off (base's per-row grid) and on (one weight pass for
+ * all rows), the same bits; the bf16 Q8_0 rows == the rows then the rounding pass. */
+static int check_row_matmuls(void) {
+    enum { Q_IN = 4096, Q_OUT = 1280, H_IN = 20480, H_OUT = 24, ROWS = 8 };
+    uint64_t q_bytes = 0;
+    uint8_t *q8 = q8_weights(Q_OUT, Q_IN, &q_bytes);
+    CHECK(q8);
+    const uint64_t h_off = q_bytes, bytes = h_off + (uint64_t)H_IN * H_OUT * 2;
+    uint8_t *map = NULL;
+    CHECK(posix_memalign((void **)&map, getpagesize(), bytes) == 0);
+    memcpy(map, q8, q_bytes);
+    free(q8);
+    uint16_t *h = (uint16_t *)(map + h_off);
+    for (uint32_t i = 0; i < H_IN * H_OUT; i++)
+        h[i] = (uint16_t)((random_bits() & 0x8000u) | (0x2000u + random_bits() % 0x1800u));
+    CHECK(ds4_gpu_set_model_map(map, bytes));
+    ds4_gpu_tensor *x = upload(NULL, ROWS * H_IN * 4), *ref = upload(NULL, ROWS * Q_OUT * 4),
+                   *got = upload(NULL, ROWS * Q_OUT * 4);
+    CHECK(x && ref && got);
+    float *xv = ds4_gpu_tensor_contents(x);
+    for (int i = 0; i < ROWS * H_IN; i++) xv[i] = random_value();
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const char *names[3] = {"kernel_mul_mv_q8_0_f32_rows_seq4", "kernel_mul_mv_q8_0_f32_bf16_rows_seq4",
+                            "kernel_mul_mv_f16_f32_4_rows"};
+    uint64_t runs[3];
+    for (int k = 0; k < 3; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
+    for (uint32_t rows = 2; rows <= ROWS; rows++) {
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_ROW_MATMULS);
+        CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ref, map, bytes, 0, Q_IN, Q_OUT, x, rows));
+        CHECK(!ds4_gpu_dsv41_matmul_q8_0_bf16_rows(got, map, bytes, 0, Q_IN, Q_OUT, x, rows));
+        ds4_gpu_test_set_v41_off(0);
+        CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(got, map, bytes, 0, Q_IN, Q_OUT, x, rows));
+        CHECK(same_bits(ref, got, rows * Q_OUT));
+        CHECK(ds4_gpu_dsv41_quantize(ref, Q_OUT, rows, DS4_V41_BF16) &&
+              ds4_gpu_dsv41_matmul_q8_0_bf16_rows(got, map, bytes, 0, Q_IN, Q_OUT, x, rows));
+        CHECK(same_bits(ref, got, rows * Q_OUT));
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_ROW_MATMULS);
+        CHECK(ds4_gpu_dsv41_projection_rows(ref, map, bytes, h_off, H_IN, H_OUT, rows, x));
+        ds4_gpu_test_set_v41_off(0);
+        CHECK(ds4_gpu_dsv41_projection_rows(got, map, bytes, h_off, H_IN, H_OUT, rows, x));
+        CHECK(same_bits(ref, got, rows * H_OUT));
+    }
+    CHECK(ds4_gpu_test_kernel_runs(names[0]) == runs[0] + 7 && ds4_gpu_test_kernel_runs(names[1]) == runs[1] + 7 &&
+          ds4_gpu_test_kernel_runs(names[2]) == runs[2] + 7);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(got);
+    /* map stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 row matmuls: Q8_0 and F16 rows in one weight pass == per-row grid\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
         check_index_bf16() && check_topk() && check_index_candidates() &&
-        check_decode_attention() && check_fixed_shapes() && check_sampler_scan();
+        check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
+        check_row_matmuls();
 }
 #else
 static int check_v41_groups(void) { return 1; }

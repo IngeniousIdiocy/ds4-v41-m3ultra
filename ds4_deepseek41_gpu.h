@@ -98,6 +98,9 @@ int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_t
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
 /* FIXED_SHAPES: ds4_gpu_attention_output_low_q8_tensor at V4.1's decode shape (8 groups of 4096 -> 1024) with that
  * shape as literals; 0 for any other shape. */
+int ds4_gpu_dsv41_matmul_q8_0_bf16_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                       uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+                                       const ds4_gpu_tensor *x, uint32_t n_rows);
 int ds4_gpu_dsv41_attention_low_static(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
                                        uint64_t out_a_offset, uint32_t group_dim, uint32_t rank, uint32_t n_groups,
                                        const ds4_gpu_tensor *heads);
