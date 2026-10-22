@@ -944,6 +944,7 @@ constant int32_t FC_flash_attn_ext_vec_ns10 [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EXT_VEC + 21)]];
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
+constant int32_t FC_flash_attn_ext_vec_hs   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
 
 // Decode FlashAttention for one query row. DS4 uses this in generation to scan
 // raw and compressed KV cache chunks, optionally splitting long contexts across
@@ -987,11 +988,14 @@ kernel void kernel_flash_attn_ext_vec(
 #define NSG  (FC_flash_attn_ext_vec_nsg)
 #define NS10 (FC_flash_attn_ext_vec_ns10)
 #define NS20 (FC_flash_attn_ext_vec_ns20)
+// FLASH_HEAD_SHARE, HS > 1: the NSG simdgroups of a threadgroup are HS heads over the same keys,
+// sharing the cache lines; each keeps the one-simdgroup key walk and reductions.
+#define HS   (FC_flash_attn_ext_vec_hs)
 
     const short iwg = tgpig[2]%NWG;
 
     const ushort iq3 = tgpig[2]/NWG;
-    const ushort iq2 = tgpig[1];
+    const ushort iq2 = HS > 1 ? tgpig[1]*HS + sgitg : tgpig[1];
     const ushort iq1 = tgpig[0];
 
     constexpr short DK4 = DK/4;
@@ -1007,7 +1011,7 @@ kernel void kernel_flash_attn_ext_vec(
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
 
-    threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                      0*PK);
+    threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 + (HS > 1 ? sgitg : 0)*PK);
     threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NSG*PK);
     threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + NSG*PK);
     threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK);
@@ -1067,7 +1071,7 @@ kernel void kernel_flash_attn_ext_vec(
             slope = pow(base, exph);
         }
 
-        for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
+        for (int ic0 = HS > 1 ? iwg : iwg*NSG + sgitg; ; ic0 += HS > 1 ? NWG : NWG*NSG) {
             int ic = ic0*C;
             if (ic >= args.ne11) {
                 break;
@@ -1286,7 +1290,7 @@ kernel void kernel_flash_attn_ext_vec(
             }
         }
 
-        if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
+        if (FC_flash_attn_ext_vec_has_sinks && (HS > 1 || sgitg == 0) && iwg == 0) {
             const float m = M;
             const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
 
@@ -1314,7 +1318,7 @@ kernel void kernel_flash_attn_ext_vec(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (short r = NSG/2; r > 0; r >>= 1) {
+    for (short r = HS > 1 ? 0 : NSG/2; r > 0; r >>= 1) {
         if (sgitg < r) {
             const float S0 = ss[           0];
             const float S1 = ss[r*(SH/2) + 0];
@@ -1342,7 +1346,7 @@ kernel void kernel_flash_attn_ext_vec(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (sgitg == 0) {
+    if (HS > 1 || sgitg == 0) {
         const int64_t nrows = args.ne3*args.ne2*args.ne1;
         const int64_t rid   = iq3*args.ne2*args.ne1 + iq2 + iq1*args.ne1;
 
@@ -1367,6 +1371,7 @@ kernel void kernel_flash_attn_ext_vec(
 #undef NSG
 #undef NS10
 #undef NS20
+#undef HS
 }
 
 #define FA_TYPES \

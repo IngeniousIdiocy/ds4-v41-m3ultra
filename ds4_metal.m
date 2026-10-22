@@ -471,6 +471,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_PREFILL_FOLDS",
             "DS4_METAL_DISABLE_V41_MOE_DEDUP",
             "DS4_METAL_DISABLE_V41_VERIFY_BATCH",
+            "DS4_METAL_DISABLE_V41_FLASH_HEAD_SHARE",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -3774,7 +3775,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
     return pipeline;
 }
 
-static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
+static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline_hs(
         const char *function_name,
         bool        has_mask,
         bool        has_sinks,
@@ -3785,7 +3786,8 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
         int32_t     ns10,
         int32_t     ns20,
         int32_t     nsg,
-        int32_t     nwg) {
+        int32_t     nwg,
+        int32_t     hs) {
     /*
      * Decode calls this once per layer with identical arguments, so memoize
      * the last hit and skip the NSString key + dictionary lookup on the hot
@@ -3794,17 +3796,17 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
     static struct {
         const char *fn;
         bool m, s, b, c, k, sp;
-        int32_t n10, n20, sg, wg;
+        int32_t n10, n20, sg, wg, hs;
         id<MTLComputePipelineState> pipeline;
     } memo;
     if (memo.pipeline && memo.fn != NULL && strcmp(memo.fn, function_name) == 0 &&
         memo.m == has_mask && memo.s == has_sinks && memo.b == has_bias &&
         memo.c == has_scap && memo.k == has_kvpad && memo.sp == shared_kvpad &&
-        memo.n10 == ns10 && memo.n20 == ns20 && memo.sg == nsg && memo.wg == nwg) {
+        memo.n10 == ns10 && memo.n20 == ns20 && memo.sg == nsg && memo.wg == nwg && memo.hs == hs) {
         return memo.pipeline;
     }
 
-    NSString *key = [NSString stringWithFormat:@"%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_sharedpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
+    NSString *key = [NSString stringWithFormat:@"%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_sharedpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_hs=%d",
                      function_name,
                      has_mask ? 1 : 0,
                      has_sinks ? 1 : 0,
@@ -3815,12 +3817,13 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
                      (int)ns10,
                      (int)ns20,
                      (int)nsg,
-                     (int)nwg];
+                     (int)nwg,
+                     (int)hs];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
         memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
                                has_scap, has_kvpad, shared_kvpad, ns10, ns20,
-                               nsg, nwg, cached };
+                               nsg, nwg, hs, cached };
         return cached;
     }
 
@@ -3835,6 +3838,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
     [constants setConstantValue:&ns20 type:MTLDataTypeInt atIndex:421];
     [constants setConstantValue:&nsg  type:MTLDataTypeInt atIndex:422];
     [constants setConstantValue:&nwg  type:MTLDataTypeInt atIndex:423];
+    [constants setConstantValue:&hs   type:MTLDataTypeInt atIndex:424];
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -3858,9 +3862,17 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
     [g_pipeline_cache setObject:pipeline forKey:key];
     memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
                            has_scap, has_kvpad, shared_kvpad, ns10, ns20,
-                           nsg, nwg, pipeline };
+                           nsg, nwg, hs, pipeline };
     return pipeline;
 }
+
+static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
+        const char *function_name, bool has_mask, bool has_sinks, bool has_bias, bool has_scap,
+        bool has_kvpad, bool shared_kvpad, int32_t ns10, int32_t ns20, int32_t nsg, int32_t nwg) {
+    return ds4_gpu_get_flash_attn_vec_pipeline_hs(function_name, has_mask, has_sinks, has_bias, has_scap,
+                                                  has_kvpad, shared_kvpad, ns10, ns20, nsg, nwg, 1);
+}
+
 
 /* Pipeline for the RoPE-fused decode reduce. Same function constants as the
  * plain reduce so the split-K geometry is identical. */
@@ -30565,14 +30577,20 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
                 (unsigned long)packed_shared_bytes);
     }
 
+    /* FLASH_HEAD_SHARE: several rows give each head one simdgroup over the whole key walk, eight heads to a
+     * threadgroup, sharing the cache lines of the keys they all read */
+    const int32_t hs = rows > 1u && !use_packed && !has_kvpad && nsg == 1u && n_head % 8u == 0 &&
+        ds4_gpu_v41_on(DS4_GPU_V41_FLASH_HEAD_SHARE) ? 8 : 1;
+    const uint32_t nsg_tg = hs > 1 ? (uint32_t)hs : nsg;
+    if (hs > 1) DS4_TEST_NOTE("flash attention head share");
     id<MTLComputePipelineState> vec_pipeline = nil;
     id<MTLComputePipelineState> reduce_pipeline = nil;
     if (!use_packed) {
-        vec_pipeline = ds4_gpu_get_flash_attn_vec_pipeline(
+        vec_pipeline = ds4_gpu_get_flash_attn_vec_pipeline_hs(
             "kernel_flash_attn_ext_vec_f16_dk512_dv512",
             true, true, false, false, has_kvpad, use_shared_kvpad,
             (int32_t)head_dim, (int32_t)head_dim,
-            (int32_t)nsg, (int32_t)nwg);
+            (int32_t)nsg_tg, (int32_t)nwg, hs);
         reduce_pipeline =
             ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim,
                                                      (int32_t)nwg, false);
@@ -30696,7 +30714,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
 
     const NSUInteger shared_elems = (ds4_gpu_align_up_ns(head_dim, 128u) +
                                      4u * ncpsg +
-                                     2u * ds4_gpu_align_up_ns(head_dim, 128u)) * nsg;
+                                     2u * ds4_gpu_align_up_ns(head_dim, 128u)) * nsg_tg;
     const NSUInteger shared_bytes = ds4_gpu_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
 
     if (use_packed) {
@@ -30733,8 +30751,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(1, n_head, nwg * rows)
-         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(1, n_head / (uint32_t)hs, nwg * rows)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg_tg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
     ds4_gpu_flash_attn_reduce_args reduce_args = {

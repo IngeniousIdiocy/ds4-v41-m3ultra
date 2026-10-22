@@ -2756,7 +2756,8 @@ static int check_moe_dedup(void) {
 
 /* VERIFY_BATCH: 2-8 rows against each row alone, bit for bit (ROWS_MMA off; on, the matrix kernels run): the
  * projection with the HC expand (the output-B and the shared down with its add), the attention low projection,
- * and the decode attention of consecutive rows, each over its own raw window and selected rows. */
+ * and the decode attention of consecutive rows, each over its own raw window and selected rows, with eight heads per
+ * threadgroup (FLASH_HEAD_SHARE) and without. */
 static int check_verify_batch(void) {
     enum { D = 5120, FF = 2304, HC = 4, ROWS = 8, GROUP = 4096, RANK = 1024, GROUPS = 8 };
     uint64_t wb = 0, lb = 0;
@@ -2858,6 +2859,16 @@ static int check_verify_batch(void) {
         CHECK(ds4_gpu_synchronize() && same_bits(want, have, (uint64_t)rows * AH * AD));
     }
     CHECK(ds4_gpu_test_kernel_runs(names[4]) == runs[4] + 7);
+    /* FLASH_HEAD_SHARE: the same rows with one head per threadgroup */
+    const uint64_t shared = ds4_gpu_test_kernel_runs("flash attention head share");
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_FLASH_HEAD_SHARE);
+    for (uint32_t rows = 2; rows <= ROWS; rows++) {
+        CHECK(ds4_gpu_dsv41_attention_decode_rows(have, sinks, getpagesize(), 0, q, raw, R, R + ROWS, 0, cache, it, K,
+                                                  C, K, AH, AD, rows));
+        CHECK(ds4_gpu_synchronize() && same_bits(want, have, (uint64_t)rows * AH * AD));
+    }
+    ds4_gpu_test_set_v41_off(0);
+    CHECK(shared == 7 && ds4_gpu_test_kernel_runs("flash attention head share") == shared);
     ds4_gpu_test_set_v41_off(DS4_GPU_V41_VERIFY_BATCH);
     CHECK(!ds4_gpu_dsv41_attention_decode_rows(have, sinks, getpagesize(), 0, q, raw, R, R + ROWS, 0, cache, it, K,
                                                C, K, AH, AD, 4));
@@ -2867,7 +2878,8 @@ static int check_verify_batch(void) {
     for (size_t i = 0; i < sizeof(atensors) / sizeof(*atensors); i++) ds4_gpu_tensor_free(atensors[i]);
     free(ids); free(v); free(sinks);
     /* the weight maps stay: the model views may wrap them */
-    fprintf(stderr, "V4.1 verify batch: 2-8 rows of the expand, the low projection and the decode attention == each row alone\n");
+    fprintf(stderr, "V4.1 verify batch: 2-8 rows of the expand, the low projection and the decode attention (heads "
+            "shared or not) == each row alone\n");
     return 1;
 }
 
