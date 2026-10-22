@@ -43,6 +43,10 @@ typedef struct {
 } ds4_gpu_attention_decode_row;
 #endif
 
+/* Metal: the DeepSeek V4.1 fast paths come in groups, one bit each in the mask ds4_gpu_v41_off(). Each group has
+ * one off switch, read once from the environment; "0" means unset. */
+#define DS4_GPU_V41_MODEL_TRACKED (1ull << 0)   /* DS4_METAL_MODEL_TRACKED: model views keep hazard tracking */
+
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
@@ -82,6 +86,9 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
+uint64_t ds4_gpu_v41_off(void);
+/* Model views skip hazard tracking by default (call before the model is mapped). */
+void ds4_gpu_set_model_untracked_default(int on);
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(

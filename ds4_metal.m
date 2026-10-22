@@ -420,6 +420,22 @@ static NSMutableDictionary<NSString *, NSNumber *> *g_dsv4_hc_barrier_gen;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 static uint32_t g_test_flags;
+static int g_v41_off_read;
+static uint64_t g_v41_off;
+uint64_t ds4_gpu_v41_off(void) {
+    if (!g_v41_off_read) {
+        static const char *names[] = {   /* the groups' off switches, in bit order */
+            "DS4_METAL_MODEL_TRACKED",
+        };
+        for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
+            const char *v = getenv(names[i]);
+            if (v && v[0] && strcmp(v, "0") != 0) g_v41_off |= 1ull << i;
+        }
+        g_v41_off_read = 1;
+    }
+    return g_v41_off;
+}
+static inline int ds4_gpu_v41_on(uint64_t group) { return (ds4_gpu_v41_off() & group) == 0; }
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
 static id<MTLComputePipelineState> g_unary_sigmoid_pipeline;
 static id<MTLComputePipelineState> g_unary_silu_pipeline;
@@ -1625,9 +1641,15 @@ static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
            strcmp(label, "ds4_attention_output_group_ids") == 0;
 }
 
+/* Set by the engine for DeepSeek V4.1: its model views are read-only to the GPU, so they skip hazard tracking, as
+ * DS4_METAL_MODEL_UNTRACKED=1 does for any model. */
+static int g_model_untracked_default;
+void ds4_gpu_set_model_untracked_default(int on) { g_model_untracked_default = on != 0; }
+
 static MTLResourceOptions ds4_gpu_model_resource_options(void) {
     MTLResourceOptions options = MTLResourceStorageModeShared;
-    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL) {
+    if (getenv("DS4_METAL_MODEL_UNTRACKED") != NULL ||
+        (g_model_untracked_default && ds4_gpu_v41_on(DS4_GPU_V41_MODEL_TRACKED))) {
         options |= MTLResourceHazardTrackingModeUntracked;
     }
     return options;
