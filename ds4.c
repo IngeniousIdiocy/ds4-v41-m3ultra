@@ -43467,6 +43467,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         ds41_step_prologue(g, logits != NULL, queued_head, ok, false);
     }
     bool sel_enc = false;
+    unsigned join = 0;   /* queued: tables whose rows join right before their layer's command buffer commits */
     for (uint32_t il = slot ? 1u : 0u; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -43478,7 +43479,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 g->engram_rows = g->engram_rows_b;
                 g->engram_rows_b = rows;
             }
-            ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i)) &&
+            if (overlap_engram && queued) join |= 1u << i;   /* the layer encodes while the rows still read */
+            else ok = (!overlap_engram || ds4_engram_reader_wait(g->engram_reader, i)) &&
                 ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         if (ok) {
@@ -43500,6 +43502,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_selector_encode(g->logits) != 0;
         }
 #endif
+        /* the first commit follows layer 0, so the GPU starts a token early */
+        const bool flush = ok && queued && !drain && (il == 0 || (il + 1u) % DS41_DECODE_FLUSH_LAYERS == 0);
+        for (uint32_t i = 0; join && (drain || flush) && i < 2; i++)
+            if (join >> i & 1u)
+                ok = ok && ds4_engram_reader_wait(g->engram_reader, i) &&
+                    ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+        if (drain || flush) join = 0;
         if (drain && pe) ok = ds41_slot_drain(g, m, w, queued_head, ok);
         else if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
@@ -43509,9 +43518,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (!ok) fprintf(stderr, "ds4: V4.1 layer %u failed at position %u\n", il, g->pos);
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
-        /* the first commit follows layer 0, so the GPU starts a token early */
-        if (ok && queued && !drain && (il == 0 || (il + 1u) % DS41_DECODE_FLUSH_LAYERS == 0))
-            ok = ds4_gpu_flush_commands() != 0;
+        if (ok && flush) ok = ds4_gpu_flush_commands() != 0;
     }
     ds41_step_tail_reset(g);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
