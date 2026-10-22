@@ -2436,6 +2436,83 @@ kernel void kernel_glm_indexer_scores_tiled_f32(
     }
 }
 
+/* The (column, row) of a lane's two elements in an 8x8 simdgroup matrix. */
+static inline short2 dsv41_mma_coord(ushort lane) {
+    const short qid = lane / 4;
+    return short2((qid & 2) * 2 + (lane % 2) * 2, (qid & 4) + ((lane / 2) % 4));
+}
+
+/* PREFILL_INDEX: V4.1 indexer scores on simdgroup matrices without threadgroup memory: each
+ * simdgroup keeps the K^T fragments of its 8 compressed rows in registers for
+ * every head and reads the Q fragments and head weights straight from device
+ * memory, so the head loop runs without barriers. The products, their order
+ * over the 16 dim blocks and the head sum order match
+ * kernel_glm_indexer_scores_tiled_f32. Threadgroup: 8 tokens x 32 rows. */
+kernel void kernel_dsv41_indexer_scores_mma(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint token_base = tgpig.y * 8u;
+    const uint row_base = tgpig.x * 32u + (uint)sg * 8u;
+    const short2 xy = dsv41_mma_coord(lane);
+    const uint token = token_base + (uint)xy.y;
+    const uint row = row_base + (uint)xy.x;
+    const bool live = token < args.n_tokens;
+    const uint visible = live ? glm_indexer_batch_visible_rows(args, token) : 0u;
+    const uint last_token = min(token_base + 8u, args.n_tokens);
+    const uint max_visible = glm_indexer_batch_visible_rows(args, last_token - 1u);
+
+    if (row_base < max_visible) {
+        /* K^T fragment db: element (dim, key) = cache[row_base + key][db * 8 + dim] */
+        simdgroup_float8x8 kt[16];
+        for (uint db = 0; db < 16u; db++) {
+            float k0 = 0.0f, k1 = 0.0f;
+            const uint d = db * 8u + (uint)xy.y;
+            if (row_base + (uint)xy.x < args.n_rows)
+                k0 = glm_cache_load_f32_or_f16(indexer_key_cache,
+                    (uint64_t)(row_base + (uint)xy.x) * 128u + d, args.cache_f16);
+            if (row_base + (uint)xy.x + 1u < args.n_rows)
+                k1 = glm_cache_load_f32_or_f16(indexer_key_cache,
+                    (uint64_t)(row_base + (uint)xy.x + 1u) * 128u + d, args.cache_f16);
+            kt[db].thread_elements()[0] = k0;
+            kt[db].thread_elements()[1] = k1;
+        }
+        device const float *qrow = (device const float *)(q + (uint64_t)min(token, args.n_tokens - 1u) *
+                                                          args.q_token_stride);
+        device const float *w = (device const float *)(weights + (uint64_t)min(token, args.n_tokens - 1u) *
+                                                       args.weights_token_stride);
+        float acc0 = 0.0f, acc1 = 0.0f;
+        for (uint head = 0; head < args.n_head; head++) {
+            device const float *qh = qrow + head * (args.q_head_stride / sizeof(float));
+            simdgroup_float8x8 dot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            #pragma clang loop unroll(full)
+            for (uint db = 0; db < 16u; db++) {
+                simdgroup_float8x8 mq;
+                mq.thread_elements()[0] = qh[db * 8u + (uint)xy.x];
+                mq.thread_elements()[1] = qh[db * 8u + (uint)xy.x + 1u];
+                simdgroup_multiply_accumulate(dot, mq, kt[db], dot);
+            }
+            const float wh = w[head];
+            acc0 += max(dot.thread_elements()[0] * args.scale, 0.0f) * wh;
+            acc1 += max(dot.thread_elements()[1] * args.scale, 0.0f) * wh;
+        }
+        if (live) {
+            device float *dst = (device float *)(scores + (uint64_t)token * args.score_token_stride);
+            if (row < args.n_rows) dst[row] = row < visible ? acc0 : -INFINITY;
+            if (row + 1u < args.n_rows) dst[row + 1u] = row + 1u < visible ? acc1 : -INFINITY;
+        }
+    } else if (live) {
+        device float *dst = (device float *)(scores + (uint64_t)token * args.score_token_stride);
+        if (row < args.n_rows) dst[row] = -INFINITY;
+        if (row + 1u < args.n_rows) dst[row + 1u] = -INFINITY;
+    }
+}
+
 kernel void kernel_glm_indexer_scores_tiled(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,

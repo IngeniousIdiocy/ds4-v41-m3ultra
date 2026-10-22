@@ -466,6 +466,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_ROWS_MMA",
             "DS4_METAL_DISABLE_V41_VERIFY_KERNELS",
             "DS4_METAL_DISABLE_V41_PUBLIC_CONTROLLER",
+            "DS4_METAL_DISABLE_V41_PREFILL_INDEX",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -36971,7 +36972,11 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         const bool use_tiled_f32 = tiled_f32;
         const bool use_tiled = !force_scalar && n_tokens >= 8u &&
                                n_head == 32u && head_dim == 128u;
+        /* PREFILL_INDEX: V4.1's f32 tiles on simdgroup matrices, K^T held in registers, the same bits */
+        const bool use_mma = use_tiled && use_tiled_f32 && ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_INDEX);
+        if (use_mma) DS4_TEST_NOTE("kernel_dsv41_indexer_scores_mma");
         id<MTLComputePipelineState> pipeline =
+            use_mma ? ds4_gpu_get_pipeline("kernel_dsv41_indexer_scores_mma") :
             use_tiled
                 ? ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
                                                      : g_glm_indexer_scores_tiled_pipeline,
@@ -37009,7 +37014,12 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
         [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
         [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-        if (use_tiled) {
+        if (use_mma) {
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u,
+                                                  ((NSUInteger)n_tokens + 7u) / 8u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        } else if (use_tiled) {
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 32u * 128u;
             const NSUInteger dot_shared = 8u * 32u;

@@ -70,6 +70,7 @@ typedef struct {
 #define DS4_GPU_V41_ROWS_MMA (1ull << 22)   /* Q8_0 matmuls of a V4.1 DSpark block's 3-8 rows on simdgroup matrices (not bit-exact) */
 #define DS4_GPU_V41_VERIFY_KERNELS (1ull << 23)   /* a V4.1 DSpark verify block's 6-8 MXFP4 rows through the fused decode MoE kernels */
 #define DS4_GPU_V41_PUBLIC_CONTROLLER (1ull << 24)   /* DSpark drafts by measured cost (ds4_deepseek41_admission.h) */
+#define DS4_GPU_V41_PREFILL_INDEX (1ull << 25)   /* prefill index scores of 8 or more rows on simdgroup matrices */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

@@ -2539,6 +2539,42 @@ static int check_public_controller(void) {
     return 1;
 }
 
+/* PREFILL_INDEX: index scores of 8 to 40 rows, early and late in the context, ratios 1 and 2, on simdgroup matrices
+ * against the tiled kernel, bit for bit. */
+static int check_prefill_index(void) {
+    enum { KEYS = 1025, ROWS = 40, HEADS = 32, DIM = 128 };
+    ds4_gpu_tensor *qt = upload(NULL, (size_t)ROWS * HEADS * DIM * 4), *kt = upload(NULL, (size_t)KEYS * DIM * 4);
+    ds4_gpu_tensor *wt = upload(NULL, (size_t)ROWS * HEADS * 4);
+    ds4_gpu_tensor *ref = upload(NULL, (size_t)ROWS * KEYS * 4), *got = upload(NULL, (size_t)ROWS * KEYS * 4);
+    CHECK(qt && kt && wt && ref && got);
+    float *q = ds4_gpu_tensor_contents(qt), *k = ds4_gpu_tensor_contents(kt), *w = ds4_gpu_tensor_contents(wt);
+    for (size_t i = 0; i < (size_t)ROWS * HEADS * DIM; i++) q[i] = random_value();
+    for (size_t i = 0; i < (size_t)KEYS * DIM; i++) k[i] = random_value();
+    for (size_t i = 0; i < (size_t)ROWS * HEADS; i++) w[i] = bf16(random_value());
+    CHECK(ds4_gpu_dsv41_quantize(qt, DIM, ROWS * HEADS, DS4_V41_FP4_E8M0));
+    CHECK(ds4_gpu_dsv41_quantize(kt, DIM, KEYS, DS4_V41_FP4_E8M0));
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv41_indexer_scores_mma");
+    const uint32_t counts[] = {8, 9, 33, 40};
+    for (uint32_t ratio = 1; ratio <= 2; ratio++)
+        for (uint32_t early = 0; early <= 1; early++)
+            for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+                const uint32_t rows = counts[ci], start = early ? 0 : KEYS * ratio - rows;
+                ds4_gpu_test_set_v41_off(DS4_GPU_V41_PREFILL_INDEX);
+                CHECK(ds4_gpu_dsv41_indexer_scores_batch(ref, qt, wt, kt, KEYS, rows, start, ratio));
+                ds4_gpu_test_set_v41_off(0);
+                CHECK(ds4_gpu_dsv41_indexer_scores_batch(got, qt, wt, kt, KEYS, rows, start, ratio));
+                CHECK(ds4_gpu_synchronize());
+                CHECK(same_bits(ref, got, (uint64_t)rows * KEYS));
+            }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_indexer_scores_mma") == runs + 16);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {qt, kt, wt, ref, got};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    fprintf(stderr, "V4.1 prefill index: 8-40 rows on simdgroup matrices == the tiled kernel\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -2546,7 +2582,7 @@ static int check_v41_groups(void) {
         check_index_bf16() && check_topk() && check_index_candidates() &&
         check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
         check_row_matmuls() && check_rows_mma() && check_verify_kernels() &&
-        check_public_controller();
+        check_public_controller() && check_prefill_index();
 }
 #else
 static int check_v41_groups(void) { return 1; }
