@@ -129,6 +129,16 @@ kernel void kernel_cpy_contig_f16_f16_bits_4(
     }
 }
 
+// Bitwise 16-byte transport for device tensor copies inside a compute batch:
+// keeps a copy in the open compute encoder instead of a blit encoder switch.
+kernel void kernel_ds4_copy_u4(
+        constant uint & n,
+        device const uint4 * src,
+        device       uint4 * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < n) dst[gid] = src[gid];
+}
+
 struct ds4_metal_args_flash_kv_stage_f16 {
     uint raw_cap;
     uint raw_start;

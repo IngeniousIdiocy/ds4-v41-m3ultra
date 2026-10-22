@@ -420,12 +420,29 @@ static NSMutableDictionary<NSString *, NSNumber *> *g_dsv4_hc_barrier_gen;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 static uint32_t g_test_flags;
+/* DS4_GPU_TEST_COUNT_KERNELS: dispatches of the V4.1 fast paths by kernel name (one branch when off). */
+static struct { const char *name; uint64_t runs; } g_test_kernel_runs[64];
+static void ds4_gpu_test_count(const char *name) {
+    for (uint32_t i = 0; i < 64u; i++)
+        if (!g_test_kernel_runs[i].name || !strcmp(g_test_kernel_runs[i].name, name)) {
+            g_test_kernel_runs[i].name = name;
+            g_test_kernel_runs[i].runs++;
+            return;
+        }
+}
+#define DS4_TEST_NOTE(name) do { if (g_test_flags & DS4_GPU_TEST_COUNT_KERNELS) ds4_gpu_test_count(name); } while (0)
+uint64_t ds4_gpu_test_kernel_runs(const char *name) {
+    for (uint32_t i = 0; i < 64u && g_test_kernel_runs[i].name; i++)
+        if (!strcmp(g_test_kernel_runs[i].name, name)) return g_test_kernel_runs[i].runs;
+    return 0;
+}
 static int g_v41_off_read;
 static uint64_t g_v41_off;
 uint64_t ds4_gpu_v41_off(void) {
     if (!g_v41_off_read) {
         static const char *names[] = {   /* the groups' off switches, in bit order */
             "DS4_METAL_MODEL_TRACKED",
+            "DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -434,6 +451,10 @@ uint64_t ds4_gpu_v41_off(void) {
         g_v41_off_read = 1;
     }
     return g_v41_off;
+}
+void ds4_gpu_test_set_v41_off(uint64_t off) {
+    g_v41_off = off;
+    g_v41_off_read = 1;
 }
 static inline int ds4_gpu_v41_on(uint64_t group) { return (ds4_gpu_v41_off() & group) == 0; }
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
@@ -9380,6 +9401,34 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
     if (bytes == 0) return 1;
     if (!g_batch_cb) return 0;
+
+    /* A 16-byte aligned copy inside a serial compute section stays in the
+     * open compute encoder: a blit closes it, and DSpark verify and rollback
+     * issue many small copies per cycle. The bytes moved are the same. */
+    const uint64_t src_at = s.offset + src_offset, dst_at = d.offset + dst_offset;
+    if (ds4_gpu_v41_on(DS4_GPU_V41_COMPUTE_TENSOR_COPY) && !g_batch_encoder_concurrent &&
+        ((src_at | dst_at | bytes) & 15u) == 0 && bytes / 16u <= UINT32_MAX &&
+        (s.buffer != d.buffer || src_at + bytes <= dst_at || dst_at + bytes <= src_at)) {
+        static id<MTLComputePipelineState> copy_pipeline;
+        if (!copy_pipeline) copy_pipeline = ds4_gpu_get_pipeline("kernel_ds4_copy_u4");
+        if (copy_pipeline) {
+            @autoreleasepool {
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+                if (!enc) return 0;
+                const uint32_t n = (uint32_t)(bytes / 16u);
+                [enc setComputePipelineState:copy_pipeline];
+                [enc setBytes:&n length:sizeof(n) atIndex:0];
+                [enc setBuffer:s.buffer offset:(NSUInteger)src_at atIndex:1];
+                [enc setBuffer:d.buffer offset:(NSUInteger)dst_at atIndex:2];
+                const NSUInteger nth = 256u;
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + nth - 1u) / nth, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+            }
+            DS4_TEST_NOTE("kernel_ds4_copy_u4");
+            return 1;
+        }
+    }
 
     /* C inference callers have no surrounding autorelease pool. In particular,
      * validation-layer blit bookkeeping otherwise accumulates across tokens. */

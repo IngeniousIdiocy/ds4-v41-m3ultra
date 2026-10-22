@@ -1256,6 +1256,51 @@ static int check_tp_attention(void) {
     return 1;
 }
 
+#ifdef __APPLE__
+/* ---- The V4.1 Metal fast-path groups ----
+ * Each check runs a group's path and its off switch (DwarfStar's code) on the same data: equal bits, and the
+ * kernel counts show which path ran. Appended after the checks above so they keep their random data. */
+
+/* COMPUTE_TENSOR_COPY: an aligned copy inside a command batch runs as a compute kernel; a misaligned one, or any
+ * copy with the switch off, as a blit. */
+static int check_compute_copy(void) {
+    enum { N = 4096 };
+    float *a = malloc(N * sizeof(float)), *b = malloc(N * sizeof(float)), *want = calloc(N, sizeof(float));
+    CHECK(a && b && want);
+    for (int i = 0; i < N; i++) a[i] = random_value();
+    for (int i = 1; i < 4; i++) want[i] = a[i + 1];
+    for (int i = 4; i < N - 4; i++) want[i] = a[i + 4];
+    ds4_gpu_tensor *src = upload(a, N * sizeof(float)), *dst = upload(NULL, N * sizeof(float));
+    CHECK(src && dst);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    for (int off = 0; off < 2; off++) {
+        ds4_gpu_test_set_v41_off(off ? DS4_GPU_V41_COMPUTE_TENSOR_COPY : 0);
+        const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_ds4_copy_u4");
+        memset(b, 0, N * sizeof(float));
+        CHECK(ds4_gpu_tensor_write(dst, 0, b, N * sizeof(float)));
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_tensor_copy(dst, 16, src, 32, (N - 8) * sizeof(float)));
+        CHECK(ds4_gpu_tensor_copy(dst, 4, src, 8, 3 * sizeof(float)));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_test_kernel_runs("kernel_ds4_copy_u4") == runs + (off ? 0u : 1u));
+        CHECK(ds4_gpu_tensor_read(dst, 0, b, N * sizeof(float)));
+        CHECK(!memcmp(b, want, N * sizeof(float)));
+    }
+    ds4_gpu_test_set_v41_off(0);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor_free(src); ds4_gpu_tensor_free(dst);
+    free(a); free(b); free(want);
+    fprintf(stderr, "V4.1 compute-encoder tensor copy: exact, kernel and blit\n");
+    return 1;
+}
+
+static int check_v41_groups(void) {
+    return check_compute_copy();
+}
+#else
+static int check_v41_groups(void) { return 1; }
+#endif
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--embedding")) {
         const int ok = ds4_gpu_init() && check_embedding();
@@ -1316,11 +1361,16 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--v41-groups")) {
+        const int ok = ds4_gpu_init() && check_v41_groups();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc != 1) return 2;
     int ok = ds4_gpu_init() && check_router() && check_quantization() && check_engram() && check_rope_stride() && check_pool() &&
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
-             check_tp_attention();
+             check_tp_attention() && check_v41_groups();
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }

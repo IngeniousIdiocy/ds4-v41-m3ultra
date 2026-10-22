@@ -46,6 +46,7 @@ typedef struct {
 /* Metal: the DeepSeek V4.1 fast paths come in groups, one bit each in the mask ds4_gpu_v41_off(). Each group has
  * one off switch, read once from the environment; "0" means unset. */
 #define DS4_GPU_V41_MODEL_TRACKED (1ull << 0)   /* DS4_METAL_MODEL_TRACKED: model views keep hazard tracking */
+#define DS4_GPU_V41_COMPUTE_TENSOR_COPY (1ull << 1)   /* aligned tensor copies stay in the compute encoder (any model) */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -315,8 +316,13 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_COUNT_KERNELS = 1u << 7,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* With DS4_GPU_TEST_COUNT_KERNELS, each V4.1 fast path counts its dispatches by kernel name. */
+uint64_t ds4_gpu_test_kernel_runs(const char *name);
+/* Replaces the V4.1 off mask read from the environment. */
+void ds4_gpu_test_set_v41_off(uint64_t off);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
