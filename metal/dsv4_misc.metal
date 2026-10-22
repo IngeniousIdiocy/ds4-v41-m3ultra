@@ -2199,6 +2199,8 @@ kernel void kernel_dsv41_indexer_score_candidates_split(
     kernel void kernel_dsv41_indexer_score_candidates_split<B, LIST, S>( \
     constant ds4_metal_args_glm_indexer_score_one &, device const float *, device const float *, device const void *, \
     device float *, device const uint *, threadgroup float *, uint3, ushort, uint3);
+DSV41_CAND_SPLIT("kernel_dsv41_indexer_score_candidates_split_bf16", true, true, 2)
+DSV41_CAND_SPLIT("kernel_dsv41_indexer_score_candidates_split_f32", false, true, 2)
 DSV41_CAND_SPLIT("kernel_dsv41_indexer_score_rows_split2_bf16", true, false, 2)
 DSV41_CAND_SPLIT("kernel_dsv41_indexer_score_rows_split4_bf16", true, false, 4)
 

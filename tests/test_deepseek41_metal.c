@@ -2058,11 +2058,56 @@ static int check_topk(void) {
     return 1;
 }
 
+/* INDEX_CANDIDATES: one row of 20,003 keys (2,501 blocks, 2,048 kept, the newest among them) scored and picked
+ * among its candidates, from the f32 keys and from their bf16 view, then again with the list reused, gives the masked
+ * wide scorer's and the radix select's ids in their order. */
+static int check_index_candidates(void) {
+    enum { N = 20003, BLOCKS = (N + 7) / 8, K = 512 };
+    float *v = malloc(((size_t)N * 128 + 4096 + 32 + BLOCKS) * sizeof(float));
+    CHECK(v);
+    for (size_t i = 0; i < (size_t)N * 128; i++) v[i] = bf16(random_value());
+    float *qv = v + (size_t)N * 128, *wv = qv + 4096, *mv = wv + 32;
+    for (int i = 0; i < 4096; i++) qv[i] = random_value();
+    for (int i = 0; i < 32; i++) wv[i] = fabsf(random_value());
+    for (int b = 0; b < BLOCKS; b++) mv[b] = 0.0f;
+    for (int dropped = 0; dropped < BLOCKS - 2048;) {   /* drop 453 blocks, never the newest */
+        const int b = (int)((uint32_t)(random_value() * 8192.0f + 32768.0f) % (BLOCKS - 1));
+        if (mv[b] == 0.0f) { mv[b] = -INFINITY; dropped++; }
+    }
+    ds4_gpu_tensor *keys = upload(v, (size_t)N * 128 * 4), *q = upload(qv, 4096 * 4), *w = upload(wv, 32 * 4);
+    ds4_gpu_tensor *mask = upload(mv, BLOCKS * 4), *view = upload(NULL, (size_t)N * 128 * 2);
+    ds4_gpu_tensor *scores = upload(NULL, N * 4), *list = upload(NULL, 2048 * 4);
+    ds4_gpu_tensor *want = upload(NULL, K * 4), *got = upload(NULL, K * 4);
+    CHECK(keys && q && w && mask && view && scores && list && want && got);
+    CHECK(ds4_gpu_dsv41_index_keys_bf16(view, keys, 0, N, NULL));
+    CHECK(ds4_gpu_dsv41_indexer_score_masked(scores, q, w, keys, mask, N) &&
+          ds4_gpu_dsv41_indexer_topk_tensor(want, scores, N, 1, K));
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t built = ds4_gpu_test_kernel_runs("kernel_dsv41_candidate_list");
+    const uint64_t picked = ds4_gpu_test_kernel_runs("kernel_topk_select_one");
+    const ds4_gpu_tensor *views[3] = {NULL, view, view};
+    for (int c = 0; c < 3; c++) {
+        CHECK(ds4_gpu_dsv41_indexer_candidates_tensor(got, scores, list, q, w, keys, views[c], mask, N, K, c == 2));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(want), ds4_gpu_tensor_contents(got), K * 4));
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_candidate_list") == built + 2 &&
+          ds4_gpu_test_kernel_runs("kernel_topk_select_one") == picked + 3);
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_INDEX_CANDIDATES);
+    CHECK(!ds4_gpu_dsv41_indexer_candidates_tensor(got, scores, list, q, w, keys, view, mask, N, K, 1));
+    ds4_gpu_test_set_v41_off(0);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {keys, q, w, mask, view, scores, list, want, got};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(v);
+    fprintf(stderr, "V4.1 index candidates: candidate-only scores and pick == masked wide scorer and radix select\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
-        check_index_bf16() && check_topk();
+        check_index_bf16() && check_topk() && check_index_candidates();
 }
 #else
 static int check_v41_groups(void) { return 1; }

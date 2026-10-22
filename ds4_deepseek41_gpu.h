@@ -96,6 +96,14 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* INDEX_CANDIDATES: one decode row's top_k (at most 512) index ids, scored and picked among the candidate blocks of
+ * block_mask (more than 2,048 blocks, 2,048 kept) only, as the masked wide scorer and the TOPK radix select pick
+ * them; list holds the kept blocks (built unless list_ready). 0: not run, score the full row. */
+int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores, ds4_gpu_tensor *list,
+                                           const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+                                           const ds4_gpu_tensor *keys, const ds4_gpu_tensor *view,
+                                           const ds4_gpu_tensor *block_mask, uint32_t n_comp, uint32_t top_k,
+                                           int list_ready);
 /* The index top-k of V4.1's attention (ds4_gpu_indexer_topk_tensor's ids in its order), which TOPK runs as a radix
  * select on rows of 16,384 scores or more and as a shorter sort and merge on one row's top 512. */
 int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,

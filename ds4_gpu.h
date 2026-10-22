@@ -62,6 +62,7 @@ typedef struct {
 #define DS4_GPU_V41_INDEX_SCORE_WIDE (1ull << 14)   /* one-token index scores of 8,192 keys or more, one thread per key */
 #define DS4_GPU_V41_INDEX_BF16 (1ull << 15)   /* index scoring reads a bf16 copy of the index keys */
 #define DS4_GPU_V41_TOPK (1ull << 16)   /* the index top-k by radix select, or a shorter sort and merge */
+#define DS4_GPU_V41_INDEX_CANDIDATES (1ull << 17)   /* past layer 20, decode scores and picks among layer 20's blocks */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

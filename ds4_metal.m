@@ -458,6 +458,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_INDEX_SCORE_WIDE",
             "DS4_METAL_DISABLE_V41_INDEX_BF16",
             "DS4_METAL_DISABLE_V41_TOPK",
+            "DS4_METAL_DISABLE_V41_INDEX_CANDIDATES",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -48940,6 +48941,71 @@ int ds4_gpu_dsv41_indexer_score_row(ds4_gpu_tensor *scores, const ds4_gpu_tensor
              threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 bf16 index score");
+    }
+}
+
+/* INDEX_CANDIDATES: one decode index row over its candidate keys only (the 2,048 blocks the mask keeps, the newest
+ * block last): the list of those blocks (unless list_ready), their scores (two lanes a key, from the bf16 view when
+ * given, else the f32 keys) and the one-threadgroup radix select, its winners mapped back to key ids. The masked wide
+ * scorer and the radix select give these ids in this order: the same scores, in key order. Returns 0, encoding
+ * nothing, where those would not run, and the caller scores the full row. */
+int ds4_gpu_dsv41_indexer_candidates_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *scores, ds4_gpu_tensor *list,
+                                           const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+                                           const ds4_gpu_tensor *keys, const ds4_gpu_tensor *view,
+                                           const ds4_gpu_tensor *block_mask, uint32_t n_comp, uint32_t top_k,
+                                           int list_ready) {
+    const uint32_t blocks = n_comp <= (1u << 23) ? (n_comp + 7u) / 8u : 0u;
+    const uint32_t count = 16384u - (blocks * 8u - n_comp);
+    if (blocks <= 2048u || !top_k || top_k > 512u || !ds4_gpu_v41_on(DS4_GPU_V41_INDEX_CANDIDATES) ||
+        !ds4_gpu_v41_on(DS4_GPU_V41_INDEX_SCORE_WIDE) || !ds4_gpu_v41_on(DS4_GPU_V41_TOPK) ||
+        !dsv41_tensor_has_floats(selected, top_k) || !dsv41_tensor_has_floats(scores, count) ||
+        !dsv41_tensor_has_floats(list, 2048u) || !dsv41_tensor_has_floats(block_mask, blocks) ||
+        !dsv41_tensor_has_floats(q, 4096u) || !dsv41_tensor_has_floats(weights, 32u) ||
+        !dsv41_tensor_has_floats(keys, (uint64_t)n_comp * 128u)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        const bool use_view = view && dsv41_tensor_has_floats(view, (uint64_t)n_comp * 64u);
+        id<MTLComputePipelineState> list_pipeline = ds4_gpu_get_pipeline("kernel_dsv41_candidate_list");
+        id<MTLComputePipelineState> score_pipeline = ds4_gpu_get_pipeline(use_view ?
+            "kernel_dsv41_indexer_score_candidates_split_bf16" : "kernel_dsv41_indexer_score_candidates_split_f32");
+        id<MTLComputePipelineState> select_pipeline = ds4_gpu_get_pipeline("kernel_topk_select_one");
+        if (!list_pipeline || !score_pipeline || !select_pipeline || list_pipeline.maxTotalThreadsPerThreadgroup < 1024u ||
+            select_pipeline.maxTotalThreadsPerThreadgroup < 1024u) return 0;
+        const ds4_gpu_glm_indexer_score_one_args args = {count, 32u, 128u, 0u, 1.0f / 64.0f};
+        const struct { uint32_t n, top_k; } sargs = {count, top_k};
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        if (!list_ready) {
+            DS4_TEST_NOTE("kernel_dsv41_candidate_list");
+            [enc setComputePipelineState:list_pipeline];
+            [enc setBytes:&blocks length:sizeof(blocks) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(block_mask) offset:ds4_gpu_tensor_offset(block_mask) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(list) offset:ds4_gpu_tensor_offset(list) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            enc = ds4_gpu_compute_encoder(cb);
+        }
+        DS4_TEST_NOTE("kernel_topk_select_one");
+        [enc setComputePipelineState:score_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        const ds4_gpu_tensor *t[] = {q, weights, use_view ? view : keys, scores, list};
+        for (unsigned i = 0; i < 5; i++)
+            [enc setBuffer:ds4_gpu_tensor_buffer(t[i]) offset:ds4_gpu_tensor_offset(t[i]) atIndex:i + 1];
+        [enc setThreadgroupMemoryLength:(4096u + 32u) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)   /* 256 keys a threadgroup */
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:select_pipeline];
+        [enc setBytes:&sargs length:sizeof(sargs) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(scores) offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(list) offset:ds4_gpu_tensor_offset(list) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 candidate index row");
     }
 }
 

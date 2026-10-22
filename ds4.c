@@ -40961,7 +40961,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(index_packed, ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u) \
     X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
     X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
-    X(block_mask, (g->ctx + 7u) / 8u) \
+    X(block_mask, (g->ctx + 7u) / 8u) X(block_list, 2048) \
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
     X(route_logits, DS4_N_EXPERT) X(route_probs, DS4_N_EXPERT) \
     X(selected, DS4_N_EXPERT_USED) X(route_weights, DS4_N_EXPERT_USED) \
@@ -41000,6 +41000,9 @@ typedef struct {
      * live key (false after a restore with keys that are not bf16-exact) */
     ds4_gpu_tensor *index_bf16[4], *index_bf16_flag;
     bool index_bf16_ok;
+    /* INDEX_CANDIDATES: the mask whose kept blocks block_list holds (cleared when layer 20 writes the mask), so the
+     * list is built once a token */
+    const ds4_gpu_tensor *block_list_mask;
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *verify_previous_kv[4], *verify_previous_score[4];
     bool verify_prefix;
@@ -41847,6 +41850,7 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     if (n_comp && ds41_index_source(il)) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
+            g->block_list_mask = NULL;
             /* Below the block cap every block survives. Their sorted order
              * is unused; only the mask is consumed by subsequent layers. */
             if (top == blocks) return ds4_gpu_tensor_fill_f32(g->block_mask, 0, blocks) != 0;
@@ -41888,17 +41892,24 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
     if (n_comp && ds41_index_source(il)) {
         if ((!ds41_narrow_indexer_mv(g, m, l, il) && !ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true)) ||
             !ds41_index_q_rope_quantize(g, il, pos) ||
-            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
+            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) return false;
 #ifdef __APPLE__
-            /* past layer 20, with more blocks than layer 20 keeps, only its kept blocks are scored */
-            !((il > 20u && (n_comp + 7u) / 8u > 2048u && DS4_N_INDEXER_HEAD == 32u &&
-               ds41_on(DS4_GPU_V41_INDEX_SCORE_WIDE) &&
+        /* past layer 20, with more blocks than layer 20 keeps, only its kept blocks are scored */
+        const bool filtered = il > 20u && (n_comp + 7u) / 8u > 2048u && DS4_N_INDEXER_HEAD == 32u;
+        const ds4_gpu_tensor *view = g->index_bf16_ok ? g->index_bf16[owner] : NULL;
+        if (filtered && ds4_gpu_dsv41_indexer_candidates_tensor(g->selected_comp, g->index_scores, g->block_list,
+                g->index_q, g->index_weights, g->index_cache[owner], view, g->block_mask, n_comp,
+                DS4_N_INDEXER_TOP_K, g->block_list_mask == g->block_mask)) {
+            g->block_list_mask = g->block_mask;
+            return true;
+        }
+        if (!((filtered && ds41_on(DS4_GPU_V41_INDEX_SCORE_WIDE) &&
                ds4_gpu_dsv41_indexer_score_masked(g->index_scores, g->index_q, g->index_weights,
                    g->index_cache[owner], g->block_mask, n_comp)) ||
               ds4_gpu_dsv41_indexer_score_row(g->index_scores, g->index_q, g->index_weights, g->index_cache[owner],
-                g->index_bf16_ok ? g->index_bf16[owner] : NULL, n_comp))) return false;
+                view, n_comp))) return false;
 #else
-            !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
+        if (!ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
 #endif
     }
