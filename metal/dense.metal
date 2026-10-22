@@ -413,6 +413,20 @@ kernel void kernel_mul_mv_q8_0_f32_bf16(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+/* TP_PREFILL_ROWS8: eight output rows per group, each row's K walk and reduction as in the two-row kernel */
+[[host_name("kernel_mul_mv_q8_0_f32_rows8")]]
+kernel void kernel_mul_mv_q8_0_f32_rows8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<8, constant ds4_metal_args_mul_mv &, false>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 [[host_name("kernel_mul_mv_q8_0_f32_bf16io")]]
 kernel void kernel_mul_mv_q8_0_f32_bf16io(
         constant ds4_metal_args_mul_mv & args,

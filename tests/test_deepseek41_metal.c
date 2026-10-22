@@ -3038,6 +3038,54 @@ static int check_sampler_gpu(void) {
     return 1;
 }
 
+/* TP_PREFILL_ROWS8: the two-Mac attention output's K-slice rows in one dispatch against one call per row, bit for
+ * bit: 40 rows (the eight-row kernel on the M3 Ultra) and 5 rows (the two-row kernel). */
+static int check_tp_prefill_rows8(void) {
+    enum { FULL = 8192, K = 4096, OUT = 5120, SKIP = 3, ROWS = 40 };
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint64_t bytes = (uint64_t)OUT * FULL / 32 * sizeof(q8_block);
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), bytes) == 0);
+    q8_block *q8 = model;
+    for (uint64_t i = 0; i < bytes / sizeof(q8_block); i++) {
+        q8[i].d = (uint16_t)(0x2000u | (seed & 0x3ffu));
+        for (int j = 0; j < 32; j++) q8[i].qs[j] = (int8_t)(random_value() * 32);
+    }
+    CHECK(ds4_gpu_set_model_map(model, bytes));
+    float *x = malloc((size_t)(SKIP + ROWS) * K * sizeof(float));
+    CHECK(x != NULL);
+    for (int i = 0; i < (SKIP + ROWS) * K; i++) x[i] = random_value();
+    ds4_gpu_tensor *in = upload(x, (uint64_t)(SKIP + ROWS) * K * sizeof(float));
+    ds4_gpu_tensor *a = upload(NULL, (uint64_t)ROWS * OUT * sizeof(float)), *b = upload(NULL, (uint64_t)ROWS * OUT * sizeof(float));
+    CHECK(in && a && b);
+    setenv("DS4_METAL_Q8_MV_NSG", "2", 1);   /* the two-Mac default */
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    int rows8 = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        const uint32_t rows = pass ? 5u : ROWS;
+        const uint64_t r8 = ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_rows8");
+        CHECK(ds4_gpu_matmul_q8_0_kslice_exact_rows_tensor(a, model, bytes, 0, FULL, K, K, OUT, in,
+                                                           (uint64_t)SKIP * K, rows));
+        rows8 += (int)(ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_rows8") - r8);
+        for (uint32_t t = 0; t < rows; t++) {
+            ds4_gpu_tensor *row = ds4_gpu_tensor_view(b, (uint64_t)t * OUT * sizeof(float), OUT * sizeof(float));
+            CHECK(row && ds4_gpu_matmul_q8_0_kslice_tensor(row, model, bytes, 0, FULL, K, K, OUT, in,
+                                                           (uint64_t)(SKIP + t) * K));
+            ds4_gpu_tensor_free(row);
+        }
+        CHECK(same_bits(a, b, (uint64_t)rows * OUT));
+    }
+    ds4_gpu_test_set_flags(0);
+    unsetenv("DS4_METAL_Q8_MV_NSG");
+    CHECK(rows8 <= 1);
+    ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b);
+    free(x);
+    /* model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 two-Mac K-slice rows in one dispatch == one call per row, 40 rows (%s) and 5\n",
+            rows8 ? "eight-row kernel" : "two-row kernel");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -3051,7 +3099,8 @@ static int check_v41_groups(void) {
         check_verify_batch() &&
         check_prefill_matmul() &&
         check_prefill_index_batch() &&
-        check_sampler_gpu();
+        check_sampler_gpu() &&
+        check_tp_prefill_rows8();
 }
 #else
 static int check_v41_groups(void) { return 1; }

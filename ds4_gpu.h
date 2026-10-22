@@ -85,6 +85,7 @@ typedef struct {
 #define DS4_GPU_V41_TP_BALANCED_ROUTE (1ull << 37)   /* on two Macs each rank runs half of every token's ordered expert list, with every expert bound */
 #define DS4_GPU_V41_TP_SHARED_SPLIT (1ull << 38)   /* on two Macs each rank computes half of the shared expert's hidden width */
 #define DS4_GPU_V41_TP_GATES (1ull << 39)   /* on two Macs the partials land in their gate slots and the HC expansion adds the ranks' partials */
+#define DS4_GPU_V41_TP_PREFILL_ROWS8 (1ull << 40)   /* on two Macs the attention output's K-slice rows run in one dispatch, eight output rows per group on the M3 Ultra */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -586,6 +587,20 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                x_elem_off);
+/* The same exact matvec over n_rows compact rows of x (each k_cnt wide) in one dispatch, every row as the one-row
+ * call computes it (Metal). */
+int ds4_gpu_matmul_q8_0_kslice_exact_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                full_in_dim,
+        uint64_t                k_off,
+        uint64_t                k_cnt,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                x_elem_off,
+        uint32_t                n_rows);
 /* CUDA input rows contain only the owned contiguous K slice. Metal input
  * rows span full_in_dim and the kernel reads the slice at k_off within them.
  * Both backends produce full-width output rows. */

@@ -486,6 +486,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_TP_BALANCED_ROUTE",
             "DS4_METAL_DISABLE_V41_TP_SHARED_SPLIT",
             "DS4_METAL_DISABLE_V41_TP_GATES",
+            "DS4_METAL_DISABLE_V41_TP_PREFILL_ROWS8",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -27293,6 +27294,15 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                     out_b_offset, full_low_dim, out_dim, low_offset, low_dim,
                     low, matrix_rows, low_dim, 0) != 0;
             }
+            if (ok && matrix_rows < n_tokens && ds4_gpu_v41_on(DS4_GPU_V41_TP_PREFILL_ROWS8)) {   /* the rows together */
+                const uint32_t rows = n_tokens - matrix_rows;
+                ds4_gpu_tensor *tail = ds4_gpu_tensor_view(out,
+                    (uint64_t)matrix_rows * out_dim * sizeof(float), (uint64_t)rows * out_dim * sizeof(float));
+                ok = tail && ds4_gpu_matmul_q8_0_kslice_exact_rows_tensor(tail, model_map, model_size,
+                    out_b_offset, full_low_dim, low_offset, low_dim, out_dim,
+                    low, (uint64_t)matrix_rows * low_dim, rows);
+                ds4_gpu_tensor_free(tail);
+            } else
             for (uint32_t t = matrix_rows; ok && t < n_tokens; t++) {
                 ds4_gpu_tensor *row = ds4_gpu_tensor_view(out,
                     (uint64_t)t * out_dim * sizeof(float), out_dim * sizeof(float));
@@ -27568,7 +27578,7 @@ int ds4_gpu_attention_output_q8_batch_f16_tensor(
     return 0;
 }
 
-int ds4_gpu_matmul_q8_0_kslice_tensor(
+int ds4_gpu_matmul_q8_0_kslice_exact_rows_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -27578,11 +27588,13 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t                k_cnt,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                x_elem_off) {
+        uint64_t                x_elem_off,
+        uint32_t                n_rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if ((full_in_dim & 31u) != 0 || (k_off & 31u) != 0 || (k_cnt & 31u) != 0 ||
         k_cnt == 0 || k_off + k_cnt > full_in_dim ||
-        full_in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        full_in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_rows == 0 || n_rows > INT32_MAX) {
         return 0;
     }
 
@@ -27590,8 +27602,8 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
         if (!xbuf || !outbuf ||
-            ds4_gpu_tensor_bytes(x) < (x_elem_off + k_cnt) * sizeof(float) ||
-            ds4_gpu_tensor_bytes(out) < out_dim * sizeof(float)) {
+            ds4_gpu_tensor_bytes(x) < (x_elem_off + (uint64_t)n_rows * k_cnt) * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) {
             fprintf(stderr, "ds4: Metal Q8_0 kslice matmul received undersized buffers\n");
             return 0;
         }
@@ -27616,13 +27628,29 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(full_in_dim, out_dim);
         mv_args.ne00 = (int32_t)k_cnt;
         mv_args.ne10 = (int32_t)k_cnt;
+        if (n_rows > 1u) {   /* compact x rows, k_cnt wide */
+            mv_args.ne11 = (int32_t)n_rows;
+            mv_args.ne1 = (int32_t)n_rows;
+            mv_args.nb11 = k_cnt * sizeof(float);
+            mv_args.nb12 = (uint64_t)n_rows * k_cnt * sizeof(float);
+            mv_args.nb13 = mv_args.nb12;
+        }
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
+        /* Many rows of the two-Mac attention output (the only caller with more than one) reuse each input across
+         * eight output rows, without changing the K walk or the SIMD reduction. */
+        if (n_rows >= 32u && full_in_dim == 8192u && k_cnt == 4096u && out_dim == 5120u &&
+            mv_dispatch.nsg == 2 && ds4_gpu_device_name_contains("M3 Ultra")) {
+            mv_dispatch.function_name = "kernel_mul_mv_q8_0_f32_rows8";
+            mv_dispatch.nr0 = 8;
+            mv_dispatch.smem = 32u * 8u * sizeof(float);
+            DS4_TEST_NOTE("kernel_mul_mv_q8_0_f32_rows8");
+        }
         mv_args.nr0 = mv_dispatch.nr0;
         /* TP partial producer: publish the gate's checked flag from the
          * same kernel (last-arriving threadgroup) when requested. */
         uint32_t fold_slot = 0, fold_value = 0;
-        const int fold = !owned &&
+        const int fold = n_rows == 1u && !owned &&
             ds4_gpu_tp_flag_fold_take(out, out_dim * sizeof(float), &fold_slot, &fold_value);
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(
@@ -27653,7 +27681,7 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
             [enc setThreadgroupMemoryLength:16 atIndex:1];
         }
         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(ntg, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(ntg, n_rows, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (fold) g_tp_flag_prepublished_seq = g_tp_seq + 1u;
@@ -27663,6 +27691,21 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         }
         return 1;
     }
+}
+
+int ds4_gpu_matmul_q8_0_kslice_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                full_in_dim,
+        uint64_t                k_off,
+        uint64_t                k_cnt,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                x_elem_off) {
+    return ds4_gpu_matmul_q8_0_kslice_exact_rows_tensor(out, model_map, model_size, weight_offset,
+        full_in_dim, k_off, k_cnt, out_dim, x, x_elem_off, 1);
 }
 
 static int ds4_gpu_matmul_q8_0_kslice_rows_impl(
