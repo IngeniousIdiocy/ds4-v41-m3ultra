@@ -492,7 +492,17 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+/* The V4.1 GPU top-p selector's sampling outcomes since process start: 0 decided, 1 heap mass short, 2 ambiguous,
+ * 3 overflow, 4 invalid, 5 zero finite, 6 unbound, 7 settings outside temp 1 / top_k 0 / top_p 0.95 / min_p 0,
+ * 8 stale (paths 1-8 fell back to the CPU sampler); and the decode steps that encoded it. */
+void ds4_sampler_gpu_counts(uint64_t out[9]);
+uint64_t ds4_sampler_gpu_encoded_count(void);
 #ifdef DS4_TEST_HOOKS
+/* the selector's reference and production consumers on one summary (HDR: 64-byte header, P: 505 partials,
+ * CAND: 2048 {float logit; uint32_t id}); the summary they leave is {int id; float logit, prob}[2048] */
+int ds4_test_selector_consume(const void *hdr, const float *P, const void *cand, const float *lg, uint64_t *rng, int *token);
+int ds4_test_selector_consume_fast(const void *hdr, const float *P, const void *cand, const float *lg, uint64_t *rng, int *token);
+const void *ds4_test_selector_summary(void);
 /* Teacher-force a V4.1 verification block, returning logits after each token. */
 int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
                                 float *logits, char *err, size_t errlen);

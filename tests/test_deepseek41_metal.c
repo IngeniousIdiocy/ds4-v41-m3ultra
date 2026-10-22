@@ -2991,6 +2991,53 @@ static int check_prefill_index_batch(void) {
     return 1;
 }
 
+/* SAMPLER_GPU: the GPU top-p selector over random V4.1 logits: the finite count, the maximum and its earliest index
+ * are exact, the cap is 512, and every one of the 512 largest logits is among the candidates it emits, with its
+ * logit bit for bit. */
+static int float_desc(const void *a, const void *b) {
+    const float x = *(const float *)a, y = *(const float *)b;
+    return x > y ? -1 : x < y;
+}
+
+static int check_sampler_gpu(void) {
+    enum { NV = 129280, CAP = 512, SUPB = 2048 };
+    typedef struct { uint32_t n, finite, best, cap; float M; uint32_t b1, above1, b2, above2, t, above, pad[5]; } hdr;
+    typedef struct { float logit; uint32_t id; } cand;
+    if (!ds4_gpu_selector_ready() && !ds4_gpu_selector_init()) {
+        fprintf(stderr, "V4.1 sampler GPU: metal/sampler_selector.metal not found (run from the tree)\n");
+        return 0;
+    }
+    ds4_gpu_tensor *logits = upload(NULL, NV * 4);
+    float *lg = malloc(NV * sizeof(float)), *sorted = malloc(NV * sizeof(float));
+    CHECK(logits && lg && sorted);
+    /* a bulk of small logits, 600 distinct large ones and a tied maximum (the earliest index wins) */
+    for (int i = 0; i < NV; i++) lg[i] = random_value();
+    for (int k = 0; k < 600; k++) lg[1000 + k * 211] = 10.0f + (float)k * 0.01f;
+    lg[77] = lg[99] = 20.0f;
+    memcpy(ds4_gpu_tensor_contents(logits), lg, NV * sizeof(float));
+    const uint64_t encoded = ds4_gpu_selector_encoded_count();
+    CHECK(ds4_gpu_begin_commands() && ds4_gpu_selector_encode(logits) && ds4_gpu_end_commands());
+    CHECK(ds4_gpu_selector_encoded_count() == encoded + 1);
+    const hdr *h = ds4_gpu_selector_out(0);
+    const cand *c = ds4_gpu_selector_out(2);
+    CHECK(h && c && h->finite == NV && h->best == 77 && h->M == 20.0f && h->cap == CAP && h->n >= CAP && h->n <= SUPB);
+    memcpy(sorted, lg, NV * sizeof(float));
+    qsort(sorted, NV, sizeof(float), float_desc);
+    const float threshold = sorted[CAP - 1];
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < h->n; i++) {
+        CHECK(c[i].id < NV && memcmp(&c[i].logit, &lg[c[i].id], 4) == 0);
+        found += c[i].logit >= threshold;
+    }
+    uint32_t want = 0;
+    for (int i = 0; i < NV; i++) want += lg[i] >= threshold;
+    CHECK(found == want);
+    free(sorted); free(lg);
+    ds4_gpu_tensor_free(logits);
+    fprintf(stderr, "V4.1 sampler GPU: selector summary == the logits' count, maximum and top 512\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -3003,7 +3050,8 @@ static int check_v41_groups(void) {
         check_moe_dedup() &&
         check_verify_batch() &&
         check_prefill_matmul() &&
-        check_prefill_index_batch();
+        check_prefill_index_batch() &&
+        check_sampler_gpu();
 }
 #else
 static int check_v41_groups(void) { return 1; }

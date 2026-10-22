@@ -482,6 +482,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_SHORT_SWEEP",
             "DS4_METAL_DISABLE_V41_ENGRAM_READAHEAD",
             "DS4_METAL_DISABLE_V41_PREENCODE",
+            "DS4_METAL_DISABLE_V41_SAMPLER_GPU",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -11841,6 +11842,7 @@ int ds4_gpu_synchronize(void) {
 
 static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
+static void ds4_gpu_selector_release(void);
 static void ds4_gpu_pe_release(void);
 
 void ds4_gpu_cleanup(void) {
@@ -12179,6 +12181,7 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache_over_limit = 0;
         ds4_gpu_model_residency_clear();
         ds4_gpu_weight_residency_clear();
+        ds4_gpu_selector_release();
         ds4_gpu_model_views_clear();
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
@@ -22038,6 +22041,90 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
  * each gives the bits of the unfolded kernels. */
 int ds4_gpu_dsv41_prefill_folds_available(void) {
     return !g_quality_mode && !g_ssd_streaming_mode && !ds4_gpu_tp_world_is_two();
+}
+
+/* SAMPLER_GPU: the V4.1 GPU top-p selector (metal/sampler_selector.metal; see ds41_selector_sample in ds4.c). Its own library,
+ * compiled once at load with the default compile options, so the engine library and every other kernel are
+ * unchanged. Buffer indices: 0 logits, 1 block records, 2-4 histograms H1/H2/H3, 5 header, 6 block mass partials,
+ * 7 slots. H1 is zeroed here once; R1 clears it at the end of every pass and K1 clears the slot counter. */
+static id<MTLComputePipelineState> g_sel_pipe[3];
+static id<MTLBuffer> g_sel_buf[8];
+static int g_sel_ready;
+static uint64_t g_sel_encoded;
+enum { DS4_SEL_NV = 129280u, DS4_SEL_NB = 129280u / 256u, DS4_SEL_SUPB = 2048u };
+
+int ds4_gpu_selector_init(void) {
+    if (g_sel_ready) return 1;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        const char *override = getenv("DS4_METAL_SAMPLER_SELECTOR_SOURCE");
+        const char *paths[3] = {override && override[0] ? override : NULL, "metal/sampler_selector.metal",
+                                "./metal/sampler_selector.metal"};
+        NSString *src = nil;
+        NSError *err = nil;
+        for (int i = 0; i < 3 && !src; i++)
+            if (paths[i]) src = [NSString stringWithContentsOfFile:@(paths[i]) encoding:NSUTF8StringEncoding error:&err];
+        id<MTLLibrary> lib = src ? [g_device newLibraryWithSource:src options:[MTLCompileOptions new] error:&err] : nil;
+        if (!lib) {
+            fprintf(stderr, "ds4: GPU top-p selector unavailable (metal/sampler_selector.metal: %s)\n",
+                    err ? err.localizedDescription.UTF8String : "not found");
+            return 0;
+        }
+        static const char *fn[3] = {"kernel_sel_k1", "kernel_sel_r1", "kernel_sel_s3"};
+        for (int k = 0; k < 3; k++) {
+            id<MTLFunction> f = [lib newFunctionWithName:@(fn[k])];
+            g_sel_pipe[k] = f ? [g_device newComputePipelineStateWithFunction:f error:&err] : nil;
+            if (!g_sel_pipe[k]) { fprintf(stderr, "ds4: GPU top-p selector kernel %s missing or failed\n", fn[k]); return 0; }
+        }
+        const NSUInteger len[8] = {0, DS4_SEL_NB * 16u, 2048u * 4u, 2048u * 4u, 1024u * 4u, 64u, DS4_SEL_NB * 4u,
+                                   DS4_SEL_SUPB * 8u};
+        for (int j = 1; j < 8; j++) {
+            g_sel_buf[j] = [g_device newBufferWithLength:len[j] options:MTLResourceStorageModeShared];
+            if (!g_sel_buf[j]) return 0;
+            memset(g_sel_buf[j].contents, 0, len[j]);
+        }
+        g_sel_ready = 1;
+        return 1;
+    }
+}
+
+int ds4_gpu_selector_ready(void) { return g_sel_ready; }
+uint64_t ds4_gpu_selector_encoded_count(void) { return g_sel_encoded; }
+
+/* append the three passes over LOGITS to the open decode batch (the final waited buffer, after the head) */
+int ds4_gpu_selector_encode(const ds4_gpu_tensor *logits) {
+    if (!g_sel_ready || !logits || !g_batch_cb) return 0;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc || owned) return 0;
+    const NSUInteger tg[3] = {DS4_SEL_NB, 1u, DS4_SEL_NB};
+    for (int k = 0; k < 3; k++) {
+        if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:g_sel_pipe[k]];
+        [enc setBuffer:ds4_gpu_tensor_buffer(logits) offset:ds4_gpu_tensor_offset(logits) atIndex:0];
+        for (int j = 1; j < 8; j++) [enc setBuffer:g_sel_buf[j] offset:0 atIndex:j];
+        [enc dispatchThreadgroups:MTLSizeMake(tg[k], 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    g_sel_encoded++;
+    return 1;
+}
+
+/* host views after the batch completed: 0 header (64 B), 1 block mass partials (505 floats), 2 slots (2048 x 8 B) */
+const void *ds4_gpu_selector_out(int which) {
+    if (!g_sel_ready) return NULL;
+    return which == 0 ? g_sel_buf[5].contents : which == 1 ? g_sel_buf[6].contents : which == 2 ? g_sel_buf[7].contents : NULL;
+}
+
+/* after a failed step that encoded the passes: R1 may not have cleared H1 */
+void ds4_gpu_selector_reset(void) { if (g_sel_ready) memset(g_sel_buf[2].contents, 0, 2048u * 4u); }
+
+static void ds4_gpu_selector_release(void) {
+    for (int k = 0; k < 3; k++) g_sel_pipe[k] = nil;
+    for (int j = 0; j < 8; j++) g_sel_buf[j] = nil;
+    g_sel_ready = 0;
 }
 
 int ds4_gpu_dsv41_add_bf16_rows(ds4_gpu_tensor *out,

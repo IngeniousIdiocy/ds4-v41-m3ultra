@@ -81,6 +81,7 @@ typedef struct {
 #define DS4_GPU_V41_SHORT_SWEEP (1ull << 33)   /* prefills of 3072 to 8191 tokens run as one sweep that rebuilds only the decoder suffix */
 #define DS4_GPU_V41_ENGRAM_READAHEAD (1ull << 34)   /* a prefill sweep reads the next sweep's Engram rows from disk while its last layers run */
 #define DS4_GPU_V41_PREENCODE (1ull << 35)   /* the next decode token's first command buffer is encoded while this token's last one runs */
+#define DS4_GPU_V41_SAMPLER_GPU (1ull << 36)   /* the decode step summarizes its logits for top-p sampling on the GPU and the CPU decides from it */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -127,6 +128,15 @@ uint64_t ds4_gpu_v41_off(void);
 void ds4_gpu_dsv41_dspark_rows(int on);
 /* Model views skip hazard tracking by default (call before the model is mapped). */
 void ds4_gpu_set_model_untracked_default(int on);
+/* The V4.1 GPU top-p selector (Metal): init compiles metal/sampler_selector.metal once (0: unavailable); encode
+ * appends its passes over a logits tensor to the open batch; out(0) header, out(1) block mass partials, out(2)
+ * slots, valid after that batch completed; reset clears H1 after a failed step. */
+int ds4_gpu_selector_init(void);
+int ds4_gpu_selector_ready(void);
+int ds4_gpu_selector_encode(const ds4_gpu_tensor *logits);
+const void *ds4_gpu_selector_out(int which);
+void ds4_gpu_selector_reset(void);
+uint64_t ds4_gpu_selector_encoded_count(void);
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(

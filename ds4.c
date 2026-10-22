@@ -40860,6 +40860,27 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
  * window; index-source layers publish selections for following reuse layers.
  * Engram tables are never GPU resources, only bounded decoded row buffers.
  */
+/* SAMPLER_GPU */
+/* The GPU top-p selector's buffers are process-global. Their content belongs to ONE generation and ONE owning
+ * graph: a generation is advanced (invalidating the previous content) before any pass is encoded, completed only
+ * after that step's batch finished and its logits were read back, and failed on any error; a session may consume
+ * only the completed current generation of its own graph. */
+typedef struct { uint64_t cur, done; const void *owner; } ds41_sel_gen_state;
+static DS4_MAYBE_UNUSED ds41_sel_gen_state g_sel_gen;
+static DS4_MAYBE_UNUSED uint64_t ds41_sel_gen_begin(ds41_sel_gen_state *G) { G->done = 0; G->owner = NULL; return ++G->cur; }
+static DS4_MAYBE_UNUSED void ds41_sel_gen_complete(ds41_sel_gen_state *G, uint64_t gen, const void *owner) {
+    if (gen && G->cur == gen) { G->done = gen; G->owner = owner; }
+}
+static DS4_MAYBE_UNUSED void ds41_sel_gen_fail(ds41_sel_gen_state *G) { G->done = 0; G->owner = NULL; }
+/* the binding decision at sampling: 0 consumable, 6 unbound (no summary of these logits), 8 stale (the buffers
+ * now hold another generation or another graph's content) */
+static DS4_MAYBE_UNUSED int ds41_sel_bind_check(const ds41_sel_gen_state *G, bool bound, uint64_t gen, uint32_t bound_pos,
+                                                const void *owner, bool sel_done, uint32_t ckpt_pos, uint32_t graph_pos) {
+    if (!bound || !sel_done || bound_pos != ckpt_pos || graph_pos != bound_pos) return 6;
+    if (!gen || G->cur != gen || G->done != gen || G->owner != owner) return 8;
+    return 0;
+}
+
 #define DS41_PREFILL_CAP 8192u
 /* A V4.1 Metal fast-path group (ds4_gpu.h) that its switch has not turned off. Other backends never take these
  * paths. */
@@ -41034,6 +41055,10 @@ typedef struct {
      * block's HC mix waits for the query kernel (hc_ffn_deferred: the FFN block's, for the concurrent FFN encoder),
      * kv_stored when that kernel stored the layer's KV row */
     bool decode_step, hc_attn_deferred, hc_ffn_deferred, kv_stored;
+    /* SAMPLER_GPU: sel_gpu latched per decode step that encodes the selector; sel_done = this step encoded it and
+     * completed with its logits read back; sel_gen = the selector-buffer generation it encoded. */
+    bool sel_gpu, sel_done;
+    uint64_t sel_gen;
     /* Metal, CONCURRENT_FFN: the last ds41_moe_partial left the whole shared expert in `shared` */
     bool shared_done;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
@@ -43077,7 +43102,17 @@ static bool ds41_moe_expand_batch(ds41_prefill_row *b, const ds4_model *m,
 /* PREENCODE: the decode step's per-token host latches, set before layer 0 (with the RoPE table producer encoded
  * into the open batch). check: encode nothing; the table counts as produced at this position (the pre-encoded
  * slot's producer ran), so the latches can be compared with the slot's. */
-static void ds41_step_prologue(ds41_gpu_graph *g, bool logits, bool ok, bool check) {
+static void ds41_step_prologue(ds41_gpu_graph *g, bool logits, bool queued_head, bool ok, bool check) {
+    g->sel_gpu = false;
+    g->sel_done = false;
+    g->sel_gen = 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* SAMPLER_GPU: the selector only on the queued-head decode step (logits, one host, resident, not quality), so
+     * prefill, verify, TP and streaming never encode it. */
+    g->sel_gpu = queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() && ds41_on(DS4_GPU_V41_SAMPLER_GPU);
+#else
+    (void)queued_head;
+#endif
     g->rope_tab_pos = 0;
 #ifdef __APPLE__
     /* One RoPE coefficient table per decode step, encoded before layer 0, read by the attention reduce and the index
@@ -43095,6 +43130,7 @@ static void ds41_step_prologue(ds41_gpu_graph *g, bool logits, bool ok, bool che
 static void ds41_step_tail_reset(ds41_gpu_graph *g) {
     g->rope_tab_pos = 0;   /* the table never outlives its step */
     g->decode_step = g->hc_attn_deferred = g->hc_ffn_deferred = false;
+    g->sel_gpu = false;
 }
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -43111,6 +43147,8 @@ static void ds41_step_tail_reset(ds41_gpu_graph *g) {
 typedef struct {
     uint32_t rope_tab_pos;
     bool decode_step, hc_attn_deferred, hc_ffn_deferred, kv_stored, shared_done;
+    bool sel_gpu, sel_done;
+    uint64_t sel_gen;
 } ds41_pe_host;
 
 static struct {
@@ -43122,18 +43160,20 @@ static struct {
 static void ds41_pe_save(const ds41_gpu_graph *g, ds41_pe_host *h) {
     *h = (ds41_pe_host){.rope_tab_pos = g->rope_tab_pos, .decode_step = g->decode_step,
         .hc_attn_deferred = g->hc_attn_deferred, .hc_ffn_deferred = g->hc_ffn_deferred,
-        .kv_stored = g->kv_stored, .shared_done = g->shared_done};
+        .kv_stored = g->kv_stored, .shared_done = g->shared_done,
+        .sel_gpu = g->sel_gpu, .sel_done = g->sel_done, .sel_gen = g->sel_gen};
 }
 
 static void ds41_pe_load(ds41_gpu_graph *g, const ds41_pe_host *h) {
     g->rope_tab_pos = h->rope_tab_pos; g->decode_step = h->decode_step;
     g->hc_attn_deferred = h->hc_attn_deferred; g->hc_ffn_deferred = h->hc_ffn_deferred;
     g->kv_stored = h->kv_stored; g->shared_done = h->shared_done;
+    g->sel_gpu = h->sel_gpu; g->sel_done = h->sel_done; g->sel_gen = h->sel_gen;
 }
 
 /* the prologue's latches are equal (all: and the layer flags carried between steps) */
 static bool ds41_pe_same(const ds41_pe_host *a, const ds41_pe_host *b, bool all) {
-    return a->rope_tab_pos == b->rope_tab_pos && a->decode_step == b->decode_step &&
+    return a->rope_tab_pos == b->rope_tab_pos && a->decode_step == b->decode_step && a->sel_gpu == b->sel_gpu &&
         (!all || (a->hc_attn_deferred == b->hc_attn_deferred && a->hc_ffn_deferred == b->hc_ffn_deferred &&
                   a->kv_stored == b->kv_stored && a->shared_done == b->shared_done));
 }
@@ -43148,7 +43188,7 @@ static bool ds41_pe_eligible(const ds41_gpu_graph *g, const float *logits, bool 
 
 /* *taken: the held slot is this step's first buffer (pe, and its key and latches hold); the step takes the host state
  * its layer 0 left and commits it. Any other slot is dropped. False: the commit failed. */
-static bool ds41_slot_take(ds41_gpu_graph *g, int token, bool pe, bool *taken) {
+static bool ds41_slot_take(ds41_gpu_graph *g, int token, bool pe, bool queued_head, bool *taken) {
     *taken = false;
     if (!ds4_gpu_pe_pending()) return true;
     ds41_pe_host cur;
@@ -43156,7 +43196,7 @@ static bool ds41_slot_take(ds41_gpu_graph *g, int token, bool pe, bool *taken) {
     bool use = pe && g_ds41_slot.g == g && g_ds41_slot.pos == g->pos && ds41_pe_same(&cur, &g_ds41_slot.P0, true);
     if (use) {   /* the latches this step's prologue sets must be the slot's */
         ds41_pe_host chk;
-        ds41_step_prologue(g, true, true, true);
+        ds41_step_prologue(g, true, queued_head, true, true);
         ds41_pe_save(g, &chk);
         use = ds41_pe_same(&chk, &g_ds41_slot.S1, false);
     }
@@ -43173,7 +43213,7 @@ static bool ds41_slot_take(ds41_gpu_graph *g, int token, bool pe, bool *taken) {
 }
 
 /* commit the final buffer (the GPU bridge behind it), encode the slot for pos + 1, then wait */
-static bool ds41_slot_drain(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, bool ok) {
+static bool ds41_slot_drain(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, bool queued_head, bool ok) {
     if (!ds4_gpu_end_commands_commit(true)) return false;
     g_ds41_slot.g = NULL;
     if (ok && g->pos + 1u < g->ctx) {
@@ -43187,7 +43227,7 @@ static bool ds41_slot_drain(ds41_gpu_graph *g, const ds4_model *m, const ds4_wei
             ds4_gpu_pe_embed_word(1);
             bool encoded = ds41_embed(g, m, w, g->residual, g->x, 0, g->pos);
             ds4_gpu_pe_embed_word(0);
-            ds41_step_prologue(g, true, encoded, false);
+            ds41_step_prologue(g, true, queued_head, encoded, false);
             if (encoded) encoded = ds41_graph_layer(g, m, &w->layer[0], 0, 0);
             ds41_pe_save(g, &g_ds41_slot.S1);
             g_ds41_slot.g = ds4_gpu_pe_end(encoded) ? g : NULL;
@@ -43203,13 +43243,13 @@ static bool ds41_pe_eligible(const ds41_gpu_graph *g, const float *logits, bool 
     (void)g; (void)logits; (void)queued_head;
     return false;
 }
-static bool ds41_slot_take(ds41_gpu_graph *g, int token, bool pe, bool *taken) {
-    (void)g; (void)token; (void)pe;
+static bool ds41_slot_take(ds41_gpu_graph *g, int token, bool pe, bool queued_head, bool *taken) {
+    (void)g; (void)token; (void)pe; (void)queued_head;
     *taken = false;
     return true;
 }
-static bool ds41_slot_drain(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, bool ok) {
-    (void)g; (void)m; (void)w; (void)ok;
+static bool ds41_slot_drain(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w, bool queued_head, bool ok) {
+    (void)g; (void)m; (void)w; (void)queued_head; (void)ok;
     return false;
 }
 #endif
@@ -43230,7 +43270,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * the next slot while its last buffer runs. */
     const bool pe = ds41_pe_eligible(g, logits, queued_head);
     bool slot = false;
-    bool ok = ds41_slot_take(g, token, pe, &slot);
+    bool ok = ds41_slot_take(g, token, pe, queued_head, &slot);
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (ok && !ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) ok = false;
@@ -43252,8 +43292,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         ok = ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_begin_commands() && ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
         if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-        ds41_step_prologue(g, logits != NULL, ok, false);
+        ds41_step_prologue(g, logits != NULL, queued_head, ok, false);
     }
+    bool sel_enc = false;
     for (uint32_t il = slot ? 1u : 0u; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -43280,7 +43321,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || (!queued && il == 13) || il + 1u == DS4_N_LAYER;
         if (ok && queued_head && il + 1u == DS4_N_LAYER) ok = ds41_graph_encode_logits(g, m, w);
-        if (drain && pe) ok = ds41_slot_drain(g, m, w, ok);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (ok && g->sel_gpu && il + 1u == DS4_N_LAYER) {   /* SAMPLER_GPU: the selector after the head, in the final buffer */
+            g->sel_gen = ds41_sel_gen_begin(&g_sel_gen);   /* invalidate before anything can overwrite */
+            sel_enc = true;
+            ok = ds4_gpu_selector_encode(g->logits) != 0;
+        }
+#endif
+        if (drain && pe) ok = ds41_slot_drain(g, m, w, queued_head, ok);
         else if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -43300,6 +43348,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (ok && logits) ok = queued_head ?
         ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0 :
         ds41_graph_logits(g, m, w, logits);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (sel_enc && !ok) ds4_gpu_selector_reset();   /* the first pass may not have cleared its histogram */
+#endif
+    g->sel_done = ok && sel_enc && logits && queued_head;
+    if (g->sel_done) ds41_sel_gen_complete(&g_sel_gen, g->sel_gen, g);
+    else if (sel_enc) ds41_sel_gen_fail(&g_sel_gen);
     /* Even a failed GPU layer must finish the reader before this graph (or
      * a borrowed row graph) can leave scope or reuse its host output rows. */
     if (reading && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
@@ -62595,6 +62649,12 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    /* SAMPLER_GPU: the selector summary in the selector buffers belongs to s->logits: set only by a successful V4.1
+     * decode eval whose step encoded it (generation sel_gen at position sel_pos), cleared by every other logits
+     * writer, consumed once. */
+    bool sel_bound;
+    uint32_t sel_pos;
+    uint64_t sel_gen;
     bool greedy_splitkv_anchor_valid;
 };
 
@@ -64774,6 +64834,7 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 
 static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
+    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     ds41_gpu_graph *g = &s->ds41_graph;
     const uint32_t pos = h[7];
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
@@ -65566,6 +65627,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -66241,6 +66303,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -75607,6 +75670,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
         if (!e->tp.active && !e->ssd_streaming && !e->quality) ds41_narrow_build(&e->model, &e->weights);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        {   /* SAMPLER_GPU: the selector's own small library, once (a failure only leaves sampling on the CPU) */
+            static bool sel_failed;
+            if (!e->tp.active && !e->ssd_streaming && !e->quality && ds41_on(DS4_GPU_V41_SAMPLER_GPU) &&
+                !sel_failed && !ds4_gpu_selector_ready())
+                sel_failed = !ds4_gpu_selector_init();
+        }
+#endif
         if (e->dspark && e->dspark_weights.v41) {
             s->ds41_graph.dspark = ds41_dspark_alloc(&e->dspark_weights);
             if (!s->ds41_graph.dspark) {
@@ -78028,6 +78099,7 @@ int ds4_session_sync_multimodal(
 }
 
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return 1;
@@ -79288,8 +79360,306 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
     return token;
 }
 
+/* SAMPLER_GPU */
+/* The V4.1 GPU top-p selector's CPU consumer (the fast form; the reference form is kept for tests).
+ *
+ * The decode step that produced s->logits also ran three small kernels over them (metal/sampler_selector.metal):
+ * the finite count, the maximum and its earliest index, FP32 block partials of expf(v - M) over each 256 logits,
+ * and every candidate whose order key falls in or above the coarse bin of the 512th largest finite logit (the
+ * "superset", up to 2048 entries). The CPU validates that summary against the logits bitwise, sorts it into the
+ * sampler's order, and makes the blk decision: the heap's expf numerators over the FP64 sum of the GPU partials.
+ * The decision is taken only where the FP64 denominator's error bound (SAMPLE_BLK_ALLOWANCE) cannot change the
+ * nucleus; otherwise, and on every invalid, zero-finite, overflowing or mass-short summary, the unchanged
+ * production sampler decides on the same logits, before any RNG draw. A decided step makes the same single RNG
+ * draw over the same filtered FP32 sum as production, so the token and the RNG state are production's.
+ *
+ * Only at temp 1, top_k 0, top_p 0.95, min_p 0 (the screened domain), on a V4.1 Metal decode that encoded it.
+ * Counters (ds4_sampler_gpu_counts): 0 decided, 1 heap mass short, 2 ambiguous, 3 overflow, 4 invalid, 5 zero
+ * finite, 6 unbound (no summary of these logits), 7 settings outside the screened domain, 8 stale (the global
+ * buffers hold another generation or another graph's content). DS4_METAL_DISABLE_V41_SAMPLER_GPU=1 turns it off. */
+static uint64_t g_sel_counts[9];
+void ds4_sampler_gpu_counts(uint64_t out[9]) { for (int i = 0; i < 9; i++) out[i] = g_sel_counts[i]; }
+uint64_t ds4_sampler_gpu_encoded_count(void) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    return ds4_gpu_selector_encoded_count();
+#else
+    return 0;
+#endif
+}
+#if (defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)) || defined(DS4_TEST_HOOKS)
+/* The blk decision's error allowance (relative, vs the exact sum of the true exponentials), predeclared from the
+ * arithmetic: the denominator's block fold (gamma_17 = 1.01e-6) plus expf's own error, doubled: 2.2e-6. When the
+ * heap-mass test or the nucleus stop (the stop step or the step before) lies within it of top_p, the decision is
+ * ambiguous and production decides. The numerators of both tests are FP64 sums of the heap's own expf values. */
+#define SAMPLE_BLK_ALLOWANCE 2.2e-6
+enum { SEL_NV = 129280u, SEL_NB = 129280u / 256u, SEL_SUPB = 2048u, SEL_CAP = 512u, SEL_CAPB = 1024u };   /* the kernels' V4.1 vocabulary */
+typedef struct { uint32_t n, finite, best, cap; float M; uint32_t b1, above1, b2, above2, t, above, pad[5]; } sel_gpu_hdr;
+typedef struct { float logit; uint32_t id; } sel_gpu_cand;
+_Static_assert(sizeof(sel_gpu_hdr) == 64, "selector header");
+static int sel_fin(const float *x) { uint32_t u; memcpy(&u, x, 4); return (u & 0x7f800000u) != 0x7f800000u; }
+static uint32_t sel_okey(float v) { uint32_t u; memcpy(&u, &v, 4); if (u == 0x80000000u) u = 0; return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
+static sample_candidate g_sel_c[SEL_SUPB];
+#ifdef DS4_TEST_HOOKS
+/* The reference consumer, the form first measured, kept for the CPU equivalence test of the fast one below.
+ * 1 = token chosen, 0 = full-vocabulary fallback, -1 ambiguous. */
+static int sample_blk_decide(sample_candidate *heap, uint32_t n, uint32_t finite,
+                             double sum64, float top_p, int best, uint64_t *rng, int *token_out) {
+    const double a = SAMPLE_BLK_ALLOWANCE;
+    if (!(sum64 > 0.0) || !isfinite(sum64)) { *token_out = best; return 1; }
+    if (n < finite) {
+        double heap64 = 0.0;
+        for (uint32_t i = 0; i < n; i++) heap64 += heap[i].prob;
+        const double t = (double)top_p * sum64;
+        if (fabs(heap64 - t) <= a * t) return -1;
+        if (heap64 < t) return 0;
+    }
+    qsort(heap, n, sizeof(heap[0]), sample_candidate_cmp_desc);
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    double q = 0.0, qprev = -1.0, prefix64 = 0.0;
+    for (uint32_t i = 0; i < n; i++) {
+        filtered_sum += heap[i].prob;
+        prefix64 += heap[i].prob;
+        filtered++;
+        q = prefix64 / sum64;
+        if (q >= (double)top_p) break;
+        qprev = q;
+    }
+    if (fabs(q - (double)top_p) <= a * q || (qprev >= 0.0 && (double)top_p - qprev <= a * (double)top_p)) return -1;
+    if (filtered == 0) { *token_out = best; return 1; }
+    float r = sample_rng_f32(rng) * filtered_sum;
+    for (uint32_t i = 0; i < filtered; i++) {
+        r -= heap[i].prob;
+        if (r <= 0.0f) { *token_out = heap[i].id; return 1; }
+    }
+    *token_out = heap[filtered - 1u].id;
+    return 1;
+}
+static uint8_t g_sel_seen[SEL_NV / 8];
+/* the CPU side on one completed GPU superset of LG: 0 decided (*token set, one RNG draw), else no RNG draw and the
+ * path: 1 heap mass short, 2 ambiguous, 3 overflow, 4 invalid, 5 zero finite */
+static int ds41_sel_consume(const sel_gpu_hdr *h, const float *P, const sel_gpu_cand *gc, const float *lg,
+                            uint64_t *rng, int *token) {
+    /* validate before anything consumes it */
+    const uint32_t finite = h->finite;
+    if (finite > SEL_NV) return 4;
+    if (!finite) return 5;
+    const int best = (int)h->best; const float M = h->M;
+    const uint32_t cap = h->cap, b = h->b1, above = h->above1, ncoarse = h->b2, n_raw = h->n;
+    const uint32_t n_emit = n_raw < SEL_SUPB ? n_raw : SEL_SUPB;
+    bool ok = best >= 0 && (uint32_t)best < SEL_NV && sel_fin(&M) && !memcmp(&lg[best], &M, 4) &&
+        cap == (finite < SEL_CAP ? finite : SEL_CAP) && b <= 2047u &&
+        !(above >= cap || ncoarse < cap || ncoarse > finite) && n_raw == ncoarse;
+    for (uint32_t k = 0; ok && k < SEL_NB; k++) ok = sel_fin(&P[k]) && P[k] >= 0.0f;
+    if (!ok) return 4;
+    if (n_raw > SEL_SUPB) return 3;
+    memset(g_sel_seen, 0, sizeof g_sel_seen);
+    uint32_t inbin = 0;
+    for (uint32_t i = 0; ok && i < n_emit; i++) {
+        const uint32_t id = gc[i].id; const float v = gc[i].logit;
+        ok = id < SEL_NV && sel_fin(&v) && (sel_okey(v) >> 21) >= b && !(g_sel_seen[id >> 3] & (1u << (id & 7))) &&
+             !memcmp(&lg[id], &v, 4);
+        if (!ok) break;
+        inbin += (sel_okey(v) >> 21) == b;
+        g_sel_seen[id >> 3] |= (uint8_t)(1u << (id & 7));
+        g_sel_c[i] = (sample_candidate){.id = (int)id, .logit = v, .prob = 0.0f};
+    }
+    if (!ok || n_emit - inbin != above) return 4;
+    /* the summary: engine order, exact threshold t = the cap-th key, keep min(n(>= t), 1024) */
+    qsort(g_sel_c, n_emit, sizeof(g_sel_c[0]), sample_candidate_cmp_desc);
+    const uint32_t t = sel_okey(g_sel_c[cap - 1u].logit);
+    uint32_t n = 0;
+    while (n < n_emit && sel_okey(g_sel_c[n].logit) >= t) n++;
+    if (n > SEL_CAPB) return 3;
+    /* finish: heap = the first cap, expf numerators; FP64 denominator over the GPU block partials in order */
+    for (uint32_t i = 0; i < cap; i++) g_sel_c[i].prob = expf(g_sel_c[i].logit - M);
+    double sum64 = 0.0;
+    for (uint32_t k = 0; k < SEL_NB; k++) sum64 += P[k];
+    const int d = sample_blk_decide(g_sel_c, cap, finite, sum64, 0.95f, best, rng, token);
+    return d == 1 ? 0 : d == 0 ? 1 : 2;
+}
+#endif
+/* The production consumer: the reference's checks, return codes, summary and RNG use, without its two qsort calls
+ * (about 80% of its CPU time). Each candidate gets the 49-bit key K = (~sel_okey(v) << 17) | id, whose ascending
+ * order is sample_candidate_cmp_desc's (logit descending with -0 == +0, then id ascending). Once ids are known
+ * unique that order is a strict total order, so any correct sort gives the same sequence. The sort is one 11-bit
+ * bucket pass on K - Kmin, then insertion (buckets of 32 or fewer) or an 8-bit MSD radix per bucket; a duplicate
+ * id has the same K and lands next to its twin, where it is rejected (4) before the overflow test (3), as the
+ * reference's bitmap rejects it. The summary takes its logits from lg[id] (bitwise equal, checked). The expf
+ * numerators, the FP64 partial sum and the decision are the reference's statements; the decision's own qsort is
+ * dropped because its input is already in that order. */
+static uint64_t g_sel_k[2][SEL_SUPB];
+#define SEL_KTOP 11u   /* bits of the first radix digit */
+static uint32_t g_sel_kcnt[1u << SEL_KTOP];
+static void sel_isort_u64(uint64_t *a, uint32_t n) {
+    for (uint32_t i = 1; i < n; i++) {
+        const uint64_t x = a[i];
+        uint32_t j = i;
+        while (j > 0 && a[j - 1u] > x) { a[j] = a[j - 1u]; j--; }
+        a[j] = x;
+    }
+}
+/* sorts a[0..n) ascending; every value < 2^bits and all share the bits above; tmp: n scratch */
+static void sel_msd_u64(uint64_t *a, uint64_t *tmp, uint32_t n, unsigned bits) {
+    if (n <= 24u || bits == 0u) { sel_isort_u64(a, n); return; }
+    const unsigned shift = bits > 8u ? bits - 8u : 0u;
+    uint32_t cnt[256] = {0}, off[256];
+    for (uint32_t i = 0; i < n; i++) cnt[(a[i] >> shift) & 255u]++;
+    uint32_t s = 0;
+    for (unsigned d = 0; d < 256u; d++) { off[d] = s; s += cnt[d]; }
+    for (uint32_t i = 0; i < n; i++) tmp[off[(a[i] >> shift) & 255u]++] = a[i];
+    memcpy(a, tmp, n * sizeof(a[0]));
+    if (!shift) return;
+    for (unsigned d = 0, s0 = 0; d < 256u; s0 += cnt[d], d++)
+        if (cnt[d] > 1u) sel_msd_u64(a + s0, tmp + s0, cnt[d], shift);
+}
+/* the blk decision on a heap already in sample_candidate_cmp_desc order with distinct ids (the reference's
+ * statements without its qsort, which is the identity on such input): 1 token chosen, 0 fallback, -1 ambiguous */
+static __attribute__((noinline)) int sample_blk_decide_sorted(sample_candidate *heap, uint32_t n, uint32_t finite,
+                             double sum64, float top_p, int best, uint64_t *rng, int *token_out) {
+    const double a = SAMPLE_BLK_ALLOWANCE;
+    if (!(sum64 > 0.0) || !isfinite(sum64)) { *token_out = best; return 1; }
+    if (n < finite) {
+        double heap64 = 0.0;
+        for (uint32_t i = 0; i < n; i++) heap64 += heap[i].prob;
+        const double t = (double)top_p * sum64;
+        if (fabs(heap64 - t) <= a * t) return -1;
+        if (heap64 < t) return 0;
+    }
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    double q = 0.0, qprev = -1.0, prefix64 = 0.0;
+    for (uint32_t i = 0; i < n; i++) {
+        filtered_sum += heap[i].prob;
+        prefix64 += heap[i].prob;
+        filtered++;
+        q = prefix64 / sum64;
+        if (q >= (double)top_p) break;
+        qprev = q;
+    }
+    if (fabs(q - (double)top_p) <= a * q || (qprev >= 0.0 && (double)top_p - qprev <= a * (double)top_p)) return -1;
+    if (filtered == 0) { *token_out = best; return 1; }
+    float r = sample_rng_f32(rng) * filtered_sum;
+    for (uint32_t i = 0; i < filtered; i++) {
+        r -= heap[i].prob;
+        if (r <= 0.0f) { *token_out = heap[i].id; return 1; }
+    }
+    *token_out = heap[filtered - 1u].id;
+    return 1;
+}
+static int ds41_sel_consume_fast(const sel_gpu_hdr *h, const float *P, const sel_gpu_cand *gc, const float *lg,
+                                 uint64_t *rng, int *token) {
+    /* validate before anything consumes it */
+    const uint32_t finite = h->finite;
+    if (finite > SEL_NV) return 4;
+    if (!finite) return 5;
+    const int best = (int)h->best; const float M = h->M;
+    const uint32_t cap = h->cap, b = h->b1, above = h->above1, ncoarse = h->b2, n_raw = h->n;
+    const uint32_t n_emit = n_raw < SEL_SUPB ? n_raw : SEL_SUPB;
+    bool ok = best >= 0 && (uint32_t)best < SEL_NV && sel_fin(&M) && !memcmp(&lg[best], &M, 4) &&
+        cap == (finite < SEL_CAP ? finite : SEL_CAP) && b <= 2047u &&
+        !(above >= cap || ncoarse < cap || ncoarse > finite) && n_raw == ncoarse;
+    for (uint32_t k = 0; ok && k < SEL_NB; k++) ok = sel_fin(&P[k]) && P[k] >= 0.0f;
+    if (!ok) return 4;
+    if (n_raw > SEL_SUPB) return 3;
+    /* the candidate checks (duplicates: after the sort) and the keys */
+    uint64_t *K = g_sel_k[0], *S = g_sel_k[1];
+    uint32_t inbin = 0, rmin = UINT32_MAX, rmax = 0;
+    for (uint32_t i = 0; i < n_emit; i++) {
+        const uint32_t id = gc[i].id; const float v = gc[i].logit;
+        if (id >= SEL_NV || !sel_fin(&v)) return 4;
+        const uint32_t key = sel_okey(v);
+        if ((key >> 21) < b || memcmp(&lg[id], &v, 4)) return 4;
+        inbin += (key >> 21) == b;
+        const uint32_t r = ~key;
+        rmin = r < rmin ? r : rmin; rmax = r > rmax ? r : rmax;
+        K[i] = (uint64_t)r << 17 | id;
+    }
+    if (n_emit - inbin != above) return 4;
+    /* sort K - Kmin ascending: one SEL_KTOP-bit bucket pass, then one insertion pass over the whole array (it only
+     * moves entries within their bucket) when no bucket holds more than 32, else sel_msd_u64 per bucket */
+    const uint64_t base = (uint64_t)rmin << 17, hi = ((uint64_t)(rmax - rmin) << 17) | 0x1ffffu;
+    const unsigned bits = 64u - (unsigned)__builtin_clzll(hi), shift = bits > SEL_KTOP ? bits - SEL_KTOP : 0u;
+    const uint32_t nd = (uint32_t)(hi >> shift) + 1u;
+    memset(g_sel_kcnt, 0, nd * sizeof(g_sel_kcnt[0]));
+    for (uint32_t i = 0; i < n_emit; i++) { K[i] -= base; g_sel_kcnt[K[i] >> shift]++; }
+    uint32_t off = 0, mx = 0;
+    for (uint32_t d = 0; d < nd; d++) { const uint32_t c = g_sel_kcnt[d]; g_sel_kcnt[d] = off; off += c; mx = c > mx ? c : mx; }
+    for (uint32_t i = 0; i < n_emit; i++) S[g_sel_kcnt[K[i] >> shift]++] = K[i];
+    if (mx <= 32u) {
+        for (uint32_t i = 1; i < n_emit; i++) {   /* a duplicate stops next to its equal: rejected here */
+            const uint64_t x = S[i];
+            uint32_t j = i;
+            while (j > 0 && S[j - 1u] > x) { S[j] = S[j - 1u]; j--; }
+            if (j > 0 && S[j - 1u] == x) return 4;
+            S[j] = x;
+        }
+    } else {
+        for (uint32_t d = 0, s0 = 0; d < nd; d++) {   /* g_sel_kcnt[d] is now the end of bucket d */
+            const uint32_t e = g_sel_kcnt[d];
+            if (e - s0 > 1u) sel_msd_u64(S + s0, K + s0, e - s0, shift);
+            s0 = e;
+        }
+        for (uint32_t i = 1; i < n_emit; i++) if (S[i] == S[i - 1u]) return 4;   /* duplicate candidate id */
+    }
+    /* the summary: t = the cap-th key, n = the count of keys >= t */
+    const uint64_t tq = S[cap - 1u] >> 17;
+    uint32_t n = cap;
+    while (n < n_emit && (S[n] >> 17) == tq) n++;
+    if (n > SEL_CAPB) return 3;
+    for (uint32_t i = 0; i < cap; i++) {
+        const uint32_t id = (uint32_t)(S[i] & 0x1ffffu);
+        g_sel_c[i] = (sample_candidate){.id = (int)id, .logit = lg[id], .prob = 0.0f};
+    }
+    /* finish: heap = the first cap, expf numerators; FP64 denominator over the GPU block partials in order */
+    for (uint32_t i = 0; i < cap; i++) g_sel_c[i].prob = expf(g_sel_c[i].logit - M);
+    double sum64 = 0.0;
+    for (uint32_t k = 0; k < SEL_NB; k++) sum64 += P[k];
+    /* top_p and the heap are made opaque to the optimizer: with constants propagated into the copy, -ffast-math
+     * reassociated a * (top_p * sum64) into sum64 * (a * top_p); opaque, the copy compiles to the reference's FP code */
+    float top_p = 0.95f;
+    sample_candidate *heap = g_sel_c;
+    __asm__ volatile("" : "+m"(top_p), "+r"(heap));
+    const int d = sample_blk_decide_sorted(heap, cap, finite, sum64, top_p, best, rng, token);
+    return d == 1 ? 0 : d == 0 ? 1 : 2;
+}
+#endif
+#ifdef DS4_TEST_HOOKS
+int ds4_test_selector_consume(const void *hdr, const float *P, const void *cand, const float *lg, uint64_t *rng, int *token) {
+    return ds41_sel_consume((const sel_gpu_hdr *)hdr, P, (const sel_gpu_cand *)cand, lg, rng, token);
+}
+int ds4_test_selector_consume_fast(const void *hdr, const float *P, const void *cand, const float *lg, uint64_t *rng, int *token) {
+    return ds41_sel_consume_fast((const sel_gpu_hdr *)hdr, P, (const sel_gpu_cand *)cand, lg, rng, token);
+}
+const void *ds4_test_selector_summary(void) { return g_sel_c; }   /* {int id; float logit, prob}[2048] */
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+static bool ds41_selector_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p,
+                                 uint64_t *rng, int *token) {
+    const bool bound = s->sel_bound;
+    s->sel_bound = false;   /* consumed once */
+    const bool on = ds41_on(DS4_GPU_V41_SAMPLER_GPU);
+    if (!bound) { if (on && ds4_gpu_selector_ready()) g_sel_counts[6]++; return false; }
+    if (!on || temperature != 1.0f || top_k != 0 || top_p != 0.95f || min_p != 0.0f) { g_sel_counts[7]++; return false; }
+    if (DS4_N_VOCAB != SEL_NV || !ds4_session_is_ds41(s)) { g_sel_counts[6]++; return false; }
+    const int bc = ds41_sel_bind_check(&g_sel_gen, true, s->sel_gen, s->sel_pos, &s->ds41_graph, s->ds41_graph.sel_done,
+                                       (uint32_t)s->checkpoint.len, s->ds41_graph.pos);
+    if (bc) { g_sel_counts[bc]++; return false; }
+    const sel_gpu_hdr *h = ds4_gpu_selector_out(0);
+    const float *P = ds4_gpu_selector_out(1);
+    const sel_gpu_cand *gc = ds4_gpu_selector_out(2);
+    if (!h || !P || !gc) { g_sel_counts[4]++; return false; }
+    const int path = ds41_sel_consume_fast(h, P, gc, s->logits, rng, token);
+    g_sel_counts[path]++;
+    return path == 0;
+}
+#endif
+
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    { int t = -1; if (ds41_selector_sample(s, temperature, top_k, top_p, min_p, rng, &t)) return t; }
+#endif
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -79360,6 +79730,7 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
+    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
@@ -80231,6 +80602,7 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    s->sel_bound = false;
 #ifndef DS4_NO_GPU
     s->dspark_rewind_end = 0;
 #endif
@@ -80290,6 +80662,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
+        s->sel_bound = s->ds41_graph.sel_done;
+        s->sel_pos = (uint32_t)s->checkpoint.len;
+        s->sel_gen = s->ds41_graph.sel_gen;
         if (rewindable) d->rewind_end = s->ds41_graph.pos;
         return 0;
     }
@@ -88596,6 +88971,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
@@ -88756,6 +89132,7 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s) return;
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
