@@ -42000,6 +42000,30 @@ static bool ds41_balance_shared(const ds41_gpu_graph *g, const ds4_layer_weights
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_shared_balance_enabled();
 }
 
+/* SHARED_EXPERT: the shared expert's mid for `count` rows of `norm` in one dispatch (a few rows at most). */
+static bool ds41_shared_swiglu(ds4_gpu_tensor *mid, const ds4_model *m, const ds4_layer_weights *l,
+                               const ds4_gpu_tensor *norm, uint32_t count) {
+#ifdef __APPLE__
+    return count <= DS4_TP_BATCH_MAX_ROWS && l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 && ds41_on(DS4_GPU_V41_SHARED_EXPERT) &&
+        ds4_gpu_dsv41_shared_swiglu(mid, m->map, m->size, l->ffn_gate_shexp->abs_offset,
+            l->ffn_up_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP, norm, DS4_SWIGLU_CLAMP_EXP, count);
+#else
+    (void)mid; (void)m; (void)l; (void)norm; (void)count;
+    return false;
+#endif
+}
+
+/* One row's shared expert: its mid, and with shared_down its down projection into g->shared. */
+static bool ds41_shared_expert(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, bool shared_down) {
+    return (ds41_shared_swiglu(g->shared_mid, m, l, g->norm, 1) ||
+            (ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) &&
+             ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) &&
+             ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                   DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f))) &&
+        (!shared_down || ds41_shared_down(g, m, l));
+}
+
 /* shared_down false: the caller runs the shared expert's down projection (HC_FUSION expands it). */
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token, bool shared_down) {
@@ -42062,12 +42086,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         if (shared_queued && balance_shared) shared_here = true;
     }
 #endif
-    if (shared_here && !shared_queued &&
-        (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
-        !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        (shared_down && !ds41_shared_down(g, m, l)))) return false;
+    if (shared_here && !shared_queued && !ds41_shared_expert(g, m, l, shared_down)) return false;
     bool routed_ok;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
@@ -42631,10 +42650,11 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             (ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
              ds41_route_batch(g, m, l, count))) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
-        (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ((ds41_shared_swiglu(b->shared_mid, m, l, b->norm, count) ||
+          (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+           ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
+           ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+               count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f))) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)

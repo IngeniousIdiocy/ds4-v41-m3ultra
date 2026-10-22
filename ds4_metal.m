@@ -453,6 +453,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_FFN_JOIN",
             "DS4_METAL_DISABLE_V41_HC_FUSION",
             "DS4_METAL_DISABLE_V41_SPLIT_REDUCE",
+            "DS4_METAL_DISABLE_V41_SHARED_EXPERT",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -20612,10 +20613,11 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp,
-        int                     store_gate_up) {
+        int                     store_gate_up,   /* 1: gate and up too; 2: gate and up rounded to bf16 first */
+        uint32_t                rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!mid || !x || !model_map ||
-        (store_gate_up && (!gate || !up)) ||
+    if (!mid || !x || !model_map || !rows || rows > 65535u ||
+        (store_gate_up == 1 && (!gate || !up)) ||
         (in_dim & 31u) != 0 ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
         !isfinite(clamp) || clamp < 0.0f) {
@@ -20625,16 +20627,16 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(mid);
-        id<MTLBuffer> gatebuf = store_gate_up ?
+        id<MTLBuffer> gatebuf = store_gate_up == 1 ?
             ds4_gpu_tensor_buffer(gate) : midbuf;
-        id<MTLBuffer> upbuf = store_gate_up ?
+        id<MTLBuffer> upbuf = store_gate_up == 1 ?
             ds4_gpu_tensor_buffer(up) : midbuf;
-        const uint64_t x_bytes = in_dim * sizeof(float);
-        const uint64_t out_bytes = out_dim * sizeof(float);
+        const uint64_t x_bytes = rows * in_dim * sizeof(float);
+        const uint64_t out_bytes = rows * out_dim * sizeof(float);
         if (!xbuf || !gatebuf || !upbuf || !midbuf ||
             ds4_gpu_tensor_bytes(x) < x_bytes ||
-            (store_gate_up && ds4_gpu_tensor_bytes(gate) < out_bytes) ||
-            (store_gate_up && ds4_gpu_tensor_bytes(up) < out_bytes) ||
+            (store_gate_up == 1 && ds4_gpu_tensor_bytes(gate) < out_bytes) ||
+            (store_gate_up == 1 && ds4_gpu_tensor_bytes(up) < out_bytes) ||
             ds4_gpu_tensor_bytes(mid) < out_bytes) {
             fprintf(stderr, "ds4: Metal shared expert fused gate/up received undersized activation buffers\n");
             return 0;
@@ -20666,9 +20668,14 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         args.nr0 = mv_dispatch.nr0;
-        const char *fn_name = store_gate_up ?
-            "kernel_dsv4_shared_gate_up_swiglu_q8_0" :
+        args.ne11 = (int32_t)rows;
+        args.nb12 = rows * in_dim * sizeof(float);
+        args.ne1 = (int32_t)rows;
+        const char *fn_name = store_gate_up == 1 ? "kernel_dsv4_shared_gate_up_swiglu_q8_0" :
+            store_gate_up == 2 ? (rows > 1u ? "kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows" :
+                                              "kernel_dsv4_shared_mid_swiglu_q8_0_bf16") :
             "kernel_dsv4_shared_mid_swiglu_q8_0";
+        if (store_gate_up == 2) DS4_TEST_NOTE("kernel_dsv4_shared_mid_swiglu_q8_0_bf16");
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(fn_name, mv_dispatch.nsg);
         if (!pipeline) return 0;
@@ -20683,25 +20690,23 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         [enc setBuffer:gate_wbuf offset:(NSUInteger)gate_inner atIndex:1];
         [enc setBuffer:up_wbuf offset:(NSUInteger)up_inner atIndex:2];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
-        [enc setBuffer:gatebuf offset:(store_gate_up ?
+        [enc setBuffer:gatebuf offset:(store_gate_up == 1 ?
                                        ds4_gpu_tensor_offset(gate) :
                                        ds4_gpu_tensor_offset(mid)) atIndex:4];
-        [enc setBuffer:upbuf offset:(store_gate_up ?
+        [enc setBuffer:upbuf offset:(store_gate_up == 1 ?
                                      ds4_gpu_tensor_offset(up) :
                                      ds4_gpu_tensor_offset(mid)) atIndex:5];
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
         [enc setBytes:&clamp length:sizeof(clamp) atIndex:7];
         [enc setThreadgroupMemoryLength:2u * mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
-                                                  (NSUInteger)mv_dispatch.nr0,
-                                              1,
-                                              1)
+        const NSUInteger groups = ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0;
+        [enc dispatchThreadgroups:(rows > 1u ? MTLSizeMake(rows, groups, 1) : MTLSizeMake(groups, 1, 1))
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb,
                                            owned,
-                                           store_gate_up ?
+                                           store_gate_up == 1 ?
                                            "shared expert fused gate/up" :
                                            "shared expert fused mid")) {
             return 0;
@@ -20945,7 +20950,7 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                                                    out_dim,
                                                    x,
                                                    clamp,
-                                                   1);
+                                                   1, 1u);
 }
 
 int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
@@ -20969,7 +20974,7 @@ int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
                                                    out_dim,
                                                    x,
                                                    clamp,
-                                                   0);
+                                                   0, 1u);
 }
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
@@ -20995,7 +21000,7 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
                                                    out_dim,
                                                    x,
                                                    clamp,
-                                                   1);
+                                                   1, 1u);
 }
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
@@ -48573,6 +48578,14 @@ int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_t
         g_heads_once_used = 0;
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 decode reduce (check entry)");
     }
+}
+
+/* SHARED_EXPERT: the shared expert's gate and up (each rounded to bf16) and SwiGLU of `rows` rows in one dispatch. */
+int ds4_gpu_dsv41_shared_swiglu(ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
+                                uint64_t gate_offset, uint64_t up_offset, uint32_t in_dim, uint32_t out_dim,
+                                const ds4_gpu_tensor *x, float clamp, uint32_t rows) {
+    return ds4_gpu_shared_gate_up_swiglu_q8_0_impl(NULL, NULL, mid, model_map, model_size, gate_offset, up_offset,
+                                                   in_dim, out_dim, x, clamp, 2, rows);
 }
 
 /* HC_FUSION. The HC block input of up to 8 rows in one dispatch: the mix projection of each row's HC streams, its

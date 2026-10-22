@@ -1848,9 +1848,54 @@ static int check_split_reduce(void) {
     return 1;
 }
 
+/* SHARED_EXPERT, bit for bit: the fused gate, up and SwiGLU against the bf16 Q8 matvecs and the SwiGLU kernel, for
+ * one row and for three (5120 -> 2304, the V4.1 shape, clamp 10). */
+static int check_shared_expert(void) {
+    enum { IN = 5120, OUT = 2304, ROWS = 3 };
+    const uint64_t row_bytes = IN / 32 * 34, wb = 2ull * OUT * row_bytes;
+    uint8_t *map = NULL;
+    CHECK(posix_memalign((void **)&map, getpagesize(), wb) == 0);
+    for (uint64_t b = 0; b < wb / 34; b++) {   /* Q8_0 blocks: f16 scale, 32 int8 */
+        const uint16_t d = (uint16_t)(0x2000u + random_bits() % 0x1800u);
+        memcpy(map + b * 34, &d, 2);
+        for (int j = 0; j < 32; j++) map[b * 34 + 2 + j] = (uint8_t)random_bits();
+    }
+    CHECK(ds4_gpu_set_model_map(map, wb));
+    ds4_gpu_tensor *x = upload(NULL, ROWS * IN * 4), *gate = upload(NULL, ROWS * OUT * 4), *up = upload(NULL, ROWS * OUT * 4);
+    ds4_gpu_tensor *ref = upload(NULL, ROWS * OUT * 4), *got = upload(NULL, ROWS * OUT * 4);
+    CHECK(x && gate && up && ref && got);
+    for (int i = 0; i < ROWS * IN; i++) ((float *)ds4_gpu_tensor_contents(x))[i] = bf16(random_value());
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv4_shared_mid_swiglu_q8_0_bf16");
+    for (uint32_t rows = 1; rows <= ROWS; rows += ROWS - 1) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, 0, rows * IN * 4), *mid = ds4_gpu_tensor_view(ref, 0, rows * OUT * 4);
+        ds4_gpu_tensor *gr = ds4_gpu_tensor_view(gate, 0, rows * OUT * 4), *ur = ds4_gpu_tensor_view(up, 0, rows * OUT * 4);
+        CHECK(xr && mid && gr && ur);
+        CHECK((rows == 1 ? ds4_gpu_matmul_q8_0_bf16_tensor(gr, map, wb, 0, IN, OUT, xr) &&
+                           ds4_gpu_matmul_q8_0_bf16_tensor(ur, map, wb, OUT * row_bytes, IN, OUT, xr) :
+                           ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(gr, map, wb, 0, IN, OUT, xr, rows) &&
+                           ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ur, map, wb, OUT * row_bytes, IN, OUT, xr, rows) &&
+                           ds4_gpu_dsv41_quantize(gr, OUT, rows, DS4_V41_BF16) &&
+                           ds4_gpu_dsv41_quantize(ur, OUT, rows, DS4_V41_BF16)) &&
+              ds4_gpu_swiglu_tensor(mid, gr, ur, rows * OUT, 10.0f, 1.0f));
+        CHECK(ds4_gpu_dsv41_shared_swiglu(got, map, wb, 0, OUT * row_bytes, IN, OUT, xr, 10.0f, rows));
+        CHECK(same_bits(ref, got, rows * OUT));
+        ds4_gpu_tensor *views[] = {xr, mid, gr, ur};
+        for (size_t i = 0; i < sizeof(views) / sizeof(*views); i++) ds4_gpu_tensor_free(views[i]);
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv4_shared_mid_swiglu_q8_0_bf16") == runs + 2);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {x, gate, up, ref, got};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    /* the model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 shared expert: fused gate, up and SwiGLU == bf16 matvecs and SwiGLU, one and three rows\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
-        check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce();
+        check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
+        check_shared_expert();
 }
 #else
 static int check_v41_groups(void) { return 1; }

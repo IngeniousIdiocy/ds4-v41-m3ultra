@@ -794,7 +794,7 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
-template<short NR0, bool STORE_GATE_UP>
+template<short NR0, bool STORE_GATE_UP, bool ROUND_GATE_UP = false>
 void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0_gate,
@@ -905,8 +905,8 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
                 gate_f32[out_row] = gate;
                 up_f32[out_row] = up;
             }
-            float g = gate;
-            float u = up;
+            float g = ROUND_GATE_UP ? ds4_bf16_round(gate) : gate;
+            float u = ROUND_GATE_UP ? ds4_bf16_round(up) : up;
             if (clamp_value > 1.0e-6f) {
                 g = min(g, clamp_value);
                 u = clamp(u, -clamp_value, clamp_value);
@@ -1448,6 +1448,49 @@ kernel void kernel_dsv4_shared_mid_swiglu_q8_0(
     kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
+/* The gate and up sums round to bf16 before the SwiGLU, as the separate
+ * bf16 matvecs would have stored them. */
+[[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_bf16")]]
+kernel void kernel_dsv4_shared_mid_swiglu_q8_0_bf16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false, true>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, tgpig, tiisg, sgitg);
+}
+
+
+/* A few rows of the bf16 shared expert: grid x is the row so that the rows'
+ * threadgroups for the same weight rows run back to back. */
+[[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows")]]
+kernel void kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        constant     float &clamp_value,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false, true>(
+            args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+            clamp_value, shmem, uint3(tgpig.y, tgpig.x, tgpig.z), tiisg, sgitg);
 }
 
 

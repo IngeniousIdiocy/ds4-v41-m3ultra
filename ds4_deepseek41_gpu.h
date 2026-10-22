@@ -96,6 +96,10 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* SHARED_EXPERT: the shared expert's mid (gate and up rounded to bf16, then the SwiGLU) for up to 65535 rows. */
+int ds4_gpu_dsv41_shared_swiglu(ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
+                                uint64_t gate_offset, uint64_t up_offset, uint32_t in_dim, uint32_t out_dim,
+                                const ds4_gpu_tensor *x, float clamp, uint32_t rows);
 /* HC_FUSION. hc_block_input(_rows): a block's whole HC input (mix, split, the weighted sum with the previous block's
  * pre weights, its norm) for up to 8 rows. matmul_expand: a bf16 in/out Q8_0 matvec of one row expanded into the HC
  * streams (joined with add first when given). deferred_collapse: the weighted sum and norm alone, ahead of the mix;
