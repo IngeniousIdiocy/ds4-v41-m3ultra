@@ -83,6 +83,7 @@ typedef struct {
 #define DS4_GPU_V41_PREENCODE (1ull << 35)   /* the next decode token's first command buffer is encoded while this token's last one runs */
 #define DS4_GPU_V41_SAMPLER_GPU (1ull << 36)   /* the decode step summarizes its logits for top-p sampling on the GPU and the CPU decides from it */
 #define DS4_GPU_V41_TP_BALANCED_ROUTE (1ull << 37)   /* on two Macs each rank runs half of every token's ordered expert list, with every expert bound */
+#define DS4_GPU_V41_TP_SHARED_SPLIT (1ull << 38)   /* on two Macs each rank computes half of the shared expert's hidden width */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

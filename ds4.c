@@ -42190,6 +42190,27 @@ static DS4_MAYBE_UNUSED bool ds41_concurrent_ffn(const ds41_gpu_graph *g, const 
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
 }
 
+#ifdef __APPLE__
+/* TP_SHARED_SPLIT: with two Macs each rank computes half of the shared expert's hidden width and its K slice of the
+ * down projection, so the shared expert's work is split instead of alternating between the ranks by layer. The two
+ * partials join the routed sums across the gate. */
+static bool ds41_tp_shared_split(const ds4_layer_weights *l) {
+    return ds41_on(DS4_GPU_V41_TP_SHARED_SPLIT) && l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 && l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        (DS4_N_FF_EXP % 64u) == 0u;
+}
+
+static bool ds41_shared_expert_half(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l) {
+    const uint32_t half = DS4_N_FF_EXP / 2u;
+    const uint64_t lane = (uint64_t)g->tp_rank * half * (DS4_N_EMBD / 32u * 34u);   /* this rank's Q8 rows */
+    return ds4_gpu_dsv41_shared_swiglu(g->shared_mid, m->map, m->size, l->ffn_gate_shexp->abs_offset + lane,
+            l->ffn_up_shexp->abs_offset + lane, DS4_N_EMBD, half, g->norm, DS4_SWIGLU_CLAMP_EXP, 1u) &&
+        ds41_bf16(g->shared_mid, half) &&
+        ds4_gpu_matmul_q8_0_kslice_tensor(g->shared, m->map, m->size, l->ffn_down_shexp->abs_offset,
+            DS4_N_FF_EXP, (uint64_t)g->tp_rank * half, half, DS4_N_EMBD, g->shared_mid, 0) != 0;
+}
+#endif
+
 /* SHARED_EXPERT: the shared expert's mid for `count` rows of `norm` in one dispatch (a few rows at most). */
 static bool ds41_shared_swiglu(ds4_gpu_tensor *mid, const ds4_model *m, const ds4_layer_weights *l,
                                const ds4_gpu_tensor *norm, uint32_t count) {
@@ -42255,7 +42276,12 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                 &table, g->selected, DS4_N_EXPERT_USED)) return false;
     }
 #endif
-    bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
+#ifdef __APPLE__
+    const bool shared_split = shared_owner && shared_down && ds41_tp_shared_split(l);
+#else
+    const bool shared_split = false;
+#endif
+    bool shared_here = !shared_owner || shared_split || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     const bool balance_shared = shared_owner && ds41_balance_shared(g, l, 1);
@@ -42293,7 +42319,10 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         }
     }
 #endif
-    if (shared_here && !shared_queued && !ds41_shared_expert(g, m, l, shared_down)) return false;
+#ifdef __APPLE__
+    if (shared_split && !ds41_shared_expert_half(g, m, l)) return false;
+#endif
+    if (shared_here && !shared_split && !shared_queued && !ds41_shared_expert(g, m, l, shared_down)) return false;
     bool routed_ok;
     const ds4_gpu_tensor *selected = g->selected, *weights = g->route_weights;
     uint32_t n_used = DS4_N_EXPERT_USED;
