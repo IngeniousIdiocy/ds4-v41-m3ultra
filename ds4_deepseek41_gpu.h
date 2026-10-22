@@ -163,6 +163,17 @@ int ds4_gpu_dsv41_hc_block_input(ds4_gpu_tensor *mix, ds4_gpu_tensor *x, ds4_gpu
                                  uint64_t fn_offset, uint64_t scale_offset, uint64_t base_offset,
                                  uint64_t norm_offset, uint32_t n, uint32_t mix_dim, uint32_t n_embd,
                                  uint32_t n_hc, uint32_t sinkhorn_iters, float hc_eps, float norm_eps);
+int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size,
+                                     uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+                                     const ds4_gpu_tensor *x, const ds4_gpu_tensor *add,
+                                     const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+                                     uint32_t n_hc, uint32_t rows);
+int ds4_gpu_dsv41_attention_decode_rows(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+                                        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+                                        const ds4_gpu_tensor *raw_kv, uint32_t n_raw, uint32_t raw_cap,
+                                        uint32_t raw_start, const ds4_gpu_tensor *comp_cache,
+                                        const ds4_gpu_tensor *ids, uint32_t ids_stride, uint32_t n_comp,
+                                        uint32_t attended, uint32_t n_head, uint32_t head_dim, uint32_t rows);
 int ds4_gpu_dsv41_matmul_expand(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size,
                                 uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
                                 const ds4_gpu_tensor *x, const ds4_gpu_tensor *add,

@@ -41722,6 +41722,17 @@ static bool ds41_heads_unrope(ds4_gpu_tensor *x, uint32_t heads, uint32_t il, ui
     return ds41_bf16(x, heads * DS4_N_HEAD_DIM) && ds41_rope(x, heads, DS4_N_HEAD_DIM, il, pos, true);
 }
 
+/* The heads of `rows` consecutive positions from `pos`: as ds41_heads_unrope for each. */
+static bool ds41_heads_unrope_rows(ds4_gpu_tensor *x, uint32_t heads, uint32_t il, uint32_t pos, uint32_t rows) {
+#ifdef __APPLE__
+    if (ds41_on(DS4_GPU_V41_FUSED_ROUNDING))
+        return ds4_gpu_dsv41_rope_bf16(x, DS4_N_HEAD_DIM, heads, rows, pos,
+                                       ds4_layer_compress_ratio(il) != 0, true) != 0;
+#endif
+    return ds4_gpu_dsv41_quantize(x, heads * DS4_N_HEAD_DIM, rows, DS4_V41_BF16) &&
+        ds4_gpu_dsv41_rope(x, DS4_N_HEAD_DIM, heads, rows, pos, ds4_layer_compress_ratio(il) != 0, true);
+}
+
 static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
                         const ds4_layer_weights *l, bool ffn) {
     const ds4_gpu_tensor *residual = ffn ? g->after_attn : g->residual;
@@ -42460,8 +42471,8 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
 }
 
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
-                                        const ds4_layer_weights *l, uint32_t count) {
-    return ds41_hc_expand_batch(b->after_attn, b->block, b->residual, b->attn_split, count) &&
+                                        const ds4_layer_weights *l, uint32_t count, bool expanded) {
+    return (expanded || ds41_hc_expand_batch(b->after_attn, b->block, b->residual, b->attn_split, count)) &&
         (ds41_hc_input_rows(b, m, l, true, b->attn_split, 24u, count) ||
          (ds41_hc_mix_batch(b, m, l, true, count) &&
           ds41_hc_sum_batch(b->x, b->after_attn, b->attn_split, count, true) &&
@@ -42701,6 +42712,111 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             (n_raw - kept + part) * row_bytes, (kept - part) * row_bytes));
 }
 
+#ifdef __APPLE__
+/* VERIFY_BATCH: whether the batch rows are one session's consecutive verify rows (a DSpark block), which attend
+ * together on one host. */
+static bool ds41_verify_block(const ds41_gpu_graph *g, ds41_gpu_graph *const *graphs, const uint32_t *positions,
+                              int count) {
+    if (g->tp_world != 1 || count < 2 || count > DS4_TP_BATCH_MAX_ROWS || !ds41_on(DS4_GPU_V41_VERIFY_BATCH))
+        return false;
+    for (int i = 0; i < count; i++)
+        if (!graphs[i]->verify_prefix || graphs[i]->window[0] != g->window[0] ||
+            positions[i] != positions[0] + (uint32_t)i) return false;
+    return true;
+}
+
+/* VERIFY_BATCH: a verify block's attention. Each row stores its key, publishes its compressed rows and picks its
+ * index selection exactly as its own decode step does, in order. Then the rows attend together with the decode
+ * kernels, over a chronological copy of the raw keys (a later row's key overwrites the ring slot an earlier row
+ * still reads); rows that see the same number of selected rows share one dispatch. Every row's heads are the bits
+ * of a decode step at its position. */
+static bool ds41_attention_verify_rows(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs, const uint32_t *positions,
+                                       ds4_gpu_tensor *const *queries, const ds4_model *m,
+                                       const ds4_layer_weights *l, uint32_t il, uint32_t count) {
+    const uint32_t start = positions[0], ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t previous = start < 127u ? start : 127u;
+    const uint32_t raw_start = (start - previous) % 128u;
+    const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
+    const uint64_t row_bytes = DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t q_row = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t sinks = l->attn_sinks->abs_offset;
+    const uint32_t raw_cap = g->prefill_cap + 128u;
+    ds41_prefill_row *b = &g->batch;
+    if ((first && !ds4_gpu_tensor_copy(g->raw_prefill, 0, g->window[il], raw_start * row_bytes,
+                                       first * row_bytes)) ||
+        (previous > first && !ds4_gpu_tensor_copy(g->raw_prefill, first * row_bytes, g->window[il], 0,
+                                                  (previous - first) * row_bytes)) ||
+        !ds4_gpu_dsv41_rope(b->q, DS4_N_HEAD_DIM, DS4_N_HEAD, count, start, ratio != 0, false)) return false;
+    for (uint32_t t = 0; t < count; t++) {
+        ds41_gpu_graph row = *graphs[t];
+        row.pos = positions[t];
+#define DS41_VERIFY_ROW(name, width) row.name = g->rows_view[t].name;
+        DS41_PREFILL_ROWS(DS41_VERIFY_ROW)
+#undef DS41_VERIFY_ROW
+        row.q = queries[t];
+        const uint64_t slot = (uint64_t)(row.pos % 128u) * row_bytes;
+        if (!ds41_rope_store(row.kv, g->window[il], slot, DS4_N_HEAD_DIM, il, row.pos, DS4_V41_FP8_E8M0) ||
+            !ds4_gpu_tensor_copy(g->raw_prefill, (previous + t) * row_bytes, g->window[il], slot, row_bytes) ||
+            !ds41_attention_select(&row, m, l, il)) return false;
+    }
+    bool ok = true, single = false;   /* a refused group goes row by row */
+    for (uint32_t t = 0; ok && t < count;) {
+        const uint32_t pos = start + t;
+        const uint32_t raw_rows = pos + 1u < 128u ? pos + 1u : 128u;
+        const uint32_t raw_first = previous + t + 1u - raw_rows;
+        const uint32_t comp = ratio ? (pos + 1u) / ratio : 0u;
+        const uint32_t attended = comp < DS4_N_INDEXER_TOP_K ? comp : DS4_N_INDEXER_TOP_K;
+        uint32_t run = 1;
+        while (!single && comp && raw_rows == 128u && t + run < count) {
+            const uint32_t c = (start + t + run + 1u) / ratio;
+            if ((c < DS4_N_INDEXER_TOP_K ? c : DS4_N_INDEXER_TOP_K) != attended) break;
+            run++;
+        }
+        ds4_gpu_tensor *q = ds4_gpu_tensor_view(b->q, t * q_row, run * q_row);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(b->heads, t * q_row, run * q_row);
+        ds4_gpu_tensor *ids = comp ? ds4_gpu_tensor_view(b->selected_comp,
+            (uint64_t)t * DS4_N_INDEXER_TOP_K * sizeof(int32_t),
+            (uint64_t)run * DS4_N_INDEXER_TOP_K * sizeof(int32_t)) : NULL;
+        const uint32_t comp_last = ratio ? (start + t + run) / ratio : 0u;
+        ok = q && out && (!comp || ids) &&
+            ((run > 1u && ds4_gpu_dsv41_attention_decode_rows(out, m->map, m->size, sinks, q, g->raw_prefill,
+                 raw_rows, raw_cap, raw_first, g->compressed[owner], ids, DS4_N_INDEXER_TOP_K, comp_last,
+                 attended, DS4_N_HEAD, DS4_N_HEAD_DIM, run)) ||
+             (run == 1u &&
+              ((comp && ds4_gpu_dsv41_attention_decode(out, m->map, m->size, sinks, q, g->raw_prefill, raw_rows,
+                    raw_cap, raw_first, g->compressed[owner], ids, comp, attended, DS4_N_HEAD, DS4_N_HEAD_DIM)) ||
+               ((!comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner], ids, comp, attended)) &&
+                ds4_gpu_attention_decode_heads_tensor(out, m->map, m->size, sinks, q, g->raw_prefill, raw_rows,
+                    raw_cap, raw_first, g->selected_kv, 0, attended, NULL, 0, DS4_N_HEAD, DS4_N_HEAD_DIM)))));
+        ds4_gpu_tensor_free(ids);
+        ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(q);
+        if (!ok && run > 1u) { single = true; ok = true; continue; }
+        single = false;
+        t += run;
+    }
+    return ok && ds41_heads_unrope_rows(b->heads, DS4_N_HEAD, il, start, count);
+}
+
+/* VERIFY_BATCH: the batch rows' attention low projections, every row in each group's weight pass. */
+static bool ds41_attention_low_batch(ds41_gpu_graph *g, const ds4_model *m,
+                                     const ds4_layer_weights *l, uint32_t count) {
+    return ds4_gpu_attention_output_low_q8_rows_exact_tensor(g->batch.low, m->map, m->size,
+            l->attn_output_a->abs_offset, 4096, DS4_N_LORA_O, DS4_N_OUT_GROUP, 0,
+            DS4_N_OUT_GROUP, g->batch.heads, count) != 0;
+}
+
+/* VERIFY_BATCH: a few rows' attention output-B expands straight into the after-attention HC streams. */
+static bool ds41_attention_expand_rows(ds41_prefill_row *b, const ds4_model *m,
+                                       const ds4_layer_weights *l, uint32_t count) {
+    return l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        ds4_gpu_dsv41_matmul_expand_rows(b->after_attn, m->map, m->size, l->attn_output_b->abs_offset,
+            (uint32_t)l->attn_output_b->dim[0], (uint32_t)l->attn_output_b->dim[1], b->low, NULL, b->residual,
+            b->attn_split, DS4_N_HC, count);
+}
+#endif
+
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
     return ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
@@ -42805,7 +42921,7 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
-                           bool shared_owner) {
+                           bool shared_owner, bool shared_down) {
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
@@ -42831,7 +42947,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
            ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
                count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f))) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
-        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
+        (!shared_down || ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true)))) &&
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         (!balance_shared || ds4_gpu_dsv41_shared_mask(b->shared, b->selected,
             DS4_N_EMBD, count, DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank, il & 1u)) &&
@@ -42858,6 +42974,23 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
 }
+
+#ifdef __APPLE__
+/* VERIFY_BATCH: a few rows' shared down projection adds the routed sum and expands into the HC streams; otherwise
+ * the shared down, the add and the expand as the batch tail runs them. */
+static bool ds41_moe_expand_batch(ds41_prefill_row *b, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t count) {
+    if (l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        ds4_gpu_dsv41_matmul_expand_rows(b->residual, m->map, m->size, l->ffn_down_shexp->abs_offset,
+            (uint32_t)l->ffn_down_shexp->dim[0], (uint32_t)l->ffn_down_shexp->dim[1], b->shared_mid, b->routed,
+            b->after_attn, b->ffn_split, DS4_N_HC, count)) return true;
+    return ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true) &&
+        ds4_gpu_add_tensor(b->block, b->routed, b->shared, count * DS4_N_EMBD) &&
+        ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, count, DS4_V41_BF16) &&
+        ds4_gpu_hc_expand_split_tensor(b->residual, b->block, b->after_attn, b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(b->residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+}
+#endif
 
 /* Layers per committed command buffer in a queued decode step. */
 #define DS41_DECODE_FLUSH_LAYERS 2u
@@ -43550,7 +43683,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                                    g->batch.low, count, true);
                 }
                 DS41_STAGE("attention output");
-                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count);
+                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count, false);
                 DS41_STAGE("hc/ffn norm");
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                     row.pos = start + t;
@@ -43563,7 +43696,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
-                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
+                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, true);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds41_ffn_add_batch(active.block, active.routed, active.shared, count) &&
@@ -43693,6 +43826,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
     const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
+    bool rows_batch = false;   /* VERIFY_BATCH, decided once the positions are known */
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds41_prefill_row active = {0};
@@ -43741,6 +43875,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+#ifdef __APPLE__
+    rows_batch = g->tp_world == 1 && rows <= DS4_TP_BATCH_MAX_ROWS && ds41_on(DS4_GPU_V41_VERIFY_BATCH) &&
+        (prefill_only || ds41_verify_block(g, graphs, positions, count));
+#endif
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -43762,14 +43900,27 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 g->rows_view[i].residual, 1);
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
+#ifdef __APPLE__
+        /* VERIFY_BATCH: one session's consecutive rows on one host attend together (a short prefill through the
+         * batch kernels, a verify block through the decode kernels); a few rows' output projections then expand
+         * straight into the HC streams */
+        if (ok && rows_batch) ok = prefill_only ? ds41_attention_batch(g, model, l, il, rows) :
+            ds41_attention_verify_rows(g, graphs, positions, queries, model, l, il, rows);
+        const bool fused_tail = rows_batch && !shared_owner && ds41_on(DS4_GPU_V41_HC_FUSION) &&
+            l->attn_output_b->type == DS4_TENSOR_Q8_0 && l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
+        const bool expanded = ok && fused_tail && ds41_attention_low_batch(g, model, l, rows) &&
+            ds41_attention_expand_rows(&active, model, l, rows);
+#else
+        const bool expanded = false;
+#endif
         bool batch_output = false;
 #ifndef DS4_ROCM_BUILD
-        batch_output =
+        batch_output = !expanded &&
             l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
             !getenv("DS4_DISABLE_V41_BATCH_OUTPUT");
 #endif
-        for (int i = 0; ok && i < count; i++) {
+        for (int i = 0; ok && !expanded && !(rows_batch && batch_output) && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
@@ -43777,7 +43928,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
-            ok = ds41_attention(&row, model, l, il, true) &&
+            ok = (rows_batch || ds41_attention(&row, model, l, il, true)) &&
                 (batch_output || ds41_attention_output(&row, model, l, -1));
         }
         if (ok && batch_output)
@@ -43788,17 +43939,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 ds4_gpu_dsv41_attention_output_batch(active.block, active.low,
                     model->map, model->size, l->attn_output_a->abs_offset,
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
-        if (ok) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
-        if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(&active, model, l, rows) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
-            (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
-                (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
-                ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
-            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+        if (ok && !expanded) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows) &&
+            ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
+        if (ok) ok = ds41_after_attention_batch(&active, model, l, rows, expanded) &&
+            ds41_moe_batch(g, model, l, il, rows, shared_owner, !expanded) &&
+#ifdef __APPLE__
+            (expanded ? ds41_moe_expand_batch(&active, model, l, rows) :
+#else
+            (
+#endif
+             ((shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
+                  (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
+                  ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
+              ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+              ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
+                  active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+              ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16)));
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
         else if (ok && g->tp_world != 2 && il + 1u < DS4_N_LAYER && (il + 1u) % DS41_DECODE_FLUSH_LAYERS == 0 &&
