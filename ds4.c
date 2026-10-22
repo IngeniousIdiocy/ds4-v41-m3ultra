@@ -41066,8 +41066,9 @@ typedef struct {
      * (the FP8 Engram and indexer sidecars serve only those steps) */
     bool decode_step, logits_step, hc_attn_deferred, hc_ffn_deferred, kv_stored;
     /* SAMPLER_GPU: sel_gpu latched per decode step that encodes the selector; sel_done = this step encoded it and
-     * completed with its logits read back; sel_gen = the selector-buffer generation it encoded. */
-    bool sel_gpu, sel_done;
+     * completed with its logits read back; sel_gen = the selector-buffer generation it encoded; sel_want = the
+     * session's last token was sampled with the settings the selector serves, so the next step encodes it. */
+    bool sel_gpu, sel_done, sel_want;
     uint64_t sel_gen;
     /* Metal, CONCURRENT_FFN: the last ds41_moe_partial left the whole shared expert in `shared` */
     bool shared_done;
@@ -43275,8 +43276,10 @@ static void ds41_step_prologue(ds41_gpu_graph *g, bool logits, bool queued_head,
     g->sel_gen = 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* SAMPLER_GPU: the selector only on the queued-head decode step (logits, one host, resident, not quality), so
-     * prefill, verify, TP and streaming never encode it. */
-    g->sel_gpu = queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() && ds41_on(DS4_GPU_V41_SAMPLER_GPU);
+     * prefill, verify, TP and streaming never encode it, and only while the session samples with it (greedy decoding
+     * and other sampler settings never read it). */
+    g->sel_gpu = g->sel_want && queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() &&
+        ds41_on(DS4_GPU_V41_SAMPLER_GPU);
 #else
     (void)queued_head;
 #endif
@@ -79810,13 +79813,24 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+/* SAMPLER_GPU: a greedy pick never reads the selector, so the session's next step does not encode it */
+static void session_sel_unwanted(ds4_session *s) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (ds4_session_is_ds41(s)) s->ds41_graph.sel_want = false;
+#else
+    (void)s;
+#endif
+}
+
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    session_sel_unwanted(s);
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    session_sel_unwanted(s);
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
@@ -79837,6 +79851,7 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    session_sel_unwanted(s);
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -80142,6 +80157,8 @@ static bool ds41_selector_sample(ds4_session *s, float temperature, int top_k, f
                                  uint64_t *rng, int *token) {
     const bool bound = s->sel_bound;
     s->sel_bound = false;   /* consumed once */
+    if (ds4_session_is_ds41(s))   /* the next step encodes the selector only if this kind of sample would read it */
+        s->ds41_graph.sel_want = temperature == 1.0f && top_k == 0 && top_p == 0.95f && min_p == 0.0f;
     const bool on = ds41_on(DS4_GPU_V41_SAMPLER_GPU);
     if (!bound) { if (on && ds4_gpu_selector_ready()) g_sel_counts[6]++; return false; }
     if (!on || temperature != 1.0f || top_k != 0 || top_p != 0.95f || min_p != 0.0f) { g_sel_counts[7]++; return false; }
