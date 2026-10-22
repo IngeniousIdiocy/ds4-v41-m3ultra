@@ -64980,12 +64980,23 @@ static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
     return n;
 }
 
-static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
+/* With a drafter loaded, a payload also carries the drafter's window (header field 3 is 2): the three target-layer
+ * feature rings and the positions they hold, so a restored session drafts at once instead of first decoding the
+ * window's 128 positions serially. A payload without it (field 3 is 1) still loads and the drafter warms up as before;
+ * one with it also loads without a drafter, which skips those bytes. */
+#define DS41_PAYLOAD_RING_BYTES ((uint64_t)DS41_DRAFT_WINDOW * DS4_N_EMBD * sizeof(float))
+#define DS41_PAYLOAD_DRAFT_BYTES (3u * ((uint64_t)DS41_DRAFT_WINDOW * sizeof(uint32_t) + DS41_PAYLOAD_RING_BYTES))
+
+static ds41_dspark *ds41_payload_draft(ds41_gpu_graph *g) {
+    return g->tp_world == 1 ? g->dspark : NULL;
+}
+
+static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos, bool draft) {
     ds41_state_span spans[54];
     const uint32_t n = ds41_state_spans(g, pos, spans);
     uint64_t bytes = ((uint64_t)pos + DS4_N_VOCAB) * sizeof(float);
     for (uint32_t i = 0; i < n; i++) bytes += spans[i].bytes;
-    return bytes;
+    return bytes + (draft ? DS41_PAYLOAD_DRAFT_BYTES : 0);
 }
 
 static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
@@ -64995,9 +65006,10 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "V4.1 graph has no complete frontier to save");
         return 1;
     }
+    ds41_dspark *d = ds41_payload_draft(g);
     const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
-        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, 0x413431u
+        g->ctx, d ? 2u : 1u, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, 0x413431u
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
         if (payload_write_u32(fp, h[i], err, errlen)) return 1;
@@ -65011,6 +65023,12 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     for (uint32_t i = 0; i < n && !rc; i++)
         rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                         buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    for (unsigned stage = 0; d && stage < 3 && !rc; stage++) {
+        for (uint32_t i = 0; i < DS41_DRAFT_WINDOW && !rc; i++)
+            rc = payload_write_u32(fp, d->positions[stage][i], err, errlen);
+        if (!rc) rc = payload_write_tensor_span(fp, d->target[stage], 0, DS41_PAYLOAD_RING_BYTES,
+                                                 buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
     free(buf);
     return rc;
 }
@@ -65019,11 +65037,13 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
     if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_dspark *d = ds41_payload_draft(g);
     const uint32_t pos = h[7];
+    const bool has_draft = h[3] == 2u;
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
-        h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
+        (h[3] != 1u && !has_draft) || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
         h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
-        h[12] != 0x413431u || remaining != ds41_payload_body_bytes(g, pos)) {
+        h[12] != 0x413431u || remaining != ds41_payload_body_bytes(g, pos, has_draft)) {
         payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
         return 1;
     }
@@ -65054,9 +65074,27 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         for (uint32_t i = 0; i < n && !rc; i++)
             rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
                                            buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+        uint32_t positions[3][DS41_DRAFT_WINDOW];
+        for (unsigned stage = 0; has_draft && stage < 3 && !rc; stage++) {
+            for (uint32_t i = 0; i < DS41_DRAFT_WINDOW && !rc; i++)
+                rc = payload_read_u32(fp, &positions[stage][i], &remaining, err, errlen);
+            if (rc) break;
+            if (d) rc = payload_read_tensor_span(fp, d->target[stage], 0, DS41_PAYLOAD_RING_BYTES,
+                                                 buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+            else for (uint64_t done = 0; done < DS41_PAYLOAD_RING_BYTES && !rc; done += DS4_SESSION_IO_CHUNK)
+                rc = payload_read_bytes(fp, buf, DS41_PAYLOAD_RING_BYTES - done < DS4_SESSION_IO_CHUNK ?
+                    DS41_PAYLOAD_RING_BYTES - done : DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+        }
         free(buf);
         if (!rc) {
             ds41_graph_reset(g);
+            /* the drafter's window, where the payload has one: each slot keeps a position of the last 128 */
+            for (unsigned stage = 0; has_draft && d && stage < 3; stage++)
+                for (uint32_t i = 0; i < DS41_DRAFT_WINDOW; i++) {
+                    const uint32_t p = positions[stage][i];
+                    if (p < pos && pos - p <= DS41_DRAFT_WINDOW && p % DS41_DRAFT_WINDOW == i)
+                        d->positions[stage][i] = p;
+                }
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
@@ -65096,7 +65134,8 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         if (!s->ds41_graph_ready || !s->ds41_graph.valid ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return 0;
         return DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
-               ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len);
+               ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len,
+                                       ds41_payload_draft(&s->ds41_graph) != NULL);
     }
 #endif
     if (ds4_session_is_cpu(s)) {
