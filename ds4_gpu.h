@@ -56,6 +56,7 @@ typedef struct {
 #define DS4_GPU_V41_ROPE (1ull << 8)   /* cache rows roped as they store; the heads' inverse RoPE in the reduce or the low */
 #define DS4_GPU_V41_FFN_JOIN (1ull << 9)   /* a decode layer's FFN outputs join and expand into the HC streams in one dispatch */
 #define DS4_GPU_V41_HC_FUSION (1ull << 10)   /* HC block input in one kernel, projections expanded into the streams, mix deferred */
+#define DS4_GPU_V41_SPLIT_REDUCE (1ull << 11)   /* the decode Engram gate and the deferred HC collapse spread over more groups */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

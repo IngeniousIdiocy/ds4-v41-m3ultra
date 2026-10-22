@@ -510,6 +510,66 @@ kernel void kernel_dsv41_deferred_collapse(
 
 }
 
+/* The split HC collapse: kernel_dsv41_deferred_collapse as two dispatches with the same bits. The single 1024-thread group
+ * spends most of its time pulling 100 KB through one core; here the loads spread over 32 groups.
+ * Part: group s is the original's simdgroup s (thread t = 32 s + lane owns elements t and t + 1024, as there) and stores
+ * the collapsed values and its simd_sum partial in slots[s]. The four-row sum is written as the fma chain the original's
+ * `acc += x * w` sequence compiles to under fast math (checked bit for bit against it), so the two cannot drift apart.
+ * Norm: every simdgroup reloads the 32 partials, lane = slot, and repeats the original's second simd_sum over the same 32
+ * values in the same lanes, then normalizes its elements from the stored collapsed values. Group 0 resets the counter as
+ * the original does at its end. Host contract: n_embd 5120, n_hc 4 (as the original). */
+kernel void kernel_dsv41_deferred_collapse_part(
+        constant ds4_deferred_hc_args &args,
+        device const float *x, device const float *pre,
+        device float *collapsed, device float *slots,
+        uint group [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n_embd = (uint)args.n_embd, n4 = n_embd >> 2;
+    const uint i0 = group * 32u + tiisg, i1 = i0 + 1024u;
+    const bool h0 = i0 < n4, h1 = i1 < n4;
+    device const float4 *x0 = (device const float4 *)(x + 0u * n_embd);
+    device const float4 *x1 = (device const float4 *)(x + 1u * n_embd);
+    device const float4 *x2 = (device const float4 *)(x + 2u * n_embd);
+    device const float4 *x3 = (device const float4 *)(x + 3u * n_embd);
+    const float w0 = pre[0], w1 = pre[1], w2 = pre[2], w3 = pre[3];
+    float4 a0 = 0.0f, b0 = 0.0f, c0 = 0.0f, d0 = 0.0f, a1 = 0.0f, b1 = 0.0f, c1 = 0.0f, d1 = 0.0f;
+    if (h0) { a0 = x0[i0]; b0 = x1[i0]; c0 = x2[i0]; d0 = x3[i0]; }
+    if (h1) { a1 = x0[i1]; b1 = x1[i1]; c1 = x2[i1]; d1 = x3[i1]; }
+    device float4 *collapsed4 = (device float4 *)collapsed;
+    float sumf = 0.0f;
+    if (h0) {
+        const float4 v = dsv41_bf16(fma(d0, w3, fma(c0, w2, fma(b0, w1, a0 * w0))));
+        collapsed4[i0] = v;
+        sumf += dot(v, v);
+    }
+    if (h1) {
+        const float4 v = dsv41_bf16(fma(d1, w3, fma(c1, w2, fma(b1, w1, a1 * w0))));
+        collapsed4[i1] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+    if (tiisg == 0) slots[group] = sumf;
+}
+
+kernel void kernel_dsv41_deferred_collapse_norm(
+        constant ds4_deferred_hc_args &args,
+        device const float *collapsed, device const float *slots,
+        device const float *norm_weight, device float *norm_dst, device atomic_uint *counter,
+        uint gid [[thread_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n4 = (uint)args.n_embd >> 2;
+    float sumf = slots[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean  = sumf / (float)args.n_embd;
+    const float rscale = 1.0f / sqrt(mean + args.norm_eps);
+    if (gid < n4) {
+        const float4 r = ((device const float4 *)collapsed)[gid];
+        const float4 v = (r * rscale) * ((device const float4 *)norm_weight)[gid];
+        ((device float4 *)norm_dst)[gid] = float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
+    }
+    if (gid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
+}
+
 /* The attention query projection (1280 -> 32768, bf16, RoPE on the outputs) of a block whose HC input was deferred:
  * the leading 16 threadgroups run the HC block input (mix, split and the collapse again), two more store the KV row
  * roped and quantized, and the rest the q tiles. */
@@ -651,6 +711,74 @@ kernel void kernel_dsv41_engram_add(
     for (uint i = lane; i < args.width; i += 32u)
         residual[offset + i] = dsv41_bf16(residual[offset + i] +
             gate * dsv41_bf16(kv[value_offset + i]));
+}
+
+/* A single product, rounded as written: fast math may not reassociate it into a neighbouring product. */
+static inline float dsv41_engram_mul(float a, float b) {
+#pragma METAL fp math_mode(safe)
+    return a * b;
+}
+
+/* The decode Engram gate with one 256-thread group per stream instead of one 32-lane SIMD group, with
+ * kernel_dsv41_engram_add's bits. Lane l of the 32-lane kernel accumulates elements l, l + 32, ..., l + 32 * 159
+ * (j = 0..159) in that order. Under fast math its `h2 += h * h; k2 += k * k; dot += h * (q * w) * k` compiles
+ * to fma(h, h, h2), fma(k, k, k2) and fma((h * q) * w, k, dot) (each product rounded), and its residual update
+ * to fma(gate, v, h); they are written out here so the different structure cannot change them. Simdgroup s loads segment j = 20 s .. 20 s + 19 of every
+ * lane's chain into registers (all loads issued up front), and the segments run in order: simdgroup s takes the
+ * three accumulators from s - 1 through threadgroup memory, adds its 20 steps per lane, and hands them on.
+ * Simdgroup 7 then does the same simd_sums, norms and gate; every thread updates its own 20 elements of the
+ * residual from registers. Width 5120 only, 512 bytes of threadgroup memory. */
+kernel void kernel_dsv41_engram_add_tg256(
+        constant ds4_metal_args_dsv41_engram &args,
+        device float *residual,
+        device const float *kv,
+        device const float *q_weight,
+        device const float *k_weight,
+        device const uchar *mask,
+        threadgroup float *sh [[threadgroup(0)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.masked && !mask[group.x]) return;
+    constexpr uint W = 5120u, J = W / 256u;
+    const uint e0 = sg * 32u * J + lane;
+    device float *hp = residual + ((ulong)group.x * 4u + group.y) * W + e0;
+    device const float *kp = kv + ((ulong)group.x * 5u + group.y) * W + e0;
+    device const float *vp = kv + ((ulong)group.x * 5u + 4u) * W + e0;
+    device const float *qp = q_weight + (ulong)group.y * W + e0;
+    device const float *wp = k_weight + (ulong)group.y * W + e0;
+    float h[J], k[J], p[J], v[J];
+    for (uint j = 0; j < J; j++) {
+        h[j] = hp[32u * j];
+        k[j] = dsv41_bf16(kp[32u * j]);
+        p[j] = dsv41_engram_mul(dsv41_engram_mul(h[j], qp[32u * j]), wp[32u * j]);
+        v[j] = vp[32u * j];
+    }
+    float h2 = 0.0f, k2 = 0.0f, dot = 0.0f;
+    for (uint s = 0; s < 8u; s++) {
+        if (sg == s) {
+            if (s) { h2 = sh[lane]; k2 = sh[32u + lane]; dot = sh[64u + lane]; }
+            for (uint j = 0; j < J; j++) {
+                h2 = fma(h[j], h[j], h2);
+                k2 = fma(k[j], k[j], k2);
+                dot = fma(p[j], k[j], dot);
+            }
+            if (s < 7u) { sh[lane] = h2; sh[32u + lane] = k2; sh[64u + lane] = dot; }
+        }
+        if (s < 7u) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg == 7u) {
+        h2 = simd_sum(h2);
+        k2 = simd_sum(k2);
+        dot = simd_sum(dot) * rsqrt(h2 / args.width + args.eps) *
+              rsqrt(k2 / args.width + args.eps) * rsqrt(float(args.width));
+        const float gate = 1.0f / (1.0f + exp(-copysign(sqrt(max(abs(dot), 1.0e-6f)), dot)));
+        if (lane == 0u) sh[96] = gate;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gate = sh[96];
+    for (uint j = 0; j < J; j++)
+        hp[32u * j] = dsv41_bf16(fma(gate, dsv41_bf16(v[j]), h[j]));
 }
 
 struct ds4_metal_args_dsv41_pool {

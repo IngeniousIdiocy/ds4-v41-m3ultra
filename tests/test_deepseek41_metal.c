@@ -1799,9 +1799,58 @@ static int check_hc_fusion(void) {
     return 1;
 }
 
+/* SPLIT_REDUCE, bit for bit against the single-group forms with the bit off: the Engram gate over 256-thread groups
+ * (five rows) and the deferred HC collapse over 32 + 10 groups (fresh inputs each draw, some of them large). */
+static int check_split_reduce(void) {
+    enum { D = 5120, ROWS = 5 };
+    const uint64_t wb = 65536;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), wb) == 0);
+    float *w = model;
+    ds4_gpu_tensor *x[2] = {upload(NULL, ROWS * 4 * D * 4), upload(NULL, ROWS * 4 * D * 4)};
+    ds4_gpu_tensor *kv = upload(NULL, ROWS * 5 * D * 4), *qw = upload(NULL, 4 * D * 4), *kw = upload(NULL, 4 * D * 4);
+    ds4_gpu_tensor *pre = upload(NULL, 16), *c[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *n[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    CHECK(x[0] && x[1] && kv && qw && kw && pre && c[0] && c[1] && n[0] && n[1] && ds4_gpu_set_model_map(model, wb));
+    float *xv = ds4_gpu_tensor_contents(x[0]), *kvv = ds4_gpu_tensor_contents(kv), *pv = ds4_gpu_tensor_contents(pre);
+    for (int i = 0; i < ROWS * 4 * D; i++) xv[i] = bf16(random_value());
+    for (int i = 0; i < ROWS * 5 * D; i++) kvv[i] = bf16(random_value());
+    for (int i = 0; i < 4 * D; i++) {
+        ((float *)ds4_gpu_tensor_contents(qw))[i] = random_value();
+        ((float *)ds4_gpu_tensor_contents(kw))[i] = random_value();
+    }
+    memcpy(ds4_gpu_tensor_contents(x[1]), xv, ROWS * 4 * D * 4);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t tg = ds4_gpu_test_kernel_runs("kernel_dsv41_engram_add_tg256");
+    CHECK(ds4_gpu_dsv41_engram_add(x[0], kv, qw, kw, NULL, D, ROWS, 1e-6f));
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_SPLIT_REDUCE);
+    const int ok = ds4_gpu_dsv41_engram_add(x[1], kv, qw, kw, NULL, D, ROWS, 1e-6f);
+    ds4_gpu_test_set_v41_off(0);
+    CHECK(ok && ds4_gpu_test_kernel_runs("kernel_dsv41_engram_add_tg256") == tg + 1);
+    CHECK(same_bits(x[0], x[1], ROWS * 4 * D));
+    const uint64_t part = ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse_part");
+    for (int draw = 0; draw < 16; draw++) {
+        for (int i = 0; i < D; i++) w[i] = 1.0f + random_value() / 8.0f;
+        for (int i = 0; i < 4 * D; i++) xv[i] = random_value() * (draw % 4 == 3 ? 64.0f : 1.0f);
+        for (int i = 0; i < 4; i++) pv[i] = random_value();
+        CHECK(ds4_gpu_dsv41_deferred_collapse(c[0], n[0], x[0], pre, model, wb, 0, 1e-6f));
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_SPLIT_REDUCE);
+        const int single = ds4_gpu_dsv41_deferred_collapse(c[1], n[1], x[0], pre, model, wb, 0, 1e-6f);
+        ds4_gpu_test_set_v41_off(0);
+        CHECK(single && same_bits(c[0], c[1], D) && same_bits(n[0], n[1], D));
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse_part") == part + 16);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {x[0], x[1], kv, qw, kw, pre, c[0], c[1], n[0], n[1]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    /* the model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 split reduce: Engram gate and HC collapse == single-group forms\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
-        check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion();
+        check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce();
 }
 #else
 static int check_v41_groups(void) { return 1; }
