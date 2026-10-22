@@ -72,6 +72,7 @@ typedef struct {
 #define DS4_GPU_V41_PUBLIC_CONTROLLER (1ull << 24)   /* DSpark drafts by measured cost (ds4_deepseek41_admission.h) */
 #define DS4_GPU_V41_PREFILL_INDEX (1ull << 25)   /* prefill index scores of 8 or more rows on simdgroup matrices */
 #define DS4_GPU_V41_PREFILL_ATTENTION (1ull << 26)   /* prefill attention stages 16 rows per barrier */
+#define DS4_GPU_V41_PREFILL_FOLDS (1ull << 27)   /* large prefills fold bf16 rounding and glue into their producers */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

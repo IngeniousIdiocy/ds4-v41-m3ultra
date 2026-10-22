@@ -2623,6 +2623,84 @@ static int check_prefill_attention(void) {
     return 1;
 }
 
+/* PREFILL_FOLDS: 9 and 33 prefill rows through each folded producer against the producer and its rounding pass, bit
+ * for bit: the f32 add, the RMS norm, the F16 projection of two rows per threadgroup (512, 1280 and 5120 wide), the
+ * HC sums and expand, and the embedding gather repeated into the HC streams. */
+static int check_prefill_folds(void) {
+    enum { D = 5120, HC = 4, ROWS = 33, VOCAB = 64 };
+    const uint64_t norm_off = 0, proj_off = norm_off + D * 2, embd_off = proj_off + (uint64_t)D * 1024 * 2;
+    const uint64_t bytes = embd_off + (uint64_t)VOCAB * D * 2;
+    _Float16 *map = NULL;
+    CHECK(posix_memalign((void **)&map, getpagesize(), bytes) == 0);
+    for (uint64_t i = 0; i < bytes / 2; i++) map[i] = (_Float16)random_value();
+    CHECK(ds4_gpu_set_model_map(map, bytes));
+    ds4_gpu_tensor *a = upload(NULL, ROWS * D * HC * 4), *b = upload(NULL, ROWS * D * HC * 4);
+    ds4_gpu_tensor *ref = upload(NULL, ROWS * D * HC * 4), *got = upload(NULL, ROWS * D * HC * 4);
+    ds4_gpu_tensor *pre = upload(NULL, ROWS * 24 * 4), *pre2 = upload(NULL, ROWS * HC * 4);
+    ds4_gpu_tensor *tok = upload(NULL, ROWS * 4), *x = upload(NULL, ROWS * D * 4);
+    CHECK(a && b && ref && got && pre && pre2 && tok && x);
+    float *av = ds4_gpu_tensor_contents(a), *bv = ds4_gpu_tensor_contents(b), *pv = ds4_gpu_tensor_contents(pre);
+    int32_t *tv = ds4_gpu_tensor_contents(tok);
+    for (int i = 0; i < ROWS * D * HC; i++) { av[i] = bf16(random_value()); bv[i] = random_value(); }
+    for (int i = 0; i < ROWS * 24; i++) pv[i] = random_value();
+    for (int i = 0; i < ROWS; i++) tv[i] = (int32_t)(random_bits() % VOCAB);
+    const char *names[] = {"kernel_dsv41_add_bf16_rows4", "kernel_dsv41_project_f16_rows2", "kernel_dsv41_repeat_init4"};
+    uint64_t runs[3];
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    for (int i = 0; i < 3; i++) runs[i] = ds4_gpu_test_kernel_runs(names[i]);
+    const uint32_t counts[] = {9, ROWS};
+    for (int c = 0; c < 2; c++) {
+        const uint32_t rows = counts[c];
+        /* the HC kernels take their row count from the output's size */
+        ds4_gpu_tensor *rv = ds4_gpu_tensor_view(ref, 0, (uint64_t)rows * D * 4);
+        ds4_gpu_tensor *gv = ds4_gpu_tensor_view(got, 0, (uint64_t)rows * D * 4);
+        ds4_gpu_tensor *rh = ds4_gpu_tensor_view(ref, 0, (uint64_t)rows * D * HC * 4);
+        ds4_gpu_tensor *gh = ds4_gpu_tensor_view(got, 0, (uint64_t)rows * D * HC * 4);
+        ds4_gpu_tensor *bv1 = ds4_gpu_tensor_view(b, 0, (uint64_t)rows * D * 4);
+        CHECK(rv && gv && rh && gh && bv1);
+        CHECK(ds4_gpu_add_tensor(rv, a, b, rows * D) && ds4_gpu_dsv41_quantize(rv, D, rows, DS4_V41_BF16));
+        CHECK(ds4_gpu_dsv41_add_bf16_rows(got, a, b, D, rows));
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)rows * D));
+        CHECK(ds4_gpu_rms_norm_weight_rows_tensor(rv, a, map, bytes, norm_off, D, rows, 1e-6f) &&
+              ds4_gpu_dsv41_quantize(rv, D, rows, DS4_V41_BF16));
+        CHECK(ds4_gpu_dsv41_norm_bf16_rows(got, a, map, bytes, norm_off, D, rows, 1e-6f));
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)rows * D));
+        const uint32_t widths[] = {512, 1280, 5120}, outs[] = {1024, 512, 1024};
+        for (int k = 0; k < 3; k++) {
+            CHECK(ds4_gpu_dsv41_projection_rows(ref, map, bytes, proj_off, widths[k], outs[k], rows, b));
+            CHECK(ds4_gpu_dsv41_projection_rows2(got, map, bytes, proj_off, widths[k], outs[k], rows, b));
+            CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)rows * outs[k]));
+        }
+        CHECK(ds4_gpu_hc_weighted_sum_split_tensor(rv, a, pre, D, HC) && ds4_gpu_dsv41_quantize(rv, D, rows, DS4_V41_BF16));
+        CHECK(ds4_gpu_hc_weighted_sum_split_bf16_tensor(gv, a, pre, D, HC));
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)rows * D));
+        CHECK(ds4_gpu_hc_expand_split_tensor(rh, bv1, a, pre, D, HC) &&
+              ds4_gpu_dsv41_quantize(rh, D * HC, rows, DS4_V41_BF16));
+        CHECK(ds4_gpu_hc_expand_split_bf16_tensor(gh, bv1, a, pre, D, HC));
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)rows * D * HC));
+        for (uint32_t t = 0; t < rows; t++) {
+            ds4_gpu_tensor *o = ds4_gpu_tensor_view(ref, (uint64_t)t * D * HC * 4, D * HC * 4);
+            CHECK(o && ds4_gpu_embed_token_hc_tensor(o, map, bytes, embd_off, VOCAB, (uint32_t)tv[t], D, HC));
+            ds4_gpu_tensor_free(o);
+        }
+        CHECK(ds4_gpu_dsv41_embed_init_rows(got, pre2, x, tok, map, bytes, embd_off, VOCAB, rows, D));
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)rows * D * HC));
+        const float *p2 = ds4_gpu_tensor_contents(pre2);
+        for (uint32_t t = 0; t < rows; t++)
+            CHECK(p2[t * HC] == 1.0f && p2[t * HC + 1] == 0.0f && p2[t * HC + 2] == 0.0f && p2[t * HC + 3] == 0.0f);
+        ds4_gpu_tensor *views[] = {rv, gv, rh, gh, bv1};
+        for (size_t i = 0; i < sizeof(views) / sizeof(*views); i++) ds4_gpu_tensor_free(views[i]);
+    }
+    CHECK(ds4_gpu_test_kernel_runs(names[0]) == runs[0] + 2 && ds4_gpu_test_kernel_runs(names[1]) == runs[1] + 6 &&
+          ds4_gpu_test_kernel_runs(names[2]) == runs[2] + 2);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {a, b, ref, got, pre, pre2, tok, x};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(map);
+    fprintf(stderr, "V4.1 prefill folds: each folded producer == the producer and its rounding pass\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -2630,7 +2708,8 @@ static int check_v41_groups(void) {
         check_index_bf16() && check_topk() && check_index_candidates() &&
         check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
         check_row_matmuls() && check_rows_mma() && check_verify_kernels() &&
-        check_public_controller() && check_prefill_index() && check_prefill_attention();
+        check_public_controller() && check_prefill_index() && check_prefill_attention() &&
+        check_prefill_folds();
 }
 #else
 static int check_v41_groups(void) { return 1; }
