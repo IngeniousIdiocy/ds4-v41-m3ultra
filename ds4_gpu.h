@@ -80,6 +80,7 @@ typedef struct {
 #define DS4_GPU_V41_PREFILL_INDEX_BATCH (1ull << 32)   /* the prefill indexer picks candidates, short rows and top-k as batches; candidates are skipped while every block is kept */
 #define DS4_GPU_V41_SHORT_SWEEP (1ull << 33)   /* prefills of 3072 to 8191 tokens run as one sweep that rebuilds only the decoder suffix */
 #define DS4_GPU_V41_ENGRAM_READAHEAD (1ull << 34)   /* a prefill sweep reads the next sweep's Engram rows from disk while its last layers run */
+#define DS4_GPU_V41_PREENCODE (1ull << 35)   /* the next decode token's first command buffer is encoded while this token's last one runs */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -221,6 +222,21 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Metal: the next decode token's first command buffer, pre-encoded during this token's terminal wait.
+ * end_commands_commit / _wait split ds4_gpu_end_commands around the slot's encoding (bridge: a short GPU kernel
+ * behind the committed buffer keeps the GPU busy across the handoff); pe_begin opens the slot as the batch (only
+ * between those two), pe_end closes it, pe_commit writes the token word and commits it as the token's first buffer.
+ * Any other command buffer drops a held slot first. pe_embed_word: the embed encoded next reads the token from the
+ * slot's word. pe_supported: retained command buffers and DS4_GPU_V41_PREENCODE on. */
+int ds4_gpu_pe_supported(void);
+int ds4_gpu_pe_pending(void);
+int ds4_gpu_pe_begin(void);
+void ds4_gpu_pe_embed_word(int on);
+int ds4_gpu_pe_end(int ok);
+int ds4_gpu_pe_commit(int32_t token);
+void ds4_gpu_pe_drop(void);
+int ds4_gpu_end_commands_commit(bool bridge);
+int ds4_gpu_end_commands_wait(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
