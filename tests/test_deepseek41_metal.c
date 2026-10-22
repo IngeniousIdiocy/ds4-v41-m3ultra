@@ -1,4 +1,5 @@
 #include "ds4_gpu.h"
+#include "ds4.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -2242,12 +2243,46 @@ static int check_fixed_shapes(void) {
     return 1;
 }
 
+/* SAMPLER_SCAN: full-vocabulary sampling picks the same token, and leaves the same random state, with the NEON scan
+ * as with the scalar loop: random logits, non-finite values, signed zeros everywhere, the maximum in the tail, no
+ * finite value, tied maxima in different lanes, and short vocabularies. */
+static int check_sampler_scan(void) {
+    enum { N = 129280 + 7 };
+    float *logits = malloc(N * sizeof(float));
+    CHECK(logits);
+    const float params[4][3] = {{0.01f, 0.5f, 0.0f}, {0.7f, 1.0f, 0.0f}, {1.0f, 0.9f, 0.0f}, {0.5f, 0.95f, 0.05f}};
+    for (int c = 0; c < 8; c++) {
+        const uint32_t n = c < 6 ? N : 16u * c + 5u;
+        for (uint32_t i = 0; i < n; i++) logits[i] = random_value() * 8;
+        if (c == 1) {
+            for (uint32_t i = 0; i < n; i += 97) logits[i] = NAN;
+            logits[5] = INFINITY; logits[9] = -INFINITY;
+        }
+        if (c == 2) for (uint32_t i = 0; i < n; i++) logits[i] = i % 3 ? -0.0f : 0.0f;
+        if (c == 3 || c == 7) logits[n - 1] = 100;
+        if (c == 4) for (uint32_t i = 0; i < n; i++) logits[i] = -INFINITY;
+        if (c == 5) logits[7] = logits[40] = logits[1000] = 50;
+        for (int k = 0; k < 4; k++)
+            for (uint64_t s = 1; s <= 16; s++) {
+                uint64_t r0 = s * 0x9e3779b97f4a7c15ull, r1 = r0;
+                ds4_gpu_test_set_v41_off(DS4_GPU_V41_SAMPLER_SCAN);
+                const int a = ds4_sample_logits(logits, (int)n, params[k][0], 0, params[k][1], params[k][2], &r0);
+                ds4_gpu_test_set_v41_off(0);
+                const int b = ds4_sample_logits(logits, (int)n, params[k][0], 0, params[k][1], params[k][2], &r1);
+                CHECK(a == b && r0 == r1);
+            }
+    }
+    free(logits);
+    fprintf(stderr, "V4.1 sampler scan: NEON first pass == scalar loop\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
         check_index_bf16() && check_topk() && check_index_candidates() &&
-        check_decode_attention() && check_fixed_shapes();
+        check_decode_attention() && check_fixed_shapes() && check_sampler_scan();
 }
 #else
 static int check_v41_groups(void) { return 1; }

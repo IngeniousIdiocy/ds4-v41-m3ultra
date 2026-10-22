@@ -46058,6 +46058,75 @@ static bool sample_fast_top_p(
     return true;
 }
 
+/* SAMPLER_SCAN: the sampler's first pass (finite count, maximum and its earliest index) in 16 NEON lanes. Each lane
+ * keeps its own first strict maximum and index; the lanes merge by value, then by smallest index among equal values,
+ * and the tail continues with the scalar rule, so every output matches the scalar loop bit for bit (value taken from
+ * the winning element, sign included). Returns false when the group is off or the build has no Metal path. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(__ARM_NEON)
+static bool sample_scan_simd(const float *logits, uint32_t n_vocab,
+                             uint32_t *finite_out, float *max_out, int *best_out) {
+    if (ds4_gpu_v41_off() & DS4_GPU_V41_SAMPLER_SCAN) return false;
+    const uint32_t nv = n_vocab & ~15u;
+    const uint32x4_t exp_mask = vdupq_n_u32(0x7f800000u);   /* finite: exponent not all ones */
+    float32x4_t mv[4];
+    uint32x4_t mi[4], cnt[4], idx[4];
+    const uint32x4_t step = vdupq_n_u32(16);
+    for (int k = 0; k < 4; k++) {
+        const uint32_t base[4] = {4u * k, 4u * k + 1u, 4u * k + 2u, 4u * k + 3u};
+        mv[k] = vdupq_n_f32(DS4_NEG_INF);
+        mi[k] = vdupq_n_u32(0);
+        cnt[k] = vdupq_n_u32(0);
+        idx[k] = vld1q_u32(base);
+    }
+    for (uint32_t i = 0; i < nv; i += 16) {
+        for (int k = 0; k < 4; k++) {
+            const float32x4_t v = vld1q_f32(logits + i + 4u * k);
+            const uint32x4_t fin = vmvnq_u32(vceqq_u32(vandq_u32(vreinterpretq_u32_f32(v), exp_mask),
+                                                        exp_mask));   /* false for NaN and +-inf */
+            const uint32x4_t gt = vandq_u32(fin, vcgtq_f32(v, mv[k]));
+            cnt[k] = vsubq_u32(cnt[k], fin);
+            mv[k] = vbslq_f32(gt, v, mv[k]);
+            mi[k] = vbslq_u32(gt, idx[k], mi[k]);
+            idx[k] = vaddq_u32(idx[k], step);
+        }
+    }
+    float max_logit = DS4_NEG_INF;
+    uint32_t best = 0, finite = 0;
+    for (int k = 0; k < 4; k++) {
+        float lv[4];
+        uint32_t li[4];
+        vst1q_f32(lv, mv[k]);
+        vst1q_u32(li, mi[k]);
+        finite += vaddvq_u32(cnt[k]);
+        for (int j = 0; j < 4; j++) {
+            if (lv[j] > max_logit || (lv[j] == max_logit && lv[j] > DS4_NEG_INF && li[j] < best)) {
+                max_logit = lv[j];
+                best = li[j];
+            }
+        }
+    }
+    for (uint32_t i = nv; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        finite++;
+        if (v > max_logit) {
+            max_logit = v;
+            best = i;
+        }
+    }
+    *finite_out = finite;
+    *max_out = max_logit;
+    *best_out = (int)best;
+    return true;
+}
+#else
+static bool sample_scan_simd(const float *logits, uint32_t n_vocab,
+                             uint32_t *finite_out, float *max_out, int *best_out) {
+    (void)logits; (void)n_vocab; (void)finite_out; (void)max_out; (void)best_out;
+    return false;
+}
+#endif
+
 static int sample_full_vocab(
         const float *logits,
         uint32_t     n_vocab,
@@ -46069,13 +46138,15 @@ static int sample_full_vocab(
     float max_logit = DS4_NEG_INF;
     int best = 0;
     uint32_t finite = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        finite++;
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
+    if (!sample_scan_simd(logits, n_vocab, &finite, &max_logit, &best)) {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            finite++;
+            if (v > max_logit) {
+                max_logit = v;
+                best = (int)i;
+            }
         }
     }
     if (finite == 0) return sample_argmax(logits, n_vocab);

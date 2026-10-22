@@ -65,6 +65,7 @@ typedef struct {
 #define DS4_GPU_V41_INDEX_CANDIDATES (1ull << 17)   /* past layer 20, decode scores and picks among layer 20's blocks */
 #define DS4_GPU_V41_DECODE_ATTENTION (1ull << 18)   /* decode attention stages its selected rows straight from the cache */
 #define DS4_GPU_V41_FIXED_SHAPES (1ull << 19)   /* decode kernels built for V4.1's exact shapes */
+#define DS4_GPU_V41_SAMPLER_SCAN (1ull << 20)   /* the sampler's first pass over the logits in 16 NEON lanes (any model) */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
