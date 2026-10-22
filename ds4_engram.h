@@ -59,6 +59,12 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
  * On macOS, large batches use bounded concurrent pread readers. */
 bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out);
+/* The same read on a worker: `rows` and `out` stay the caller's until finish,
+ * which joins the worker and returns its result. */
+typedef struct ds4_engram_prefetch ds4_engram_prefetch;
+ds4_engram_prefetch *ds4_engram_read_batch_start(const ds4_engram_table *table, const uint32_t *rows,
+                                                 size_t tokens, size_t stride, float *out);
+bool ds4_engram_read_batch_finish(ds4_engram_prefetch *prefetch);
 
 /* One reusable reader for a token's two tables. Tables/IDs are copied at
  * start; descriptors and output must remain valid until wait(reader, 1) or

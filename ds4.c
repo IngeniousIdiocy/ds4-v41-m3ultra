@@ -43662,9 +43662,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    /* ENGRAM_ASYNC: every row's Engram rows are read on workers while the first layers are encoded; each table
+     * joins before the layer that uploads it */
+    const bool engram_async = ds41_on(DS4_GPU_V41_ENGRAM_ASYNC);
+    uint32_t engram_ids[DS4_TP_BATCH_MAX_ROWS][2][DS4_ENGRAM_COLS];
+    ds4_engram_prefetch *reads[DS4_TP_BATCH_MAX_ROWS][2] = {{NULL}};
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        uint32_t ids[2][DS4_ENGRAM_COLS];
+        uint32_t (*ids)[DS4_ENGRAM_COLS] = engram_ids[i];
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
         positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
@@ -43672,7 +43677,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
         for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+            ok = engram_async ?
+                (reads[i][table] = ds4_engram_read_batch_start(&s->table[table], ids[table], 1, DS4_ENGRAM_COLS,
+                                                               disk_rows[table])) != NULL :
+                ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
@@ -43683,6 +43691,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         const ds4_layer_weights *l = &weights->layer[il];
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
+            for (int i = 0; i < count; i++) {   /* each table joins at its layer */
+                if (reads[i][table] && !ds4_engram_read_batch_finish(reads[i][table])) ok = false;
+                reads[i][table] = NULL;
+            }
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
                 ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
@@ -43776,6 +43788,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)
 #undef DS41_SESSION_FREE
+    for (int i = 0; i < count; i++)   /* a failure before the joins */
+        for (unsigned t = 0; t < 2; t++) if (reads[i][t]) ds4_engram_read_batch_finish(reads[i][t]);
     for (int i = 0; i < count; i++) {
         ds4_gpu_tensor_free(queries[i]);
         ds4_gpu_tensor_free(heads[i]);
