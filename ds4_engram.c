@@ -390,7 +390,13 @@ bool ds4_engram_read_batch_finish(ds4_engram_prefetch *p) {
     return ok;
 }
 
+/* Each table's rows are needed one layer after the step starts. On Apple every row has its own worker, so a table
+ * is ready after one disk read instead of six in a row. */
+#ifdef __APPLE__
+enum { TOKEN_READERS = DS4_ENGRAM_COLS };
+#else
 enum { TOKEN_READERS = 4 };
+#endif
 
 typedef struct {
     pthread_t thread;
