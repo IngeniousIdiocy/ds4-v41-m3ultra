@@ -100,6 +100,14 @@ decode rows; CUDA network TP currently serves sessions in order.
 separate V4.1 support GGUF and currently requires one host. Pipeline execution
 is not implemented for V4.1; vision requires Metal.
 
+The MXFP4 build of the October 17 checkpoint (467 GiB, resident on a 512 GB
+Mac) and its DSpark drafter come from the public files with
+`gguf-tools/deepseek41_prepare.py`; see
+[preparing V4.1 Flash 1017](../gguf-tools/README.md#prepare-deepseek-v41-flash-1017).
+On Metal, `--v41-sidecar FILE` (repeatable, one per family) loads optional
+decode sidecars with DeepSeek's released router, Engram and indexer values;
+see [V4.1 decode sidecars](../gguf-tools/README.md#v41-decode-sidecars).
+
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
 continuation test, with unchanged overall top-token agreement. See the

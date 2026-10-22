@@ -268,6 +268,60 @@ Pass `--quant q4` to the audit as well when checking a Q4 file.
 The audit checks the complete layout, all non-expert tensors, sampled experts
 and native Engram rows. It does not replace [inference quality tests](quality-testing/deepseek-v4.1-flash-20260910/README.md).
 
+### Prepare DeepSeek V4.1 Flash 1017
+
+`deepseek41_prepare.py` goes from the public files to the engine's two GGUFs in
+one command. It needs the nine split MXFP4 GGUFs of
+`antirez/deepseek-v4.1-flash-gguf` and three shards of the original
+checkpoint for the drafter:
+
+```sh
+hf download antirez/deepseek-v4.1-flash-gguf --revision 9dcee51692e6540f697141fc98b097e3c96492a3 \
+    --include 'DeepSeek-V4.1-Flash-1017-MXFP4-experts-*' --local-dir shards
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+    --include config.json tokenizer.json 'model-0004[456]-of-00048.safetensors' --local-dir dspark-source
+python3 gguf-tools/deepseek41_prepare.py --shards shards --dspark-source dspark-source --out gguf
+python3 gguf-tools/deepseek41_prepare.py --verify --out gguf
+```
+
+It writes `gguf/DeepSeek-V4.1-Flash-MXFP4.gguf` (467.2 GiB) and
+`gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf` (7.4 GiB). The shards are checked
+against their published SHA-256 sums while they are merged; only
+`general.alignment` changes and the `split.*` keys are dropped, so every
+tensor byte is the release's. The drafter is converted with
+`deepseek41_quantize.py --quant mxfp4 --dspark-out`. `--verify` re-reads both
+files and compares every tensor with the digests pinned in
+`deepseek41_prepare.json`; `--dry-run` checks inputs, free space and Python
+modules without writing; `--digest FILE...` prints a GGUF's digests. It needs
+about 544 GB free beside `--out`, Python 3.10+ with numpy, tokenizers and
+sympy, and `cc` and `make`.
+
+### V4.1 decode sidecars
+
+Three optional sidecars hold tensors as DeepSeek released them, where the
+public GGUF stores a widened or rounded copy. Each writer copies the bytes out
+of the original safetensors:
+
+```sh
+python3 gguf-tools/deepseek41_router_bf16_sidecar.py --help
+python3 gguf-tools/deepseek41_engram_fp8_sidecar.py --help
+python3 gguf-tools/deepseek41_indexer_fp8_sidecar.py --help
+```
+
+- Router BF16: the 40 router gates; the GGUF stores the same values widened to F32.
+- Engram FP8: the E4M3 codes and E8M0 32x32 scales of both Engram KV
+  projections; the GGUF's F16 copy lost values.
+- Indexer FP8: the same for the indexer query projection of the eight
+  index-source layers; the F16 copy is rounded where a block's scale is small.
+
+Pass them to `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench` or `ds4-eval` with
+`--v41-sidecar FILE`, once per family; the engine tells them apart by
+`general.architecture`. It checks each against the main model's source
+revision and audits every tensor, and refuses to start on a mismatch. They
+replace the narrow decode copies that are otherwise built from the GGUF at
+load: the router on every decode step, the Engram and indexer copies only on
+steps that return logits, so prefill never reads them. Metal only.
+
 ### Convert V4.1 DSpark
 
 The V4.1 support converter needs NumPy, the official config and tensor index,

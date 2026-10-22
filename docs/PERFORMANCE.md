@@ -32,6 +32,26 @@ chunks, CUDA TP uses 2048, and long PRO prompts may use 8192. GLM chooses its
 own chunks and rejects `--prefill-chunk`. The strict DeepSeek API-vector test
 pins 2048; do not generalize that setting to every benchmark.
 
+## Sampled runs, digests and the job runner
+
+`--temp F` samples instead of taking the greedy token, with `--top-p`,
+`--top-k`, `--min-p` (defaults 1, 0, 0) and `--seed N`, reset at each
+frontier; an end-of-sequence token ends that frontier's run. `--token-csv PATH`
+writes per-token timings to PATH and one row per frontier to `PATH.runs.csv`,
+with the sampler settings, speed and hashes of the frontier prefix and of the
+final logits.
+
+`--jobs FILE` (with `--token-csv`) keeps one engine and session loaded and
+reads job lines as they are appended: `save`, `load`, `run` and `quit` (see
+the comment in `ds4_bench.c`). `run` restores the frontier held in memory,
+applies `set=NAME=VALUE` / `unset=NAME` environment changes and decodes;
+switches that are read once at startup keep their startup value. Saved caches
+use snapshot format 4 (`ds4_snapstore.h`): the payload and a `.meta` file
+recording the producer, the payload size and hash, and optionally a numerics
+canary, written atomically. A load checks all of it before the engine sees a
+byte. `DS4_BENCH_SHA_DIR` names a directory of recorded `*.sha256` files for
+the weight identities.
+
 ## Recorded Flash Q2 baseline
 
 These existing sweeps use 2048-token intervals and 128 generation tokens per

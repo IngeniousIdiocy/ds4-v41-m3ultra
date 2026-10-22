@@ -91,6 +91,31 @@ Metal, where `--mtp` also batches speculative decoding. Its
 requests. Other models do not use MTP/DSpark while session batching is active.
 For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-users).
 
+## Request defaults, utility requests and serial reasoning
+
+```sh
+./ds4-server -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --ctx 393216 \
+  --default-top-p 0.95 --default-min-p 0 --default-reasoning-effort high \
+  --utility-ctx 32768 --serial-reasoning
+```
+
+`--default-top-p F`, `--default-min-p F` and `--default-reasoning-effort E`
+(`low`, `medium`, `high` or `max`; default `high`) set what a request gets
+when it names none. A request's own values, thinking switches and model
+aliases still win. DeepSeek V4.1 renders `low` as effort level 50, as
+DeepSeek's encoder does.
+
+`--utility-ctx N` (default 0, off) keeps a second session of N tokens for
+requests that set `"ds4_utility": true`, such as titles, tags or follow-up
+suggestions. They never think, never draft and never read or write the disk
+KV cache, and they leave the main session's state alone. A utility request
+whose prompt plus `max_tokens` does not fit in N tokens is refused. It needs
+non-batched mode.
+
+`--serial-reasoning` (default off) makes DeepSeek V4.1 decode every reasoning
+span serially; DSpark then drafts only answers and tool calls. It changes
+nothing for other models or in batched mode.
+
 ## Images
 
 Start with the matching language GGUF and `--vision FILE`; see
@@ -127,6 +152,24 @@ Check `./ds4-server --help` for their defaults.
 
 Quantization variants may share compatible prefixes. Add
 `--kv-cache-reject-different-quant` for same-quant reuse only.
+
+Each checkpoint records the weights that wrote it (a hash of the model and
+drafter GGUF headers and tensor tables), the weight form prefill reads, and a
+hash of its payload. A file from other weights, an older format or with a
+damaged payload is refused before it touches the session, and is evicted under
+the space budget like any other entry. After it starts listening, the server
+prefills a fixed 4,096-token prompt once in a side session (the numerics
+canary) and binds every checkpoint to the hash of its logits, so entries
+written under other kernels or switches are refused too. Requests are accepted
+meanwhile but wait until the canary has finished; `KV disk cache on: canary`
+in the log marks it. If the canary fails, the cache stays off for the life of
+the process and a warning says why. `make ds4-server-testhooks` builds a test
+server in which `DS4_KV_CANARY_FAIL_TEST=1` forces that failure.
+
+A request that restores a prefix from disk and extends it by at least one
+continued interval saves its own deeper checkpoint (log line `kv cache extends
+restored prefix`). A prefill interrupted by shutdown or by the client keeps the
+disk entry it started from; during shutdown such a request gets HTTP 503.
 Cache files contain prompt text and model state: treat the directory as
 private. It is disposable; stop the server before clearing it.
 
