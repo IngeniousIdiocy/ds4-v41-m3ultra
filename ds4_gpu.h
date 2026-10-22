@@ -47,6 +47,7 @@ typedef struct {
  * one off switch, read once from the environment; "0" means unset. */
 #define DS4_GPU_V41_MODEL_TRACKED (1ull << 0)   /* DS4_METAL_MODEL_TRACKED: model views keep hazard tracking */
 #define DS4_GPU_V41_COMPUTE_TENSOR_COPY (1ull << 1)   /* aligned tensor copies stay in the compute encoder (any model) */
+#define DS4_GPU_V41_DECODE_QUEUE (1ull << 2)   /* a decode step's layers queue into one command stream */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

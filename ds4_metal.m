@@ -443,6 +443,7 @@ uint64_t ds4_gpu_v41_off(void) {
         static const char *names[] = {   /* the groups' off switches, in bit order */
             "DS4_METAL_MODEL_TRACKED",
             "DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY",
+            "DS4_METAL_DISABLE_V41_DECODE_QUEUE",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
