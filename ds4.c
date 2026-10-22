@@ -41012,6 +41012,7 @@ typedef struct {
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor *tp_logits_half;
+    ds4_gpu_tensor *selected_half, *route_weights_half;   /* TP_BALANCED_ROUTE: this rank's half of the list */
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_gpu_tensor **tp_batch_out, **tp_batch_in;
     ds4_imatrix_collector *imatrix;
@@ -41089,6 +41090,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_decode_graphs_invalidate();
 #endif
     ds4_gpu_tensor_free(g->tp_logits_half);
+    ds4_gpu_tensor_free(g->selected_half);
+    ds4_gpu_tensor_free(g->route_weights_half);
     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
 #define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
         DS41_PREFILL_ROWS(DS41_ROW_FREE)
@@ -41453,6 +41456,25 @@ static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights 
     const float *data = image->embedding.data + (uint64_t)(pos - image->token_start) * DS4_N_EMBD;
     return ds4_gpu_tensor_write(scratch, 0, data, (uint64_t)DS4_N_EMBD * sizeof(float)) &&
         ds4_gpu_repeat_hc_tensor(out, scratch, DS4_N_EMBD, DS4_N_HC);
+}
+
+/* TP_BALANCED_ROUTE: each rank takes half of the ordered selection, so neither waits on an uneven split of the
+ * experts it owns. Both ranks then map every expert. */
+static bool ds41_tp_balanced_route(void) {
+#ifdef __APPLE__
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !(DS4_N_EXPERT_USED & 1u) &&
+        ds41_on(DS4_GPU_V41_TP_BALANCED_ROUTE);
+#else
+    return false;
+#endif
+}
+
+static bool ds41_tp_balanced_views(ds41_gpu_graph *g) {
+    if (!ds41_tp_balanced_route()) return false;
+    const uint64_t bytes = (uint64_t)(DS4_N_EXPERT_USED / 2u) * sizeof(float);
+    if (!g->selected_half) g->selected_half = ds4_gpu_tensor_view(g->selected, g->tp_rank * bytes, bytes);
+    if (!g->route_weights_half) g->route_weights_half = ds4_gpu_tensor_view(g->route_weights, g->tp_rank * bytes, bytes);
+    return g->selected_half && g->route_weights_half;
 }
 
 static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
@@ -42273,6 +42295,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     if (shared_here && !shared_queued && !ds41_shared_expert(g, m, l, shared_down)) return false;
     bool routed_ok;
+    const ds4_gpu_tensor *selected = g->selected, *weights = g->route_weights;
+    uint32_t n_used = DS4_N_EXPERT_USED;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
         routed_ok = ds4_gpu_routed_moe_batch_owned_tensor(routed, g->gate, g->up, g->mid, g->experts,
@@ -42283,14 +42307,26 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank * (DS4_N_EXPERT / 2u),
             DS4_N_EXPERT / 2u, DS4_SWIGLU_CLAMP_EXP, g->norm, il, 1, NULL);
     } else
+#else
+    /* TP_BALANCED_ROUTE: this rank's half of the ordered list, over every expert */
+    const bool balanced = g->tp_world == 2 && ds41_tp_balanced_views(g);
+    if (balanced) {
+        n_used /= 2u;
+        selected = g->selected_half;
+        weights = g->route_weights_half;
+        ds4_gpu_tp_full_expert_bind(1);
+    }
 #endif
     routed_ok = ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
-            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, selected, weights,
+            DS4_N_EXPERT, n_used, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
             !g->streaming);
+#ifdef __APPLE__
+    if (balanced) ds4_gpu_tp_full_expert_bind(0);
+#endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
@@ -73424,7 +73460,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #ifndef DS4_NO_GPU
     const bool tp_shard =
         opt->tp.role != DS4_TP_NONE &&
-        !e->ssd_streaming;
+        !e->ssd_streaming && !ds41_tp_balanced_route();   /* TP_BALANCED_ROUTE: both ranks map every expert */
     const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
     bool tp_expert_split_active = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)

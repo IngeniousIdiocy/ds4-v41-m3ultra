@@ -82,6 +82,7 @@ typedef struct {
 #define DS4_GPU_V41_ENGRAM_READAHEAD (1ull << 34)   /* a prefill sweep reads the next sweep's Engram rows from disk while its last layers run */
 #define DS4_GPU_V41_PREENCODE (1ull << 35)   /* the next decode token's first command buffer is encoded while this token's last one runs */
 #define DS4_GPU_V41_SAMPLER_GPU (1ull << 36)   /* the decode step summarizes its logits for top-p sampling on the GPU and the CPU decides from it */
+#define DS4_GPU_V41_TP_BALANCED_ROUTE (1ull << 37)   /* on two Macs each rank runs half of every token's ordered expert list, with every expert bound */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -210,6 +211,8 @@ int ds4_gpu_add_tensor_tp_flag(
  * the gate's checked flag itself (taken by the attention output K-slice
  * matvec when its output is that slot; otherwise ignored). */
 void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
+/* TP_BALANCED_ROUTE: bind every routed expert and mask none (the caller splits the list). */
+void ds4_gpu_tp_full_expert_bind(int on);
 
 /* Deferred kv norm task: call before ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor
  * to run only its q task now and fold the kv task into the KV staging
