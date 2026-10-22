@@ -23,6 +23,21 @@ typedef enum {
 } ds4_v41_activation_format;
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
+#ifdef __APPLE__
+/* One-token router: probabilities, biased top-k and normalised weights in one dispatch. */
+int ds4_gpu_dsv41_router_one(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                             ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits,
+                             const void *model_map, uint64_t model_size, uint64_t bias_offset,
+                             uint32_t n_expert, uint32_t top_k, float scale);
+/* The same for a few rows, and the rows' F32 logits with the single-row matvec's reduction. */
+int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                              ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits,
+                              const void *model_map, uint64_t model_size, uint64_t bias_offset,
+                              uint32_t n_expert, uint32_t top_k, float scale, uint32_t rows);
+int ds4_gpu_dsv41_matmul_f32_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                  uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+                                  const ds4_gpu_tensor *x, uint32_t rows);
+#endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Same reductions as the ordinary kernels, with the required BF16 store
  * folded into the operation. hc_sum reads either 4- or 24-float row weights. */

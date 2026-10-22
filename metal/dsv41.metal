@@ -13,6 +13,14 @@ static inline float dsv41_bf16(float x) {
     return as_type<float>(bits & 0xffff0000u);
 }
 
+/* Router softplus, the same formula as the DeepSeek V4 router kernels: a log1p series where exp(x) < 1/32. */
+static inline float dsv41_router_softplus(float x) {
+    const float ex = exp(x);
+    const float em = min(ex, 0.03125f);
+    const float poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+    return select(select(log(1.0f + ex), poly, ex < 0.03125f), x, x > 20.0f);
+}
+
 static inline float dsv41_pow2_ceil(float x) {
     const uint bits = as_type<uint>(x);
     return as_type<float>((bits & 0x7f800000u) +
@@ -36,6 +44,209 @@ kernel void kernel_dsv41_bf16_linear(
                 bits += 0x7fffu + ((bits >> 16u) & 1u);
             x[i] = bits & 0xffff0000u;
         }
+    }
+}
+
+struct ds4_metal_args_dsv41_router {
+    uint n_expert, top_k, has_bias;
+    float scale;
+};
+
+/* One-token router for up to 1024 experts in one dispatch: the softplus/sqrt
+ * probability transform, the biased top-k through the same bitonic network as
+ * kernel_argsort_f32_i32_desc (padding indices sort last), and the weights
+ * normalised as the generic chain does: gather, SIMD sum over the top_k lanes,
+ * clamp, divide, scale. Threadgroup memory holds nth ints and 2 * nth floats. */
+kernel void kernel_dsv41_router_one(
+        constant ds4_metal_args_dsv41_router &args,
+        device const float *logits,
+        device const float *bias,
+        device float *probs,
+        device int32_t *selected,
+        device float *weights,
+        threadgroup int32_t *shmem_i32 [[threadgroup(0)]],
+        uint2 tg [[threadgroup_position_in_grid]],
+        uint2 tpos [[thread_position_in_threadgroup]],
+        uint2 tsize [[threads_per_threadgroup]]) {
+    const uint col = tpos.x, ntg = tsize.x;
+    const int width = (int)args.n_expert;
+    logits += tg.y * args.n_expert;   /* one threadgroup per row */
+    probs += tg.y * args.n_expert;
+    selected += tg.y * args.top_k;
+    weights += tg.y * args.top_k;
+    threadgroup float *score = (threadgroup float *)(shmem_i32 + ntg);
+    threadgroup float *prob = score + ntg;
+    shmem_i32[col] = (int)col;
+    if ((int)col < width) {
+        const float x = logits[col];
+        const float sp = dsv41_router_softplus(x);
+        const float p = sqrt(sp);
+        probs[col] = p;
+        prob[col] = p;
+        score[col] = args.has_bias ? p + bias[col] : p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = 2; k <= (int)ntg; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            const int ixj = (int)col ^ j;
+            if (ixj > (int)col) {
+                const int a = shmem_i32[col], b = shmem_i32[ixj];
+                const bool swap = ((int)col & k) == 0 ?
+                    (a >= width || (b < width && score[a] < score[b])) :
+                    (b >= width || (a < width && score[a] > score[b]));
+                if (swap) { shmem_i32[col] = b; shmem_i32[ixj] = a; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (col < args.top_k) {
+        const int32_t idx = shmem_i32[col];
+        selected[col] = idx;
+        const float w = prob[idx];
+        const float total = clamp(simd_sum(w), 6.103515625e-5f, INFINITY);
+        /* two stores as in the generic chain: the quotient is rounded before the scale */
+        threadgroup volatile float *quotient = (threadgroup volatile float *)(prob + ntg) + col;
+        *quotient = w / total;
+        weights[col] = *quotient * args.scale;
+    }
+}
+
+/* SIMD nominations for the unique finite top-six case; ties use the original
+ * bitonic order. Keep six active lanes in the normalization reduction. */
+kernel void kernel_dsv41_router_hier(
+        constant ds4_metal_args_dsv41_router & args,
+        device const float *logits,
+        device const float *bias,
+        device       float *probs,
+        device     int32_t *selected,
+        device       float *weights,
+        threadgroup   char *shmem [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    const uint lane = tid % 32u, sg = tid / 32u;
+    threadgroup float *cscore = (threadgroup float *)shmem;
+    threadgroup uint *cid = (threadgroup uint *)(shmem + 128u*4u);
+    threadgroup uint *valids = (threadgroup uint *)(shmem + 256u*4u);
+    float score = -INFINITY, prob = 0.f;
+    bool valid = true;
+    if (tid < 384u) {
+        const float x = logits[tid];
+        const float sp = dsv41_router_softplus(x);
+        prob = sqrt(sp);
+        probs[tid] = prob;
+        score = args.has_bias ? prob + bias[tid] : prob;
+        valid = isfinite(prob) && isfinite(score);
+    }
+    valid = simd_all(valid);
+    if (lane == 0u) valids[sg] = valid;
+    for (uint k=0; k<6u; ++k) {
+        const float best = simd_max(score);
+        const uint id = simd_min(score == best ? tid : 0xffffffffu);
+        if (lane == 0u) {cscore[sg*6u+k] = best; cid[sg*6u+k] = id;}
+        if (tid == id) score = -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if (sg == 0u) {
+        float v[3]; uint ix[3];
+        for (uint j=0;j<3u;++j) {v[j] = cscore[lane+32u*j];ix[j] = cid[lane+32u*j];}
+        bool ok = args.n_expert == 384u && args.top_k == 6u && simd_all(lane >= 16u || valids[lane] != 0u);
+        float selected_prob=0.f;
+        for (uint k=0;k<6u;++k) {
+            const float best=simd_max(max(v[0],max(v[1],v[2])));
+            uint count=0,id=0xffffffffu;
+            for (uint j=0;j<3u;++j) if(v[j]==best){++count;id=min(id,ix[j]);}
+            count=simd_sum(count);id=simd_min(id);
+            ok = ok && count == 1u && id < 384u;
+            const uint safe=min(id,383u);
+            if(lane==k){selected[k]=int(safe);selected_prob=probs[safe];}
+            for(uint j=0;j<3u;++j) if(ix[j]==id)v[j]=-INFINITY;
+        }
+        if(lane<6u){
+            const float total=simd_sum(selected_prob);
+            const float clamped=clamp(total,6.103515625e-5f,INFINITY);
+            if(lane<6u) ((threadgroup volatile float *)cscore)[lane]=selected_prob/clamped;
+        }
+        if(lane==0u)valids[0]=ok;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if(valids[0]){
+        if(tid<6u) weights[tid]=((threadgroup volatile float *)cscore)[tid]*args.scale;
+        return;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr int NT = 512;                 /* argsort threadgroup width */
+    const int width = (int)args.n_expert;   /* 384 */
+
+    threadgroup int32_t *sidx =
+        (threadgroup int32_t *)shmem;
+    threadgroup float *sscore =
+        (threadgroup float *)(shmem + NT * sizeof(int32_t));
+    threadgroup float *sprob =
+        (threadgroup float *)(shmem + NT * sizeof(int32_t) + NT * sizeof(float));
+
+    const int col = (int)tid;
+    sidx[col] = col;
+    if (col < width) {
+        const float x = logits[col];
+        const float sp = dsv41_router_softplus(x);
+        const float p = sqrt(sp);
+        probs[col] = p;
+        sprob[col] = p;
+        sscore[col] = args.has_bias ? p + bias[col] : p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 2; k <= NT; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            const int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (sidx[col] >= width ||
+                        (sidx[ixj] < width &&
+                         sscore[sidx[col]] < sscore[sidx[ixj]])) {
+                        const int32_t t = sidx[col];
+                        sidx[col] = sidx[ixj];
+                        sidx[ixj] = t;
+                    }
+                } else {
+                    if (sidx[ixj] >= width ||
+                        (sidx[col] < width &&
+                         sscore[sidx[col]] > sscore[sidx[ixj]])) {
+                        const int32_t t = sidx[col];
+                        sidx[col] = sidx[ixj];
+                        sidx[ixj] = t;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const int used = (int)args.top_k;
+    if (col < used) {
+        selected[col] = sidx[col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* sum_rows stages element j in lane j of one simdgroup and reduces with
+     * simd_sum; reproduce that lane layout rather than a serial sum. */
+    /* sum_rows is dispatched with exactly n_expert_used threads (nth is clamped
+     * to ne00 in ds4_gpu_encode_sum_rows_f32), so its simd_sum runs with only
+     * those lanes active; reproduce that by calling simd_sum under the same
+     * lane predicate rather than padding to a full simdgroup.  The divide and
+     * the scale were two kernels with an f32 store between them, so the
+     * intermediate is round-tripped through threadgroup memory to keep that
+     * rounding boundary. */
+    threadgroup volatile float *wtmp =
+        (threadgroup volatile float *)(shmem + NT * sizeof(int32_t));
+    if (col < used) {
+        const float wv = sprob[sidx[col]];
+        const float total = simd_sum(wv);
+        const float clamped = clamp(total, 6.103515625e-5f, INFINITY);
+        wtmp[col] = wv / clamped;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (col < used) {
+        weights[col] = wtmp[col] * args.scale;
     }
 }
 

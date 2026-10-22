@@ -1294,8 +1294,55 @@ static int check_compute_copy(void) {
     return 1;
 }
 
+/* ROUTER_SELECT: one row's fused select (the hierarchical 384 -> 6 kernel) and the per-row kernel of a few rows,
+ * against DwarfStar's router select: probabilities, experts and weights bit for bit, on random, tied and patterned
+ * logits. */
+static int check_router_select(void) {
+    enum { N = 384, K = 6 };
+    float *bias = NULL;
+    CHECK(posix_memalign((void **)&bias, getpagesize(), getpagesize()) == 0);
+    ds4_gpu_tensor *x = upload(NULL, 2 * N * 4), *p[3], *ids[3], *w[3];
+    CHECK(x);
+    for (int a = 0; a < 3; a++) {
+        p[a] = upload(NULL, 2 * N * 4); ids[a] = upload(NULL, 2 * K * 4); w[a] = upload(NULL, 2 * K * 4);
+        CHECK(p[a] && ids[a] && w[a]);
+    }
+    float *lg = ds4_gpu_tensor_contents(x);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    for (uint32_t draw = 0; draw < 32; draw++) {
+        for (int i = 0; i < N; i++) {
+            lg[i] = draw % 11 == 0 ? 1.0f : draw % 13 == 0 ? (float)(i % 6) : random_value() * 4;
+            bias[i] = draw % 11 == 0 || draw % 13 == 0 ? 0.0f : random_value() / 40.0f;
+            lg[N + i] = lg[i];
+        }
+        CHECK(ds4_gpu_set_model_map(bias, getpagesize()));
+        const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv41_router_hier");
+        CHECK(ds4_gpu_begin_commands() &&
+              ds4_gpu_router_select_tensor(ids[0], w[0], p[0], bias, getpagesize(), 0, 0, 0, 0,
+                  N, K, 1.5f, 0, 0, true, false, x) &&
+              ds4_gpu_dsv41_router_one(ids[1], w[1], p[1], x, bias, getpagesize(), 0, N, K, 1.5f) &&
+              ds4_gpu_dsv41_router_rows(ids[2], w[2], p[2], x, bias, getpagesize(), 0, N, K, 1.5f, 2) &&
+              ds4_gpu_end_commands());
+        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_router_hier") == runs + 1);
+        for (int a = 1; a < 3; a++) {
+            CHECK(!memcmp(ds4_gpu_tensor_contents(p[0]), ds4_gpu_tensor_contents(p[a]), N * 4));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(ids[0]), ds4_gpu_tensor_contents(ids[a]), K * 4));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(w[0]), ds4_gpu_tensor_contents(w[a]), K * 4));
+        }
+        CHECK(!memcmp(ds4_gpu_tensor_contents(p[2]), (float *)ds4_gpu_tensor_contents(p[2]) + N, N * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(ids[2]), (int32_t *)ds4_gpu_tensor_contents(ids[2]) + K, K * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(w[2]), (float *)ds4_gpu_tensor_contents(w[2]) + K, K * 4));
+    }
+    ds4_gpu_test_set_flags(0);
+    for (int a = 0; a < 3; a++) { ds4_gpu_tensor_free(p[a]); ds4_gpu_tensor_free(ids[a]); ds4_gpu_tensor_free(w[a]); }
+    ds4_gpu_tensor_free(x);
+    /* bias stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 fused router select == router select over 32 draws, one row and two\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
-    return check_compute_copy();
+    return check_compute_copy() && check_router_select();
 }
 #else
 static int check_v41_groups(void) { return 1; }
