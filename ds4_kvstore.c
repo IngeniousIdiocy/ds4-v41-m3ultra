@@ -339,6 +339,35 @@ void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     hex20(digest, out);
 }
 
+void ds4_kvstore_entry_sha(const char *text, size_t len,
+                           const ds4_kvstore_images *images, char out[41]) {
+    uint32_t inside = 0;
+    while (images && inside < images->len && images->v[inside].text_offset < len) inside++;
+    if (!inside) {
+        ds4_kvstore_sha1_bytes_hex(text, len, out);
+        return;
+    }
+    sha1_ctx c;
+    sha1_init(&c);
+    sha1_update(&c, text, len);
+    uint8_t b[16];
+    memcpy(b, "\0KVIM", 5);
+    sha1_update(&c, b, 5);
+    kv_le_put64(b, images->encoder);
+    sha1_update(&c, b, 8);
+    for (uint32_t i = 0; i < inside; i++) {
+        const ds4_kvstore_image *im = &images->v[i];
+        ds4_kvstore_le_put32(b, im->text_offset);
+        ds4_kvstore_le_put32(b + 4, im->text_len);
+        ds4_kvstore_le_put32(b + 8, im->token_count);
+        sha1_update(&c, b, 12);
+        sha1_update(&c, im->fingerprint, sizeof(im->fingerprint));
+    }
+    uint8_t digest[20];
+    sha1_final(&c, digest);
+    hex20(digest, out);
+}
+
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
     if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
     for (int i = 0; i < 40; i++) {
@@ -933,8 +962,8 @@ static bool kv_cache_incoming_supersedes_continued(
     if (incoming->ctx_size > e->ctx_size) return false;
 
     char prefix_sha[41];
-    ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
-                               prefix_sha);
+    ds4_kvstore_entry_sha(incoming->text, (size_t)e->text_bytes,
+                          incoming->images, prefix_sha);
     return !strcmp(prefix_sha, e->sha);
 }
 
@@ -1277,7 +1306,8 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
 static bool kv_entry_images(const ds4_kvstore_entry *e, ds4_kvstore_images *out);
 
 static bool kv_cache_file_text_matches(const char *path, const char sha[41],
-                                       const char *text, size_t text_len) {
+                                       const char *text, size_t text_len,
+                                       const ds4_kvstore_images *images) {
     if (text_len > UINT32_MAX) return false;
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
@@ -1298,7 +1328,7 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     }
 
     char stored_sha[41];
-    ds4_kvstore_sha1_bytes_hex(stored, text_bytes, stored_sha);
+    ds4_kvstore_entry_sha(stored, text_bytes, images, stored_sha);
     ok = !strcmp(stored_sha, sha) &&
          (text_len == 0 || memcmp(stored, text, text_len) == 0);
     free(stored);
@@ -1322,7 +1352,7 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                       (!kc->reject_different_quant ||
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
-                      kv_cache_file_text_matches(path, sha, text, text_len);
+                      kv_cache_file_text_matches(path, sha, text, text_len, images);
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {
@@ -1520,8 +1550,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_tokens_free(&store_tokens);
         return false;
     }
+    /* Image entries are named by their images too, so chats that share text
+     * but not pixels keep separate checkpoints. */
     char sha[41];
-    ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
+    ds4_kvstore_entry_sha(text, text_len, &im, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
@@ -1579,6 +1611,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .images = &im,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
@@ -1757,11 +1790,12 @@ int ds4_kvstore_find_image_prefix(ds4_kvstore *kc, const char *prompt_text,
             if (e->text_bytes < b->text_bytes) continue;
             if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
         }
+        /* The name binds the request's images inside the prefix, so another
+         * image behind the same text never names this entry. The stored list
+         * is still checked: it is what a restore attaches. */
         char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        ds4_kvstore_entry_sha(prompt_text, (size_t)e->text_bytes, images, sha);
         if (strcmp(sha, e->sha)) continue;
-        /* Same text is not the same state when an image differs: a refused
-         * entry leaves shorter prefixes, or a full re-read, to serve. */
         ds4_kvstore_images stored;
         const char *why = kv_entry_images(e, &stored) ?
             ds4_kvstore_images_mismatch(&stored, images, e->text_bytes) :
@@ -1781,7 +1815,7 @@ int ds4_kvstore_find_image_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if (best >= 0 && e->text_bytes <= kc->entry[best].text_bytes) continue;
         char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        ds4_kvstore_entry_sha(prompt_text, (size_t)e->text_bytes, images, sha);
         if (strcmp(sha, e->sha)) continue;
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache refused %s tokens=%u: %s (entry identity %016llx canary %016llx, "
@@ -1847,7 +1881,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             } else {
                 cached_text[text_bytes] = '\0';
                 char text_sha[41];
-                ds4_kvstore_sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                ds4_kvstore_entry_sha(cached_text, text_bytes, images, text_sha);
                 if (strcmp(text_sha, e.sha)) {
                     header_ok = false;
                     fail_reason = "cached text hash mismatch";

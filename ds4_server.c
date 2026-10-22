@@ -11650,6 +11650,10 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: multimodal disk kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
                    req->image_count, loaded, effective_prompt->len);
+    else
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: multimodal disk kv miss images=%zu: no entry holds this text with these images at these offsets",
+                   req->image_count);
     return loaded;
 }
 
@@ -22685,6 +22689,362 @@ static void test_kv_cache_payload_hash_round_trip(void) {
     rmdir(dir);
 }
 
+/* ---- disk entries for image-conditioned checkpoints ---- */
+
+#define TEST_IMG_ENCODER UINT64_C(0xe1e1e1e1)
+
+/* One stored or requested image: its normalized marker at text_offset. */
+static ds4_kvstore_image test_kv_image(uint32_t text_offset, uint32_t token_start,
+                                       uint8_t pixels) {
+    ds4_kvstore_image im = {.text_offset = text_offset,
+                            .text_len = SERVER_IMAGE_MARKER_LEN,
+                            .token_start = token_start, .token_count = 20};
+    memset(im.fingerprint, pixels, sizeof(im.fingerprint));
+    return im;
+}
+
+/* "<a>" + marker + "<b>" + marker ... with each image's marker as the \036 run
+ * request keys are normalized to; offsets are written into images. */
+static char *test_kv_image_key(const char *const *parts, size_t nparts,
+                               ds4_kvstore_images *images) {
+    buf b = {0};
+    for (size_t i = 0; i < nparts; i++) {
+        buf_puts(&b, parts[i]);
+        if (i + 1 < nparts) {
+            if (images && i < images->len) images->v[i].text_offset = (uint32_t)b.len;
+            for (int k = 0; k < SERVER_IMAGE_MARKER_LEN; k++) buf_putc(&b, '\036');
+        }
+    }
+    return buf_take(&b);
+}
+
+/* An entry as ds4_kvstore_store_live_prefix_text writes it: named by its text
+ * and images, the image list ahead of a staged dummy payload. */
+static char *test_kv_image_entry(const char *dir, const char *text,
+                                 const ds4_kvstore_images *images,
+                                 const ds4_session_payload_file *staged) {
+    char sha[41], name[44];
+    ds4_kvstore_entry_sha(text, strlen(text), images, sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 0, 2, KV_REASON_SHUTDOWN, 0, 600, 0, 32768, 100, 100,
+                            staged->bytes);
+    uint64_t trailer = 0, ph = 0;
+    char err[160] = {0};
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(ds4_kvstore_write_entry_images(fp, h, text, strlen(text), images,
+                                                   staged, NULL, &trailer, &ph,
+                                                   err, sizeof(err)));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    return path;
+}
+
+static void test_kv_clear_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    while (d && (de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char *path = path_join(dir, de->d_name);
+        unlink(path);
+        free(path);
+    }
+    if (d) closedir(d);
+}
+
+/* The entry a request reaches, or NULL. */
+static const char *test_kv_find_images(kv_disk_cache *kc, const char *prompt,
+                                       const ds4_kvstore_images *images) {
+    const int idx = ds4_kvstore_find_image_prefix(kc, prompt, images, 0, 2, 32768);
+    return idx >= 0 ? kc->entry[idx].path : NULL;
+}
+
+static bool test_kv_same_path(const char *a, const char *b) {
+    return a && b && !strcmp(a, b);
+}
+
+/* What dsh does across turns: the same image bytes, at the same place, every
+ * turn. Only that request may restore an image entry; another image behind the
+ * same text, a moved image, swapped images, another encoder, an old text-only
+ * payload or a corrupt list all miss. */
+static void test_kv_image_entries_match_only_the_same_images(void) {
+    char tmpl[] = "/tmp/ds4-kv-image-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    ds4_kvstore_set_identity(0);
+    ds4_kvstore_set_canary(0);
+
+    const size_t n = 4096 + 5;
+    uint8_t *payload = malloc(n);
+    for (size_t i = 0; i < n; i++) payload[i] = (uint8_t)(i * 7u);
+    char *staged_path = path_join(dir, "staged.payload");
+    FILE *sp = fopen(staged_path, "wb");
+    TEST_ASSERT(sp != NULL && fwrite(payload, 1, n, sp) == n);
+    if (sp) TEST_ASSERT(fclose(sp) == 0);
+    ds4_session_payload_file staged = {.path = staged_path, .bytes = n};
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    /* One image: red behind "look at this". */
+    const char *one[] = {"<user>look at this <tool_result>", "</tool_result><assistant>it is red"};
+    ds4_kvstore_images red = {.len = 1, .encoder = TEST_IMG_ENCODER,
+                              .v = {test_kv_image(0, 40, 0x11)}};
+    char *key = test_kv_image_key(one, 2, &red);
+    char *red_path = test_kv_image_entry(dir, key, &red, &staged);
+    buf prompt = {0};
+    buf_puts(&prompt, key);
+    buf_puts(&prompt, "<user>and the shape?");
+
+    /* The stored list sits in front of the payload under ABI 3, inside the
+     * verified digest. */
+    {
+        FILE *fp = fopen(red_path, "rb");
+        ds4_kvstore_entry e = {0};
+        uint32_t text_bytes = 0;
+        ds4_kvstore_images got;
+        TEST_ASSERT(fp && ds4_kvstore_read_header(fp, &e, &text_bytes) && e.images);
+        TEST_ASSERT(e.payload_bytes == n + ds4_kvstore_images_bytes(&red));
+        TEST_ASSERT(fp && fseeko(fp, text_bytes, SEEK_CUR) == 0 &&
+                    ds4_kvstore_read_images(fp, e.payload_bytes, &got) ==
+                        ds4_kvstore_images_bytes(&red));
+        TEST_ASSERT(got.len == 1 && got.encoder == TEST_IMG_ENCODER &&
+                    got.v[0].token_start == 40 && got.v[0].text_offset == red.v[0].text_offset &&
+                    !memcmp(got.v[0].fingerprint, red.v[0].fingerprint, 32));
+        if (fp) fclose(fp);
+        char why[160] = {0};
+        TEST_ASSERT(test_kv_verify_file(red_path, why, sizeof(why)) == 0);
+    }
+
+    /* Same image, same place: restores. Token rows come from the entry, so the
+     * request's own token_start is not part of the match. */
+    ds4_kvstore_images req = red;
+    req.v[0].token_start = 999;
+    TEST_ASSERT(test_kv_same_path(test_kv_find_images(&kc, prompt.ptr, &req), red_path));
+
+    /* Different pixels behind the same text: refused. */
+    req = red;
+    memset(req.v[0].fingerprint, 0x22, 32);
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, &req) == NULL);
+    TEST_ASSERT(ds4_kvstore_images_mismatch(&red, &req, strlen(key)) != NULL);
+    /* ...and a different row count for the same fingerprint. */
+    req = red;
+    req.v[0].token_count = 21;
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, &req) == NULL);
+
+    /* Another vision encoder: refused. */
+    req = red;
+    req.encoder = TEST_IMG_ENCODER + 1;
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, &req) == NULL);
+    TEST_ASSERT(ds4_kvstore_images_mismatch(&red, &req, strlen(key)) &&
+                strstr(ds4_kvstore_images_mismatch(&red, &req, strlen(key)), "encoder"));
+
+    /* A text-only request, or literal \036 text where the image was: refused. */
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, NULL) == NULL);
+
+    /* Moved: a key with a literal \036 run in the user text and the image after
+     * it; a request claiming the image at the literal run is refused, the true
+     * position restores. */
+    const char *two_runs[] = {"<user>", " typed, then the image ", "</user><assistant>ok"};
+    ds4_kvstore_images moved = {.len = 2, .encoder = TEST_IMG_ENCODER,
+                                .v = {test_kv_image(0, 10, 0x33), test_kv_image(0, 40, 0x33)}};
+    char *literal_key = test_kv_image_key(two_runs, 3, &moved);
+    ds4_kvstore_images at_image = {.len = 1, .encoder = TEST_IMG_ENCODER,
+                                   .v = {moved.v[1]}};
+    at_image.v[0].token_start = 40;
+    char *moved_path = test_kv_image_entry(dir, literal_key, &at_image, &staged);
+    buf moved_prompt = {0};
+    buf_puts(&moved_prompt, literal_key);
+    buf_puts(&moved_prompt, "<user>next");
+    ds4_kvstore_images at_literal = {.len = 1, .encoder = TEST_IMG_ENCODER,
+                                     .v = {moved.v[0]}};
+    TEST_ASSERT(test_kv_find_images(&kc, moved_prompt.ptr, &at_literal) == NULL);
+    TEST_ASSERT(ds4_kvstore_images_mismatch(&at_image, &at_literal, strlen(literal_key)) &&
+                strstr(ds4_kvstore_images_mismatch(&at_image, &at_literal, strlen(literal_key)),
+                       "position"));
+    TEST_ASSERT(test_kv_same_path(test_kv_find_images(&kc, moved_prompt.ptr, &at_image),
+                                  moved_path));
+    /* Both runs claimed as images: a different count, refused. */
+    TEST_ASSERT(test_kv_find_images(&kc, moved_prompt.ptr, &moved) == NULL);
+
+    /* Two images in swapped order: refused; in order: restores. */
+    const char *pair[] = {"<user>first ", " then ", "</user><assistant>a square and a circle"};
+    ds4_kvstore_images ab = {.len = 2, .encoder = TEST_IMG_ENCODER,
+                             .v = {test_kv_image(0, 10, 0x44), test_kv_image(0, 40, 0x55)}};
+    char *pair_key = test_kv_image_key(pair, 3, &ab);
+    char *pair_path = test_kv_image_entry(dir, pair_key, &ab, &staged);
+    buf pair_prompt = {0};
+    buf_puts(&pair_prompt, pair_key);
+    buf_puts(&pair_prompt, "<user>compare");
+    ds4_kvstore_images ba = ab;
+    memcpy(ba.v[0].fingerprint, ab.v[1].fingerprint, 32);
+    memcpy(ba.v[1].fingerprint, ab.v[0].fingerprint, 32);
+    TEST_ASSERT(test_kv_find_images(&kc, pair_prompt.ptr, &ba) == NULL);
+    TEST_ASSERT(test_kv_same_path(test_kv_find_images(&kc, pair_prompt.ptr, &ab), pair_path));
+    /* A third image appended after the stored prefix still restores it. */
+    ds4_kvstore_images abc = ab;
+    abc.len = 3;
+    abc.v[2] = test_kv_image((uint32_t)strlen(pair_prompt.ptr) + 1, 90, 0x66);
+    TEST_ASSERT(test_kv_same_path(test_kv_find_images(&kc, pair_prompt.ptr, &abc), pair_path));
+
+    /* Same text, other pixels: a second chat keeps its own checkpoint. */
+    ds4_kvstore_images blue = red;
+    memset(blue.v[0].fingerprint, 0x22, 32);
+    char *blue_path = test_kv_image_entry(dir, key, &blue, &staged);
+    TEST_ASSERT(strcmp(blue_path, red_path) != 0);
+    TEST_ASSERT(access(red_path, F_OK) == 0 && access(blue_path, F_OK) == 0);
+    TEST_ASSERT(test_kv_same_path(test_kv_find_images(&kc, prompt.ptr, &blue), blue_path));
+    TEST_ASSERT(test_kv_same_path(test_kv_find_images(&kc, prompt.ptr, &red), red_path));
+    unlink(blue_path);
+
+    /* An old text-only payload with the same key bytes (no image identity)
+     * never serves the image request; it still serves a text-only one. */
+    char *old_path = test_kv_image_entry(dir, key, NULL, &staged);
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, &red) != NULL &&
+                !test_kv_same_path(test_kv_find_images(&kc, prompt.ptr, &red), old_path));
+    unlink(red_path);
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, &red) == NULL);
+    TEST_ASSERT(test_kv_same_path(test_kv_find_images(&kc, prompt.ptr, NULL), old_path));
+    TEST_ASSERT(ds4_kvstore_images_mismatch(NULL, &red, strlen(key)) != NULL);
+    unlink(old_path);
+
+    /* A corrupt image list: the payload digest fails, and the lookup refuses
+     * a list that no longer matches its name. */
+    free(red_path);
+    red_path = test_kv_image_entry(dir, key, &red, &staged);
+    const long list_at = (long)KV_CACHE_FIXED_HEADER + 4 + (long)strlen(key);
+    uint8_t flip = 0x99;
+    TEST_ASSERT(test_kv_patch_file(red_path, list_at + 24 + 16, &flip, 1));
+    char why[160] = {0};
+    TEST_ASSERT(test_kv_verify_file(red_path, why, sizeof(why)) == 1 && strstr(why, "corrupt"));
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, &red) == NULL);
+    TEST_ASSERT(test_kv_patch_file(red_path, list_at, "XXXX", 4));
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, &red) == NULL);
+
+    /* An entry from a payload ABI this reader does not know is refused. */
+    unlink(red_path);
+    free(red_path);
+    red_path = test_kv_image_entry(dir, key, &red, &staged);
+    uint8_t abi4 = 4;
+    TEST_ASSERT(test_kv_patch_file(red_path, 20, &abi4, 1));
+    TEST_ASSERT(test_kv_find_images(&kc, prompt.ptr, &red) == NULL);
+
+    kv_cache_close(&kc);
+    test_kv_clear_dir(dir);
+    rmdir(dir);
+    buf_free(&prompt);
+    buf_free(&moved_prompt);
+    buf_free(&pair_prompt);
+    free(key);
+    free(literal_key);
+    free(pair_key);
+    free(red_path);
+    free(blue_path);
+    free(old_path);
+    free(moved_path);
+    free(pair_path);
+    free(staged_path);
+    free(payload);
+}
+
+/* Text-only entries keep the old format byte for byte: ABI 2, the plain text
+ * SHA-1 as their name, and the same bytes whichever writer produced them. */
+static void test_kv_text_entries_unchanged_by_image_identity(void) {
+    char tmpl[] = "/tmp/ds4-kv-text-abi-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    ds4_kvstore_set_identity(0);
+    ds4_kvstore_set_canary(0);
+    const uint8_t payload[] = "text-only payload bytes";
+    char *staged_path = path_join(dir, "staged.payload");
+    FILE *sp = fopen(staged_path, "wb");
+    TEST_ASSERT(sp != NULL && fwrite(payload, 1, sizeof(payload), sp) == sizeof(payload));
+    if (sp) TEST_ASSERT(fclose(sp) == 0);
+    ds4_session_payload_file staged = {.path = staged_path, .bytes = sizeof(payload)};
+    const char *text = "<user>plain transcript";
+
+    char sha[41], plain[41];
+    ds4_kvstore_entry_sha(text, strlen(text), NULL, sha);
+    sha1_bytes_hex(text, strlen(text), plain);
+    TEST_ASSERT(!strcmp(sha, plain));
+    ds4_kvstore_images none = {.encoder = TEST_IMG_ENCODER};
+    ds4_kvstore_entry_sha(text, strlen(text), &none, sha);
+    TEST_ASSERT(!strcmp(sha, plain));
+
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 0, 2, KV_REASON_COLD, 0, 600, 0, 32768, 100, 100, staged.bytes);
+    uint8_t *files[2] = {0};
+    size_t sizes[2] = {0};
+    for (int w = 0; w < 2; w++) {
+        char *path = path_join(dir, w ? "b.kv" : "a.kv");
+        FILE *fp = fopen(path, "wb");
+        uint64_t trailer = 0, ph = 0;
+        char err[160] = {0};
+        TEST_ASSERT(fp != NULL);
+        if (fp) {
+            TEST_ASSERT(w ? ds4_kvstore_write_entry_images(fp, h, text, strlen(text), &none,
+                                                           &staged, NULL, &trailer, &ph,
+                                                           err, sizeof(err)) :
+                            ds4_kvstore_write_entry(fp, h, text, strlen(text), &staged, NULL,
+                                                    &trailer, &ph, err, sizeof(err)));
+            TEST_ASSERT(ph == ds4_kvstore_payload_hash(payload, sizeof(payload)));
+            TEST_ASSERT(fclose(fp) == 0);
+        }
+        fp = fopen(path, "rb");
+        files[w] = malloc(4096);
+        sizes[w] = fp ? fread(files[w], 1, 4096, fp) : 0;
+        if (fp) fclose(fp);
+        unlink(path);
+        free(path);
+    }
+    const size_t expect = KV_CACHE_FIXED_HEADER + 4 + strlen(text) + sizeof(payload);
+    TEST_ASSERT(sizes[0] == expect && sizes[1] == expect);
+    TEST_ASSERT(sizes[0] == sizes[1] && !memcmp(files[0], files[1], sizes[0]));
+    TEST_ASSERT(files[0][20] == 2u);   /* payload ABI 2: readable by older builds */
+    free(files[0]);
+    free(files[1]);
+    unlink(staged_path);
+    free(staged_path);
+    rmdir(dir);
+}
+
+/* Only a backend whose payload is its whole image state hands out image
+ * identities (the test shell is none), and a load attaches identities only
+ * where the restored tokens are image placeholders. */
+static void test_session_image_identities_gate(void) {
+    int tokens[64] = {0};
+    ds4_session *s = ds4_session_new_test_checkpoint(tokens, 64);
+    ds4_vision_span out[4];
+    TEST_ASSERT(ds4_session_vision_identities(s, out, 4) == 0);
+    ds4_vision_span img = {.token_start = 8, .embedding = {.token_count = 16, .fingerprint = {7}}};
+    TEST_ASSERT(!ds4_session_restore_vision_identities(s, &img, 1));
+    TEST_ASSERT(ds4_session_restore_vision_identities(s, NULL, 0));
+    ds4_session_set_test_images(s, &img, 1);
+    TEST_ASSERT(ds4_session_vision_identities(s, out, 4) == -1);
+    TEST_ASSERT(ds4_session_restore_vision_identities(s, NULL, 0));
+    TEST_ASSERT(!ds4_session_has_vision_state(s));
+    ds4_session_free_test_checkpoint(s);
+}
+
+/* Disk keys write a stored image as SERVER_IMAGE_MARKER_LEN \036 bytes: every
+ * request marker must have that length for the normalized forms to agree. */
+static void test_image_marker_length_matches_disk_key(void) {
+    server_image_inputs images = {0};
+    char marker[SERVER_IMAGE_MARKER_BYTES];
+    for (int i = 0; i < 8; i++) {
+        TEST_ASSERT(server_image_inputs_push_base64(&images, "image/png", "AAAA", marker));
+        TEST_ASSERT(strlen(marker) == SERVER_IMAGE_MARKER_LEN);
+    }
+    server_image_inputs_free(&images);
+}
+
 /* The disk cache refuses loads and stores until the canary completes (and for
  * good if it fails). ds4-server keeps requests queued meanwhile, so a pending
  * canary never reaches this gate as a miss there; ds4-agent never sets one. */
@@ -24177,6 +24537,10 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_refuses_identity_and_canary_mismatch();
     test_kv_cache_v1_entries_refused_and_evictable();
     test_kv_cache_payload_hash_round_trip();
+    test_kv_image_entries_match_only_the_same_images();
+    test_kv_text_entries_unchanged_by_image_identity();
+    test_session_image_identities_gate();
+    test_image_marker_length_matches_disk_key();
     test_kv_cache_canary_gate();
     test_server_jobs_wait_for_canary();
     test_kv_cache_text_only_entry_verifies();

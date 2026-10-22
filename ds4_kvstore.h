@@ -119,6 +119,7 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    const ds4_kvstore_images *images;   /* the incoming entry's, NULL: none */
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -316,6 +317,11 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
+/* An entry's file name: the SHA-1 of its key text, extended for an image entry
+ * by the encoder and each image inside the key (offset, marker length, rows,
+ * fingerprint). Text-only names are the plain text SHA-1, as before. */
+void ds4_kvstore_entry_sha(const char *text, size_t len,
+                           const ds4_kvstore_images *images, char out[41]);
 char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
