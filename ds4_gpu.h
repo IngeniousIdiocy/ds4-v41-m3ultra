@@ -49,6 +49,7 @@ typedef struct {
 #define DS4_GPU_V41_COMPUTE_TENSOR_COPY (1ull << 1)   /* aligned tensor copies stay in the compute encoder (any model) */
 #define DS4_GPU_V41_DECODE_QUEUE (1ull << 2)   /* a decode step's layers queue into one command stream */
 #define DS4_GPU_V41_ROUTER_SELECT (1ull << 3)   /* a few rows' expert selection, one fused dispatch per row */
+#define DS4_GPU_V41_ENGRAM_ASYNC (1ull << 4)   /* a decode step's Engram rows are read while its first layers run */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

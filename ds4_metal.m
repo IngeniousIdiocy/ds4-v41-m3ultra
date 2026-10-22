@@ -445,6 +445,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY",
             "DS4_METAL_DISABLE_V41_DECODE_QUEUE",
             "DS4_METAL_DISABLE_V41_ROUTER_SELECT",
+            "DS4_METAL_DISABLE_V41_ENGRAM_ASYNC",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);

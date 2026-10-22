@@ -41220,9 +41220,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
             (uint64_t)ds41_carry_words(count, format, g->compact_carry) * g->carry_cap * sizeof(float)))) goto fail;
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
 #undef DS41_CARRY_ALLOC
-#ifndef __APPLE__
-    g->engram_reader = ds4_engram_reader_create();
+#ifdef __APPLE__
+    if (ds41_on(DS4_GPU_V41_ENGRAM_ASYNC))
 #endif
+    g->engram_reader = ds4_engram_reader_create();
     ds41_graph_reset(g);
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
             (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
