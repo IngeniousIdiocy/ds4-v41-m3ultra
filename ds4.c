@@ -41801,9 +41801,40 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
         ds41_attention_select_published(g, m, l, il);
 }
 
+/* QKV_FUSION: q_a and kv in one pass over the norm, both norms in one dispatch, and with rope_il >= 0 the q
+ * projection with that layer's RoPE applied as it stores (*roped then says so). */
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
-                                    const ds4_layer_weights *l) {
+                                    const ds4_layer_weights *l, int rope_il, bool *roped) {
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+    if (roped) *roped = false;
+#ifdef __APPLE__
+    if (ds41_on(DS4_GPU_V41_QKV_FUSION)) {
+        const bool paired = l->attn_q_a->type == DS4_TENSOR_Q8_0 && l->attn_kv->type == DS4_TENSOR_Q8_0 &&
+            ds4_gpu_dsv41_project_pair_q8(g->qr, g->kv, m->map, m->size,
+                l->attn_q_a->abs_offset, l->attn_kv->abs_offset, DS4_N_EMBD,
+                (uint32_t)l->attn_q_a->dim[1], (uint32_t)l->attn_kv->dim[1], g->norm);
+        if (!(paired || (ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
+                         ds41_matmul(g->kv, m, l->attn_kv, g->norm, true)))) return false;
+        if (!ds4_gpu_dsv41_norm_pair_rows(g->qr, g->qr, l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q,
+                                          g->kv, g->kv, l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM,
+                                          m->map, m->size, DS4_RMS_EPS, 1) &&
+            !(ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) && ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm)))
+            return false;
+        uint64_t q_row;
+        if (rope_il >= 0 && l->attn_q_b->type == DS4_TENSOR_Q8_0 &&
+            tensor_nbytes(l->attn_q_b->type, l->attn_q_b->dim[0], &q_row) &&
+            ds4_gpu_dsv41_project_q(g->q, m->map, m->size,
+                l->attn_q_b->abs_offset + (uint64_t)g->tp_rank * q_dim * q_row,
+                (uint32_t)l->attn_q_b->dim[0], q_dim, g->qr, g->pos,
+                ds4_layer_compress_ratio((uint32_t)rope_il) != 0)) {
+            if (roped) *roped = true;
+            return true;
+        }
+        return ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, g->tp_rank * q_dim, q_dim);
+    }
+#else
+    (void)rope_il;
+#endif
     return ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
         ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
         ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
@@ -41819,8 +41850,9 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
-    if (!projected && !ds41_attention_project(g, m, l)) return false;
-    if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
+    bool q_roped = false;
+    if (!projected && !ds41_attention_project(g, m, l, (int)il, &q_roped)) return false;
+    if ((!q_roped && !ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false)) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
@@ -42094,6 +42126,22 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
                                          const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+#ifdef __APPLE__
+    /* both norms in one dispatch */
+    if (ds41_on(DS4_GPU_V41_QKV_FUSION) && count <= DS4_TP_BATCH_MAX_ROWS) {
+        if (!ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) ||
+            !ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true)) return false;
+        if (!ds4_gpu_dsv41_norm_pair_rows(b->qr, b->qr, l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q,
+                b->kv, b->kv, l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, m->map, m->size, DS4_RMS_EPS, count) &&
+            !(ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
+                  l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
+              ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
+              ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
+                  l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
+              ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16))) return false;
+        return ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr, g->tp_rank * q_dim, q_dim, count);
+    }
+#endif
     return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
@@ -42326,7 +42374,7 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
         const int state = ds4_gpu_decode_graph_begin(&key);
         if (state == 1) return true;
         const bool ok = island == 0 ?
-            ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l) :
+            ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l, -1, NULL) :
             island == 2 ? ds41_attention_output(g, m, l) :
             ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
         if (state != 0) return ok;

@@ -1503,8 +1503,63 @@ static int check_narrow_weights(void) {
     return 1;
 }
 
+/* QKV_FUSION: the q_a/kv pair against two bf16 matvecs, the paired norm against two bf16 norms (one row and three),
+ * and the q projection with RoPE against the bf16 matvec followed by the RoPE kernel (both RoPE kinds), bit for bit. */
+static int check_qkv_fusion(void) {
+    enum { IN = 4096, OUT_A = 1024, OUT_B = 512, Q_IN = 1024, Q_OUT = 2048, ROWS = 3 };
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint64_t a_bytes = (uint64_t)OUT_A * IN / 32 * sizeof(q8_block), b_bytes = (uint64_t)OUT_B * IN / 32 * sizeof(q8_block);
+    const uint64_t q_bytes = (uint64_t)Q_OUT * Q_IN / 32 * sizeof(q8_block);
+    const uint64_t n_off = a_bytes + b_bytes + q_bytes, bytes = n_off + (OUT_A + OUT_B) * sizeof(float);
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), bytes) == 0);
+    q8_block *q8 = model;
+    for (uint64_t i = 0; i < n_off / sizeof(q8_block); i++) {
+        q8[i].d = (uint16_t)(0x2000u | (seed & 0x3ffu));
+        for (int j = 0; j < 32; j++) q8[i].qs[j] = (int8_t)(random_value() * 32);
+    }
+    float *norm_w = (float *)((char *)model + n_off);
+    for (int i = 0; i < OUT_A + OUT_B; i++) norm_w[i] = random_value();
+    CHECK(ds4_gpu_set_model_map(model, bytes));
+    float x[ROWS * IN];
+    for (int i = 0; i < ROWS * IN; i++) x[i] = random_value();
+    ds4_gpu_tensor *in = upload(x, sizeof(x)), *a0 = upload(NULL, sizeof(x)), *b0 = upload(NULL, sizeof(x));
+    ds4_gpu_tensor *a1 = upload(NULL, sizeof(x)), *b1 = upload(NULL, sizeof(x));
+    CHECK(in && a0 && b0 && a1 && b1);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const char *names[3] = {"kernel_mul_mv_q8_0_f32_bf16_pair", "kernel_dsv41_norm_pair", "kernel_mul_mv_q8_0_f32_bf16_rope"};
+    uint64_t runs[3];
+    for (int k = 0; k < 3; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
+    CHECK(ds4_gpu_matmul_q8_0_bf16_tensor(a0, model, bytes, 0, IN, OUT_A, in) &&
+          ds4_gpu_matmul_q8_0_bf16_tensor(a1, model, bytes, a_bytes, IN, OUT_B, in) &&
+          ds4_gpu_dsv41_project_pair_q8(b0, b1, model, bytes, 0, a_bytes, IN, OUT_A, OUT_B, in));
+    CHECK(same_bits(a0, b0, OUT_A) && same_bits(a1, b1, OUT_B));
+    for (uint32_t rows = 1; rows <= ROWS; rows += 2) {
+        CHECK(ds4_gpu_rms_norm_weight_rows_tensor(a0, in, model, bytes, n_off, OUT_A, rows, 1e-6f) &&
+              ds4_gpu_dsv41_quantize(a0, OUT_A, rows, DS4_V41_BF16) &&
+              ds4_gpu_rms_norm_weight_rows_tensor(a1, in, model, bytes, n_off + OUT_A * 4, OUT_B, rows, 1e-6f) &&
+              ds4_gpu_dsv41_quantize(a1, OUT_B, rows, DS4_V41_BF16) &&
+              ds4_gpu_dsv41_norm_pair_rows(b0, in, n_off, OUT_A, b1, in, n_off + OUT_A * 4, OUT_B, model, bytes, 1e-6f, rows));
+        CHECK(same_bits(a0, b0, rows * OUT_A) && same_bits(a1, b1, rows * OUT_B));
+    }
+    for (int compressed = 0; compressed < 2; compressed++) {
+        CHECK(ds4_gpu_matmul_q8_0_bf16_tensor(a0, model, bytes, a_bytes + b_bytes, Q_IN, Q_OUT, in) &&
+              ds4_gpu_dsv41_rope(a0, 512, Q_OUT / 512, 1, 777, compressed, false) &&
+              ds4_gpu_dsv41_project_q(b0, model, bytes, a_bytes + b_bytes, Q_IN, Q_OUT, in, 777, compressed));
+        CHECK(same_bits(a0, b0, Q_OUT));
+    }
+    CHECK(ds4_gpu_test_kernel_runs(names[0]) == runs[0] + 1 && ds4_gpu_test_kernel_runs(names[1]) == runs[1] + 2 &&
+          ds4_gpu_test_kernel_runs(names[2]) == runs[2] + 2);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(a0); ds4_gpu_tensor_free(b0); ds4_gpu_tensor_free(a1); ds4_gpu_tensor_free(b1);
+    /* model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 q_a/kv pair, paired norm and q projection with RoPE == separate kernels\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
-    return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights();
+    return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
+        check_qkv_fusion();
 }
 #else
 static int check_v41_groups(void) { return 1; }

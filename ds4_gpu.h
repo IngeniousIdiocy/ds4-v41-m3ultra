@@ -52,6 +52,7 @@ typedef struct {
 #define DS4_GPU_V41_ENGRAM_ASYNC (1ull << 4)   /* a decode step's Engram rows are read while its first layers run */
 #define DS4_GPU_V41_FUSED_ROUNDING (1ull << 5)   /* producers write bf16 directly, no separate rounding pass */
 #define DS4_GPU_V41_NARROW_WEIGHTS (1ull << 6)   /* decode reads narrow router, Engram and indexer copies built at load */
+#define DS4_GPU_V41_QKV_FUSION (1ull << 7)   /* q_a and kv in one pass, their norms in one dispatch, RoPE in q_b */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

@@ -63,6 +63,19 @@ int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_te
 /* The whole head rounded to bf16, then the RoPE. */
 int ds4_gpu_dsv41_rope_bf16(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                             uint32_t rows, uint32_t start, bool compressed, bool inverse);
+/* QKV_FUSION. The q_a and kv projections of one row in one dispatch (bf16 outputs), and both of their norms in one
+ * dispatch; the q projection with its RoPE applied to the bf16 outputs (the last 64 columns of every 512-wide head).
+ * Each returns 0, encoding nothing, when its kernel does not apply. */
+int ds4_gpu_dsv41_project_pair_q8(ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
+                                  const void *model_map, uint64_t model_size,
+                                  uint64_t offset_a, uint64_t offset_b, uint32_t in_dim,
+                                  uint32_t out_a_dim, uint32_t out_b_dim, const ds4_gpu_tensor *x);
+int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0, uint64_t weight0_offset, uint32_t n0,
+                                 ds4_gpu_tensor *out1, const ds4_gpu_tensor *x1, uint64_t weight1_offset, uint32_t n1,
+                                 const void *model_map, uint64_t model_size, float eps, uint32_t rows);
+int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                            uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+                            const ds4_gpu_tensor *x, uint32_t pos, bool compressed);
 /* Weights built at load: the model views' storage options, and a residency set of their own (requested at once and
  * added to the queue); ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);

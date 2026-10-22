@@ -12,6 +12,9 @@ static inline float dsv41_bf16(float x) {
         bits += 0x7fffu + ((bits >> 16u) & 1u);
     return as_type<float>(bits & 0xffff0000u);
 }
+static inline float4 dsv41_bf16(float4 v) {
+    return float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
+}
 
 /* Router softplus, the same formula as the DeepSeek V4 router kernels: a log1p series where exp(x) < 1/32. */
 static inline float dsv41_router_softplus(float x) {
@@ -297,6 +300,62 @@ kernel void kernel_dsv41_quantize(
         result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
     }
     if (valid) x[index] = dsv41_bf16(result);
+}
+
+struct ds4_metal_args_dsv41_norm_pair {
+    uint n0, n1, ntg0, ntg1;
+    float eps;
+};
+
+/* Two weighted RMS norms in one dispatch, each row on its own thread count
+ * (ntg0 threads then ntg1), so every reduction matches the single-row kernel. */
+kernel void kernel_dsv41_norm_pair(
+        constant ds4_metal_args_dsv41_norm_pair &args,
+        device const float4 *x0,
+        device const float4 *w0,
+        device float4 *y0,
+        device const float4 *x1,
+        device const float4 *w1,
+        device float4 *y1,
+        threadgroup float *shmem [[threadgroup(0)]],
+        uint2 tg [[threadgroup_position_in_grid]],
+        ushort2 tpos [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const ushort tid = tpos.x;
+    const bool second = tid >= args.ntg0;
+    const uint ntg = second ? args.ntg1 : args.ntg0;
+    const uint t = second ? tid - args.ntg0 : tid;
+    const uint sg = second ? sgitg - args.ntg0 / 32u : sgitg;
+    const int n = int(second ? args.n1 : args.n0);
+    const int ne00_t = n / 4;
+    const uint row = tg.y;   /* grid row = activation row */
+    device const float4 *x = (second ? x1 : x0) + (ulong)row * ne00_t;
+    device const float4 *w = second ? w1 : w0;
+    device float4 *y = (second ? y1 : y0) + (ulong)row * ne00_t;
+    threadgroup float *sh = shmem + (second ? 32u : 0u);
+    if (sg == 0) {
+        sh[tiisg] = 0.0f;
+    }
+    float sumf = 0.0f;
+    for (int i = int(t); i < ne00_t; i += int(ntg)) {
+        sumf += dot(x[i], x[i]);
+    }
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        sh[sg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = sh[tiisg];
+    sumf = simd_sum(sumf);
+    const float mean  = sumf/n;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+    for (int i = int(t); i < ne00_t; i += int(ntg)) {
+        float4 v = x[i]*scale;
+        v = v*w[i];
+        y[i] = dsv41_bf16(v);
+    }
 }
 
 struct ds4_metal_args_dsv41_engram {
