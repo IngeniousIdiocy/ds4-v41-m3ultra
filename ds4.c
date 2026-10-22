@@ -41637,7 +41637,8 @@ static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
 
 /* The decode readers of the copies: true when a copy served the matvec. */
 static DS4_MAYBE_UNUSED bool ds41_narrow_on(const ds41_gpu_graph *g, const ds4_model *m) {
-    return g_ds41_narrow.owner == m && g->tp_world == 1 && !g->streaming && !g->quality;
+    return g_ds41_narrow.owner == m && g->tp_world == 1 && !g->streaming && !g->quality &&
+        ds41_on(DS4_GPU_V41_NARROW_WEIGHTS);
 }
 
 static bool ds41_narrow_router_mv(ds41_gpu_graph *g, const ds4_model *m, uint32_t il) {
