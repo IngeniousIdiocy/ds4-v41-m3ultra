@@ -42007,19 +42007,28 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                                            DS4_N_HEAD_DIM, il, pos, DS4_V41_FP8_E8M0)) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
-                                         g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
+    const uint64_t sinks = l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float);
 #ifdef __APPLE__
     /* with this step's RoPE table the decode reduce writes the heads bf16-rounded and inverse-roped */
     const bool arm = !projected && g->tp_world == 1 && g->rope_tab_pos == pos + 1u;
     if (arm) ds4_gpu_dsv41_heads_once_arm(g->rope_tab, ratio != 0);
 #endif
-    const bool done = ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
-            l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
+#ifdef __APPLE__
+    /* DECODE_ATTENTION: the staging kernel gathers the selected rows itself */
+    const bool staged = n_comp && ds4_gpu_dsv41_attention_decode(g->heads, m->map, m->size, sinks,
+            g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u, g->compressed[owner],
+            g->selected_comp, n_comp, attended, heads, DS4_N_HEAD_DIM);
+#else
+    const bool staged = false;
+#endif
+    const bool done = staged ||
+        ((!n_comp || ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                             g->selected_comp, n_comp, attended)) &&
+         ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size, sinks,
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM);
+            heads, DS4_N_HEAD_DIM));
 #ifdef __APPLE__
     const bool transformed = arm && ds4_gpu_dsv41_heads_once_take();
 #else

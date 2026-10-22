@@ -2103,11 +2103,51 @@ static int check_index_candidates(void) {
     return 1;
 }
 
+/* DECODE_ATTENTION: one decode row (64 heads, 128 raw rows from a wrapped start, 512 of 4,096 compressed rows)
+ * with the rows staged straight from the cache against the gather and the attention after it, bit for bit. */
+static int check_decode_attention(void) {
+    enum { D = 512, H = 64, R = 128, C = 4096, K = 512 };
+    float *sinks = NULL;
+    CHECK(posix_memalign((void **)&sinks, getpagesize(), getpagesize()) == 0);
+    for (int h = 0; h < H; h++) sinks[h] = random_value();
+    CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
+    ds4_gpu_set_quality(false);
+    float *v = malloc(((size_t)H * D + (size_t)R * D + (size_t)C * D) * sizeof(float));
+    int32_t *ids = malloc(K * sizeof(int32_t));
+    CHECK(v && ids);
+    for (size_t i = 0; i < (size_t)H * D + (size_t)R * D + (size_t)C * D; i++) v[i] = bf16(random_value() / 4);
+    for (int j = 0; j < K; j++) ids[j] = (int32_t)((j * 1031u + 7u) % C);
+    ds4_gpu_tensor *q = upload(v, H * D * 4), *raw = upload(v + H * D, R * D * 4);
+    ds4_gpu_tensor *cache = upload(v + H * D + R * D, (size_t)C * D * 4), *it = upload(ids, K * 4);
+    ds4_gpu_tensor *picked = upload(NULL, K * D * 4), *want = upload(NULL, H * D * 4), *got = upload(NULL, H * D * 4);
+    CHECK(q && raw && cache && it && picked && want && got);
+    CHECK(ds4_gpu_dsv41_gather_kv(picked, cache, it, C, K) &&
+          ds4_gpu_attention_decode_heads_tensor(want, sinks, getpagesize(), 0, q, raw, R, R, 37, picked, 0, K,
+                                                NULL, 0, H, D));
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t staged = ds4_gpu_test_kernel_runs("kernel_dsv41_flash_kv_stage");
+    CHECK(ds4_gpu_dsv41_attention_decode(got, sinks, getpagesize(), 0, q, raw, R, R, 37, cache, it, C, K, H, D));
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_flash_kv_stage") == staged + 1);
+    ds4_gpu_test_set_flags(0);
+    CHECK(same_bits(want, got, H * D));
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_DECODE_ATTENTION);
+    CHECK(!ds4_gpu_dsv41_attention_decode(got, sinks, getpagesize(), 0, q, raw, R, R, 37, cache, it, C, K, H, D));
+    ds4_gpu_test_set_v41_off(0);
+    ds4_gpu_tensor *tensors[] = {q, raw, cache, it, picked, want, got};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(ids);
+    free(v);
+    free(sinks);
+    fprintf(stderr, "V4.1 decode attention: rows staged from the cache == gather, then attention\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
-        check_index_bf16() && check_topk() && check_index_candidates();
+        check_index_bf16() && check_topk() && check_index_candidates() &&
+        check_decode_attention();
 }
 #else
 static int check_v41_groups(void) { return 1; }

@@ -96,6 +96,14 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* DECODE_ATTENTION: ds4_gpu_attention_decode_heads_tensor of one row over the raw window and the `attended` rows of
+ * the f32 compressed cache that ids picks, staged straight from the cache. 0: not run, gather and attend as before. */
+int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+                                   uint64_t sinks_offset, const ds4_gpu_tensor *q,
+                                   const ds4_gpu_tensor *raw_kv, uint32_t n_raw, uint32_t raw_cap,
+                                   uint32_t raw_start, const ds4_gpu_tensor *comp_cache,
+                                   const ds4_gpu_tensor *ids, uint32_t n_comp, uint32_t attended,
+                                   uint32_t n_head, uint32_t head_dim);
 /* INDEX_CANDIDATES: one decode row's top_k (at most 512) index ids, scored and picked among the candidate blocks of
  * block_mask (more than 2,048 blocks, 2,048 kept) only, as the masked wide scorer and the TOPK radix select pick
  * them; list holds the kept blocks (built unless list_ready). 0: not run, score the full row. */
