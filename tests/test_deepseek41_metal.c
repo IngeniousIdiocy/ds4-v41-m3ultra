@@ -1671,9 +1671,137 @@ static int check_ffn_join(void) {
     return 1;
 }
 
+static uint32_t random_bits(void) {
+    (void)random_value();
+    return seed;
+}
+
+/* HC_FUSION, bit for bit, on random weights of the V4.1 shapes: the HC block input against the norm, mix, split,
+ * weighted sum and norm kernels (one row with both pre layouts, and three rows against the batch kernels); the
+ * expanded Q8 matvec against the matvec and the expand (8192 -> 5120 alone, 2304 -> 5120 joined with an add); and the
+ * deferred collapse plus the query kernel against the block input, the q projection and the KV row's RoPE store. */
+static int check_hc_fusion(void) {
+    const uint64_t qo = 0, ho = qo + 32768ull * 40 * 34, so = ho + 20480ull * 24 * 2, bo = so + 64, no = bo + 128,
+                   ao = no + 5120 * 4, eo = ao + 5120ull * 256 * 34, bytes = eo + 5120ull * 72 * 34;
+    uint8_t *map = NULL;
+    CHECK(posix_memalign((void **)&map, getpagesize(), bytes) == 0);
+    memset(map, 0, bytes);
+    const uint64_t q8[3][2] = {{qo, 32768ull * 40}, {ao, 5120ull * 256}, {eo, 5120ull * 72}};
+    for (int k = 0; k < 3; k++)
+        for (uint64_t b = 0; b < q8[k][1]; b++) {   /* Q8_0 blocks: f16 scale, 32 int8 */
+            const uint16_t d = (uint16_t)(0x2000u + random_bits() % 0x1800u);
+            memcpy(map + q8[k][0] + b * 34, &d, 2);
+            for (int j = 0; j < 32; j++) map[q8[k][0] + b * 34 + 2 + j] = (uint8_t)random_bits();
+        }
+    uint16_t *fn = (uint16_t *)(map + ho);
+    for (uint32_t i = 0; i < 20480 * 24; i++)
+        fn[i] = (uint16_t)((random_bits() & 0x8000u) | (0x2000u + random_bits() % 0x1800u));
+    float *scale = (float *)(map + so), *base = (float *)(map + bo), *nw = (float *)(map + no);
+    scale[0] = .04f; scale[1] = .03f; scale[2] = .02f;
+    for (int i = 0; i < 24; i++) base[i] = random_value() / 32.0f;
+    for (int i = 0; i < 5120; i++) nw[i] = 1.0f + random_value() / 64.0f;
+    CHECK(ds4_gpu_set_model_map(map, bytes));
+    enum { ROWS = 3 };
+    enum { MIX, SPLIT, X, NORM, NT };
+    const uint32_t width[NT] = {24, 24, 5120, 5120};
+    ds4_gpu_tensor *res = upload(NULL, ROWS * 20480 * 4), *pre = upload(NULL, ROWS * 24 * 4);
+    ds4_gpu_tensor *flat = upload(NULL, ROWS * 20480 * 4), *t[2][2][NT];   /* [ref, fused][1 row, ROWS] */
+    CHECK(res && pre && flat);
+    for (int a = 0; a < 2; a++)
+        for (int n = 0; n < 2; n++)
+            for (int i = 0; i < NT; i++) CHECK((t[a][n][i] = upload(NULL, (n ? ROWS : 1) * width[i] * 4)) != NULL);
+    ds4_gpu_tensor *res1 = ds4_gpu_tensor_view(res, 0, 20480 * 4), *flat1 = ds4_gpu_tensor_view(flat, 0, 20480 * 4);
+    ds4_gpu_tensor *pre4 = ds4_gpu_tensor_view(pre, 0, 4 * 4), *pre24 = ds4_gpu_tensor_view(pre, 0, 24 * 4);
+    CHECK(res1 && flat1 && pre4 && pre24);
+    float *rv = ds4_gpu_tensor_contents(res), *pv = ds4_gpu_tensor_contents(pre);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const char *names[4] = {"kernel_dsv41_hc_block_input", "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4",
+                            "kernel_dsv41_deferred_collapse", "kernel_dsv41_query_deferred_hc"};
+    uint64_t runs[4];
+    for (int k = 0; k < 4; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
+    /* the block input: one row with pre as 4 weights and as a split row, then three rows (split rows) */
+    for (int step = 0; step < 3; step++) {
+        const int n = step == 2;
+        const uint32_t rows = n ? ROWS : 1;
+        for (uint32_t i = 0; i < ROWS * 20480; i++) rv[i] = random_value();
+        for (uint32_t i = 0; i < ROWS * 24; i++) pv[i] = fabsf(random_value()) / 4;
+        ds4_gpu_tensor **r = t[0][n], **d = t[1][n];
+        ds4_gpu_tensor *in = n ? res : res1, *w = step == 0 ? pre4 : n ? pre : pre24;
+        CHECK((n ? ds4_gpu_rms_norm_plain_rows_tensor(flat, res, 20480, ROWS, 1e-6f) &&
+                   ds4_gpu_dsv41_projection_rows(r[MIX], map, bytes, ho, 20480, 24, ROWS, flat) :
+                   ds4_gpu_rms_norm_plain_tensor(flat1, res1, 20480, 1e-6f) &&
+                   ds4_gpu_matmul_f16_tensor(r[MIX], map, bytes, ho, 20480, 24, flat1, 1)) &&
+              ds4_gpu_hc_split_sinkhorn_tensor(r[SPLIT], r[MIX], map, bytes, so, bo, 4, 20, 1e-6f) &&
+              (step ? ds4_gpu_hc_weighted_sum_split_tensor(r[X], in, w, 5120, 4) :
+                      ds4_gpu_hc_weighted_sum_tensor(r[X], in, w, 5120, 4)) &&
+              ds4_gpu_dsv41_quantize(r[X], 5120, rows, DS4_V41_BF16) &&
+              ds4_gpu_rms_norm_weight_rows_tensor(r[NORM], r[X], map, bytes, no, 5120, rows, 1e-6f) &&
+              ds4_gpu_dsv41_quantize(r[NORM], 5120, rows, DS4_V41_BF16));
+        CHECK(n ? ds4_gpu_dsv41_hc_block_input_rows(d[MIX], d[X], d[NORM], d[SPLIT], res, pre, map, bytes, ho, so, bo,
+                                                    no, 20480, 24, 5120, 4, 20, 1e-6f, 1e-6f, ROWS, 24) :
+                  ds4_gpu_dsv41_hc_block_input(d[MIX], d[X], d[NORM], d[SPLIT], res1, w, map, bytes, ho, so, bo, no,
+                                               20480, 24, 5120, 4, 20, 1e-6f, 1e-6f));
+        for (int i = 0; i < NT; i++) CHECK(same_bits(r[i], d[i], rows * width[i]));
+    }
+    /* the expanded matvec: x, the add, the block and the streams */
+    ds4_gpu_tensor *xin = upload(NULL, 8192 * 4), *add = upload(NULL, 5120 * 4), *block = upload(NULL, 5120 * 4);
+    ds4_gpu_tensor *ref = upload(NULL, 20480 * 4), *got = upload(NULL, 20480 * 4);
+    CHECK(xin && add && block && ref && got);
+    for (int joined = 0; joined < 2; joined++) {
+        const uint32_t k = joined ? 2304 : 8192;
+        const uint64_t w = joined ? eo : ao;
+        float *xv = ds4_gpu_tensor_contents(xin), *av = ds4_gpu_tensor_contents(add);
+        for (uint32_t i = 0; i < k; i++) xv[i] = random_value();
+        for (int i = 0; i < 5120; i++) av[i] = random_value();
+        for (int i = 0; i < 20480; i++) rv[i] = random_value();
+        ds4_gpu_tensor *x = ds4_gpu_tensor_view(xin, 0, k * 4);
+        CHECK(x);
+        CHECK(ds4_gpu_matmul_q8_0_bf16io_tensor(block, map, bytes, w, k, 5120, x) &&
+              (joined ? ds4_gpu_hc_expand_add_split_bf16_tensor(ref, block, add, res1, pre24, 5120, 4) :
+                        ds4_gpu_hc_expand_split_bf16_tensor(ref, block, res1, pre24, 5120, 4)));
+        CHECK(ds4_gpu_dsv41_matmul_expand(got, map, bytes, w, k, 5120, x, joined ? add : NULL, res1, pre24, 4));
+        CHECK(same_bits(ref, got, 20480));
+        ds4_gpu_tensor_free(x);
+    }
+    /* the deferred block input with the query kernel, which also stores the KV row */
+    ds4_gpu_tensor *qr = upload(NULL, 1280 * 4), *kv = upload(NULL, 512 * 4), *q[2] = {upload(NULL, 32768 * 4),
+                   upload(NULL, 32768 * 4)}, *cache[2] = {upload(NULL, 512 * 4), upload(NULL, 512 * 4)};
+    CHECK(qr && kv && q[0] && q[1] && cache[0] && cache[1]);
+    for (uint32_t draw = 0; draw < 8; draw++) {
+        const bool compressed = draw & 1;
+        const uint32_t pos = (draw * 7919u) % 393216u;
+        for (int i = 0; i < 20480; i++) rv[i] = random_value();
+        for (int i = 0; i < 4; i++) pv[i] = random_value();
+        for (int i = 0; i < 1280; i++) ((float *)ds4_gpu_tensor_contents(qr))[i] = random_value();
+        for (int i = 0; i < 512; i++) ((float *)ds4_gpu_tensor_contents(kv))[i] = random_value();
+        ds4_gpu_tensor **r = t[0][0], **d = t[1][0];
+        CHECK(ds4_gpu_dsv41_hc_block_input(r[MIX], r[X], r[NORM], r[SPLIT], res1, pre4, map, bytes, ho, so, bo, no,
+                                           20480, 24, 5120, 4, 20, 1e-6f, 1e-6f) &&
+              ds4_gpu_dsv41_project_q(q[0], map, bytes, qo, 1280, 32768, qr, pos, compressed) &&
+              ds4_gpu_dsv41_rope_quantize(kv, cache[0], 0, 512, pos, compressed, DS4_V41_FP8_E8M0));
+        CHECK(ds4_gpu_dsv41_deferred_collapse(d[X], d[NORM], res1, pre4, map, bytes, no, 1e-6f) &&
+              ds4_gpu_dsv41_query_deferred_hc(q[1], d[MIX], d[SPLIT], qr, res1, map, bytes, qo, ho, so, bo, pos,
+                                              compressed, 20, 1e-6f, 1e-6f, d[X], d[NORM], pre4, no, kv, cache[1], 0));
+        for (int i = 0; i < NT; i++) CHECK(same_bits(r[i], d[i], width[i]));
+        CHECK(same_bits(q[0], q[1], 32768) && same_bits(cache[0], cache[1], 512));
+    }
+    CHECK(ds4_gpu_test_kernel_runs(names[0]) == runs[0] + 3 + 8 && ds4_gpu_test_kernel_runs(names[1]) == runs[1] + 2 &&
+          ds4_gpu_test_kernel_runs(names[2]) == runs[2] + 8 && ds4_gpu_test_kernel_runs(names[3]) == runs[3] + 8);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {res1, flat1, pre4, pre24, res, pre, flat, xin, add, block, ref, got,
+                                 qr, kv, q[0], q[1], cache[0], cache[1]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    for (int a = 0; a < 2; a++)
+        for (int n = 0; n < 2; n++)
+            for (int i = 0; i < NT; i++) ds4_gpu_tensor_free(t[a][n][i]);
+    /* the model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 HC fusion: block input, expanded matvec, deferred collapse and query == separate kernels\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
-        check_qkv_fusion() && check_rope() && check_ffn_join();
+        check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion();
 }
 #else
 static int check_v41_groups(void) { return 1; }

@@ -1130,18 +1130,36 @@ struct ds4_metal_args_hc_norm_mix {
 // rounds identically to the materialized normalized row.  The host wrapper
 // gates this to n == 16384 && out_dim == 24, where the virtual-thread count
 // is exactly 1024 and the mv tail loop is empty.
-kernel void kernel_dsv4_hc_rms_norm_mix_f16(
+/* Loads of what other threadgroups of the same dispatch wrote go through the
+ * coherent atomic path: a plain load may return a line another threadgroup
+ * on the same core cached before the writes. */
+static inline float dsv41_coherent_load(device const float *p) {
+    return as_type<float>(atomic_load_explicit((device atomic_uint *)p, memory_order_relaxed));
+}
+static inline float4 dsv41_coherent_load4(device const float *p) {
+    return float4(dsv41_coherent_load(p), dsv41_coherent_load(p + 1),
+                  dsv41_coherent_load(p + 2), dsv41_coherent_load(p + 3));
+}
+static inline void dsv41_coherent_store(device float *p, float v) {
+    atomic_store_explicit((device atomic_uint *)p, as_type<uint>(v), memory_order_relaxed);
+}
+static inline void dsv41_coherent_store4(device float *p, float4 v) {
+    dsv41_coherent_store(p, v.x); dsv41_coherent_store(p + 1, v.y);
+    dsv41_coherent_store(p + 2, v.z); dsv41_coherent_store(p + 3, v.w);
+}
+
+template<short NR0 = 2, bool COHERENT = false>
+static inline void dsv4_hc_rms_norm_mix_body(
         constant ds4_metal_args_hc_norm_mix & args,
         device const char  * x,
         device const char  * weight,
         device       char  * dst,
-        threadgroup  char  * shmem [[threadgroup(0)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char  * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     constexpr short NSG = 8;   // ds4_gpu_make_plain_mv_dispatch(16384)
     constexpr short NW  = N_SIMDWIDTH;
-    constexpr short NR0 = 2;   // plain mv nr0
     constexpr short NB  = 32;
     constexpr short NF  = 16;
     constexpr short NF4 = NF/4;
@@ -1214,8 +1232,207 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16(
 
     // n == 16384 makes the scalar tail loop of the original empty.
     device float * dst_f32 = (device float *) dst;
+    if (COHERENT) {
+        /* the same reduction, the outputs stored for another threadgroup to read */
+        threadgroup float * shmem_f32[NR0];
+        for (short row = 0; row < NR0; ++row) {
+            shmem_f32[row] = (threadgroup float *) mv_shmem + NW*row;
+            if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;
+            sumf_mv[row] = simd_sum(sumf_mv[row]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short row = 0; row < NR0; ++row) {
+            if (tiisg == 0) shmem_f32[row][sgitg] = sumf_mv[row];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short row = 0; row < NR0 && r0 + row < args.out_dim; ++row) {
+            const float tot = simd_sum(shmem_f32[row][tiisg]);
+            if (tiisg == 0 && sgitg == 0) dsv41_coherent_store(dst_f32 + r0 + row, tot);
+        }
+        return;
+    }
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf_mv, r0, args.out_dim,
                                     tiisg, sgitg, (threadgroup char *)mv_shmem);
+}
+
+kernel void kernel_dsv4_hc_rms_norm_mix_f16(
+        constant ds4_metal_args_hc_norm_mix & args,
+        device const char  * x,
+        device const char  * weight,
+        device       char  * dst,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    dsv4_hc_rms_norm_mix_body(args, x, weight, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+/* DeepSeek V4.1: one block's whole HC input. The leading threadgroups
+ * produce the mix rows as above while four more take the weighted sum with
+ * the previous block's pre weights (kernel_dsv41_hc_split_sum_norm's
+ * arithmetic, one virtual 256-thread slice of its 1024-thread reduction
+ * each); everyone counts itself in and the last arrival runs the split and
+ * the norm. */
+template<short NR0>
+static inline void dsv41_hc_block_input_body(
+        constant ds4_metal_args_hc_norm_mix & args,
+        constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args,
+        device const char  * x,
+        device const char  * weight,
+        device       char  * mix,
+        device const float * hc_scale,
+        device const float * hc_base,
+        device       char  * split,
+        device       char  * collapse_dst,
+        device const char  * norm_weight,
+        device       char  * norm_dst,
+        device const float * pre_w,
+        device atomic_uint * completion,
+        threadgroup  char  * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr short NSG = 8;
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short VSLICES = 1024 / (NSG * NW);
+    const uint groups = ((uint)args.out_dim + NR0 - 1) / NR0;
+    const uint n_embd = uint(split_args.n_embd);
+    const uint n4 = n_embd >> 2;
+    device float * partials = (device float *)((device uint *)completion + 1);
+    device float4 * dst4 = (device float4 *)collapse_dst;
+    if (tgpig.x < groups) {
+        dsv4_hc_rms_norm_mix_body<NR0, true>(args, x, weight, mix, shmem, tgpig, tiisg, sgitg);
+    } else {
+        /* one virtual 256-thread slice of the weighted sum: the per-lane walk
+         * and the partial sums of the single-threadgroup kernel */
+        const uint v = tgpig.x - groups;
+        device const float4 * x0 = (device const float4 *)(x + 0 * split_args.nb_x1);
+        device const float4 * x1 = (device const float4 *)(x + 1 * split_args.nb_x1);
+        device const float4 * x2 = (device const float4 *)(x + 2 * split_args.nb_x1);
+        device const float4 * x3 = (device const float4 *)(x + 3 * split_args.nb_x1);
+        const uint vt = (uint)(sgitg + NSG * v) * NW + tiisg;
+        float sumf = 0.0f;
+        for (uint i = vt; i < n4; i += 1024u) {
+            float4 val = 0.0f;
+            val += x0[i] * pre_w[0];
+            val += x1[i] * pre_w[1];
+            val += x2[i] * pre_w[2];
+            val += x3[i] * pre_w[3];
+            val = ds4_bf16_round(val);
+            dsv41_coherent_store4((device float *)(dst4 + i), val);
+            sumf += dot(val, val);
+        }
+        sumf = simd_sum(sumf);
+        if (tiisg == 0) {
+            dsv41_coherent_store(partials + sgitg + NSG * v, sumf);
+        }
+    }
+
+    threadgroup float * flag = (threadgroup float *)shmem;   /* the mix shmem is dead now */
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (tiisg == 0 && sgitg == 0) {
+        const uint old = atomic_fetch_add_explicit(completion, 1u, memory_order_relaxed);
+        flag[0] = old + 1u == groups + VSLICES ? 1.0f : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (flag[0] == 0.0f) return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    /* the continuation, on the last threadgroup */
+    device const float * mixes = (device const float *)mix;
+    device       float * out = (device float *)split;
+    if (tiisg == 0 && sgitg == 0) {
+        const float epsv = split_args.eps;
+        const float pre_scale = hc_scale[0];
+        const float post_scale = hc_scale[1];
+        const float comb_scale = hc_scale[2];
+        const float4 pre_z = dsv41_coherent_load4(mixes) * pre_scale + *((device const float4 *)hc_base);
+        const float4 pre = ds4_hc_sigmoid(pre_z) + epsv;
+        *((device float4 *)out) = pre;
+        const float4 post_z = dsv41_coherent_load4(mixes + 4) * post_scale + *((device const float4 *)(hc_base + 4));
+        *((device float4 *)(out + 4)) = ds4_hc_twice_sigmoid(post_z);
+        float4 r0 = dsv41_coherent_load4(mixes + 8) * comb_scale + *((device const float4 *)(hc_base + 8));
+        float4 r1 = dsv41_coherent_load4(mixes + 12) * comb_scale + *((device const float4 *)(hc_base + 12));
+        float4 r2 = dsv41_coherent_load4(mixes + 16) * comb_scale + *((device const float4 *)(hc_base + 16));
+        float4 r3 = dsv41_coherent_load4(mixes + 20) * comb_scale + *((device const float4 *)(hc_base + 20));
+        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
+        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
+        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
+        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
+        r0 = exp(r0 - m0);
+        r1 = exp(r1 - m1);
+        r2 = exp(r2 - m2);
+        r3 = exp(r3 - m3);
+        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
+        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
+        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
+        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
+        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+        r0 *= col_inv;
+        r1 *= col_inv;
+        r2 *= col_inv;
+        r3 *= col_inv;
+        for (int iter = 1; iter < split_args.sinkhorn_iters; ++iter) {
+            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
+            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
+            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
+            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
+            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+            r0 *= col_inv;
+            r1 *= col_inv;
+            r2 *= col_inv;
+            r3 *= col_inv;
+        }
+        *((device float4 *)(out + 8)) = r0;
+        *((device float4 *)(out + 12)) = r1;
+        *((device float4 *)(out + 16)) = r2;
+        *((device float4 *)(out + 20)) = r3;
+    }
+    const float total = simd_sum(dsv41_coherent_load(partials + tiisg));
+    const float norm_arg = total / float(n_embd) + split_args.norm_eps;
+    const float norm_scale = 1.0f / sqrt(norm_arg);
+    device const float4 * w4 = (device const float4 *)norm_weight;
+    device float4 * norm4 = (device float4 *)norm_dst;
+    device const float * dst1 = (device const float *)collapse_dst;
+    for (uint i = (uint)sgitg * NW + tiisg; i < n4; i += NSG * NW) {
+        norm4[i] = ds4_bf16_round((dsv41_coherent_load4(dst1 + 4u * i) * norm_scale) * w4[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0 && sgitg == 0) {
+        atomic_store_explicit(completion, 0u, memory_order_relaxed);
+    }
+}
+
+kernel void kernel_dsv41_hc_block_input(
+        constant ds4_metal_args_hc_norm_mix & args,
+        constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args,
+        device const char  * x,
+        device const char  * weight,
+        device       char  * mix,
+        device const float * hc_scale,
+        device const float * hc_base,
+        device       char  * split,
+        device       char  * collapse_dst,
+        device const char  * norm_weight,
+        device       char  * norm_dst,
+        device const float * pre_w,
+        device atomic_uint * completion,
+        constant uint      & pre_stride,
+        threadgroup  char  * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    /* grid row = activation row; each row has its own completion count and partials */
+    const uint row = tgpig.y;
+    const uint mix_hc = (uint)split_args.mix_hc, n_embd = (uint)split_args.n_embd;
+    x += (ulong)row * (ulong)args.n * sizeof(float);
+    mix += (ulong)row * mix_hc * sizeof(float);
+    split += (ulong)row * mix_hc * sizeof(float);
+    collapse_dst += (ulong)row * n_embd * sizeof(float);
+    norm_dst += (ulong)row * n_embd * sizeof(float);
+    pre_w += (ulong)row * pre_stride;
+    completion += row * 64u;
+    dsv41_hc_block_input_body<2>(args, split_args, x, weight, mix, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, pre_w, completion, shmem, tgpig, tiisg, sgitg);
 }
 
 // M5 specialization: pack two exact NR0=2 HC-mix producer groups into one
