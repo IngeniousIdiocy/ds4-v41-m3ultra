@@ -41477,11 +41477,45 @@ static bool ds41_tp_balanced_views(ds41_gpu_graph *g) {
     return g->selected_half && g->route_weights_half;
 }
 
+/* TP_GATES: on two Macs the decode partials cross the gate with no extra copy and no extra add. The attention output
+ * and the routed experts write this rank's partial straight into its slab slot (the producing kernel publishes the
+ * gate's flag where it can), and in a decode step the HC expansion that consumes a partial sums both ranks' slots
+ * itself, rounding the sum to bf16 as the separate add did. */
+static bool ds41_tp_slab(const ds41_gpu_graph *g) {
+#ifdef __APPLE__
+    return g->tp_world == 2 && ds41_on(DS4_GPU_V41_TP_GATES);
+#else
+    (void)g;
+    return false;
+#endif
+}
+
+/* the expansion adds the partials: a decode step whose shared expert rides in the routed partial */
+static bool ds41_tp_gate_fused(const ds41_gpu_graph *g) {
+    static int owner_off = -1;
+    if (owner_off < 0) owner_off = getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER") != NULL;
+    return ds41_tp_slab(g) && g->decode_step && !owner_off;
+}
+
+static bool ds41_expand_partials(ds41_gpu_graph *g, ds4_gpu_tensor *out, const ds4_gpu_tensor *base,
+                                 const ds4_gpu_tensor *split, uint32_t il, uint32_t gate) {
+#ifdef __APPLE__
+    const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
+    ds4_gpu_tensor *first = g->tp_rank ? g->tp_in[slot] : g->tp_out[slot];
+    ds4_gpu_tensor *second = g->tp_rank ? g->tp_out[slot] : g->tp_in[slot];
+    return ds4_gpu_hc_expand_add_split_bf16_tensor(out, first, second, base, split, DS4_N_EMBD, DS4_N_HC) != 0;
+#else
+    (void)g; (void)out; (void)base; (void)split; (void)il; (void)gate;
+    return false;
+#endif
+}
+
 static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                              uint32_t il, uint32_t gate) {
     if (g->tp_world != 2) return true;
     const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
-    if (!ds4_gpu_tensor_copy(g->tp_out[slot], 0, x, 0, (uint64_t)DS4_N_EMBD * 4u) ||
+    /* TP_GATES: the producer already wrote the partial into the slot */
+    if ((!ds41_tp_slab(g) && !ds4_gpu_tensor_copy(g->tp_out[slot], 0, x, 0, (uint64_t)DS4_N_EMBD * 4u)) ||
         !ds4_gpu_tp_gate_encode(il, gate)) return false;
     ds4_gpu_tensor *first = g->tp_rank ? g->tp_in[slot] : g->tp_out[slot];
     ds4_gpu_tensor *second = g->tp_rank ? g->tp_out[slot] : g->tp_in[slot];
@@ -42148,6 +42182,16 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                 (uint32_t)l->attn_output_b->dim[0], (uint32_t)l->attn_output_b->dim[1], g->low, NULL,
                 g->residual, g->attn_split, DS4_N_HC);
 #endif
+    if (ds41_tp_slab(g)) {   /* TP_GATES: this rank's output partial lands in its gate slot */
+        const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
+        ds4_gpu_tp_flag_fold_request(il, DS4_TP_GATE_ATTN);
+        return ds41_attention_low(g, m, l, rope_il, true) &&
+            metal_graph_matmul_dense_quant_kslice(g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN], m,
+                l->attn_output_b, 8192, (uint64_t)g->tp_rank * groups * 1024u, (uint64_t)groups * 1024u,
+                DS4_N_EMBD, g->low, 0) &&
+            (ds41_tp_gate_fused(g) ? ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0 :
+             ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) && ds41_bf16(g->block, DS4_N_EMBD));
+    }
     return ds41_attention_output(g, m, l, rope_il) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
            (ds41_output_rounds(g, l) || ds41_bf16(g->block, DS4_N_EMBD));
@@ -42244,6 +42288,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
+    if (ds41_tp_slab(g)) routed = g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN];   /* TP_GATES */
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
     if (!ds41_narrow_router_mv(g, m, il) &&
@@ -42372,7 +42417,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     /* The balanced path writes zero on the non-owning rank. Keep the shared
      * expert's BF16 boundary, then include it once in the F32 rank reduction. */
     if (shared_owner && shared_here &&
-        !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)) return false;
+        !(ds41_tp_slab(g) ? ds4_gpu_add_tensor_tp_flag(routed, routed, g->shared, DS4_N_EMBD, il, DS4_TP_GATE_FFN) :
+          ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD))) return false;
     return true;
 }
 
@@ -42380,6 +42426,7 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
+    if (ds41_tp_gate_fused(g)) return ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;   /* TP_GATES */
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
@@ -42464,8 +42511,10 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
-                                      const ds4_layer_weights *l) {
-    return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
+                                      const ds4_layer_weights *l, uint32_t il) {
+    return (ds41_tp_gate_fused(g) ?
+            ds41_expand_partials(g, g->after_attn, g->residual, g->attn_split, il, DS4_TP_GATE_ATTN) :
+            ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split)) &&
         ds41_hc_input(g, m, l, true, g->attn_split);
 }
 
@@ -42473,7 +42522,7 @@ static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
     return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
         (ds41_attention_expands(g, l) ? ds41_hc_input(g, m, l, true, g->attn_split) :
-                                        ds41_graph_after_attention(g, m, l));
+                                        ds41_graph_after_attention(g, m, l, il));
 }
 
 /* PREFILL_FOLDS: rows of a large prefill (more than eight) fold their bf16 rounding and small glue kernels into the
@@ -42987,8 +43036,10 @@ static bool ds41_attention_expand_rows(ds41_prefill_row *b, const ds4_model *m,
 }
 #endif
 
-static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split) &&
+static bool ds41_graph_after_moe(ds41_gpu_graph *g, uint32_t il) {
+    return (ds41_tp_gate_fused(g) ?
+            ds41_expand_partials(g, g->residual, g->after_attn, g->ffn_split, il, DS4_TP_GATE_FFN) :
+            ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split)) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
@@ -43009,7 +43060,7 @@ static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
             (il + 1u < DS4_N_LAYER || ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float)));
     }
 #endif
-    return ds41_moe(g, m, l, il, (uint32_t)token) && ds41_graph_after_moe(g);
+    return ds41_moe(g, m, l, il, (uint32_t)token) && ds41_graph_after_moe(g, il);
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -43029,7 +43080,7 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
         const bool ok = island == 0 ?
             ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l, -1, NULL) :
             island == 2 ? ds41_attention_output(g, m, l, -1) :
-            ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0, true);
+            ds41_graph_after_attention(g, m, l, il) && ds41_moe_partial(g, m, l, il, 0, true);
         if (state != 0) return ok;
         if (!ok) ds4_gpu_decode_graph_abort(&key);
         else if (ds4_gpu_decode_graph_end(&key) == 0) return true;
@@ -43050,7 +43101,7 @@ static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
         ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
         ds41_bf16(g->block, DS4_N_EMBD) &&
         ds41_decode_island(g, m, l, il, 1) &&
-        ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
+        ds41_moe_finish(g, il) && ds41_graph_after_moe(g, il);
 }
 #endif
 
@@ -44117,9 +44168,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_USE_FFN_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_FFN_ROW)
 #undef DS41_USE_FFN_ROW
-                    ok = ds41_graph_after_attention(&row, m, l);
+                    ok = ds41_graph_after_attention(&row, m, l, il);
                     if (ok && !batch_moe) ok = ds41_moe(&row, m, l, il, (uint32_t)tokens[off + t]) &&
-                        ds41_graph_after_moe(&row);
+                        ds41_graph_after_moe(&row, il);
                 }
             }
             if (ok && batch_moe) {
@@ -44134,7 +44185,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     DS41_PREFILL_ROWS(DS41_USE_MOE_ROW)
 #undef DS41_USE_MOE_ROW
                     ok = ds4_gpu_add_tensor(row.block, row.routed, row.shared, DS4_N_EMBD) &&
-                        ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row);
+                        ds41_bf16(row.block, DS4_N_EMBD) && ds41_graph_after_moe(&row, il);
                 }
             }
             DS41_STAGE("hc expand");

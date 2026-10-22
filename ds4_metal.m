@@ -485,6 +485,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_SAMPLER_GPU",
             "DS4_METAL_DISABLE_V41_TP_BALANCED_ROUTE",
             "DS4_METAL_DISABLE_V41_TP_SHARED_SPLIT",
+            "DS4_METAL_DISABLE_V41_TP_GATES",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
