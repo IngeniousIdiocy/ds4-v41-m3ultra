@@ -19,6 +19,7 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     uint64_t nb_w1;
     uint64_t nb0;
     uint64_t nb1;
+    uint64_t round_bf16;
 };
 
 
@@ -81,6 +82,7 @@ struct ds4_metal_args_dsv4_hc_expand {
     uint64_t nb1;
     uint64_t nb2;
     int32_t  has_add;
+    int32_t  round_bf16;
 };
 
 // Numerically stable sigmoid for the standalone split/sinkhorn path. The naive
@@ -643,7 +645,7 @@ kernel void kernel_dsv4_hc_expand(
         acc += comb_v * res_v;
     }
 
-    *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+    *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = args.round_bf16 ? ds4_bf16_round(acc) : acc;
 }
 
 // HC=4 specialization of the post/expand step. One thread computes all four
@@ -688,7 +690,7 @@ kernel void kernel_dsv4_hc_expand4(
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
 
-        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = args.round_bf16 ? ds4_bf16_round(acc) : acc;
     }
 }
 
@@ -1067,7 +1069,7 @@ kernel void kernel_dsv4_hc_weighted_sum(
         acc += xv * wv;
     }
 
-    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = args.round_bf16 ? ds4_bf16_round(acc) : acc;
 }
 
 // The one-row HC=4 output head historically materializes four device-F32

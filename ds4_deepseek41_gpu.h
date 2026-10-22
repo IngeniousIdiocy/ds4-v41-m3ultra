@@ -37,6 +37,32 @@ int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
 int ds4_gpu_dsv41_matmul_f32_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                   uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
                                   const ds4_gpu_tensor *x, uint32_t rows);
+/* Producers that write their outputs already rounded to bf16, the same bits as the producer followed by the
+ * rounding pass. One row each (the norm, the sums and the expand take one token). The Q8 bf16io matvec also rounds
+ * its activation as it loads it. */
+int ds4_gpu_matmul_q8_0_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                    const ds4_gpu_tensor *x);
+int ds4_gpu_matmul_q8_0_bf16io_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                      uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                      ds4_gpu_tensor *x);
+/* 0 when the shape has no rounding kernel; the caller then rounds separately. */
+int ds4_gpu_dsv41_project_f16_bf16(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                   uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
+                                   const ds4_gpu_tensor *x);
+int ds4_gpu_rms_norm_weight_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                                        const void *model_map, uint64_t model_size,
+                                        uint64_t weight_offset, uint32_t n, float eps);
+int ds4_gpu_hc_weighted_sum_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc,
+                                        const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc);
+int ds4_gpu_hc_weighted_sum_split_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual_hc,
+                                              const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc);
+int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+                                        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+                                        uint32_t n_embd, uint32_t n_hc);
+/* The whole head rounded to bf16, then the RoPE. */
+int ds4_gpu_dsv41_rope_bf16(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                            uint32_t rows, uint32_t start, bool compressed, bool inverse);
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Same reductions as the ordinary kernels, with the required BF16 store

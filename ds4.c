@@ -41240,6 +41240,16 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
 
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+#ifdef __APPLE__
+    if (round && ds41_on(DS4_GPU_V41_FUSED_ROUNDING)) {
+        if (weight->type == DS4_TENSOR_Q8_0)
+            return ds4_gpu_matmul_q8_0_bf16_tensor(out, m->map, m->size, weight->abs_offset,
+                                                   weight->dim[0], weight->dim[1], in) != 0;
+        if (weight->type == DS4_TENSOR_F16 &&
+            ds4_gpu_dsv41_project_f16_bf16(out, m->map, m->size, weight->abs_offset,
+                                           (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], in)) return true;
+    }
+#endif
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
@@ -41271,6 +41281,8 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             ok = x && y && ds41_matmul(y, m, weight, x, false);
             ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(y);
         }
+    } else if (count == 1 && round) {
+        return ds41_matmul(out, m, weight, in, true);
     } else {
         ok = metal_graph_matmul_plain_tensor(out, m, weight, width, outputs, in, count);
     }
@@ -41370,6 +41382,10 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
             (uint32_t)weight->dim[0], 1, DS4_RMS_EPS);
+#elif defined(__APPLE__)
+    if (ds41_on(DS4_GPU_V41_FUSED_ROUNDING))
+        return ds4_gpu_rms_norm_weight_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) != 0;
 #endif
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
@@ -41381,6 +41397,10 @@ static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_sum(out, in, weights, DS4_N_EMBD, 1, split ? 24u : 4u);
+#elif defined(__APPLE__)
+    if (ds41_on(DS4_GPU_V41_FUSED_ROUNDING))
+        return (split ? ds4_gpu_hc_weighted_sum_split_bf16_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC) :
+            ds4_gpu_hc_weighted_sum_bf16_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC)) != 0;
 #endif
     return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC) :
         ds4_gpu_hc_weighted_sum_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC)) &&
@@ -41392,6 +41412,9 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_expand(out, block, residual, split, DS4_N_EMBD, 1);
+#elif defined(__APPLE__)
+    if (ds41_on(DS4_GPU_V41_FUSED_ROUNDING))
+        return ds4_gpu_hc_expand_split_bf16_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) != 0;
 #endif
     return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(out, DS4_N_EMBD * DS4_N_HC);
@@ -41425,6 +41448,16 @@ static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width,
                               ds4_layer_compress_ratio(il) != 0, inverse);
 }
 
+/* The attention heads rounded to bf16, then their inverse RoPE. */
+static bool ds41_heads_unrope(ds4_gpu_tensor *x, uint32_t heads, uint32_t il, uint32_t pos) {
+#ifdef __APPLE__
+    if (ds41_on(DS4_GPU_V41_FUSED_ROUNDING))
+        return ds4_gpu_dsv41_rope_bf16(x, DS4_N_HEAD_DIM, heads, 1, pos,
+                                       ds4_layer_compress_ratio(il) != 0, true) != 0;
+#endif
+    return ds41_bf16(x, heads * DS4_N_HEAD_DIM) && ds41_rope(x, heads, DS4_N_HEAD_DIM, il, pos, true);
+}
+
 static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
                         const ds4_layer_weights *l, bool ffn) {
     const ds4_gpu_tensor *residual = ffn ? g->after_attn : g->residual;
@@ -41440,20 +41473,32 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
-                               const ds4_layer_weights *l) {
+                               const ds4_layer_weights *l, bool round) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
     return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
         ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
             l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
-            4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
+            4096, 1024, groups, g->heads) && (!round || ds41_bf16(g->low, groups * DS4_N_LORA_O));
+}
+
+/* At tp 1 with fused rounding, the Q8 attention output projection rounds the low rows to bf16 as it loads them
+ * and its outputs as it stores them. */
+static bool ds41_output_rounds(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
+    return g->tp_world != 2 && l->attn_output_b->type == DS4_TENSOR_Q8_0 && ds41_on(DS4_GPU_V41_FUSED_ROUNDING);
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
-    if (!ds41_attention_low(g, m, l)) return false;
+#ifdef __APPLE__
+    if (ds41_output_rounds(g, l))
+        return ds41_attention_low(g, m, l, false) &&
+            ds4_gpu_matmul_q8_0_bf16io_tensor(g->block, m->map, m->size, l->attn_output_b->abs_offset,
+                l->attn_output_b->dim[0], l->attn_output_b->dim[1], g->low) != 0;
+#endif
+    if (!ds41_attention_low(g, m, l, true)) return false;
     return g->tp_world == 2 ?
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
@@ -41582,12 +41627,21 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
             heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+        !ds41_heads_unrope(g->heads, heads, il, pos)) return false;
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-           ds41_bf16(g->block, DS4_N_EMBD);
+           (ds41_output_rounds(g, l) || ds41_bf16(g->block, DS4_N_EMBD));
+}
+
+/* The shared expert's down projection; with fused rounding the Q8 matvec rounds its input and outputs to bf16. */
+static bool ds41_shared_down(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l) {
+#ifdef __APPLE__
+    if (l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_on(DS4_GPU_V41_FUSED_ROUNDING))
+        return ds4_gpu_matmul_q8_0_bf16io_tensor(g->shared, m->map, m->size, l->ffn_down_shexp->abs_offset,
+            l->ffn_down_shexp->dim[0], l->ffn_down_shexp->dim[1], g->shared_mid) != 0;
+#endif
+    return ds41_bf16(g->shared_mid, DS4_N_FF_EXP) && ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
 }
 
 static bool ds41_shared_balance_enabled(void) {
@@ -41673,8 +41727,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
         !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                               DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
-        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+        !ds41_shared_down(g, m, l))) return false;
     bool routed_ok;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
@@ -42845,7 +42898,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     for (uint32_t t = 0; ok && t < count; t++) {
                         row.heads = g->rows_view[t].heads;
                         row.low = g->rows_view[t].low;
-                        ok = ds41_attention_low(&row, m, l);
+                        ok = ds41_attention_low(&row, m, l, true);
                     }
                     if (ok) ok = ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
                                                    g->batch.low, count, true);

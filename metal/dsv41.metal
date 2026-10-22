@@ -253,6 +253,7 @@ kernel void kernel_dsv41_router_hier(
 struct ds4_metal_args_dsv41_rope {
     uint width, heads, rows, start, inverse, stride;
     float frequencies[32];
+    uint round_all;
 };
 
 kernel void kernel_dsv41_rope(
@@ -263,9 +264,13 @@ kernel void kernel_dsv41_rope(
     const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
     const float c = precise::cos(theta);
     const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
-    const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
-                    args.width - 64u + 2u * lane;
-    const float re = x[i], im = x[i + 1u];
+    const ulong head = ((ulong)group.y * args.heads + group.x) * args.width;
+    if (args.round_all) {
+        for (uint k = lane; k + 64u < args.width; k += 32u) x[head + k] = dsv41_bf16(x[head + k]);
+    }
+    const ulong i = head + args.width - 64u + 2u * lane;
+    float re = x[i], im = x[i + 1u];
+    if (args.round_all) { re = dsv41_bf16(re); im = dsv41_bf16(im); }
     x[i] = dsv41_bf16(re * c - im * s);
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }

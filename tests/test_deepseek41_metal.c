@@ -1341,8 +1341,96 @@ static int check_router_select(void) {
     return 1;
 }
 
+static int same_bits(ds4_gpu_tensor *a, ds4_gpu_tensor *b, uint64_t n) {
+    return !memcmp(ds4_gpu_tensor_contents(a), ds4_gpu_tensor_contents(b), n * sizeof(float));
+}
+
+/* FUSED_ROUNDING: each producer that writes bf16 directly against the producer followed by the rounding pass,
+ * bit for bit; the counts show the rounding kernels ran. */
+static int check_fused_rounding(void) {
+    enum { IN = 4096, Q8_OUT = 1024, F16_OUT = 512, HC = 4, HEADS = 8, HEAD_DIM = 512 };
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    const uint64_t q8_bytes = (uint64_t)Q8_OUT * IN / 32 * sizeof(q8_block), f16_bytes = (uint64_t)F16_OUT * IN * 2;
+    const uint64_t bytes = q8_bytes + f16_bytes + IN * sizeof(float);
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), bytes) == 0);
+    q8_block *q8 = model;
+    for (uint64_t i = 0; i < q8_bytes / sizeof(q8_block); i++) {
+        q8[i].d = (uint16_t)(0x2000u | (seed & 0x3ffu));
+        for (int j = 0; j < 32; j++) q8[i].qs[j] = (int8_t)(random_value() * 32);
+    }
+    uint16_t *f16 = (uint16_t *)((char *)model + q8_bytes);
+    for (uint64_t i = 0; i < (uint64_t)F16_OUT * IN; i++) f16[i] = (uint16_t)(0x2c00u + (seed % 0x1000u) + (random_value() < 0 ? 0x8000u : 0));
+    float *norm_w = (float *)((char *)model + q8_bytes + f16_bytes);
+    for (int i = 0; i < IN; i++) norm_w[i] = random_value();
+    CHECK(ds4_gpu_set_model_map(model, bytes));
+    float x[HC * IN], split[24];
+    for (int i = 0; i < HC * IN; i++) x[i] = random_value();
+    for (int i = 0; i < 24; i++) split[i] = random_value() / 4;
+    ds4_gpu_tensor *in = upload(x, sizeof(x)), *in2 = upload(x, sizeof(x)), *w = upload(split, sizeof(split));
+    ds4_gpu_tensor *a = upload(NULL, sizeof(x)), *b = upload(NULL, sizeof(x));
+    CHECK(in && in2 && w && a && b);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t q8r = ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_bf16");
+    const uint64_t q8io = ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_bf16io");
+    const uint64_t f16r = ds4_gpu_test_kernel_runs("kernel_mul_mv_f16_f32_4_bf16");
+    /* Q8 matvec, outputs rounded */
+    CHECK(ds4_gpu_matmul_q8_0_tensor(a, model, bytes, 0, IN, Q8_OUT, in, 1) &&
+          ds4_gpu_dsv41_quantize(a, Q8_OUT, 1, DS4_V41_BF16) &&
+          ds4_gpu_matmul_q8_0_bf16_tensor(b, model, bytes, 0, IN, Q8_OUT, in));
+    CHECK(same_bits(a, b, Q8_OUT));
+    /* Q8 matvec, activation and outputs rounded; the activation itself stays as it was */
+    CHECK(ds4_gpu_matmul_q8_0_bf16io_tensor(b, model, bytes, 0, IN, Q8_OUT, in2) && same_bits(in, in2, IN));
+    CHECK(ds4_gpu_dsv41_quantize(in2, IN, 1, DS4_V41_BF16) &&
+          ds4_gpu_matmul_q8_0_tensor(a, model, bytes, 0, IN, Q8_OUT, in2, 1) &&
+          ds4_gpu_dsv41_quantize(a, Q8_OUT, 1, DS4_V41_BF16));
+    CHECK(same_bits(a, b, Q8_OUT));
+    CHECK(ds4_gpu_tensor_write(in2, 0, x, sizeof(x)));
+    /* F16 matvec */
+    CHECK(ds4_gpu_matmul_f16_tensor(a, model, bytes, q8_bytes, IN, F16_OUT, in, 1) &&
+          ds4_gpu_dsv41_quantize(a, F16_OUT, 1, DS4_V41_BF16) &&
+          ds4_gpu_dsv41_project_f16_bf16(b, model, bytes, q8_bytes, IN, F16_OUT, in));
+    CHECK(same_bits(a, b, F16_OUT));
+    CHECK(ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_bf16") == q8r + 1 &&
+          ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_bf16io") == q8io + 1 &&
+          ds4_gpu_test_kernel_runs("kernel_mul_mv_f16_f32_4_bf16") == f16r + 1);
+    /* RMS norm with its weight */
+    CHECK(ds4_gpu_rms_norm_weight_tensor(a, in, model, bytes, q8_bytes + f16_bytes, IN, 1e-6f) &&
+          ds4_gpu_dsv41_quantize(a, IN, 1, DS4_V41_BF16) &&
+          ds4_gpu_rms_norm_weight_bf16_tensor(b, in, model, bytes, q8_bytes + f16_bytes, IN, 1e-6f));
+    CHECK(same_bits(a, b, IN));
+    /* HC weighted sums: 4 pre weights, and the pre weights inside a 24-wide split row */
+    ds4_gpu_tensor *a1 = ds4_gpu_tensor_view(a, 0, IN * sizeof(float)), *b1 = ds4_gpu_tensor_view(b, 0, IN * sizeof(float));
+    CHECK(a1 && b1);
+    CHECK(ds4_gpu_hc_weighted_sum_tensor(a1, in, w, IN, HC) && ds4_gpu_dsv41_quantize(a1, IN, 1, DS4_V41_BF16) &&
+          ds4_gpu_hc_weighted_sum_bf16_tensor(b1, in, w, IN, HC));
+    CHECK(same_bits(a1, b1, IN));
+    CHECK(ds4_gpu_hc_weighted_sum_split_tensor(a1, in, w, IN, HC) && ds4_gpu_dsv41_quantize(a1, IN, 1, DS4_V41_BF16) &&
+          ds4_gpu_hc_weighted_sum_split_bf16_tensor(b1, in, w, IN, HC));
+    CHECK(same_bits(a1, b1, IN));
+    /* HC expand of a block into the four streams */
+    CHECK(ds4_gpu_hc_expand_split_tensor(a, in2, in, w, IN, HC) && ds4_gpu_dsv41_quantize(a, IN * HC, 1, DS4_V41_BF16) &&
+          ds4_gpu_hc_expand_split_bf16_tensor(b, in2, in, w, IN, HC));
+    CHECK(same_bits(a, b, HC * IN));
+    /* the attention heads' bf16 rounding and inverse RoPE, both RoPE kinds */
+    for (int compressed = 0; compressed < 2; compressed++) {
+        CHECK(ds4_gpu_tensor_write(a, 0, x, sizeof(x)) && ds4_gpu_tensor_write(b, 0, x, sizeof(x)));
+        CHECK(ds4_gpu_dsv41_quantize(a, HEADS * HEAD_DIM, 1, DS4_V41_BF16) &&
+              ds4_gpu_dsv41_rope(a, HEAD_DIM, HEADS, 1, 4321, compressed, true) &&
+              ds4_gpu_dsv41_rope_bf16(b, HEAD_DIM, HEADS, 1, 4321, compressed, true));
+        CHECK(same_bits(a, b, HEADS * HEAD_DIM));
+    }
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor_free(a1); ds4_gpu_tensor_free(b1);
+    ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(in2); ds4_gpu_tensor_free(w);
+    ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b);
+    /* model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 fused bf16 rounding == separate rounding: Q8, Q8 in/out, F16, norm, HC sums, expand, RoPE\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
-    return check_compute_copy() && check_router_select();
+    return check_compute_copy() && check_router_select() && check_fused_rounding();
 }
 #else
 static int check_v41_groups(void) { return 1; }
