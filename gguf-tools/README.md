@@ -226,7 +226,7 @@ Omit `--dry-run` to write the file. Add `--resume` after an interrupted conversi
 Use `libds4quants.so` on Linux. Gate/up experts use IQ2_XXS and down experts use
 Q2_K; attention, shared experts and the output head use Q8_0. Engram rows retain
 their original FP8 values and scales, packed together at the end of the GGUF for
-disk lookups. Vision and DSpark weights are not included.
+disk lookups. Vision weights are not included; DSpark weights only with `--dspark-out`.
 
 The first conversion uses weight-energy importance for IQ2_XXS. After runtime
 calibration, add `--imatrix FILE` and choose a new output filename to regenerate
@@ -235,6 +235,24 @@ from the original safetensors. Do not requantize the first GGUF.
 For Q4, add `--quant q4` and use `DeepSeek-V4.1-Flash-Q4.gguf` as the output.
 This changes only the routed experts to Q4_K; the other tensor formats and
 disk-only Engram layout stay the same. The same imatrix works for both recipes.
+
+For MXFP4, add `--quant mxfp4`. The routed experts keep the checkpoint's own
+MXFP4 values, repacked into GGUF blocks without calibration, so no imatrix is
+used. `--dspark-out FILE` also writes the checkpoint's DSpark stages to their
+own GGUF, with Q8_0 dense weights and MXFP4 experts, for `--dspark`. Omit
+`--out` to write only that file; it then opens only the shards that hold
+`mtp.*` tensors. For the October 17 checkpoint:
+
+```sh
+python3 gguf-tools/deepseek41_quantize.py \
+  --hf models/DeepSeek-V4.1-Flash-1017 \
+  --source-revision 1bae0e1088993b9b82de08f59de5be5a34e42170 --quant mxfp4 \
+  --out gguf/DeepSeek-V4.1-Flash-MXFP4.gguf \
+  --dspark-out gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+```
+
+The model is 467 GiB, of which 189 GiB are the disk-only Engram rows; the
+DSpark file is 7.4 GiB.
 
 Check the finished artifact against the pinned source before running it:
 

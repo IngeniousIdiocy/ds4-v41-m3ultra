@@ -21,14 +21,15 @@ import time
 from deepseek41_metadata import GGUF_ALIGNMENT, metadata
 from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
-    QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, align,
-    conversion_signature, kv_string, load_resume_state, print_plan,
+    QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, QTYPE_MXFP4, align,
+    conversion_signature, kv_string, kv_u32, kv_u32_array, load_resume_state, print_plan,
     qtype_nbytes, save_resume_state, tensor_header,
 )
 
 QUANTIZATION = {
     "q2": "IQ2_XXS gate/up; Q2_K down; Q8_0 attention/shared/head",
     "q4": "Q4_K gate/up/down; Q8_0 attention/shared/head",
+    "mxfp4": "released MXFP4 gate/up/down; Q8_0 attention/shared/head",
 }
 
 
@@ -56,9 +57,14 @@ def validate_scales(tensors):
             raise ValueError(f"{name}: expected E8M0 scales {expected}")
 
 
-def build_plan(db, config, quant="q2"):
+def build_plan(db, config, quant="q2", dspark="none", trunk=True):
+    """The main plan, and separately the DSpark stages when dspark is "separate".
+
+    With trunk=False only the mtp.* source tensors are needed (drafter-only runs)."""
     if quant not in QUANTIZATION:
         raise ValueError(f"unknown quantization recipe: {quant}")
+    if dspark not in ("separate", "none"):
+        raise ValueError(f"unknown DSpark layout: {dspark}")
     c = config["text_config"]
     if config["quantization_config"]["weight_block_size"] != [32, 32]:
         raise ValueError("expected native 32x32 FP8 blocks")
@@ -82,11 +88,11 @@ def build_plan(db, config, quant="q2"):
         claim(source, shape)
         plan.append(TensorPlan(name, tuple(reversed(shape)), qtype, role, source=source))
 
-    regular("token_embd.weight", "embed.weight", (vocab, dim), QTYPE_F16, "embedding")
-    regular("output_norm.weight", "norm.weight", (dim,), QTYPE_F32, "norm")
-    regular("output.weight", "head.weight", (vocab, dim), QTYPE_Q8_0, "output")
-    for layer in range(c["num_hidden_layers"]):
-        src, dst = f"layers.{layer}", f"blk.{layer}"
+    def expert_qtype(qt):
+        return QTYPE_MXFP4 if quant == "mxfp4" else QTYPE_Q4_K if quant == "q4" else qt
+
+    def block(src, dst, n_exp, layer, middle=None):
+        """One transformer block: HC, attention, `middle` (compressor and indexer), MoE."""
         for site in ("attn", "ffn"):
             for part, shape, qt in (("fn", (hc * (hc + 2), hc * dim), QTYPE_F16),
                                     ("base", (hc * (hc + 2),), QTYPE_F32),
@@ -104,37 +110,49 @@ def build_plan(db, config, quant="q2"):
             ("attn_output_b.weight", "wo_b.weight", (dim, groups * orank), QTYPE_Q8_0),
         ):
             regular(f"{dst}.{target}", f"{src}.attn.{source}", shape, qt, "attention")
-        if layer in c["kv_source_layer_ids"]:
-            for target, source, shape, qt in (
-                ("attn_compressor_kv.weight", "compressor.wkv.weight", (hd, dim), QTYPE_F16),
-                ("attn_compressor_norm.weight", "compressor.norm.weight", (hd,), QTYPE_F32),
-                ("indexer.attn_k.weight", "indexer.wk.weight", (idim, hd), QTYPE_F16),
-                ("indexer.k_norm.weight", "indexer.k_norm.weight", (idim,), QTYPE_F32),
-            ):
-                regular(f"{dst}.{target}", f"{src}.attn.{source}", shape, qt, "compressor")
-            if c["compress_ratios"][layer] > 1:
-                regular(f"{dst}.attn_compressor_gate.weight", f"{src}.attn.compressor.wgate.weight",
-                        (hd, dim), QTYPE_F16, "compressor")
-        if layer in c["index_source_layer_ids"]:
-            regular(f"{dst}.indexer.attn_q_b.weight", f"{src}.attn.indexer.wq_b.weight",
-                    (ih * idim, qrank), QTYPE_F16, "indexer")
-            regular(f"{dst}.indexer.proj.weight", f"{src}.attn.indexer.weights_proj.weight",
-                    (ih, dim), QTYPE_F16, "indexer")
-        regular(f"{dst}.ffn_gate_inp.weight", f"{src}.ffn.gate.weight", (experts, dim), QTYPE_F32, "router")
+        if middle:
+            middle()
+        regular(f"{dst}.ffn_gate_inp.weight", f"{src}.ffn.gate.weight", (n_exp, dim), QTYPE_F32, "router")
         for suffix, target in (("bias", "exp_probs_b.bias"), ("bias_vl", "exp_probs_b_vl.bias")):
-            regular(f"{dst}.{target}", f"{src}.ffn.gate.{suffix}", (experts,), QTYPE_F32, "router")
+            regular(f"{dst}.{target}", f"{src}.ffn.gate.{suffix}", (n_exp,), QTYPE_F32, "router")
         for part, source, shape, qt in (("gate", "w1", (inter, dim), QTYPE_IQ2_XXS),
                                        ("up", "w3", (inter, dim), QTYPE_IQ2_XXS),
                                        ("down", "w2", (dim, inter), QTYPE_Q2_K)):
             regular(f"{dst}.ffn_{part}_shexp.weight", f"{src}.ffn.shared_experts.{source}.weight",
                     shape, QTYPE_Q8_0, "shared")
             pattern = f"{src}.ffn.experts.{{expert}}.{source}.weight"
-            for expert in range(experts):
+            for expert in range(n_exp):
                 claim(pattern.format(expert=expert), (shape[0], shape[1] // 2), "I8")
-            plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), experts),
-                                   QTYPE_Q4_K if quant == "q4" else qt,
-                                   "experts", source=pattern, expert_layer=layer,
-                                   expert_part=part, expert_count=experts))
+            plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), n_exp),
+                                   expert_qtype(qt), "experts", source=pattern, expert_layer=layer,
+                                   expert_part=part, expert_count=n_exp))
+
+    if trunk:
+        regular("token_embd.weight", "embed.weight", (vocab, dim), QTYPE_F16, "embedding")
+        regular("output_norm.weight", "norm.weight", (dim,), QTYPE_F32, "norm")
+        regular("output.weight", "head.weight", (vocab, dim), QTYPE_Q8_0, "output")
+    for layer in range(c["num_hidden_layers"] if trunk else 0):
+        src, dst = f"layers.{layer}", f"blk.{layer}"
+
+        def middle(src=src, dst=dst, layer=layer):
+            if layer in c["kv_source_layer_ids"]:
+                for target, source, shape, qt in (
+                    ("attn_compressor_kv.weight", "compressor.wkv.weight", (hd, dim), QTYPE_F16),
+                    ("attn_compressor_norm.weight", "compressor.norm.weight", (hd,), QTYPE_F32),
+                    ("indexer.attn_k.weight", "indexer.wk.weight", (idim, hd), QTYPE_F16),
+                    ("indexer.k_norm.weight", "indexer.k_norm.weight", (idim,), QTYPE_F32),
+                ):
+                    regular(f"{dst}.{target}", f"{src}.attn.{source}", shape, qt, "compressor")
+                if c["compress_ratios"][layer] > 1:
+                    regular(f"{dst}.attn_compressor_gate.weight", f"{src}.attn.compressor.wgate.weight",
+                            (hd, dim), QTYPE_F16, "compressor")
+            if layer in c["index_source_layer_ids"]:
+                regular(f"{dst}.indexer.attn_q_b.weight", f"{src}.attn.indexer.wq_b.weight",
+                        (ih * idim, qrank), QTYPE_F16, "indexer")
+                regular(f"{dst}.indexer.proj.weight", f"{src}.attn.indexer.weights_proj.weight",
+                        (ih, dim), QTYPE_F16, "indexer")
+
+        block(src, dst, experts, layer, middle)
         if layer in c["engram_layer_ids"]:
             index = c["engram_layer_ids"].index(layer)
             rows = c["engram_num_embeddings"][index]
@@ -146,15 +164,49 @@ def build_plan(db, config, quant="q2"):
             for part in ("q", "k"):
                 regular(f"{dst}.engram_{part}_norm.weight", f"{engram}.{part}_weight", (hc, dim), QTYPE_F32, "engram")
             regular(f"{dst}.engram_kv.weight", f"{engram}.wkv.weight", ((hc + 1) * dim, 24 * 256), QTYPE_F16, "engram")
-    omitted = {name for name in db.tensors if name.startswith(("mtp.", "vision.", "aligner.", "image_"))}
+    trunk, plan = plan, []
+    stages = c["num_nextn_predict_layers"] if dspark != "none" else 0
+    for stage in range(stages):
+        src, dst, layer = f"mtp.{stage}", f"mtp.{stage}", c["num_hidden_layers"] + stage
+        if stage == 0:
+            regular(f"{dst}.main_proj.weight", f"{src}.main_proj.weight",
+                    (dim, len(c["dspark_target_layer_ids"]) * dim), QTYPE_Q8_0, "dspark")
+            regular(f"{dst}.main_norm.weight", f"{src}.main_norm.weight", (dim,), QTYPE_F32, "dspark")
+        block(src, dst, c["dspark_n_routed_experts"], layer)
+        if stage + 1 == stages:
+            rank = c["dspark_markov_rank"]
+            regular(f"{dst}.norm.weight", f"{src}.norm.weight", (dim,), QTYPE_F32, "dspark")
+            regular(f"{dst}.markov_head.markov_w1.weight", f"{src}.markov_head.embed.weight", (vocab, rank), QTYPE_F16, "dspark")
+            regular(f"{dst}.markov_head.markov_w2.weight", f"{src}.markov_head.head.weight", (vocab, rank), QTYPE_F16, "dspark")
+            regular(f"{dst}.confidence_head.proj.weight", f"{src}.confidence_head.proj.weight",
+                    (1, dim + rank), QTYPE_F32, "dspark")
+    draft, plan = plan, trunk
+    omitted = {name for name in db.tensors if name.startswith(("vision.", "aligner.", "image_"))}
+    if not stages:
+        omitted |= {name for name in db.tensors if name.startswith("mtp.")}
+    if not trunk:
+        omitted |= {name for name in db.tensors if not name.startswith("mtp.")}
     if consumed | omitted != set(db.tensors):
         raise ValueError(f"unclaimed source tensors: {sorted(set(db.tensors) - consumed - omitted)[:10]}")
-    offset = 0
-    for item in plan + disk:
-        item.offset = offset
-        item.nbytes = qtype_nbytes(item.qtype, item.shape)
-        offset += align(item.nbytes, GGUF_ALIGNMENT)
-    return plan + disk
+    main = plan + disk
+    for items in (main, draft if dspark == "separate" else []):
+        offset = 0
+        for item in items:
+            item.offset = offset
+            item.nbytes = qtype_nbytes(item.qtype, item.shape)
+            offset += align(item.nbytes, GGUF_ALIGNMENT)
+    return main, draft if dspark == "separate" else []
+
+
+def dspark_records(config):
+    """The DSpark metadata the engine reads from either file."""
+    c = config["text_config"]
+    return [kv_u32("dspark.block_size", c["dspark_block_size"]),
+            kv_u32("dspark.markov_rank", c["dspark_markov_rank"]),
+            kv_u32("dspark.noise_token_id", c["dspark_noise_token_id"]),
+            kv_u32_array("dspark.target_layer_ids", c["dspark_target_layer_ids"]),
+            kv_u32("dspark.n_routed_experts", c["dspark_n_routed_experts"]),
+            kv_u32("dspark.num_experts_per_tok", c["dspark_num_experts_per_tok"])]
 
 
 class NativeQuantizer(Quantizer):
@@ -192,6 +244,25 @@ class NativeQuantizer(Quantizer):
             raise ValueError(f"{name}: nonfinite dequantized weight")
         return np.ascontiguousarray(result, dtype=np.float32)
 
+    def to_mxfp4(self, db, name):
+        """Repack released E2M1 pairs into GGUF MXFP4 blocks without touching the values."""
+        np = self.np
+        info = db.info(name)
+        if info["dtype"] != "I8" or info["shape"][1] % 16:
+            raise ValueError(f"{name}: not a packed MXFP4 tensor")
+        rows, blocks = info["shape"][0], info["shape"][1] // 16
+        codes = np.frombuffer(db.read(name), dtype=np.uint8).reshape(rows, blocks, 16)
+        scales = np.frombuffer(db.read(scale_name(name)), dtype=np.uint8).reshape(rows, blocks)
+        if np.any(scales == 255):
+            raise ValueError(f"{name}: nonfinite scale")
+        values = np.empty((rows, blocks, 32), dtype=np.uint8)
+        values[:, :, 0::2] = codes & 15
+        values[:, :, 1::2] = codes >> 4
+        packed = np.empty((rows, blocks, 17), dtype=np.uint8)
+        packed[:, :, 0] = scales
+        packed[:, :, 1:] = values[:, :, :16] | (values[:, :, 16:] << 4)
+        return packed.tobytes()
+
     def encode(self, array, qtype, imatrix=None):
         if qtype == QTYPE_F16 and self.np.any(self.np.abs(array) > 65504):
             raise ValueError("F16 tensor would overflow; preserve this family in BF16/F32")
@@ -215,7 +286,7 @@ def write_engram(fp, item, db, np):
         fp.write(packed.tobytes())
 
 
-def write_gguf(args, plan, records, db):
+def write_gguf(args, plan, records, db, out):
     quantizer = NativeQuantizer(args.quants_library)
     imatrix = Imatrix(args.imatrix, quantizer.np)
     if args.imatrix:
@@ -225,13 +296,13 @@ def write_gguf(args, plan, records, db):
         if any(quantizer.np.any(values < 0) for values in imatrix.entries.values()):
             raise ValueError("negative importance values")
     data_start, data_bytes = print_plan(plan, records, [], GGUF_ALIGNMENT)
-    partial, journal = args.out + ".partial", args.out + ".partial.json"
+    partial, journal = out + ".partial", out + ".partial.json"
     signature = conversion_signature(plan, records, [], args.imatrix)
     # A metadata/recipe match alone cannot distinguish two source downloads.
     source_identity = [(name, db.info(name)) for name in sorted(db.tensors)]
     signature = hashlib.sha256((signature + json.dumps(source_identity, sort_keys=True)).encode()).hexdigest()
-    if os.path.exists(args.out):
-        raise ValueError(f"refusing to overwrite {args.out}")
+    if os.path.exists(out):
+        raise ValueError(f"refusing to overwrite {out}")
     completed = 0
     if os.path.exists(partial) or os.path.exists(journal):
         if not args.resume or not (os.path.exists(partial) and os.path.exists(journal)):
@@ -239,7 +310,7 @@ def write_gguf(args, plan, records, db):
         completed = load_resume_state(journal, signature, plan)
     end = data_start + (plan[completed - 1].offset +
                        align(plan[completed - 1].nbytes, GGUF_ALIGNMENT) if completed else 0)
-    free = shutil.disk_usage(os.path.dirname(os.path.abspath(args.out))).free
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(out))).free
     if free < data_start + data_bytes - end + (32 << 30):
         raise ValueError("insufficient disk space for remaining output plus 32 GiB reserve")
     header = b"GGUF" + struct.pack("<IQQ", 3, len(plan), len(records))
@@ -268,6 +339,8 @@ def write_gguf(args, plan, records, db):
                 write_engram(fp, item, db, quantizer.np)
             elif item.is_expert:
                 def convert(expert):
+                    if item.qtype == QTYPE_MXFP4:
+                        return quantizer.to_mxfp4(db, item.source.format(expert=expert)), False
                     values = quantizer.to_f32(db, item.source.format(expert=expert))
                     importance = imatrix.expert(item.name, expert, item.shape[0], item.expert_count)
                     return quantizer.encode(values, item.qtype, importance), importance is None
@@ -289,16 +362,17 @@ def write_gguf(args, plan, records, db):
             save_resume_state(journal, signature, index + 1)
             print(f"[{index + 1}/{len(plan)}] {item.name}: {item.nbytes / (1 << 30):.3f} GiB, "
                   f"{time.monotonic() - started:.1f}s, uncalibrated_experts={missing}", flush=True)
-    os.rename(partial, args.out)
+    os.rename(partial, out)
     os.unlink(journal)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hf", required=True)
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--out", help="the model GGUF; omit to write only --dspark-out")
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--quant", choices=QUANTIZATION, default="q2")
+    parser.add_argument("--dspark-out", help="write the DSpark stages to this support GGUF")
     parser.add_argument("--imatrix")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
@@ -310,20 +384,33 @@ def main():
         parser.error("source revision must be a full commit hash")
     if not 1 <= args.threads <= 32:
         parser.error("threads must be between 1 and 32")
+    if not args.out and not args.dspark_out:
+        parser.error("--out or --dspark-out is required")
+    dspark = "separate" if args.dspark_out else "none"
     config, records = metadata(args.hf, args.source_revision)
-    db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
+    db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales,
+                  tensor_prefix=None if args.out else "mtp.")
     try:
-        plan = build_plan(db, config, args.quant)
-        records.append(kv_string("deepseek41.quantization", QUANTIZATION[args.quant]))
-        records.append(kv_string("deepseek41.calibration", "imatrix" if args.imatrix else "weight-energy bootstrap"))
+        plan, draft = build_plan(db, config, args.quant, dspark, trunk=bool(args.out))
+        quantization = [kv_string("deepseek41.quantization", QUANTIZATION[args.quant]),
+                        kv_string("deepseek41.calibration", "imatrix" if args.imatrix else "weight-energy bootstrap")]
         if args.imatrix:
-            records.append(kv_string("quantize.imatrix.file", os.path.basename(args.imatrix)))
-        if args.dry_run:
-            print_plan(plan, records, [], GGUF_ALIGNMENT)
-            for item in plan:
-                print(json.dumps(dataclasses.asdict(item), sort_keys=True))
-        else:
-            write_gguf(args, plan, records, db)
+            quantization.append(kv_string("quantize.imatrix.file", os.path.basename(args.imatrix)))
+        records += quantization
+        support = [kv_string("general.architecture", "deepseek41-dspark"),
+                   kv_string("dspark.target_architecture", "deepseek41"),
+                   kv_string("general.name", "DeepSeek V4.1 Flash DSpark"),
+                   kv_string("general.source.revision", args.source_revision),
+                   kv_u32("general.alignment", GGUF_ALIGNMENT)] + dspark_records(config) + quantization
+        outputs = ([(args.out, plan, records)] if args.out else []) + \
+                  ([(args.dspark_out, draft, support)] if args.dspark_out else [])
+        for out, items, kv in outputs:
+            if args.dry_run:
+                print_plan(items, kv, [], GGUF_ALIGNMENT)
+                for item in items:
+                    print(json.dumps(dataclasses.asdict(item), sort_keys=True))
+            else:
+                write_gguf(args, items, kv, db, out)
     finally:
         db.close()
 
