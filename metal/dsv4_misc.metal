@@ -273,6 +273,11 @@ struct ds4_metal_args_glm_indexer_score_one {
     float    scale;
 };
 
+struct ds4_metal_args_dsv41_index_keys_bf16 {
+    uint32_t n_vec;
+    uint32_t check;
+};
+
 struct ds4_metal_args_glm_indexer_scores_batch {
     uint32_t n_rows;
     uint32_t n_tokens;
@@ -2060,6 +2065,142 @@ kernel void kernel_glm_indexer_score_one_wide(
     FOR_UNROLL (uint h = 0; h < 32u; h++) score += max(acc[h] * args.scale, 0.0f) * ws[h];
     scores[row] = score;
 }
+
+/* V4.1 index keys are FP4 values on a power-of-two scale, rounded to bf16 by
+ * every producer, so their upper halves are the keys. Rows [0, rows) of src
+ * become bf16 rows of dst; with check set, any nonzero lower half raises *flag
+ * (a restored cache from elsewhere). */
+kernel void kernel_dsv41_index_keys_bf16(
+        constant ds4_metal_args_dsv41_index_keys_bf16 & args,
+        device const uint4 *src,
+        device ushort4 *dst,
+        device atomic_uint *flag,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_vec) return;
+    const uint4 b = src[gid];
+    dst[gid] = ushort4(b >> 16);
+    if (args.check != 0u && any((b & 0xffffu) != 0u))
+        atomic_fetch_or_explicit(flag, 1u, memory_order_relaxed);
+}
+
+/* The wide scorer over the bf16 key view: two keys per thread and sixteen
+ * heads per pass, so each threadgroup query load feeds two keys while the
+ * accumulators stay in registers. Every dot and every sum is the wide
+ * kernel's expression in the wide kernel's order (heads 0..31), so the
+ * scores are its bits. */
+kernel void kernel_dsv41_indexer_score_bf16(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *qf,
+        device const float *weights,
+        device const ushort4 *keys,
+        device float *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        uint3 ntg_u [[threads_per_threadgroup]]) {
+    const uint ntg = ntg_u.x;
+    threadgroup float *qs = shared;           /* [32][128] */
+    threadgroup float *ws = shared + 4096u;   /* [32] */
+    for (uint i = tid; i < 4096u; i += ntg) qs[i] = qf[i];
+    if (tid < 32u) ws[tid] = weights[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    const uint first = tgpig.x * ntg * 2u + tid;
+    /* the tail's second key rereads the last row and is not written */
+    const uint row[2] = {min(first, args.n_rows - 1u), min(first + ntg, args.n_rows - 1u)};
+    float score[2] = {0.0f, 0.0f};
+    for (uint g = 0; g < 32u; g += 16u) {
+        float acc[2][16];
+        FOR_UNROLL (uint r = 0; r < 2u; r++) FOR_UNROLL (uint h = 0; h < 16u; h++) acc[r][h] = 0.0f;
+        for (uint d0 = 0; d0 < 128u; d0 += 16u) {
+            float4 k[2][4];
+            FOR_UNROLL (uint r = 0; r < 2u; r++) {
+                device const ushort4 *kb = keys + (((uint64_t)row[r] * 128u + d0) >> 2);
+                FOR_UNROLL (uint i = 0; i < 4u; i++) k[r][i] = as_type<float4>(uint4(kb[i]) << 16);
+            }
+            FOR_UNROLL (uint h = 0; h < 16u; h++) {
+                threadgroup const float4 *q4 = (threadgroup const float4 *)(qs + (g + h) * 128u + d0);
+                FOR_UNROLL (uint r = 0; r < 2u; r++)
+                    acc[r][h] += dot(q4[0], k[r][0]) + dot(q4[1], k[r][1]) + dot(q4[2], k[r][2]) + dot(q4[3], k[r][3]);
+            }
+        }
+        FOR_UNROLL (uint r = 0; r < 2u; r++) FOR_UNROLL (uint h = 0; h < 16u; h++)
+            score[r] += max(acc[r][h] * args.scale, 0.0f) * ws[g + h];
+    }
+    if (first < args.n_rows) scores[first] = score[0];
+    if (first + ntg < args.n_rows) scores[first + ntg] = score[1];
+}
+
+/* The wide scorer with S lanes per key (32 / S heads each) and two keys per
+ * lane, over the bf16 key view (B) or the f32 keys; with LIST, key i is
+ * position i % 8 of block list[i / 8], else key i is row i. Each head's
+ * dot is the wide kernel's expression; the head sum runs 0..31 in order, each
+ * lane handing its partial sum to the next, so the scores are the one-lane
+ * kernels' bits. A threadgroup of T threads scores 2T / S keys. */
+template <bool B, bool LIST, uint S>
+kernel void kernel_dsv41_indexer_score_candidates_split(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const float *qf,
+        device const float *weights,
+        device const void *keys,
+        device float *scores,
+        device const uint *list,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        uint3 ntg_u [[threads_per_threadgroup]]) {
+    const uint ntg = ntg_u.x;
+    threadgroup float *qs = shared;           /* [32][128] */
+    threadgroup float *ws = shared + 4096u;   /* [32] */
+    for (uint i = tid; i < 4096u; i += ntg) qs[i] = qf[i];
+    if (tid < 32u) ws[tid] = weights[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    constexpr uint HS = 32u / S;
+    const uint part = tid % S, lanes = ntg / S;
+    uint slot[2], row[2];
+    FOR_UNROLL (uint r = 0; r < 2u; r++) {
+        slot[r] = tgpig.x * lanes * 2u + r * lanes + tid / S;
+        const uint s = min(slot[r], args.n_rows - 1u);
+        row[r] = LIST ? list[s >> 3] * 8u + (s & 7u) : s;
+    }
+    float acc[2][HS];
+    FOR_UNROLL (uint r = 0; r < 2u; r++) FOR_UNROLL (uint i = 0; i < HS; i++) acc[r][i] = 0.0f;
+    for (uint d0 = 0; d0 < 128u; d0 += 16u) {
+        float4 k[2][4];
+        FOR_UNROLL (uint r = 0; r < 2u; r++) {
+            if (B) {
+                device const ushort4 *kb = (device const ushort4 *)keys + (((uint64_t)row[r] * 128u + d0) >> 2);
+                FOR_UNROLL (uint i = 0; i < 4u; i++) k[r][i] = as_type<float4>(uint4(kb[i]) << 16);
+            } else {
+                device const float4 *kf = (device const float4 *)keys + (((uint64_t)row[r] * 128u + d0) >> 2);
+                FOR_UNROLL (uint i = 0; i < 4u; i++) k[r][i] = kf[i];
+            }
+        }
+        FOR_UNROLL (uint i = 0; i < HS; i++) {
+            threadgroup const float4 *q4 = (threadgroup const float4 *)(qs + (part * HS + i) * 128u + d0);
+            FOR_UNROLL (uint r = 0; r < 2u; r++)
+                acc[r][i] += dot(q4[0], k[r][0]) + dot(q4[1], k[r][1]) + dot(q4[2], k[r][2]) + dot(q4[3], k[r][3]);
+        }
+    }
+    FOR_UNROLL (uint r = 0; r < 2u; r++) {
+        float score = 0.0f;
+        FOR_UNROLL (uint p = 0; p < S; p++) {
+            if (p) score = simd_shuffle_up(score, (ushort)1);
+            if (part == p) {
+                FOR_UNROLL (uint i = 0; i < HS; i++) score += max(acc[r][i] * args.scale, 0.0f) * ws[p * HS + i];
+            }
+        }
+        if (part == S - 1u && slot[r] < args.n_rows) scores[slot[r]] = score;
+    }
+}
+#define DSV41_CAND_SPLIT(NAME, B, LIST, S) template [[host_name(NAME)]] \
+    kernel void kernel_dsv41_indexer_score_candidates_split<B, LIST, S>( \
+    constant ds4_metal_args_glm_indexer_score_one &, device const float *, device const float *, device const void *, \
+    device float *, device const uint *, threadgroup float *, uint3, ushort, uint3);
+DSV41_CAND_SPLIT("kernel_dsv41_indexer_score_rows_split2_bf16", true, false, 2)
+DSV41_CAND_SPLIT("kernel_dsv41_indexer_score_rows_split4_bf16", true, false, 4)
 
 /* Keep the wide scorer arithmetic unchanged; skip blocks already excluded by
  * layer 20. The per-thread exit must follow the shared-query barrier. */

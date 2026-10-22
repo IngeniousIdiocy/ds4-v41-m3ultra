@@ -60,6 +60,7 @@ typedef struct {
 #define DS4_GPU_V41_SHARED_EXPERT (1ull << 12)   /* the shared expert's gate, up and SwiGLU in one dispatch */
 #define DS4_GPU_V41_CONCURRENT_FFN (1ull << 13)   /* the shared expert beside the routed experts in one concurrent encoder */
 #define DS4_GPU_V41_INDEX_SCORE_WIDE (1ull << 14)   /* one-token index scores of 8,192 keys or more, one thread per key */
+#define DS4_GPU_V41_INDEX_BF16 (1ull << 15)   /* index scoring reads a bf16 copy of the index keys */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

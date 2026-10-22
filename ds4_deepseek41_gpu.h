@@ -96,6 +96,13 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* INDEX_BF16: index_keys_bf16 writes rows [first, first + rows) of the f32 index keys into their bf16 view (with
+ * flag, a key that is not bf16-exact sets *flag); indexer_score_row scores one token over `rows` keys, from the view
+ * where the wide scorer runs, else from the f32 keys. */
+int ds4_gpu_dsv41_index_keys_bf16(ds4_gpu_tensor *view, const ds4_gpu_tensor *cache, uint32_t first, uint32_t rows,
+                                  ds4_gpu_tensor *flag);
+int ds4_gpu_dsv41_indexer_score_row(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+                                    const ds4_gpu_tensor *cache, const ds4_gpu_tensor *view, uint32_t rows);
 /* INDEX_SCORE_WIDE: one token's index scores over `rows` f32 keys (32 heads of 128, scale 1/64) with the wide
  * scorer, the keys of blocks of 8 that the block mask excludes set to -inf unread. */
 int ds4_gpu_dsv41_indexer_score_masked(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,

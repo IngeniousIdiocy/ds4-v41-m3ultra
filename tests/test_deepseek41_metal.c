@@ -1989,10 +1989,48 @@ static int check_index_score_wide(void) {
     return 1;
 }
 
+/* INDEX_BF16: the bf16 key copy, its restore check (a key that is not bf16-exact sets the flag), and the bf16
+ * scorers against the wide f32 scorer, bit for bit, on each of the three kernel sizes. */
+static int check_index_bf16(void) {
+    enum { MAXR = 66000 };
+    ds4_gpu_tensor *q = upload(NULL, 4096 * 4), *w = upload(NULL, 32 * 4), *keys = upload(NULL, (uint64_t)MAXR * 128 * 4);
+    ds4_gpu_tensor *view = upload(NULL, (uint64_t)MAXR * 128 * 2), *flag = upload(NULL, 4);
+    ds4_gpu_tensor *s[2] = {upload(NULL, MAXR * 4), upload(NULL, MAXR * 4)};
+    CHECK(q && w && keys && view && flag && s[0] && s[1]);
+    float *qv = ds4_gpu_tensor_contents(q), *wv = ds4_gpu_tensor_contents(w), *kv = ds4_gpu_tensor_contents(keys);
+    for (int i = 0; i < 4096; i++) qv[i] = bf16(random_value());
+    for (int i = 0; i < 32; i++) wv[i] = random_value() / 8;
+    for (uint64_t i = 0; i < (uint64_t)MAXR * 128; i++) kv[i] = bf16(random_value());
+    uint32_t *fv = ds4_gpu_tensor_contents(flag);
+    *fv = 0;
+    CHECK(ds4_gpu_dsv41_index_keys_bf16(view, keys, 0, MAXR, flag) && ds4_gpu_synchronize() && *fv == 0);
+    const float exact = kv[5 * 128 + 7];
+    kv[5 * 128 + 7] = 1.0f + 0x1p-12f;   /* not bf16-exact */
+    CHECK(ds4_gpu_dsv41_index_keys_bf16(view, keys, 5, 1, flag) && ds4_gpu_synchronize() && *fv != 0);
+    kv[5 * 128 + 7] = exact;
+    CHECK(ds4_gpu_dsv41_index_keys_bf16(view, keys, 5, 1, NULL));
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const char *names[3] = {"kernel_dsv41_indexer_score_rows_split4_bf16", "kernel_dsv41_indexer_score_rows_split2_bf16",
+                            "kernel_dsv41_indexer_score_bf16"};
+    const uint32_t sizes[3] = {9001, 30001, MAXR};
+    for (int k = 0; k < 3; k++) {
+        const uint64_t runs = ds4_gpu_test_kernel_runs(names[k]);
+        CHECK(ds4_gpu_glm_indexer_score_one_tensor(s[0], q, w, keys, sizes[k], 32, 128, 1.0f / 64.0f, false) &&
+              ds4_gpu_dsv41_indexer_score_row(s[1], q, w, keys, view, sizes[k]));
+        CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs + 1 && same_bits(s[0], s[1], sizes[k]));
+    }
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {q, w, keys, view, flag, s[0], s[1]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    fprintf(stderr, "V4.1 bf16 index keys: copy and restore check, bf16 scorers == wide f32 scorer\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
-        check_shared_expert() && check_concurrent_ffn() && check_index_score_wide();
+        check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
+        check_index_bf16();
 }
 #else
 static int check_v41_groups(void) { return 1; }
