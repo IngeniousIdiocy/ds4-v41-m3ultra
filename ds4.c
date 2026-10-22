@@ -36,6 +36,7 @@
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
+#include <CommonCrypto/CommonDigest.h>   /* the indexer FP8 sidecar's identity (SHA-256) */
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -4711,6 +4712,11 @@ typedef struct {
     ds4_tensor *nextn_hc_head_norm;
     ds4_tensor *nextn_hc_head_down;
     ds4_tensor *nextn_hc_head_up;
+    /* DeepSeek V4.1 decode sidecars (--v41-sidecar): the BF16 router gates, the FP8 Engram KV projections (E4M3 codes
+     * + E8M0 32x32 scales) and the index-source layers' FP8 indexer q_b, as DeepSeek released them */
+    const ds4_tensor *ffn_gate_inp_bf16;
+    const ds4_tensor *engram_kv_fp8, *engram_kv_e8m0;
+    const ds4_tensor *indexer_attn_q_b_fp8, *indexer_attn_q_b_e8m0;
 } ds4_layer_weights;
 
 typedef struct {
@@ -4724,6 +4730,8 @@ typedef struct {
     ds4_tensor *output_hc_down;
     ds4_tensor *output_hc_up;
     ds4_tensor *ple_embd;
+    /* the loaded V4.1 decode sidecars that hold the layers' *_bf16 / *_fp8 tensors (NULL: none) */
+    const struct ds4_model *router_bf16_model, *engram_fp8_model, *indexer_fp8_model;
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 
@@ -41054,8 +41062,9 @@ typedef struct {
     uint32_t rope_tab_pos;
     /* Metal, HC_FUSION: decode_step while ds41_graph_step runs its layers, hc_attn_deferred while the attention
      * block's HC mix waits for the query kernel (hc_ffn_deferred: the FFN block's, for the concurrent FFN encoder),
-     * kv_stored when that kernel stored the layer's KV row */
-    bool decode_step, hc_attn_deferred, hc_ffn_deferred, kv_stored;
+     * kv_stored when that kernel stored the layer's KV row; logits_step while a decode step that returns logits runs
+     * (the FP8 Engram and indexer sidecars serve only those steps) */
+    bool decode_step, logits_step, hc_attn_deferred, hc_ffn_deferred, kv_stored;
     /* SAMPLER_GPU: sel_gpu latched per decode step that encodes the selector; sel_done = this step encoded it and
      * completed with its logits read back; sel_gen = the selector-buffer generation it encoded. */
     bool sel_gpu, sel_done;
@@ -41526,7 +41535,10 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
  * builder, extended to the indexer q_b): the router as BF16 (the F32 tensor's high halves, every low half zero),
  * and the Engram projections and the index-source indexer q_b as E4M3 codes with one E8M0 byte per 32x32 block, every
  * F16 weight re-encoded exactly at its block scale. A family whose tensors do not narrow exactly keeps its wide reads.
- * Model-wide, built once by the first session, freed with the engine. */
+ * A family whose --v41-sidecar is loaded takes the sidecar's bytes instead (DeepSeek's released values, which the
+ * public GGUF stores widened or rounded): the router on every decode step, the Engram and indexer copies only on
+ * steps that return logits, so prefill and prompt steps never read sidecar values. Model-wide, built once by the
+ * first session, freed with the engine. */
 typedef struct {
     ds4_gpu_tensor *codes, *e8m0;   /* [rows][cols] codes; [rows/32][cols/32] bytes, e + 127 */
 } ds41_fp8_copy;
@@ -41536,6 +41548,7 @@ static struct {
     const ds4_model *owner;
     ds4_gpu_tensor *router[DS41_NARROW_LAYERS];
     ds41_fp8_copy engram[2], indexer[DS41_NARROW_LAYERS];
+    bool engram_sidecar, indexer_sidecar;   /* those copies hold sidecar values: logits steps only */
 } g_ds41_narrow;
 
 static void ds41_fp8_copy_free(ds41_fp8_copy *c) {
@@ -41632,6 +41645,29 @@ static bool ds41_fp8_copy_build(const ds4_model *m, const ds4_tensor *t, ds41_fp
 }
 #endif
 
+#if defined(__APPLE__) && defined(__aarch64__) && !defined(DS4_NO_GPU)
+/* A GPU weight buffer holding a sidecar tensor's bytes, or NULL. */
+static ds4_gpu_tensor *ds41_sidecar_copy(const ds4_model *sm, const ds4_tensor *t, uint64_t bytes) {
+    ds4_gpu_tensor *dst = ds4_gpu_tensor_alloc_weights(bytes);
+    void *o = dst ? ds4_gpu_tensor_contents(dst) : NULL;
+    if (!o) { ds4_gpu_tensor_free(dst); return NULL; }
+    memcpy(o, sm->map + t->abs_offset, bytes);
+    return dst;
+}
+
+/* An FP8 copy from a sidecar's codes [rows][cols] and E8M0 scales [rows/32][cols/32]; false keeps nothing. */
+static bool ds41_fp8_copy_sidecar(const ds4_model *sm, const ds4_tensor *codes, const ds4_tensor *e8m0,
+                                  ds41_fp8_copy *out) {
+    memset(out, 0, sizeof(*out));
+    if (!sm || !codes || !e8m0) return false;
+    ds41_fp8_copy c = {ds41_sidecar_copy(sm, codes, codes->dim[0] * codes->dim[1]),
+                       ds41_sidecar_copy(sm, e8m0, e8m0->dim[0] * e8m0->dim[1])};
+    if (!c.codes || !c.e8m0) { ds41_fp8_copy_free(&c); return false; }
+    *out = c;
+    return true;
+}
+#endif
+
 /* Build the copies for model m once (single-host, non-streaming sessions). */
 static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
 #if defined(__APPLE__) && defined(__aarch64__) && !defined(DS4_NO_GPU)
@@ -41641,6 +41677,13 @@ static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *t = w->layer[il].ffn_gate_inp;
         if (!t) continue;
+        if (w->router_bf16_model) {   /* the BF16 router sidecar: every layer was bound at engine open */
+            g_ds41_narrow.router[il] = ds41_sidecar_copy(w->router_bf16_model, w->layer[il].ffn_gate_inp_bf16,
+                                                         t->dim[0] * t->dim[1] * sizeof(uint16_t));
+            if (g_ds41_narrow.router[il]) continue;
+            for (uint32_t j = 0; j < il; j++) { ds4_gpu_tensor_free(g_ds41_narrow.router[j]); g_ds41_narrow.router[j] = NULL; }
+            break;
+        }
         const uint64_t n = t->dim[0] * t->dim[1];
         const uint32_t *src = (const uint32_t *)(m->map + t->abs_offset);
         bool exact = t->type == DS4_TENSOR_F32;
@@ -41657,7 +41700,9 @@ static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
     }
     for (uint32_t i = 0; i < 2u; i++) {
         ds41_fp8_copy *c = &g_ds41_narrow.engram[i];
-        if (!ds41_fp8_copy_build(m, w->layer[i == 0 ? 1 : 14].engram_kv, c)) {
+        const ds4_layer_weights *l = &w->layer[i == 0 ? 1 : 14];
+        if (!(w->engram_fp8_model ? ds41_fp8_copy_sidecar(w->engram_fp8_model, l->engram_kv_fp8, l->engram_kv_e8m0, c) :
+              ds41_fp8_copy_build(m, l->engram_kv, c))) {
             ds41_fp8_copy_free(&g_ds41_narrow.engram[0]);
             ds41_fp8_copy_free(&g_ds41_narrow.engram[1]);
             break;
@@ -41666,11 +41711,16 @@ static void ds41_narrow_build(const ds4_model *m, const ds4_weights *w) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!ds41_index_source(il)) continue;
         ds41_fp8_copy *c = &g_ds41_narrow.indexer[il];
-        if (!ds41_fp8_copy_build(m, w->layer[il].indexer_attn_q_b, c)) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!(w->indexer_fp8_model ?
+              ds41_fp8_copy_sidecar(w->indexer_fp8_model, l->indexer_attn_q_b_fp8, l->indexer_attn_q_b_e8m0, c) :
+              ds41_fp8_copy_build(m, l->indexer_attn_q_b, c))) {
             for (uint32_t j = 0; j < DS41_NARROW_LAYERS; j++) ds41_fp8_copy_free(&g_ds41_narrow.indexer[j]);
             break;
         }
     }
+    g_ds41_narrow.engram_sidecar = w->engram_fp8_model && g_ds41_narrow.engram[0].codes;
+    g_ds41_narrow.indexer_sidecar = w->indexer_fp8_model != NULL;
     ds4_gpu_tensor *all[DS41_NARROW_LAYERS * 3u + 4u];
     uint32_t n_all = 0;
     for (uint32_t il = 0; il < DS41_NARROW_LAYERS; il++) {
@@ -41710,7 +41760,7 @@ static bool ds41_narrow_router_mv(ds41_gpu_graph *g, const ds4_model *m, uint32_
 static bool ds41_narrow_engram_mv(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t table) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const ds41_fp8_copy *c = &g_ds41_narrow.engram[table];
-    return ds41_narrow_on(g, m) && c->codes &&
+    return ds41_narrow_on(g, m) && c->codes && (!g_ds41_narrow.engram_sidecar || g->logits_step) &&
         ds4_gpu_matmul_engram_fp8_weights(g->engram_kv, c->codes, c->e8m0, (uint32_t)l->engram_kv->dim[0],
                                           (uint32_t)l->engram_kv->dim[1], g->engram_rows);
 #else
@@ -41722,7 +41772,7 @@ static bool ds41_narrow_engram_mv(ds41_gpu_graph *g, const ds4_model *m, const d
 static bool ds41_narrow_indexer_mv(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const ds41_fp8_copy *c = il < DS41_NARROW_LAYERS ? &g_ds41_narrow.indexer[il] : NULL;
-    return ds41_narrow_on(g, m) && c && c->codes &&
+    return ds41_narrow_on(g, m) && c && c->codes && (!g_ds41_narrow.indexer_sidecar || g->logits_step) &&
         ds4_gpu_dsv41_project_fp8_bf16_weights(g->index_q, c->codes, c->e8m0, (uint32_t)l->indexer_attn_q_b->dim[0],
                                                (uint32_t)l->indexer_attn_q_b->dim[1], g->qr);
 #else
@@ -43238,15 +43288,16 @@ static void ds41_step_prologue(ds41_gpu_graph *g, bool logits, bool queued_head,
         (check || ds4_gpu_dsv41_rope_coeff_table(g->rope_tab, g->pos)))
         g->rope_tab_pos = g->pos + 1u;
 #else
-    (void)logits; (void)ok; (void)check;
+    (void)ok; (void)check;
 #endif
     g->decode_step = true;
+    g->logits_step = logits;
 }
 
 /* the decode step's host resets after its layers */
 static void ds41_step_tail_reset(ds41_gpu_graph *g) {
     g->rope_tab_pos = 0;   /* the table never outlives its step */
-    g->decode_step = g->hc_attn_deferred = g->hc_ffn_deferred = false;
+    g->decode_step = g->logits_step = g->hc_attn_deferred = g->hc_ffn_deferred = false;
     g->sel_gpu = false;
 }
 
@@ -43263,7 +43314,7 @@ static void ds41_step_tail_reset(ds41_gpu_graph *g) {
  * switch off) drops it. */
 typedef struct {
     uint32_t rope_tab_pos;
-    bool decode_step, hc_attn_deferred, hc_ffn_deferred, kv_stored, shared_done;
+    bool decode_step, logits_step, hc_attn_deferred, hc_ffn_deferred, kv_stored, shared_done;
     bool sel_gpu, sel_done;
     uint64_t sel_gen;
 } ds41_pe_host;
@@ -43275,14 +43326,14 @@ static struct {
 } g_ds41_slot;
 
 static void ds41_pe_save(const ds41_gpu_graph *g, ds41_pe_host *h) {
-    *h = (ds41_pe_host){.rope_tab_pos = g->rope_tab_pos, .decode_step = g->decode_step,
+    *h = (ds41_pe_host){.rope_tab_pos = g->rope_tab_pos, .decode_step = g->decode_step, .logits_step = g->logits_step,
         .hc_attn_deferred = g->hc_attn_deferred, .hc_ffn_deferred = g->hc_ffn_deferred,
         .kv_stored = g->kv_stored, .shared_done = g->shared_done,
         .sel_gpu = g->sel_gpu, .sel_done = g->sel_done, .sel_gen = g->sel_gen};
 }
 
 static void ds41_pe_load(ds41_gpu_graph *g, const ds41_pe_host *h) {
-    g->rope_tab_pos = h->rope_tab_pos; g->decode_step = h->decode_step;
+    g->rope_tab_pos = h->rope_tab_pos; g->decode_step = h->decode_step; g->logits_step = h->logits_step;
     g->hc_attn_deferred = h->hc_attn_deferred; g->hc_ffn_deferred = h->hc_ffn_deferred;
     g->kv_stored = h->kv_stored; g->shared_done = h->shared_done;
     g->sel_gpu = h->sel_gpu; g->sel_done = h->sel_done; g->sel_gen = h->sel_gen;
@@ -43290,7 +43341,8 @@ static void ds41_pe_load(ds41_gpu_graph *g, const ds41_pe_host *h) {
 
 /* the prologue's latches are equal (all: and the layer flags carried between steps) */
 static bool ds41_pe_same(const ds41_pe_host *a, const ds41_pe_host *b, bool all) {
-    return a->rope_tab_pos == b->rope_tab_pos && a->decode_step == b->decode_step && a->sel_gpu == b->sel_gpu &&
+    return a->rope_tab_pos == b->rope_tab_pos && a->decode_step == b->decode_step &&
+        a->logits_step == b->logits_step && a->sel_gpu == b->sel_gpu &&
         (!all || (a->hc_attn_deferred == b->hc_attn_deferred && a->hc_ffn_deferred == b->hc_ffn_deferred &&
                   a->kv_stored == b->kv_stored && a->shared_done == b->shared_done));
 }
@@ -44594,6 +44646,7 @@ struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
+    ds4_model v41_sidecar_model[3];   /* --v41-sidecar: router BF16, Engram FP8, indexer FP8 */
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -73186,6 +73239,246 @@ static void tp_dspark_split_meta(const ds4_engine *e, uint8_t meta[DS4_TP_DSPARK
 }
 #endif
 
+/* DeepSeek V4.1 decode sidecars (--v41-sidecar FILE, one per family). Each is a small GGUF written from the original
+ * DeepSeek safetensors by gguf-tools/deepseek41_{router_bf16,engram_fp8,indexer_fp8}_sidecar.py, where the public
+ * conversion stores a widened or rounded copy: the BF16 router gates (the GGUF has them widened to F32), the E4M3
+ * codes and E8M0 32x32 scales of both Engram KV projections (the GGUF's F16 copy lost values) and of the index-source
+ * layers' indexer q_b. Opened at engine open, bound to the main model's general.source.revision and audited tensor by
+ * tensor; a sidecar that fails a check refuses the engine. The narrow decode copies (NARROW_WEIGHTS) then take the
+ * sidecar's bytes instead of building them from the GGUF; every other path keeps reading the main model. The
+ * environment variables DS4_V41_{ROUTER_BF16,ENGRAM_FP8,INDEXER_FP8}_SIDECAR stay as diagnostics and fill only the
+ * families no option named. */
+bool ds4_v41_sidecar_add(const char *list[DS4_V41_SIDECAR_MAX], const char *path) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    for (int i = 0; i < DS4_V41_SIDECAR_MAX; i++)
+        if (!list[i]) { list[i] = path; return true; }
+    return false;
+#else
+    (void)list;
+    fprintf(stderr, "ds4: --v41-sidecar %s: V4.1 decode sidecars need the Metal build\n", path);
+    return false;
+#endif
+}
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+enum { DS41_SIDECAR_ROUTER, DS41_SIDECAR_ENGRAM, DS41_SIDECAR_INDEXER };
+static const char *const ds41_sidecar_arch[3] = {"deepseek41-router-bf16", "deepseek41-engram-fp8",
+                                                 "deepseek41-indexer-fp8"};
+
+/* The family of a sidecar file by its general.architecture, or -1. */
+static int v41_sidecar_family(const char *path) {
+    ds4_model sm;
+    model_open(&sm, path, false, false);
+    ds4_str arch = {0};
+    int family = -1;
+    if (model_get_string(&sm, "general.architecture", &arch))
+        for (int i = 0; i < 3 && family < 0; i++) if (ds4_streq(arch, ds41_sidecar_arch[i])) family = i;
+    model_close(&sm);
+    return family;
+}
+
+/* Engram FP8: per Engram layer the I8 codes [in_dim, out_dim] and E8M0 scales [in_dim/32, out_dim/32]; every code a
+ * finite E4M3 value (no 0x7f/0xff), every scale byte within 109..119, and exactly these four tensors. */
+static int engram_fp8_sidecar_bind(const ds4_model *sm, ds4_weights *w) {
+    const ds4_tensor *f1 = w->layer[1].engram_kv, *f14 = w->layer[14].engram_kv;
+    if (!f1 || !f14 || f1->dim[0] != f14->dim[0] || f1->dim[1] != f14->dim[1]) return -1;
+    const uint64_t in_dim = f1->dim[0], out_dim = f1->dim[1];
+    uint32_t consumed = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds41_engram_layer(il)) continue;
+        char name[64];
+        snprintf(name, sizeof(name), "blk.%u.engram_kv.fp8", il);
+        const ds4_tensor *c = model_find_tensor(sm, name);
+        snprintf(name, sizeof(name), "blk.%u.engram_kv.e8m0", il);
+        const ds4_tensor *sc = model_find_tensor(sm, name);
+        if (!c || !sc || c->type != DS4_TENSOR_I8 || sc->type != DS4_TENSOR_I8 ||
+            c->ndim != 2 || sc->ndim != 2 || c->dim[0] != in_dim || c->dim[1] != out_dim ||
+            in_dim % 32 || out_dim % 32 || sc->dim[0] != in_dim / 32 || sc->dim[1] != out_dim / 32) {
+            fprintf(stderr, "ds4: FP8 Engram sidecar lacks layer %u codes/scales matching engram_kv\n", il);
+            return -1;
+        }
+        const uint8_t *code = sm->map + c->abs_offset, *scale = sm->map + sc->abs_offset;
+        const uint64_t nc = c->dim[0] * c->dim[1], ns = sc->dim[0] * sc->dim[1];
+        uint64_t nan = 0;
+        uint8_t lo = 255, hi = 0;
+        for (uint64_t i = 0; i < nc; i++) nan += (code[i] & 0x7f) == 0x7f;
+        for (uint64_t i = 0; i < ns; i++) {
+            if (scale[i] < lo) lo = scale[i];
+            if (scale[i] > hi) hi = scale[i];
+        }
+        fprintf(stderr, "ds4: FP8 Engram audit layer %u: %llu codes, %llu NaN; %llu E8M0 scales in %u..%u (allowed 109..119)\n",
+                il, (unsigned long long)nc, (unsigned long long)nan, (unsigned long long)ns, lo, hi);
+        if (nan || lo < 109 || hi > 119) {
+            fprintf(stderr, "ds4: FP8 Engram sidecar is outside the audited domain; refusing it\n");
+            return -1;
+        }
+        w->layer[il].engram_kv_fp8 = c;
+        w->layer[il].engram_kv_e8m0 = sc;
+        consumed += 2;
+    }
+    if (consumed != 4 || sm->n_tensors != consumed) {
+        fprintf(stderr, "ds4: FP8 Engram sidecar holds %llu tensors, %u consumed (expected 4)\n",
+                (unsigned long long)sm->n_tensors, consumed);
+        return -1;
+    }
+    return 0;
+}
+
+/* The screened indexer sidecar (checkpoint 1bae0e10): its size and SHA-256. */
+#define DS4_V41_INDEXER_FP8_BYTES 42090496ull
+static const char ds4_v41_indexer_fp8_sha256[] = "22f2e3a776b649c92d23d8abfc4e75fb906e30a63ecef27f34140cf3ad326f6a";
+
+/* Indexer FP8: per index-source layer the I8 codes indexer.attn_q_b.fp8 [1280, 4096] and E8M0 scales
+ * indexer.attn_q_b.e8m0 [40, 128]; every code a finite E4M3 value, every scale byte in 1..246, exactly 2 x 8 tensors,
+ * and the file's size and SHA-256 those of the screened artifact. */
+static int indexer_fp8_sidecar_bind(const ds4_model *sm, ds4_weights *w) {
+    if (sm->size != DS4_V41_INDEXER_FP8_BYTES) {
+        fprintf(stderr, "ds4: indexer FP8 sidecar is %llu bytes, expected %llu; refusing it\n",
+                (unsigned long long)sm->size, DS4_V41_INDEXER_FP8_BYTES);
+        return -1;
+    }
+    unsigned char md[CC_SHA256_DIGEST_LENGTH];
+    char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    CC_SHA256_CTX sha;
+    CC_SHA256_Init(&sha);
+    for (uint64_t o = 0; o < sm->size; o += 1u << 30) {
+        const uint64_t n = sm->size - o < (1u << 30) ? sm->size - o : (1u << 30);
+        CC_SHA256_Update(&sha, sm->map + o, (CC_LONG)n);
+    }
+    CC_SHA256_Final(md, &sha);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+    if (strcmp(hex, ds4_v41_indexer_fp8_sha256) != 0) {
+        fprintf(stderr, "ds4: indexer FP8 sidecar sha256 %s, expected %s; refusing it\n", hex, ds4_v41_indexer_fp8_sha256);
+        return -1;
+    }
+    static const char *nm[2] = {"indexer.attn_q_b.fp8", "indexer.attn_q_b.e8m0"};
+    static const uint64_t d0[2] = {1280, 1280 / 32}, d1[2] = {4096, 4096 / 32};
+    uint64_t nan = 0, ncodes = 0, low = 0;
+    uint8_t lo = 255, hi = 0;
+    uint32_t consumed = 0, nsrc = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds41_index_source(il)) continue;
+        const ds4_tensor *x[2];
+        for (int k = 0; k < 2; k++) {
+            char name[64];
+            snprintf(name, sizeof(name), "blk.%u.%s", il, nm[k]);
+            x[k] = model_find_tensor(sm, name);
+            if (!x[k] || x[k]->type != DS4_TENSOR_I8 || x[k]->ndim != 2 || x[k]->dim[0] != d0[k] || x[k]->dim[1] != d1[k]) {
+                fprintf(stderr, "ds4: indexer FP8 sidecar lacks %s with shape [%llu, %llu]\n", name,
+                        (unsigned long long)d0[k], (unsigned long long)d1[k]);
+                return -1;
+            }
+            const uint8_t *b = sm->map + x[k]->abs_offset;
+            const uint64_t n = d0[k] * d1[k];
+            if (k == 0) {
+                for (uint64_t i = 0; i < n; i++) nan += (b[i] & 0x7f) == 0x7f;
+                ncodes += n;
+            } else {
+                for (uint64_t i = 0; i < n; i++) {
+                    if (b[i] < lo) lo = b[i];
+                    if (b[i] > hi) hi = b[i];
+                    low += b[i] < 112;
+                }
+            }
+            consumed++;
+        }
+        w->layer[il].indexer_attn_q_b_fp8 = x[0];
+        w->layer[il].indexer_attn_q_b_e8m0 = x[1];
+        nsrc++;
+    }
+    /* below E8M0 112 the GGUF's F16 tensor holds rounded weights, so there the sidecar changes values */
+    fprintf(stderr, "ds4: indexer FP8 audit: %u index-source layers, %llu codes, %llu NaN; E8M0 scales in %u..%u "
+            "(allowed 1..246), %llu blocks below 112\n", nsrc, (unsigned long long)ncodes, (unsigned long long)nan, lo, hi,
+            (unsigned long long)low);
+    if (nan || lo < 1 || hi > 246 || nsrc != 8u) {
+        fprintf(stderr, "ds4: indexer FP8 sidecar is outside the audited domain; refusing it\n");
+        return -1;
+    }
+    if (sm->n_tensors != consumed) {
+        fprintf(stderr, "ds4: indexer FP8 sidecar holds %llu tensors, %u consumed (expected %u)\n",
+                (unsigned long long)sm->n_tensors, consumed, 2u * nsrc);
+        return -1;
+    }
+    return 0;
+}
+
+/* Router BF16: every layer's blk.N.ffn_gate_inp.weight as BF16 [n_embd, n_expert]. */
+static int router_bf16_sidecar_bind(const ds4_model *sm, ds4_weights *w) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        char name[64];
+        snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", il);
+        const ds4_tensor *t = model_find_tensor(sm, name);
+        if (!t || t->type != DS4_TENSOR_BF16 || t->ndim != 2 || t->dim[0] != DS4_N_EMBD || t->dim[1] != DS4_N_EXPERT) {
+            fprintf(stderr, "ds4: BF16 router sidecar lacks a BF16 %u x %u %s\n",
+                    (unsigned)DS4_N_EMBD, (unsigned)DS4_N_EXPERT, name);
+            return -1;
+        }
+        w->layer[il].ffn_gate_inp_bf16 = t;
+    }
+    return 0;
+}
+
+static int engine_load_v41_sidecars(ds4_engine *e, const ds4_engine_options *opt) {
+    static const char *const env_name[3] = {"DS4_V41_ROUTER_BF16_SIDECAR", "DS4_V41_ENGRAM_FP8_SIDECAR",
+                                            "DS4_V41_INDEXER_FP8_SIDECAR"};
+    static const char *const what[3] = {"BF16 router", "FP8 Engram", "indexer FP8"};
+    const char *path[3] = {NULL, NULL, NULL};
+    for (int i = 0; i < DS4_V41_SIDECAR_MAX && opt->v41_sidecar[i]; i++) {
+        const int family = v41_sidecar_family(opt->v41_sidecar[i]);
+        if (family < 0 || path[family]) {
+            fprintf(stderr, "ds4: --v41-sidecar %s is %s\n", opt->v41_sidecar[i],
+                    family < 0 ? "not a DeepSeek V4.1 router/Engram/indexer sidecar" : "a second sidecar of one family");
+            return -1;
+        }
+        path[family] = opt->v41_sidecar[i];
+    }
+    for (int i = 0; i < 3; i++) {
+        const char *v = path[i] ? NULL : getenv(env_name[i]);
+        if (v && v[0]) path[i] = v;
+    }
+    for (int family = 0; family < 3; family++) {
+        if (!path[family]) continue;
+        if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend != DS4_BACKEND_METAL || e->ssd_streaming) {
+            fprintf(stderr, "ds4: the %s sidecar needs resident DeepSeek V4.1 on Metal\n", what[family]);
+            return -1;
+        }
+        ds4_model *sm = &e->v41_sidecar_model[family];
+        model_open(sm, path[family], false, false);
+        ds4_str arch = {0}, rev = {0}, main_rev = {0};
+        if (!model_get_string(sm, "general.architecture", &arch) || !ds4_streq(arch, ds41_sidecar_arch[family]) ||
+            !model_get_string(sm, "general.source.revision", &rev) ||
+            !model_get_string(&e->model, "general.source.revision", &main_rev) ||
+            rev.len != main_rev.len || memcmp(rev.ptr, main_rev.ptr, rev.len) != 0) {
+            fprintf(stderr, "ds4: %s is not a %s sidecar for this checkpoint revision\n", path[family], what[family]);
+            return -1;
+        }
+        const int rc = family == DS41_SIDECAR_ROUTER ? router_bf16_sidecar_bind(sm, &e->weights) :
+                       family == DS41_SIDECAR_ENGRAM ? engram_fp8_sidecar_bind(sm, &e->weights) :
+                                                       indexer_fp8_sidecar_bind(sm, &e->weights);
+        if (rc != 0) return -1;
+        if (family == DS41_SIDECAR_ROUTER) e->weights.router_bf16_model = sm;
+        else if (family == DS41_SIDECAR_ENGRAM) e->weights.engram_fp8_model = sm;
+        else e->weights.indexer_fp8_model = sm;
+        fprintf(stderr, "ds4: %s sidecar loaded (%s)\n", what[family], path[family]);
+    }
+    return 0;
+}
+#else
+static int engine_load_v41_sidecars(ds4_engine *e, const ds4_engine_options *opt) {
+    (void)e; (void)opt;
+    static const char *const env_name[3] = {"DS4_V41_ROUTER_BF16_SIDECAR", "DS4_V41_ENGRAM_FP8_SIDECAR",
+                                            "DS4_V41_INDEXER_FP8_SIDECAR"};
+    for (int i = 0; i < 3; i++) {
+        const char *v = getenv(env_name[i]);
+        if (v && v[0]) {
+            fprintf(stderr, "ds4: %s: V4.1 decode sidecars need the Metal build\n", env_name[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+#endif
+
 static int engine_install_dspark_support_cache(ds4_engine *e);
 static int engine_install_gpu_placement(ds4_engine *e);
 static int ds4_engine_open_internal(ds4_engine **out,
@@ -74554,6 +74847,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        if (engine_load_v41_sidecars(e, opt) != 0) {
+            free(load_offsets);
+            free(load_sizes);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if (!ds4_engine_preload_pro_q4_expert_tables(e,
                                                      load_slice,
                                                      load_layer_start,
@@ -75619,6 +75919,8 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
+    for (int i = 0; i < 3; i++)
+        if (e->v41_sidecar_model[i].map) model_close(&e->v41_sidecar_model[i]);
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU

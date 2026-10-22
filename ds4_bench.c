@@ -37,6 +37,7 @@ extern int cudaProfilerStop(void) __attribute__((weak));
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *v41_sidecar[DS4_V41_SIDECAR_MAX];
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -270,6 +271,11 @@ static bench_config parse_options(int argc, char **argv) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--v41-sidecar")) {
+            if (!ds4_v41_sidecar_add(c.v41_sidecar, need_arg(&i, argc, argv, arg))) {
+                fprintf(stderr, "ds4-bench: --v41-sidecar takes at most %d files\n", DS4_V41_SIDECAR_MAX);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--dspark")) {
             c.dspark = true;
         } else if (!strcmp(arg, "--dspark-confidence")) {
@@ -648,6 +654,7 @@ int main(int argc, char **argv) {
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
+        .v41_sidecar = {cfg.v41_sidecar[0], cfg.v41_sidecar[1], cfg.v41_sidecar[2]},
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,

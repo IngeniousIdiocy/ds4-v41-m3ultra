@@ -128,6 +128,8 @@ typedef struct {
     int debug_hash;             /* cross-check hidden state every N tokens */
 } ds4_tp_options;
 
+#define DS4_V41_SIDECAR_MAX 3
+
 typedef struct {
     const char *model_path;
     const char *mtp_path;
@@ -176,7 +178,13 @@ typedef struct {
     bool load_output;
     ds4_distributed_options distributed;
     ds4_tp_options tp;
+    /* --v41-sidecar FILE (up to one per family): optional DeepSeek V4.1 decode sidecars, told apart by their
+     * general.architecture (router BF16, Engram FP8, indexer FP8). Without them the narrow copies are built at load. */
+    const char *v41_sidecar[DS4_V41_SIDECAR_MAX];
 } ds4_engine_options;
+
+/* Record one --v41-sidecar FILE in list (DS4_V41_SIDECAR_MAX slots); false when the list is full. */
+bool ds4_v41_sidecar_add(const char *list[DS4_V41_SIDECAR_MAX], const char *path);
 
 typedef struct {
     float *data;

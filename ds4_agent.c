@@ -828,6 +828,11 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--v41-sidecar")) {
+            if (!ds4_v41_sidecar_add(c.engine.v41_sidecar, need_arg(&i, argc, argv, arg))) {
+                fprintf(stderr, "ds4-agent: --v41-sidecar takes at most %d files\n", DS4_V41_SIDECAR_MAX);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
