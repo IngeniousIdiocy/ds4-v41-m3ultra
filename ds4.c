@@ -45804,6 +45804,8 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
 
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
     int level = ds4_think_mode_level(mode);
+    /* DeepSeek's encoding.py aliases: low 50, high 75, max 100. */
+    if (mode == DS4_THINK_LOW) level = 50;
     if (mode == DS4_THINK_HIGH) level = 75;
     if (mode == DS4_THINK_MAX) level = 100;
     if (level <= 0) return NULL;
@@ -62538,6 +62540,17 @@ ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
         return DS4_THINK_HIGH;
     }
     return mode;
+}
+
+/* Test entry: ds4_think_mode_for_context under the DeepSeek V4 Flash or V4.1
+ * Flash shape, then the process's shape restored, so a test does not depend
+ * on which model the process loaded before it. */
+ds4_think_mode ds4_test_think_mode_for_context_as(bool deepseek41, ds4_think_mode mode, int ctx_size) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = deepseek41 ? DS4_SHAPE_FLASH41 : DS4_SHAPE_FLASH;
+    const ds4_think_mode r = ds4_think_mode_for_context(mode, ctx_size);
+    g_ds4_shape = saved_shape;
+    return r;
 }
 
 static void ds4_release_instance_lock(void) {
