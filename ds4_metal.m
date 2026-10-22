@@ -464,6 +464,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_SAMPLER_SCAN",
             "DS4_METAL_DISABLE_V41_ROW_MATMULS",
             "DS4_METAL_DISABLE_V41_ROWS_MMA",
+            "DS4_METAL_DISABLE_V41_VERIFY_KERNELS",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -44271,7 +44272,11 @@ int ds4_gpu_routed_moe_batch_tensor(
             n_expert == 6u && expert_in_dim == 5120u && expert_mid_dim == 2304u &&
             out_dim == 5120u &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K) ||
-             (gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K));
+             (gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K) ||
+             /* VERIFY_KERNELS: V4.1's MXFP4 experts too, so a DSpark verify block of 6-8 rows runs every row as
+              * decode does; a prefill or any other batch keeps the batch kernels */
+             (gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4 && g_v41_dspark_rows &&
+              ds4_gpu_v41_on(DS4_GPU_V41_VERIFY_KERNELS)));
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
             (n_tokens <= 5u || v41_decode_batch ||
@@ -44288,6 +44293,8 @@ int ds4_gpu_routed_moe_batch_tensor(
               getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
               getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL));
         id<MTLComputePipelineState> tiny_pair_swiglu_pipeline = nil;
+        if (use_tiny_pair_mv && n_tokens > 5u && gate_type == DS4_METAL_TENSOR_MXFP4)
+            DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_f32");
         const bool use_tp_mxfp4_static_batch = use_tiny_pair_mv &&
             ds4_gpu_device_is_m5_apple_silicon() && g_tp_split_world == 2 &&
             gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4 &&

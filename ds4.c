@@ -43811,7 +43811,7 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
     if (!ok) g->valid = false;
     return ok;
 }
-/* ROWS_MMA takes only DSpark's rows: the drafter's and the verify block's */
+/* ROWS_MMA and VERIFY_KERNELS take only DSpark's rows: the drafter's and the verify block's */
 static void ds41_dspark_rows(bool on) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     ds4_gpu_dsv41_dspark_rows(on);
