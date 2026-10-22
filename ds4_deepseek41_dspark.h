@@ -290,6 +290,8 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
     ds41_prefill_row *b = &d->batch;
     const bool local_experts = target_graph && target_graph->tp_world == 2;
     if (local_experts) ds4_gpu_tp_suspend_expert_sharding(1);
+    /* The seed's newly accepted rows are the drafter's rows too */
+    ds41_dspark_rows(true);
     bool ok = ds4_gpu_begin_commands() && ds41_dspark_seed(d, draft, pos);
     if (!ok) fprintf(stderr, "ds4: V4.1 DSpark seed failed\n");
     const float pre[DS41_DRAFT_ROWS][4] = {{1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}};
@@ -313,6 +315,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
     if (ok) ok = target_graph ?
         ds41_output_projection(target_graph, d->logits, target, tw, b->norm, DS41_DRAFT_ROWS) :
         ds41_matmul_batch(d->logits, target, tw->output, b->norm, DS41_DRAFT_ROWS, false);
+    ds41_dspark_rows(false);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (local_experts) ds4_gpu_tp_suspend_expert_sharding(0);
     if (!ok) d->kv_valid = false;
@@ -417,7 +420,9 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
                     ds4_gpu_tensor_copy(row->verify_previous_score[owner], 0, g->previous_score[owner], 0, kv);
         }
     }
+    ds41_dspark_rows(true);
     if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
+    ds41_dspark_rows(false);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
         ds4_tp_mark_failed(g_tp_block_ctx);

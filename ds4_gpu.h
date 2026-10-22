@@ -67,6 +67,7 @@ typedef struct {
 #define DS4_GPU_V41_FIXED_SHAPES (1ull << 19)   /* decode kernels built for V4.1's exact shapes */
 #define DS4_GPU_V41_SAMPLER_SCAN (1ull << 20)   /* the sampler's first pass over the logits in 16 NEON lanes (any model) */
 #define DS4_GPU_V41_ROW_MATMULS (1ull << 21)   /* Q8_0 and F16 matmuls of 2-8 rows share one weight pass (any model) */
+#define DS4_GPU_V41_ROWS_MMA (1ull << 22)   /* Q8_0 matmuls of a V4.1 DSpark block's 3-8 rows on simdgroup matrices (not bit-exact) */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -108,6 +109,9 @@ int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 uint64_t ds4_gpu_v41_off(void);
+/* V4.1 DSpark: on while the drafter's rows or a verify block are encoded. ROWS_MMA applies only then, so prefills and
+ * other batches of 3-8 rows keep main's kernels. */
+void ds4_gpu_dsv41_dspark_rows(int on);
 /* Model views skip hazard tracking by default (call before the model is mapped). */
 void ds4_gpu_set_model_untracked_default(int on);
 int ds4_gpu_parallel_ffn_finish(void);
