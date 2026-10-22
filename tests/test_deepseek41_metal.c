@@ -3086,6 +3086,76 @@ static int check_tp_prefill_rows8(void) {
     return 1;
 }
 
+/* VERIFY_INDEXED: a verify block's index rows over the bf16 key view against the batch scorer on the f32 keys in a
+ * verify block (the tiled f32 kernel for 2-7 rows, the matrix kernel from 8): the same bits, except -inf in the blocks
+ * a masked row's mask drops (which the candidate filter drops anyway); outside a verify block it declines. */
+static int check_verify_indexed(void) {
+    enum { HEADS = 32, DIM = 128, MAXR = 17 };
+    const uint32_t counts[] = {9, 1031, 17011};
+    const uint32_t max_keys = 17011, mask_width = (max_keys + 7) / 8;
+    ds4_gpu_tensor *qt = upload(NULL, (size_t)MAXR * HEADS * DIM * sizeof(float));
+    ds4_gpu_tensor *wt = upload(NULL, (size_t)MAXR * HEADS * sizeof(float));
+    ds4_gpu_tensor *kt = upload(NULL, (size_t)max_keys * DIM * sizeof(float));
+    ds4_gpu_tensor *vt = upload(NULL, (size_t)max_keys * DIM * sizeof(uint16_t));
+    ds4_gpu_tensor *mt = upload(NULL, (size_t)MAXR * mask_width * sizeof(float));
+    ds4_gpu_tensor *sr = upload(NULL, (size_t)MAXR * max_keys * sizeof(float));
+    ds4_gpu_tensor *sv = upload(NULL, (size_t)MAXR * max_keys * sizeof(float));
+    CHECK(qt && wt && kt && vt && mt && sr && sv);
+    float *q = ds4_gpu_tensor_contents(qt), *w = ds4_gpu_tensor_contents(wt);
+    float *k = ds4_gpu_tensor_contents(kt), *mask = ds4_gpu_tensor_contents(mt);
+    float *ref = ds4_gpu_tensor_contents(sr), *got = ds4_gpu_tensor_contents(sv);
+    uint64_t skipped = 0;
+    ds4_gpu_dsv41_verify_rows(1);
+    for (int dist = 0; dist < 2; dist++) {   /* wide and narrow FP4 block scales */
+        for (size_t i = 0; i < (size_t)MAXR * HEADS * DIM; i++)
+            q[i] = ldexpf(random_value(), dist ? (int)((i / 32 * 7) % 13) - 6 : (int)((i / 32) % 41) - 20);
+        for (size_t i = 0; i < (size_t)MAXR * HEADS; i++) w[i] = bf16(random_value());
+        for (size_t i = 0; i < (size_t)max_keys * DIM; i++)
+            k[i] = ldexpf(random_value(), dist ? (int)((i / 32 * 5 + i / DIM) % 13) - 6 : (int)((i / 32) % 41) - 20);
+        CHECK(ds4_gpu_dsv41_quantize(qt, DIM, MAXR * HEADS, DS4_V41_FP4_E8M0));
+        CHECK(ds4_gpu_dsv41_quantize(kt, DIM, max_keys, DS4_V41_FP4_E8M0));
+        CHECK(ds4_gpu_dsv41_index_keys_bf16(vt, kt, 0, max_keys, NULL));
+        for (size_t i = 0; i < (size_t)MAXR * mask_width; i++)   /* about one block in ten kept */
+            mask[i] = random_value() < -3.2f ? 0.0f : -INFINITY;
+        for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++)
+            for (uint32_t ratio = 1; ratio <= 2; ratio++)
+                for (uint32_t rows = 2; rows <= MAXR && rows <= counts[ci] * ratio; rows++)
+                    for (uint32_t mode = 0; mode < 3; mode++) {   /* no mask, every row masked, the later half */
+                        const uint32_t n = counts[ci], start = n * ratio - rows;
+                        const uint32_t first = mode == 0 ? rows : mode == 1 ? 0 : rows / 2;
+                        ds4_gpu_tensor *qv = ds4_gpu_tensor_view(qt, 0, (uint64_t)rows * HEADS * DIM * 4u);
+                        ds4_gpu_tensor *wv = ds4_gpu_tensor_view(wt, 0, (uint64_t)rows * HEADS * 4u);
+                        CHECK(qv && wv);
+                        CHECK(ds4_gpu_dsv41_indexer_scores_batch(sr, qv, wv, kt, n, rows, start, ratio));
+                        CHECK(ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qv, wv, vt, mode ? mt : NULL, mask_width,
+                                                                     first, n, rows, start, ratio));
+                        CHECK(ds4_gpu_synchronize());
+                        ds4_gpu_tensor_free(qv); ds4_gpu_tensor_free(wv);
+                        for (uint32_t t = 0; t < rows; t++)
+                            for (uint32_t j = 0; j < n; j++) {
+                                const float r = ref[(size_t)t * n + j], v = got[(size_t)t * n + j];
+                                const bool same = !memcmp(&r, &v, sizeof(r));
+                                const bool dropped = mode && t >= first && mask[(size_t)t * mask_width + j / 8] != 0.0f;
+                                if (!same && !(dropped && v == -INFINITY)) {
+                                    fprintf(stderr, "verify index bf16: n=%u ratio=%u rows=%u mode=%u row=%u key=%u "
+                                            "ref=%a got=%a\n", n, ratio, rows, mode, t, j, r, v);
+                                    CHECK(0);
+                                }
+                                skipped += !same;
+                            }
+                    }
+    }
+    CHECK(skipped > 0);
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 1, 1030, 1));
+    ds4_gpu_dsv41_verify_rows(0);
+    CHECK(!ds4_gpu_dsv41_indexer_scores_rows_bf16(sv, qt, wt, vt, NULL, 0, 0, 1031, 2, 0, 1));
+    ds4_gpu_tensor *tensors[] = {qt, wt, kt, vt, mt, sr, sv};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    fprintf(stderr, "V4.1 verify indexed: 2-17 rows over the bf16 keys == the batch scorer's bits (%llu masked entries "
+            "skipped)\n", (unsigned long long)skipped);
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -3100,7 +3170,8 @@ static int check_v41_groups(void) {
         check_prefill_matmul() &&
         check_prefill_index_batch() &&
         check_sampler_gpu() &&
-        check_tp_prefill_rows8();
+        check_tp_prefill_rows8() &&
+        check_verify_indexed();
 }
 #else
 static int check_v41_groups(void) { return 1; }

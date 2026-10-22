@@ -303,6 +303,13 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
                                      const ds4_gpu_tensor *keys,
                                      uint32_t source_rows, uint32_t rows,
                                      uint32_t start, uint32_t ratio);
+/* VERIFY_INDEXED: whether a DSpark verify block is running through the batched attention, and its index rows over
+ * the bf16 key view (0: not applicable, score the f32 keys) */
+void ds4_gpu_dsv41_verify_rows(int on);
+int ds4_gpu_dsv41_indexer_scores_rows_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *view, const ds4_gpu_tensor *mask,
+        uint32_t mask_stride, uint32_t mask_first, uint32_t source_rows, uint32_t rows,
+        uint32_t start, uint32_t ratio);
 int ds4_gpu_dsv41_tensor_ops_available(void);
 /* Reuse exact BF16 views of FP4 queries/keys across score tiles. Invalid
  * casts retain the F32 arithmetic for the affected tile. */

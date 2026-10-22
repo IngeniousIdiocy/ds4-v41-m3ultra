@@ -103,6 +103,7 @@
 /tests/test_deepseek41_cli
 /tests/test_deepseek41_preencode
 tests/test_deepseek41_dspark_payload
+tests/test_deepseek41_verify_indexed
 /tests/test_engram
 /tests/test_snapstore
 *.o

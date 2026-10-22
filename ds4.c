@@ -42841,23 +42841,41 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
     if (packed && !ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q,
         g->index_cache[owner], n_comp, count)) return false;
     const bool batched = ds41_on(DS4_GPU_V41_PREFILL_INDEX_BATCH);
+    const ds4_gpu_tensor *view = !packed && g->index_bf16_ok ? g->index_bf16[owner] : NULL;
     for (uint32_t off = 0; off < count; off += DS41_INDEX_BATCH) {
         const uint32_t rows = count - off < DS41_INDEX_BATCH ? count - off : DS41_INDEX_BATCH;
         const uint64_t q_bytes = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         const uint64_t w_bytes = DS4_N_INDEXER_HEAD * sizeof(float);
         ds4_gpu_tensor *q = ds4_gpu_tensor_view(b->index_q, off * q_bytes, rows * q_bytes);
         ds4_gpu_tensor *weights = ds4_gpu_tensor_view(b->index_weights, off * w_bytes, rows * w_bytes);
-        bool ok = q && weights && (packed ?
+        const bool batch_topk = (batched ? count > 1u : (start + off + 1u) / ratio >= 1024u) &&
+            !getenv("DS4_METAL_DISABLE_V41_BATCH_TOPK");
+        bool scored = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* VERIFY_INDEXED: verify rows score the bf16 key view; past layer 20 they skip the blocks their layer-20
+         * masks drop, which the candidate filter below drops anyway */
+        if (q && weights && view && DS4_N_INDEXER_HEAD == 32u) {
+            const uint32_t mask_width = (g->ctx + 7u) / 8u;
+            const uint32_t skip = start + off + 1u < 16385u * ratio ? 16385u * ratio - start - off - 1u : 0u;
+            ds4_gpu_tensor *mask = batched && batch_topk && il > 20u && skip < rows ?
+                ds4_gpu_tensor_view(g->batch.block_mask, (uint64_t)off * mask_width * sizeof(float),
+                                    (uint64_t)rows * mask_width * sizeof(float)) : NULL;
+            scored = ds4_gpu_dsv41_indexer_scores_rows_bf16(g->index_scores, q, weights, view, mask,
+                mask_width, skip, n_comp, rows, start + off, ratio) != 0;
+            ds4_gpu_tensor_free(mask);
+        }
+#else
+        (void)view;
+#endif
+        bool ok = q && weights && (scored || (packed ?
             ds4_gpu_dsv41_indexer_scores_packed(g->index_scores, q, weights,
                 g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
             ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
-                q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio));
+                q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio)));
         ds4_gpu_tensor_free(weights);
         ds4_gpu_tensor_free(q);
         /* PREFILL_INDEX_BATCH: every batch of two or more rows sorts as a batch and runs its candidates as one;
          * off, only rows past 1024 visible keys sort as a batch and the candidates go row by row. */
-        const bool batch_topk = (batched ? count > 1u : (start + off + 1u) / ratio >= 1024u) &&
-            !getenv("DS4_METAL_DISABLE_V41_BATCH_TOPK");
         if (ok && batched && batch_topk && il >= 20u)
             ok = ds41_candidates_batch(g, il, n_comp, start + off, off, rows);
         for (uint32_t t = 0; ok && (!batch_topk || (!batched && il >= 20u)) && t < rows; t++) {
@@ -42896,7 +42914,16 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
-static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
+static void ds41_verify_rows(bool on) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_dsv41_verify_rows(on);
+#else
+    (void)on;
+#endif
+}
+
+/* graphs: a verify block's row graphs (VERIFY_INDEXED), else NULL */
+static bool ds41_attention_batch(ds41_gpu_graph *g, ds41_gpu_graph *const *graphs, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
@@ -42928,16 +42955,39 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
         (ratio == 2u || ds41_on(DS4_GPU_V41_PREFILL_INDEX_BATCH)) &&
 #endif
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
+    /* VERIFY_INDEXED: each row keeps the pooling carry its own decode step would leave (the carry from before the
+     * block, or the block's last even row at or before it), so a commit can rewind to any row */
+    const uint64_t carry = DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t t = 0; graphs && batch_publish && t < count; t++)
+        if (ratio != 2u || ((start + t) & ~1u) < start)
+            if (!ds4_gpu_tensor_copy(graphs[t]->verify_previous_kv[owner], 0, g->previous_kv[owner], 0, carry) ||
+                !ds4_gpu_tensor_copy(graphs[t]->verify_previous_score[owner], 0, g->previous_score[owner], 0, carry))
+                return false;
     if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;
+    for (uint32_t t = 0; graphs && batch_publish && ratio == 2u && t < count; t++) {
+        const uint32_t even = (start + t) & ~1u;
+        if (even >= start &&
+            (!ds4_gpu_tensor_copy(graphs[t]->verify_previous_kv[owner], 0, b->pool_kv, (even - start) * carry, carry) ||
+             !ds4_gpu_tensor_copy(graphs[t]->verify_previous_score[owner], 0, b->pool_score, (even - start) * carry,
+                                  carry))) return false;
+    }
     for (uint32_t t = 0; (!batch_index || !batch_publish) && t < count; t++) {
         row.pos = start + t;
 #define DS41_SELECT_ROW(name, width) row.name = g->rows_view[t].name;
         DS41_PREFILL_ROWS(DS41_SELECT_ROW)
 #undef DS41_SELECT_ROW
+        if (graphs) {   /* the row's own pooling carry */
+            memcpy(row.verify_previous_kv, graphs[t]->verify_previous_kv, sizeof(row.verify_previous_kv));
+            memcpy(row.verify_previous_score, graphs[t]->verify_previous_score, sizeof(row.verify_previous_score));
+        }
         if (!batch_publish && !ds41_attention_publish(&row, m, l, il)) return false;
         if (!batch_index && !ds41_attention_select_published(&row, m, l, il)) return false;
     }
-    if (batch_index && !ds41_index_batch(g, m, l, il, count)) return false;
+    ds41_verify_rows(graphs != NULL);   /* VERIFY_INDEXED: the verify rows' index scores and attention */
+    if (batch_index && !ds41_index_batch(g, m, l, il, count)) {
+        ds41_verify_rows(false);
+        return false;
+    }
     bool ok;
     if (!n_comp) {
         /* Raw attention rounds probabilities per key block. Keep its existing
@@ -42970,6 +43020,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
             b->selected_comp, count, start, n_raw, g->prefill_cap + 128u, 0, n_comp,
             DS4_N_INDEXER_TOP_K, 128, ratio, heads, DS4_N_HEAD_DIM);
     }
+    ds41_verify_rows(false);
     if (!ok || !ds4_gpu_dsv41_quantize(b->heads, heads * DS4_N_HEAD_DIM, count, DS4_V41_BF16) ||
         !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, heads, count, start, ratio != 0, true))
         return false;
@@ -44193,7 +44244,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 const ds4_layer_weights *l = &w->layer[il];
                 ok = ds41_attention_project_batch(g, m, l, count);
                 DS41_STAGE("attention projections");
-                if (ok && batch_core) ok = ds41_attention_batch(g, m, l, il, count);
+                if (ok && batch_core) ok = ds41_attention_batch(g, NULL, m, l, il, count);
                 for (uint32_t t = 0; ok && !batch_core && t < count; t++) {
                     row.pos = start + t;
 #define DS41_USE_ATTN_ROW(name, width) row.name = g->rows_view[t].name;
@@ -44452,9 +44503,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds41_attention_project_batch(g, model, l, rows);
 #ifdef __APPLE__
         /* VERIFY_BATCH: one session's consecutive rows on one host attend together (a short prefill through the
-         * batch kernels, a verify block through the decode kernels); a few rows' output projections then expand
-         * straight into the HC streams */
-        if (ok && rows_batch) ok = prefill_only ? ds41_attention_batch(g, model, l, il, rows) :
+         * batch kernels; a verify block too with VERIFY_INDEXED, else through the decode kernels); a few rows'
+         * output projections then expand straight into the HC streams */
+        if (ok && rows_batch) ok = prefill_only ? ds41_attention_batch(g, NULL, model, l, il, rows) :
+            ds41_on(DS4_GPU_V41_VERIFY_INDEXED) ? ds41_attention_batch(g, graphs, model, l, il, rows) :
             ds41_attention_verify_rows(g, graphs, positions, queries, model, l, il, rows);
         const bool fused_tail = rows_batch && !shared_owner && ds41_on(DS4_GPU_V41_HC_FUSION) &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0 && l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;

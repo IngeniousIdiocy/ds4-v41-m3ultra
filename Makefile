@@ -281,6 +281,16 @@ tests/test_deepseek41_dspark_payload: tests/test_deepseek41_dspark_payload.o $(C
 test-deepseek41-dspark-payload: tests/test_deepseek41_dspark_payload
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_TEST_DSPARK="$(DS4_TEST_DSPARK)" ./tests/test_deepseek41_dspark_payload
 
+tests/test_deepseek41_verify_indexed.o: tests/test_deepseek41_verify_indexed.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_deepseek41_verify_indexed: tests/test_deepseek41_verify_indexed.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-verify-indexed
+test-deepseek41-verify-indexed: tests/test_deepseek41_verify_indexed
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_TEST_DSPARK="$(DS4_TEST_DSPARK)" ./tests/test_deepseek41_verify_indexed
+
 tests/test_metal_tp_bulk: tests/test_metal_tp_bulk.c ds4_gpu.h ds4_tp.h $(CORE_OBJS)
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 
@@ -1394,6 +1404,7 @@ clean:
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_preencode
 	rm -f tests/test_deepseek41_dspark_payload
+	rm -f tests/test_deepseek41_verify_indexed
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows

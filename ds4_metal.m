@@ -487,6 +487,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_TP_SHARED_SPLIT",
             "DS4_METAL_DISABLE_V41_TP_GATES",
             "DS4_METAL_DISABLE_V41_TP_PREFILL_ROWS8",
+            "DS4_METAL_DISABLE_V41_VERIFY_INDEXED",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -31903,6 +31904,10 @@ int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
     return 1;
 }
 
+/* VERIFY_INDEXED: set while a DSpark verify block runs through the batched attention */
+static int g_v41_verify_rows;
+void ds4_gpu_dsv41_verify_rows(int on) { g_v41_verify_rows = on; }
+
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -31974,8 +31979,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
             (n_head == 64u || n_head == 32u) &&
             top_k == 512u && window == 128u && head_dim == 512u;
-        const uint32_t decode_splits =
-            decode_one_token && !g_quality_mode ? 12u : 1u;
+        /* VERIFY_INDEXED: a verify block's few rows take decode's split path and score order too */
+        const bool decode_rows = (decode_one_token || (n_tokens <= 8u && g_v41_verify_rows)) && !g_quality_mode;
+        const uint32_t decode_splits = decode_rows ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
         /* PREFILL_ATTENTION: V4.1's prefill rows (ratio 1 and 2) stage sixteen rows per barrier, as decode does */
         const bool prefill_rb16 = n_tokens > 8u && ratio <= 2u && !prefill_dual_heads && !g_quality_mode &&
@@ -32013,7 +32019,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
          * them in score order, avoiding a chronological sort dispatch.
          * --quality restores the sorted order for stricter reproducibility.
          */
-        const bool skip_decode_sort = !g_quality_mode && decode_one_token;
+        const bool skip_decode_sort = decode_rows;
         if (!skip_decode_sort &&
             !ds4_gpu_ensure_scratch_buffer(&g_indexed_topk_buffer,
                                              &g_indexed_topk_bytes,
@@ -37506,10 +37512,12 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
 
         const bool force_scalar = g_quality_mode;
         const bool use_tiled_f32 = tiled_f32;
-        const bool use_tiled = !force_scalar && n_tokens >= 8u &&
-                               n_head == 32u && head_dim == 128u;
+        /* VERIFY_INDEXED: a verify block's few rows take the tiled kernel too (the scalar one reduces every head once
+         * per key and row) */
+        const bool use_tiled = !force_scalar && n_head == 32u && head_dim == 128u &&
+                               (n_tokens >= 8u || (n_tokens >= 2u && g_v41_verify_rows));
         /* PREFILL_INDEX: V4.1's f32 tiles on simdgroup matrices, K^T held in registers, the same bits */
-        const bool use_mma = use_tiled && use_tiled_f32 && ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_INDEX);
+        const bool use_mma = use_tiled && use_tiled_f32 && n_tokens >= 8u && ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_INDEX);
         if (use_mma) DS4_TEST_NOTE("kernel_dsv41_indexer_scores_mma");
         id<MTLComputePipelineState> pipeline =
             use_mma ? ds4_gpu_get_pipeline("kernel_dsv41_indexer_scores_mma") :
@@ -37724,6 +37732,51 @@ int ds4_gpu_dsv41_indexer_scores_batch(ds4_gpu_tensor *scores,
     if (ratio != 1u && ratio != 2u) return 0;
     return ds4_gpu_glm_indexer_scores_batch_grouped_tensor(scores, q, weights,
         keys, source_rows, rows, start, ratio, 32, 128, 1.0f / 64.0f, false, true);
+}
+
+/* VERIFY_INDEXED: a verify block's rows over the bf16 key view, on simdgroup matrices with the products and sum order of
+ * kernel_glm_indexer_scores_tiled_f32, without padding the rows to an 8-row tile and with half the key bytes. Rows from
+ * mask_first on skip the 8-key blocks their mask row drops (-inf, as the candidate filter that follows leaves them).
+ * 0 where it does not apply (outside a verify block, fewer than 2 rows), so the caller scores the f32 keys. */
+int ds4_gpu_dsv41_indexer_scores_rows_bf16(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *view, const ds4_gpu_tensor *mask,
+        uint32_t mask_stride, uint32_t mask_first, uint32_t source_rows, uint32_t rows,
+        uint32_t start, uint32_t ratio) {
+    if (rows < 2u || !g_v41_verify_rows || g_quality_mode || (ratio != 1u && ratio != 2u) ||
+        !source_rows || source_rows > INT32_MAX || rows > UINT32_MAX - start ||
+        (start + rows) / ratio > source_rows || !scores || !q || !weights || !view) return 0;
+    if (!mask) mask_first = rows;
+    const bool masked = mask_first < rows;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (ds4_gpu_tensor_bytes(scores) < (uint64_t)rows * source_rows * 4u ||
+        ds4_gpu_tensor_bytes(q) < (uint64_t)rows * 4096u * 4u ||
+        ds4_gpu_tensor_bytes(weights) < (uint64_t)rows * 32u * 4u ||
+        ds4_gpu_tensor_bytes(view) < (uint64_t)source_rows * 128u * 2u ||
+        (masked && (mask_stride < (source_rows + 7u) / 8u ||
+                    ds4_gpu_tensor_bytes(mask) < ((uint64_t)(rows - 1u) * mask_stride + (source_rows + 7u) / 8u) * 4u)))
+        return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_indexer_scores_rows_bf16");
+        if (!pipeline) return 0;
+        DS4_TEST_NOTE("kernel_dsv41_indexer_scores_rows_bf16");
+        const NSUInteger keys_per_tg = 32u;   /* 8 per simdgroup */
+        const struct { uint32_t n_comp, rows, pos0, ratio, mask_stride, mask_first; float scale; uint32_t pad; } args =
+            {source_rows, rows, start, ratio, mask_stride, masked ? mask_first : rows, 1.0f / 64.0f, 0u};
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        const ds4_gpu_tensor *t[] = {q, weights, view, masked ? mask : view, scores};
+        for (unsigned i = 0; i < 5; i++)
+            [enc setBuffer:ds4_gpu_tensor_buffer(t[i]) offset:ds4_gpu_tensor_offset(t[i]) atIndex:i + 1];
+        [enc setThreadgroupMemoryLength:4u * 1024u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)source_rows + keys_per_tg - 1u) / keys_per_tg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 verify index scores");
+    }
 }
 
 int ds4_gpu_glm_qk_lowrank_typed_tensor(

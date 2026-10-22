@@ -7563,3 +7563,97 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+struct ds4_metal_args_dsv41_index_rows_bf16 {
+    uint32_t n_comp;       /* keys, and each score row's stride */
+    uint32_t rows;         /* row t sees min((pos0 + t + 1) / ratio, n_comp) keys */
+    uint32_t pos0;
+    uint32_t ratio;
+    uint32_t mask_stride;  /* floats per block-mask row */
+    uint32_t mask_first;   /* rows from here on skip the blocks their mask drops; >= rows: no mask */
+    float    scale;
+    uint32_t pad;
+};
+
+/* A verify block's few index rows over the bf16 key view on simdgroup
+ * matrices. The matrix rows are (row, head) pairs, eight heads of one row per
+ * tile, so no row is padded to the 8-token tile of
+ * kernel_glm_indexer_scores_tiled_f32; its products, their order over the 16
+ * dim blocks and the head sum order are kept (the same bits). Each simdgroup
+ * holds the K^T fragments of one block of 8 keys in registers. A block that
+ * no unmasked row sees and every masked row's block mask drops is not scored
+ * (-inf, as the candidate filter leaves it). Threadgroup: 4 simdgroups,
+ * 4 KiB of threadgroup memory each. */
+kernel void kernel_dsv41_indexer_scores_rows_bf16(
+        constant ds4_metal_args_dsv41_index_rows_bf16 & args,
+        device const float  *q,
+        device const float  *weights,
+        device const ushort *view,
+        device const float  *mask,
+        device float        *scores,
+        threadgroup float   *shared [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint key0 = (tgpig * 4u + (uint)sg) * 8u;
+    if (key0 >= args.n_comp) return;
+
+    bool live = false;
+    for (uint t = 0; t < args.rows; t++) {
+        const uint visible = min((args.pos0 + t + 1u) / args.ratio, args.n_comp);
+        if (key0 < visible && (t < args.mask_first ||
+                               mask[(ulong)t * args.mask_stride + key0 / 8u] == 0.0f)) live = true;
+    }
+    if (!live) {
+        for (uint i = lane; i < args.rows * 8u; i += 32u) {
+            const uint key = key0 + i % 8u;
+            if (key < args.n_comp) scores[(ulong)(i / 8u) * args.n_comp + key] = -INFINITY;
+        }
+        return;
+    }
+
+    const short2 xy = dsv41_mma_coord(lane);
+    /* K^T fragment db: element (dim, key) = view[key0 + key][db * 8 + dim] */
+    simdgroup_float8x8 kt[16];
+    const uint k0 = key0 + (uint)xy.x;
+    device const ushort *v0 = view + (ulong)min(k0, args.n_comp - 1u) * 128u + (uint)xy.y;
+    device const ushort *v1 = view + (ulong)min(k0 + 1u, args.n_comp - 1u) * 128u + (uint)xy.y;
+    #pragma clang loop unroll(full)
+    for (uint db = 0; db < 16u; db++) {
+        kt[db].thread_elements()[0] = k0 < args.n_comp ? as_type<float>((uint)v0[db * 8u] << 16) : 0.0f;
+        kt[db].thread_elements()[1] = k0 + 1u < args.n_comp ? as_type<float>((uint)v1[db * 8u] << 16) : 0.0f;
+    }
+
+    threadgroup float *buf = shared + (uint)sg * 1024u;   /* [head][column], column = (row, key) */
+    for (uint t0 = 0; t0 < args.rows; t0 += 4u) {
+        for (uint g = 0; g < 4u && t0 + g < args.rows; g++) {
+            device const float *qt = q + (ulong)(t0 + g) * 4096u;
+            for (uint hg = 0; hg < 4u; hg++) {
+                device const float *qh = qt + (hg * 8u + (uint)xy.y) * 128u + (uint)xy.x;
+                simdgroup_float8x8 dot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                #pragma clang loop unroll(full)
+                for (uint db = 0; db < 16u; db++) {
+                    const float2 v = *(device const float2 *)(qh + db * 8u);
+                    simdgroup_float8x8 mq;
+                    mq.thread_elements()[0] = v.x;
+                    mq.thread_elements()[1] = v.y;
+                    simdgroup_multiply_accumulate(dot, mq, kt[db], dot);
+                }
+                simdgroup_store(dot, buf + hg * 8u * 32u + g * 8u, 32u);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const uint t = t0 + lane / 8u, key = key0 + lane % 8u;
+        if (t < args.rows && key < args.n_comp) {
+            const uint visible = min((args.pos0 + t + 1u) / args.ratio, args.n_comp);
+            float acc = 0.0f;
+            if (key < visible) {
+                device const float *w = weights + t * 32u;
+                for (uint h = 0; h < 32u; h++)
+                    acc += max(buf[h * 32u + lane] * args.scale, 0.0f) * w[h];
+            }
+            scores[(ulong)t * args.n_comp + key] = key < visible ? acc : -INFINITY;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

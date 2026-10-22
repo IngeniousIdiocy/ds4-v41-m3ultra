@@ -86,6 +86,7 @@ typedef struct {
 #define DS4_GPU_V41_TP_SHARED_SPLIT (1ull << 38)   /* on two Macs each rank computes half of the shared expert's hidden width */
 #define DS4_GPU_V41_TP_GATES (1ull << 39)   /* on two Macs the partials land in their gate slots and the HC expansion adds the ranks' partials */
 #define DS4_GPU_V41_TP_PREFILL_ROWS8 (1ull << 40)   /* on two Macs the attention output's K-slice rows run in one dispatch, eight output rows per group on the M3 Ultra */
+#define DS4_GPU_V41_VERIFY_INDEXED (1ull << 41)   /* a DSpark verify block attends like a short prefill: index top-k and indexed attention as batches */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
