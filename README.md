@@ -6,7 +6,7 @@ M3 Ultra with the MXFP4 build of the October 17 checkpoint, it decodes about
 twice as fast as main: **41.4 tok/s at 8K context and 40.5 at 131K**, against
 main's 19.9 and 17.9. With DSpark drafting, code answers run at **59.0 tok/s**.
 
-The speed-ups come in 44 groups. Each group does one thing, is added on top of
+The speed-ups come in 43 groups. Each group does one thing, is added on top of
 main in its own commits, and has one switch that turns it off and runs main's
 code instead.
 Serial decoding gives main's output bit for bit.
@@ -224,7 +224,6 @@ that checks a draft; "TP" means two Macs.
 | SHORT_SWEEP | Prefill: 3,072 to 8,191 tokens in one sweep, with less decoder work. |
 | ENGRAM_READAHEAD | Prefill: the next sweep's Engram reads start during this one. |
 | ENGRAM_READERS | Prefill: 32 concurrent Engram readers instead of 16. |
-| SHORT_MMA | Prefill: an eight-token batch on the matrix units, with main's order of sums. |
 | PREENCODE | Decode: the next token's first command buffer is encoded during this token's wait. |
 | SAMPLER_GPU | Sampled decode: the top-p summary is computed on the GPU. |
 | TP_BALANCED_ROUTE | TP: each Mac takes half of every token's experts. |
@@ -247,6 +246,12 @@ at every step of the progression below, and the logits after a cold 32K
 prefill. Short prompts are exact too: after prompts of three to eight tokens the
 logits and the next 32 greedy tokens are main's. Strict DSpark gives the serial
 tokens.
+
+One switch exists only for exactness. An eight-token prompt is prefilled as one
+batch of eight rows, and SHORT_MMA runs that batch on the matrix units in main's
+order of sums, so it gives main's bits at the speed of the faster kernels it
+replaced. `DS4_METAL_DISABLE_V41_SHORT_MMA=1` runs main's own kernels instead,
+with the same output.
 
 DSpark's default mode is different, on main as here. It keeps the state of the
 batched verify, and the batched verify is not bit for bit equal to decoding one
@@ -371,14 +376,13 @@ Cold prefill of 32K tokens, in seconds:
 A cold 131K prefill takes 190.0 s on main (an earlier session), 189.4 s with
 every group off and 151.6 s with every group on.
 
-SHORT_MMA came after the progression session. At that point ROWS_MMA and
-VERIFY_KERNELS were also limited to DSpark's rows; before, they took an
-eight-token prefill too, which was fast but not main's bits. The change was
-measured against that previous head with every group on, in alternating
-processes, not in the progression session: an eight-token prefill takes 0.3 s,
-as before, and now gives main's logits; a cold 32K prefill takes 37.8 s, under
-0.1 s from before; DSpark code at 8K runs at 59.2 t/s, within 0.1 t/s of before
-and within run-to-run noise.
+After the progression session, ROWS_MMA and VERIFY_KERNELS were limited to
+DSpark's rows; before, they also took an eight-token prefill, which was fast but
+not main's bits. That change and the SHORT_MMA exactness switch (see Exactness)
+were measured against the previous head with every group on, in alternating
+processes: an eight-token prefill takes 0.3 s, as before, and now gives main's
+logits; a cold 32K prefill takes 37.8 s, under 0.1 s from before; DSpark code at
+8K runs at 59.2 t/s, within 0.1 t/s of before and within run-to-run noise.
 
 Groups that share a row were measured together: they have little or no effect on
 that row's measurements alone, and the TP groups and SAMPLER_GPU cannot change
