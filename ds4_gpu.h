@@ -70,24 +70,6 @@ typedef struct {
 #define DS4_GPU_V41_ROWS_MMA (1ull << 22)   /* Q8_0 matmuls of a V4.1 DSpark block's 3-8 rows on simdgroup matrices (not bit-exact) */
 #define DS4_GPU_V41_VERIFY_KERNELS (1ull << 23)   /* a V4.1 DSpark verify block's 6-8 MXFP4 rows through the fused decode MoE kernels */
 #define DS4_GPU_V41_PUBLIC_CONTROLLER (1ull << 24)   /* DSpark drafts by measured cost (ds4_deepseek41_admission.h) */
-#define DS4_GPU_V41_PREFILL_INDEX (1ull << 25)   /* prefill index scores of 8 or more rows on simdgroup matrices */
-#define DS4_GPU_V41_PREFILL_ATTENTION (1ull << 26)   /* prefill attention stages 16 rows per barrier */
-#define DS4_GPU_V41_PREFILL_FOLDS (1ull << 27)   /* large prefills fold bf16 rounding and glue into their producers */
-#define DS4_GPU_V41_MOE_DEDUP (1ull << 28)   /* 2-8 MXFP4 rows read each selected expert once (any MXFP4 model) */
-#define DS4_GPU_V41_VERIFY_BATCH (1ull << 29)   /* one session's 2-8 consecutive rows attend together and expand their outputs into the streams */
-#define DS4_GPU_V41_FLASH_HEAD_SHARE (1ull << 30)   /* multi-row flash attention runs eight heads per threadgroup over shared key reads (any model) */
-#define DS4_GPU_V41_PREFILL_MATMUL (1ull << 31)   /* wide prefill Q8 matmuls unpack their weights to F16 once on the M3 Ultra */
-#define DS4_GPU_V41_PREFILL_INDEX_BATCH (1ull << 32)   /* the prefill indexer picks candidates, short rows and top-k as batches; candidates are skipped while every block is kept */
-#define DS4_GPU_V41_SHORT_SWEEP (1ull << 33)   /* prefills of 3072 to 8191 tokens run as one sweep that rebuilds only the decoder suffix */
-#define DS4_GPU_V41_ENGRAM_READAHEAD (1ull << 34)   /* a prefill sweep reads the next sweep's Engram rows from disk while its last layers run */
-#define DS4_GPU_V41_PREENCODE (1ull << 35)   /* the next decode token's first command buffer is encoded while this token's last one runs */
-#define DS4_GPU_V41_SAMPLER_GPU (1ull << 36)   /* the decode step summarizes its logits for top-p sampling on the GPU and the CPU decides from it */
-#define DS4_GPU_V41_TP_BALANCED_ROUTE (1ull << 37)   /* on two Macs each rank runs half of every token's ordered expert list, with every expert bound */
-#define DS4_GPU_V41_TP_SHARED_SPLIT (1ull << 38)   /* on two Macs each rank computes half of the shared expert's hidden width */
-#define DS4_GPU_V41_TP_GATES (1ull << 39)   /* on two Macs the partials land in their gate slots and the HC expansion adds the ranks' partials */
-#define DS4_GPU_V41_TP_PREFILL_ROWS8 (1ull << 40)   /* on two Macs the attention output's K-slice rows run in one dispatch, eight output rows per group on the M3 Ultra */
-#define DS4_GPU_V41_VERIFY_INDEXED (1ull << 41)   /* a DSpark verify block attends like a short prefill: index top-k and indexed attention as batches */
-#define DS4_GPU_V41_ENGRAM_READERS (1ull << 42)   /* a prefill sweep reads its Engram rows from disk with 32 concurrent readers instead of 16 */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

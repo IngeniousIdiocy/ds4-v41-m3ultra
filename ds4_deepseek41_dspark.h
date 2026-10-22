@@ -22,6 +22,9 @@ struct ds41_dspark {
     ds41_gpu_graph verified[DS41_VERIFY_ROWS + 1u];
     float *host_verified;
     uint32_t verify_start, verify_count, rewind_end;
+    ds41_admission admission;   /* PUBLIC_CONTROLLER */
+    uint32_t admission_end;     /* the position its last measured step ended at */
+    bool in_cycle;              /* a drafted cycle's own serial token, priced with the cycle */
 };
 
 static void ds41_dspark_reset(ds41_dspark *d) {

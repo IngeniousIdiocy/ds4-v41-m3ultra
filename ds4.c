@@ -43819,6 +43819,7 @@ static void ds41_dspark_rows(bool on) {
     (void)on;
 #endif
 }
+#include "ds4_deepseek41_admission.h"
 #include "ds4_deepseek41_dspark.h"
 #undef DS41_PREFILL_ROWS
 #undef DS41_PREFILL_ALIASES
@@ -79945,6 +79946,30 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+/* PUBLIC_CONTROLLER: the session's DSpark admission, or NULL where main's confidence threshold decides alone. A
+ * session whose position moved other than by decoding (a new prompt, a rewind) starts a new request. */
+static ds41_admission *ds41_session_admission(ds4_session *s) {
+    ds41_dspark *d = ds4_session_is_ds41(s) ? s->ds41_graph.dspark : NULL;
+    if (!d || d->in_cycle || s->engine->tp.active || !ds41_on(DS4_GPU_V41_PUBLIC_CONTROLLER)) return NULL;
+    if (d->admission_end != s->ds41_graph.pos) ds41_admit_begin(&d->admission);
+    return &d->admission;
+}
+
+static int ds41_cycle_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    s->ds41_graph.dspark->in_cycle = true;
+    const int rc = ds4_session_eval(s, token, err, errlen);
+    s->ds41_graph.dspark->in_cycle = false;
+    return rc;
+}
+
+static void ds41_cycle_done(ds4_session *s, ds41_admission *a, double started, uint32_t rows, bool verified) {
+    if (!a) return;
+    ds41_admit_cycle(a, (now_sec() - started) * 1000, rows, verified);
+    s->ds41_graph.dspark->admission_end = s->ds41_graph.pos;
+}
+#endif
+
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
@@ -79952,7 +79977,18 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
         probe_mtp = false;
     }
 #endif
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    ds41_admission *a = ds41_session_admission(s);   /* PUBLIC_CONTROLLER prices serial tokens */
+    const double started = a ? now_sec() : 0;
+    const int rc = ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    if (a && !rc) {
+        ds41_admit_serial(a, (now_sec() - started) * 1000);
+        s->ds41_graph.dspark->admission_end = s->ds41_graph.pos;
+    }
+    return rc;
+#else
     return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+#endif
 }
 
 #ifndef DS4_NO_GPU
@@ -86881,7 +86917,8 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     if (draft_cap && draft_cap < (uint32_t)cap - 1u) cap = (int)draft_cap + 1;
     const bool stats = ds4_dspark_stats_enabled();
     if (stats) { s->dspark_stats.cycles++; s->dspark_stats.first_tokens++; }
-    bool ready = d && !e->quality && !e->dspark_strict && cap > 1 &&
+    ds41_admission *a = ds41_session_admission(s);   /* PUBLIC_CONTROLLER: whether drafting pays here */
+    bool ready = d && !e->quality && !e->dspark_strict && cap > 1 && (!a || ds41_admit_draft(a)) &&
         first_token != eos && g->pos && g->pos <= 1048576u - DS41_DRAFT_ROWS &&
         ds41_tp_batch_enabled(g);
     /* Old session files contain target caches, not draft features. Warm the
@@ -86905,8 +86942,12 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         const uint32_t row = count - 1u;
         float confidence;
         if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
-        if (e->dspark_confidence_threshold > 0 &&
-            sigmoid_stable(confidence) < e->dspark_confidence_threshold) break;
+        if (a ? !ds41_admit_confident(row, sigmoid_stable(confidence)) :
+            e->dspark_confidence_threshold > 0 &&
+            sigmoid_stable(confidence) < e->dspark_confidence_threshold) {
+            if (a) count = 1;   /* PUBLIC_CONTROLLER verifies the whole block or declines it */
+            break;
+        }
         const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
         if (exact) {
             float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
@@ -86922,7 +86963,8 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             s->dspark_stats.no_draft++;
             s->dspark_stats.propose_ms += (now_sec() - started) * 1000;
         }
-        if (ds4_session_eval(s, first_token, err, errlen)) return -1;
+        if (ds41_cycle_eval(s, first_token, err, errlen)) return -1;
+        ds41_cycle_done(s, a, started, 1, false);
         accepted[0] = first_token;
         return 1;
     }
@@ -86972,12 +87014,13 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         }
     }
     if (correction >= 0) {
-        if (ds4_session_eval(s, correction, err, errlen)) return -1;
+        if (ds41_cycle_eval(s, correction, err, errlen)) return -1;
         accepted[keep++] = correction;
         /* The correction occupies a rejected slot whose old ring contents
          * are already saved. Earlier verified prefixes remain rewindable. */
         d->rewind_end = g->pos;
     }
+    ds41_cycle_done(s, a, started, keep, true);
     if (getenv("DS4_DSPARK_SPEC_LOG")) fprintf(stderr,
         "ds4: V4.1 DSpark proposed=%u accepted=%u draft=%.3f ms verify=%.3f ms\n",
         count - 1u, accepted_drafts, (proposed - started) * 1000, (now_sec() - proposed) * 1000);

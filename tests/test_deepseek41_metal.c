@@ -1,5 +1,6 @@
 #include "ds4_gpu.h"
 #include "ds4.h"
+#include "ds4_deepseek41_admission.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -2506,13 +2507,46 @@ static int check_verify_kernels(void) {
     return 1;
 }
 
+/* PUBLIC_CONTROLLER: DSpark admission fed measured times. A request starts serial, a block needs three confident
+ * leading positions, a losing window backs off for 16 and then 32 serial tokens, a small loss is carried, and a
+ * winning window clears the back-off. */
+static int check_public_controller(void) {
+    ds41_admission a;
+    ds41_admit_begin(&a);
+    for (uint32_t i = 0; i < DS41_ADMIT_FIRST_SERIAL; i++) {
+        CHECK(!ds41_admit_draft(&a));
+        ds41_admit_serial(&a, i == 3 ? 90.0 : 25.0);   /* one slow token does not move the median */
+    }
+    CHECK(ds41_admit_draft(&a) && a.serial_ms == 25.0);
+    CHECK(ds41_admit_confident(0, 0.75f) && !ds41_admit_confident(2, 0.7f) && ds41_admit_confident(3, 0.1f));
+    for (int i = 0; i < 3; i++) ds41_admit_cycle(&a, 60.0, 4, true);    /* 4 tokens for 60 ms, not 100 */
+    CHECK(ds41_admit_draft(&a));
+    for (int i = 0; i < 3; i++) ds41_admit_cycle(&a, 30.0, 1, false);   /* declines: drafter + one token */
+    CHECK(!ds41_admit_draft(&a) && a.skip == 16);
+    for (int i = 0; i < 16; i++) {
+        CHECK(!ds41_admit_draft(&a));
+        ds41_admit_serial(&a, 25.0);
+    }
+    CHECK(ds41_admit_draft(&a));
+    for (int i = 0; i < 3; i++) ds41_admit_cycle(&a, 60.0, 2, true);
+    CHECK(a.skip == 32);
+    for (int i = 0; i < 32; i++) ds41_admit_serial(&a, 25.0);
+    for (int i = 0; i < 3; i++) ds41_admit_cycle(&a, 51.0, 2, true);    /* 3 ms over, within half a token */
+    CHECK(ds41_admit_draft(&a) && a.backoffs == 2);
+    for (int i = 0; i < 3; i++) ds41_admit_cycle(&a, 60.0, 4, true);
+    CHECK(ds41_admit_draft(&a) && a.backoffs == 0);
+    fprintf(stderr, "V4.1 DSpark admission: serial start, confident blocks, back-off and recovery by measured cost\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
         check_index_bf16() && check_topk() && check_index_candidates() &&
         check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
-        check_row_matmuls() && check_rows_mma() && check_verify_kernels();
+        check_row_matmuls() && check_rows_mma() && check_verify_kernels() &&
+        check_public_controller();
 }
 #else
 static int check_v41_groups(void) { return 1; }
