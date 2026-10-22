@@ -89,12 +89,16 @@ def main():
             raise AssertionError(exc.read().decode()) from exc
         text = "".join(b.get("text", "") for b in reply["content"] if b.get("type") == "text")
         usage = reply["usage"]
+        cached = usage.get("cache_read_input_tokens", 0)
         result = {"label": label, "seconds": round(time.monotonic() - started, 2),
-                  "input": usage.get("input_tokens"),
-                  "cached": usage.get("cache_read_input_tokens", 0), "text": text}
+                  "prompt": usage["input_tokens"] + cached
+                            + usage.get("cache_creation_input_tokens", 0),
+                  "cached": cached, "text": text}
         print(json.dumps(result), flush=True)
         (args.output / f"{label}.json").write_text(json.dumps(result, indent=2))
-        return text, result
+        # Like dsh and other Messages clients, the reply goes back verbatim
+        # (thinking included) as the next turn's assistant message.
+        return text, result, {"role": "assistant", "content": reply["content"]}
 
     def image_result(name):
         data = base64.b64encode((FIXTURES / name).read_bytes()).decode()
@@ -120,14 +124,14 @@ def main():
                              for i in range(700))
             history = [{"role": "user", "content": story + "\nWhich ship did line 3 log?"}]
             start("text-1")
-            answer, first = ask("text-turn-1", history, 256)
-            history.append({"role": "assistant", "content": answer})
+            _, first, reply = ask("text-turn-1", history, 256)
+            history.append(reply)
             log = stop()
             saves = re.findall(r"kv cache stored tokens=(\d+).*reason=shutdown.* save=([\d.]+) ms", log)
             assert saves, "no shutdown checkpoint stored"
             start("text-2")
             history.append({"role": "user", "content": "And line 5?"})
-            _, second = ask("text-turn-2", history, 256)
+            _, second, _ = ask("text-turn-2", history, 256)
             log = stop()
             loads = re.findall(r"kv cache hit text tokens=(\d+).* load=([\d.]+) ms", log)
             assert loads and second["cached"] > 0, "text-only checkpoint did not restore"
@@ -139,33 +143,33 @@ def main():
 
         history = chat("text.png")
         start("image-1")
-        answer, _ = ask("image-turn-1", history)
+        answer, _, reply = ask("image-turn-1", history)
         assert "MINT-731" in answer.upper(), answer
-        history.append({"role": "assistant", "content": [{"type": "text", "text": answer}]})
+        history.append(reply)
         history.append({"role": "user", "content": "Give just the train number from that image."})
-        answer, live = ask("image-turn-2", history)
+        answer, live, reply = ask("image-turn-2", history)
         assert "482" in answer, answer
         assert live["cached"] > 0, "turn 2 did not reuse the live image prefix"
-        history.append({"role": "assistant", "content": [{"type": "text", "text": answer}]})
+        history.append(reply)
         log = stop()
         assert re.search(r"kv cache stored tokens=\d+.*reason=shutdown.* images=1", log), \
             "the image chat was not checkpointed at shutdown"
 
         start("image-2")
         history.append({"role": "user", "content": "Now give just the gate from that image."})
-        answer, restored = ask("image-turn-3-restored", history)
+        answer, restored, _ = ask("image-turn-3-restored", history)
         assert "C7" in answer.upper(), answer
-        assert restored["cached"] >= live["input"], "restart lost part of the image prefix"
+        assert restored["cached"] >= live["prompt"], "restart lost part of the image prefix"
 
         # The same text with another image: the stored identity must not match.
         other = chat("text.png")
         other[2]["content"][0]["content"][2] = image_result("spatial.png")[2]
         swapped = other + history[3:]
-        _, missed = ask("image-turn-3-other-image", swapped, 256)
+        _, missed, _ = ask("image-turn-3-other-image", swapped, 256)
         log = stop()
         assert re.search(r"multimodal disk kv hit images=1 cached=\d+", log), "no disk restore"
         assert re.search(r"multimodal disk kv miss images=1", log), "other image was not refused"
-        assert missed["cached"] < live["input"] // 2, "other image reused the image prefix"
+        assert missed["cached"] < live["prompt"] // 2, "other image reused the image prefix"
         print("PASS image chat restored after restart; other image re-read", flush=True)
     finally:
         for proc, log, _ in runs:
