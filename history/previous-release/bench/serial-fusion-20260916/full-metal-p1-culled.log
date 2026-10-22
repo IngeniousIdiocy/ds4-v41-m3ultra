@@ -1,0 +1,2 @@
+-[MTLComputePipelineDescriptorInternal setComputeFunction:withType:]:866: failed assertion `computeFunction must not be nil.'
+PASS kernel_dsv41_attn_out_hc nsg4 maxThreads1024

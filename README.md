@@ -407,6 +407,7 @@ make test-deepseek41-verify-indexed DS4_TEST_MODEL=gguf/DeepSeek-V4.1-Flash-MXFP
 - [CHANGES-V41.md](CHANGES-V41.md): the commits, and what changed since the previous release.
 - [THIRD_PARTY-V41.md](THIRD_PARTY-V41.md): where the pieces came from.
 - [.claude/skills](.claude/skills): three skills for Claude Code and Codex users optimizing Metal inference: decode, prefill and speculative decoding.
+- [history/previous-release](history/previous-release/README.md): the previous release's experiments, receipts and release notes, kept unchanged as the record.
 
 ---
 

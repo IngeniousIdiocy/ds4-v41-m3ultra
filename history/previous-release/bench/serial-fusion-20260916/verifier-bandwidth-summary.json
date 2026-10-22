@@ -1,0 +1,194 @@
+{
+  "8192": {
+    "control": {
+      "observations": [
+        {
+          "file": "release-six-code-8192-1-control.json",
+          "sha256": "973ec6466071c751ea70227016b5b5a9e3927ca5fc833c903044d293a1d26841",
+          "verify_ms": 10349.429,
+          "cycles": 117
+        },
+        {
+          "file": "release-six-code-8192-2-control.json",
+          "sha256": "31a2ea85c171a4a03308ddae78f0eb7e84d8924eb8459c9c065d14d6b204d42f",
+          "verify_ms": 10329.261,
+          "cycles": 117
+        },
+        {
+          "file": "release-six-code-8192-3-control.json",
+          "sha256": "040322ee4693dcb73a0caabdf45603e2a3c5230b90b5e9f6f383396cfcef50b6",
+          "verify_ms": 10360.701,
+          "cycles": 117
+        },
+        {
+          "file": "release-six-code-8192-4-control.json",
+          "sha256": "c6830784b579d1c0bdfd149094f314a2551284be1752f0d5053f0b16683d6f30",
+          "verify_ms": 10343.221,
+          "cycles": 117
+        }
+      ],
+      "pooled_verify_ms": 88.42438461538461,
+      "logical_GB_per_block": 37.657,
+      "normalized_GBps": 425.8666900967972
+    },
+    "all_kv_mix": {
+      "observations": [
+        {
+          "file": "release-six-code-8192-1-all_kv_mix.json",
+          "sha256": "759b2aed09ebd13831ed58f3d0fa4f0abcc1c4ded90449a067a0c68304e7faaf",
+          "verify_ms": 10163.962,
+          "cycles": 117
+        },
+        {
+          "file": "release-six-code-8192-2-all_kv_mix.json",
+          "sha256": "407b06de31b82bab7bd7e8091afd0f16006836d07cdfa4006f9423569effa01a",
+          "verify_ms": 10181.024,
+          "cycles": 117
+        },
+        {
+          "file": "release-six-code-8192-3-all_kv_mix.json",
+          "sha256": "45dcc4799e7d5cf1a22408fb184262750479524cef462183425d41252fb241a5",
+          "verify_ms": 10180.483,
+          "cycles": 117
+        },
+        {
+          "file": "release-six-code-8192-4-all_kv_mix.json",
+          "sha256": "98adf43a5ec6d81d232a9ac5e37d1991b09b898f3012c12d0a0da2859171c815",
+          "verify_ms": 10184.282,
+          "cycles": 117
+        }
+      ],
+      "pooled_verify_ms": 86.98664743589742,
+      "logical_GB_per_block": 37.657,
+      "normalized_GBps": 432.90552182448874
+    }
+  },
+  "62000": {
+    "control": {
+      "observations": [
+        {
+          "file": "release-six-code-62000-1-control.json",
+          "sha256": "e7286d18dc5e831cd81fbc0037ed4646926e4a76bb15571a68eea63141ef60b3",
+          "verify_ms": 9495.6,
+          "cycles": 105
+        },
+        {
+          "file": "release-six-code-62000-2-control.json",
+          "sha256": "8f2559095cca0d47a7d9f826f45dd006c982c65c6d897e2d332edb7e5450b8cc",
+          "verify_ms": 9500.192,
+          "cycles": 105
+        },
+        {
+          "file": "release-six-code-62000-3-control.json",
+          "sha256": "af5a38b9a58e2be3d3360345fefde6b0f8f2bd23dd4b1669451660b595117672",
+          "verify_ms": 9498.137,
+          "cycles": 105
+        },
+        {
+          "file": "release-six-code-62000-4-control.json",
+          "sha256": "002cc1d7bc4aa0fa39caee8654be3151525fced9c4228c7953c1e3874a59928a",
+          "verify_ms": 9508.635,
+          "cycles": 105
+        }
+      ],
+      "pooled_verify_ms": 90.48229523809523,
+      "logical_GB_per_block": 37.657,
+      "normalized_GBps": 416.18086611208656
+    },
+    "all_kv_mix": {
+      "observations": [
+        {
+          "file": "release-six-code-62000-1-all_kv_mix.json",
+          "sha256": "04661741c3bc046c8e0fb3c8da3f20c300526abddb41dce9017c90bb8df29e57",
+          "verify_ms": 9332.984,
+          "cycles": 105
+        },
+        {
+          "file": "release-six-code-62000-2-all_kv_mix.json",
+          "sha256": "5718465ea566a70a64ecde435f6e741a0753c8bb71b9481cfe81cd12bab6f3ad",
+          "verify_ms": 9343.456,
+          "cycles": 105
+        },
+        {
+          "file": "release-six-code-62000-3-all_kv_mix.json",
+          "sha256": "7167790d5237ca321f43c8a2fb70b9e2e72bb6c769f873de4c5d38e1ce1ec5ef",
+          "verify_ms": 9342.054,
+          "cycles": 105
+        },
+        {
+          "file": "release-six-code-62000-4-all_kv_mix.json",
+          "sha256": "e109515c727c91c2606f55c78e9ba97dde3aa5e4528a4551a2afbc75709f8c4d",
+          "verify_ms": 9343.285,
+          "cycles": 105
+        }
+      ],
+      "pooled_verify_ms": 88.95661666666668,
+      "logical_GB_per_block": 37.657,
+      "normalized_GBps": 423.3187076022263
+    }
+  },
+  "300000": {
+    "control": {
+      "observations": [
+        {
+          "file": "release-six-code-300000-1-control.json",
+          "sha256": "ca2114b38e46bfea73ad62b6a352d897bfa700f06f90a122214679eebb4159cb",
+          "verify_ms": 8936.032,
+          "cycles": 90
+        },
+        {
+          "file": "release-six-code-300000-2-control.json",
+          "sha256": "ec9102752f066edf25378a758d932991d5a34152eddd09057d73612050b5c1fa",
+          "verify_ms": 8917.086,
+          "cycles": 90
+        },
+        {
+          "file": "release-six-code-300000-3-control.json",
+          "sha256": "81a310ebc3ce6701b11d223fe06b81b616c3f7cf2b531d56a03a5dfa68209c51",
+          "verify_ms": 8935.966,
+          "cycles": 90
+        },
+        {
+          "file": "release-six-code-300000-4-control.json",
+          "sha256": "e24ed4561b9fe3d757251abf948415907bb0367b50e4365775f35f485aa633ee",
+          "verify_ms": 8932.82,
+          "cycles": 90
+        }
+      ],
+      "pooled_verify_ms": 99.2275111111111,
+      "logical_GB_per_block": 37.657,
+      "normalized_GBps": 379.50160775304704
+    },
+    "all_kv_mix": {
+      "observations": [
+        {
+          "file": "release-six-code-300000-1-all_kv_mix.json",
+          "sha256": "1a12f3bfad49a73ee2f2f7d53793b8cd319e697f8c95041f99faac701554100f",
+          "verify_ms": 8809.076,
+          "cycles": 90
+        },
+        {
+          "file": "release-six-code-300000-2-all_kv_mix.json",
+          "sha256": "dcb745c2c79f04f835645f3f269620b155a6fe4eb050c363e24d161e608429e5",
+          "verify_ms": 8809.634,
+          "cycles": 90
+        },
+        {
+          "file": "release-six-code-300000-3-all_kv_mix.json",
+          "sha256": "cfa38ef1f9356e1b9893f706304e88b69e979cf047b2653547037e07fcf863e1",
+          "verify_ms": 8813.933,
+          "cycles": 90
+        },
+        {
+          "file": "release-six-code-300000-4-all_kv_mix.json",
+          "sha256": "46f40b54121ac602a7ff9c86c8cd9359fa5498a600ffc2abea810faaa4880328",
+          "verify_ms": 8805.967,
+          "cycles": 90
+        }
+      ],
+      "pooled_verify_ms": 97.88502777777778,
+      "logical_GB_per_block": 37.657,
+      "normalized_GBps": 384.70643422087306
+    }
+  }
+}

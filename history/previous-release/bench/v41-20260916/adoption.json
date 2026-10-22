@@ -1,0 +1,34 @@
+{
+  "approved": true,
+  "baseline": "59c15768b3ff5e7a6c3c63804e24894ff186f53d",
+  "goal_agent_answer_tps": 50.0,
+  "paired_agent_answer_tps": {
+    "A": 49.273350192501454,
+    "B": 50.04017320448473
+  },
+  "enabled_new": [
+    "mtp_q8_round",
+    "mtp_swiglu_round"
+  ],
+  "retained_changes": [
+    "A2",
+    "A3",
+    "A4",
+    "A6"
+  ],
+  "rejected": [
+    "A1",
+    "A5",
+    "A6-tile64"
+  ],
+  "screen_only": [
+    "A7-cpu-argmax"
+  ],
+  "tier": 1,
+  "controller_policy_changed": false,
+  "verification_ms_per_block": {
+    "A": 91.86064529914529,
+    "B": 90.77847008547009
+  },
+  "physical_dram_bandwidth_measured": false
+}

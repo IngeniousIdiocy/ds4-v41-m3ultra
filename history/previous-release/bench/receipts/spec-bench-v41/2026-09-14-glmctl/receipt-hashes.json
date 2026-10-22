@@ -1,0 +1,12 @@
+{
+  "controller-levers.json": "1313fd77f48f8f933029fd1a898f9e59311ae50445b96437255d71ae3dc2d73d",
+  "controller-records.jsonl": "72930cb79a686e8651bb7a1937d16654f0528f99c924686fbfa3bcff967dea00",
+  "identity.json": "97f399e7eba5b8c37e8db9f88f9ffbfefe7368b14c464292d134340d0d6ddbc7",
+  "prime-pass.json": "9ecb9d79a98e05a9277eb165072526e654d2d4d084a6d38a292601f35ce7d8af",
+  "report.json": "db740f27bf8e74c2cefb6aebb8ae10474fad46da598a10ac334657b4c9b20cb3",
+  "serial-levers.json": "f119da9d91b3194a8a1552b1ff2ea429a327b155f28027008fc7b577c143a387",
+  "serial-records.jsonl": "b58185cad52391768759a4fc2a1beb427b69e03c4ad0c50438230b3875420df9",
+  "six-levers.json": "407120823d8f268293d905dc059e2c458cdbb26550c4b2369a97a4c50945ad4d",
+  "six-records.jsonl": "60c801a7f0530c8d9a77b11a1c606f27ff322603571a04d8b80a873c4799bf15",
+  "subset-manifest.json": "ef2d3e71dfcb554b5efa81edb16122c68452f60c9e40fd476344296231d9123b"
+}

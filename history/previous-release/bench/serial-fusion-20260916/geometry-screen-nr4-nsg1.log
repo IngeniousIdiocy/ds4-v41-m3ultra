@@ -1,0 +1,15 @@
+CHECKER SELFTEST PASS first/middle/last mismatches, NaN, infinity, guards, control
+draws64/64 mismatch0 finite1.000000 controls64/64 poison0 guard0
+PASS draws64 words1966336 finite1.000000 controls64 determinism1000/1000
+TIMING folded1 tail0 nsg1 nr04 run0 arm0 us64.277500
+TIMING folded1 tail0 nsg1 nr04 run1 arm1 us64.880829
+TIMING folded1 tail0 nsg1 nr04 run2 arm1 us64.899996
+TIMING folded1 tail0 nsg1 nr04 run3 arm0 us65.017501
+TIMING folded1 tail0 nsg1 nr04 run4 arm0 us64.657507
+TIMING folded1 tail0 nsg1 nr04 run5 arm1 us65.129995
+TIMING folded1 tail0 nsg1 nr04 run6 arm1 us64.737499
+TIMING folded1 tail0 nsg1 nr04 run7 arm0 us65.514166
+TIMING folded1 tail0 nsg1 nr04 run8 arm0 us65.618334
+TIMING folded1 tail0 nsg1 nr04 run9 arm1 us64.767497
+TIMING folded1 tail0 nsg1 nr04 run10 arm1 us64.615831
+TIMING folded1 tail0 nsg1 nr04 run11 arm0 us65.729171

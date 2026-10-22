@@ -1,0 +1,32 @@
+62000 0 control 33.6457 quiet 98.17 hash bd7d961f0eba
+62000 0 kv_mix 35.8069 quiet 95.51 hash bd7d961f0eba
+PAIR EXACT 62000 0
+62000 1 kv_mix 35.7874 quiet 95.42 hash bd7d961f0eba
+62000 1 control 33.5954 quiet 97.79 hash bd7d961f0eba
+PAIR EXACT 62000 1
+62000 2 control 33.6046 quiet 95.27 hash bd7d961f0eba
+62000 2 kv_mix 35.6743 quiet 98.3 hash bd7d961f0eba
+PAIR EXACT 62000 2
+62000 3 kv_mix 35.664 quiet 98.22 hash bd7d961f0eba
+62000 3 control 33.5379 quiet 96.47 hash bd7d961f0eba
+PAIR EXACT 62000 3
+62000 4 control 33.5649 quiet 98.2 hash bd7d961f0eba
+62000 4 kv_mix 35.7305 quiet 98.6 hash bd7d961f0eba
+PAIR EXACT 62000 4
+SUMMARY 62000 {'control': {'values': [33.5954, 33.6046, 33.5379, 33.5649], 'best': 33.6046, 'mean': 33.5757, 'delta': 0.0, 'se': 0.0}, 'kv_mix': {'values': [35.7874, 35.6743, 35.664, 35.7305], 'best': 35.7874, 'mean': 35.71405, 'delta': 2.138350000000001, 'se': 0.026589111179828307}}
+300000 0 control 32.1374 quiet 97.9 hash 3a49c1348e83
+300000 0 kv_mix 34.8126 quiet 93.32 hash 3a49c1348e83
+PAIR EXACT 300000 0
+300000 1 kv_mix 34.4069 quiet 93.45 hash 3a49c1348e83
+300000 1 control 32.1208 quiet 97.51 hash 3a49c1348e83
+PAIR EXACT 300000 1
+300000 2 control 32.0724 quiet 97.1 hash 3a49c1348e83
+300000 2 kv_mix 34.0923 quiet 97.73 hash 3a49c1348e83
+PAIR EXACT 300000 2
+300000 3 kv_mix 34.0968 quiet 98.14 hash 3a49c1348e83
+300000 3 control 32.0683 quiet 98.1 hash 3a49c1348e83
+PAIR EXACT 300000 3
+300000 4 control 32.0795 quiet 98.0 hash 3a49c1348e83
+300000 4 kv_mix 34.1043 quiet 97.81 hash 3a49c1348e83
+PAIR EXACT 300000 4
+SUMMARY 300000 {'control': {'values': [32.1208, 32.0724, 32.0683, 32.0795], 'best': 32.1208, 'mean': 32.08525, 'delta': 0.0, 'se': 0.0}, 'kv_mix': {'values': [34.4069, 34.0923, 34.0968, 34.1043], 'best': 34.4069, 'mean': 34.175075, 'delta': 2.0898249999999994, 'se': 0.0654486996942383}}

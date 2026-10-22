@@ -1,0 +1,14 @@
+{
+  "reference_arm": "arp",
+  "candidate_arm": "full",
+  "paired_delta": [
+    0.19209999999999638,
+    0.13520000000000465,
+    0.19590000000000174,
+    0.23930000000000007
+  ],
+  "mean_delta": 0.1906250000000007,
+  "se": 0.02135257107859906,
+  "full_vs_control_output_and_acceptance_exact": true,
+  "server_manifest": "server-manifest.json"
+}

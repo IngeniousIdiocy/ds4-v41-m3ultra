@@ -1,0 +1,48 @@
+8192 0 control 43.971 quiet 96.76 hash c21119215ff8
+8192 0 all_kv_mix 45.0306 quiet 97.76 hash c21119215ff8
+PAIR EXACT 8192 0
+8192 1 all_kv_mix 45.0159 quiet 95.42 hash c21119215ff8
+8192 1 control 44.3131 quiet 98.29 hash c21119215ff8
+PAIR EXACT 8192 1
+8192 2 control 44.3745 quiet 97.8 hash c21119215ff8
+8192 2 all_kv_mix 44.9478 quiet 97.95 hash c21119215ff8
+PAIR EXACT 8192 2
+8192 3 all_kv_mix 44.9455 quiet 97.77 hash c21119215ff8
+8192 3 control 44.2411 quiet 97.43 hash c21119215ff8
+PAIR EXACT 8192 3
+8192 4 control 44.3207 quiet 97.9 hash c21119215ff8
+8192 4 all_kv_mix 44.929 quiet 96.41 hash c21119215ff8
+PAIR EXACT 8192 4
+SUMMARY 8192 {'control': {'values': [44.3131, 44.3745, 44.2411, 44.3207], 'best': 44.3745, 'mean': 44.31235, 'delta': 0.0, 'se': 0.0}, 'all_kv_mix': {'values': [45.0159, 44.9478, 44.9455, 44.929], 'best': 45.0159, 'mean': 44.95955, 'delta': 0.6472000000000016, 'se': 0.03333869123605969}}
+62000 0 control 48.1366 quiet 96.9 hash bd7d961f0eba
+62000 0 all_kv_mix 49.1397 quiet 95.41 hash bd7d961f0eba
+PAIR EXACT 62000 0
+62000 1 all_kv_mix 49.1804 quiet 97.95 hash bd7d961f0eba
+62000 1 control 48.4129 quiet 97.49 hash bd7d961f0eba
+PAIR EXACT 62000 1
+62000 2 control 48.4105 quiet 98.15 hash bd7d961f0eba
+62000 2 all_kv_mix 49.1407 quiet 97.71 hash bd7d961f0eba
+PAIR EXACT 62000 2
+62000 3 all_kv_mix 49.1354 quiet 98.3 hash bd7d961f0eba
+62000 3 control 48.4086 quiet 98.36 hash bd7d961f0eba
+PAIR EXACT 62000 3
+62000 4 control 48.3595 quiet 96.81 hash bd7d961f0eba
+62000 4 all_kv_mix 49.1198 quiet 98.12 hash bd7d961f0eba
+PAIR EXACT 62000 4
+SUMMARY 62000 {'control': {'values': [48.4129, 48.4105, 48.4086, 48.3595], 'best': 48.4129, 'mean': 48.397875, 'delta': 0.0, 'se': 0.0}, 'all_kv_mix': {'values': [49.1804, 49.1407, 49.1354, 49.1198], 'best': 49.1804, 'mean': 49.144075, 'delta': 0.7462, 'se': 0.010347543992013866}}
+300000 0 control 51.479 quiet 97.78 hash 3a49c1348e83
+300000 0 all_kv_mix 52.455 quiet 98.9 hash 3a49c1348e83
+PAIR EXACT 300000 0
+300000 1 all_kv_mix 52.4165 quiet 98.1 hash 3a49c1348e83
+300000 1 control 51.713 quiet 96.39 hash 3a49c1348e83
+PAIR EXACT 300000 1
+300000 2 control 51.8142 quiet 97.1 hash 3a49c1348e83
+300000 2 all_kv_mix 52.3948 quiet 97.92 hash 3a49c1348e83
+PAIR EXACT 300000 2
+300000 3 all_kv_mix 52.396 quiet 98.7 hash 3a49c1348e83
+300000 3 control 51.7097 quiet 97.91 hash 3a49c1348e83
+PAIR EXACT 300000 3
+300000 4 control 51.7419 quiet 97.87 hash 3a49c1348e83
+300000 4 all_kv_mix 52.4337 quiet 98.21 hash 3a49c1348e83
+PAIR EXACT 300000 4
+SUMMARY 300000 {'control': {'values': [51.713, 51.8142, 51.7097, 51.7419], 'best': 51.8142, 'mean': 51.7447, 'delta': 0.0, 'se': 0.0}, 'all_kv_mix': {'values': [52.4165, 52.3948, 52.396, 52.4337], 'best': 52.4337, 'mean': 52.41025, 'delta': 0.6655499999999996, 'se': 0.02854284790743054}}

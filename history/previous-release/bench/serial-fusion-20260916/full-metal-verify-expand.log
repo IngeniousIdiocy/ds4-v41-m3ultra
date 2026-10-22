@@ -1,0 +1,4 @@
+PASS kernel_dsv41_attn_out_hc nsg4 maxThreads1024
+PASS kernel_dsv41_router_shared_hc nsg8 maxThreads1024
+PASS kernel_dsv41_group6_expand_packed_tail nsg2 maxThreads1024
+PASS kernel_dsv41_verify_round_expand4 nsg4 maxThreads1024

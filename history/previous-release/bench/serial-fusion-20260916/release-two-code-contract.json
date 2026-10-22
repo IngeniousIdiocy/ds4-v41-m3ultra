@@ -1,0 +1,143 @@
+{
+  "passed": true,
+  "tag": "release-two-code",
+  "cases": [
+    {
+      "file": "release-two-code-8192-0-control.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 23.7512,
+      "warmup": true
+    },
+    {
+      "file": "release-two-code-8192-0-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 23.9368,
+      "warmup": true
+    },
+    {
+      "file": "release-two-code-8192-1-control.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 23.7992,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-8192-1-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 23.9207,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-8192-2-control.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 23.79,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-8192-2-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 23.992,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-62000-0-control.json",
+      "tokens": 512,
+      "text_sha256": "bd7d961f0ebaf12b3fec267de339e99d9f201c159e1aaf36cf926f27d296f2c1",
+      "steady_tps": 24.2664,
+      "warmup": true
+    },
+    {
+      "file": "release-two-code-62000-0-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "bd7d961f0ebaf12b3fec267de339e99d9f201c159e1aaf36cf926f27d296f2c1",
+      "steady_tps": 24.4396,
+      "warmup": true
+    },
+    {
+      "file": "release-two-code-62000-1-control.json",
+      "tokens": 512,
+      "text_sha256": "bd7d961f0ebaf12b3fec267de339e99d9f201c159e1aaf36cf926f27d296f2c1",
+      "steady_tps": 24.2551,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-62000-1-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "bd7d961f0ebaf12b3fec267de339e99d9f201c159e1aaf36cf926f27d296f2c1",
+      "steady_tps": 24.443,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-62000-2-control.json",
+      "tokens": 512,
+      "text_sha256": "bd7d961f0ebaf12b3fec267de339e99d9f201c159e1aaf36cf926f27d296f2c1",
+      "steady_tps": 24.285,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-62000-2-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "bd7d961f0ebaf12b3fec267de339e99d9f201c159e1aaf36cf926f27d296f2c1",
+      "steady_tps": 24.4315,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-300000-0-control.json",
+      "tokens": 512,
+      "text_sha256": "3a49c1348e83595dcf21ff4216eea8decd1b50683c7e53338246dd2eff257e5e",
+      "steady_tps": 24.1107,
+      "warmup": true
+    },
+    {
+      "file": "release-two-code-300000-0-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "3a49c1348e83595dcf21ff4216eea8decd1b50683c7e53338246dd2eff257e5e",
+      "steady_tps": 24.281,
+      "warmup": true
+    },
+    {
+      "file": "release-two-code-300000-1-control.json",
+      "tokens": 512,
+      "text_sha256": "3a49c1348e83595dcf21ff4216eea8decd1b50683c7e53338246dd2eff257e5e",
+      "steady_tps": 24.1023,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-300000-1-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "3a49c1348e83595dcf21ff4216eea8decd1b50683c7e53338246dd2eff257e5e",
+      "steady_tps": 24.2628,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-300000-2-control.json",
+      "tokens": 512,
+      "text_sha256": "3a49c1348e83595dcf21ff4216eea8decd1b50683c7e53338246dd2eff257e5e",
+      "steady_tps": 24.098,
+      "warmup": false
+    },
+    {
+      "file": "release-two-code-300000-2-all_kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "3a49c1348e83595dcf21ff4216eea8decd1b50683c7e53338246dd2eff257e5e",
+      "steady_tps": 24.3666,
+      "warmup": false
+    }
+  ],
+  "mtp_work_fields": [
+    "dspark_cycles",
+    "dspark_committed",
+    "dspark_verified_rows",
+    "dspark_processed_rows",
+    "dspark_serial_rows",
+    "dspark_attempts",
+    "dspark_skipped_steps",
+    "dspark_declines",
+    "dspark_accept_hist"
+  ]
+}

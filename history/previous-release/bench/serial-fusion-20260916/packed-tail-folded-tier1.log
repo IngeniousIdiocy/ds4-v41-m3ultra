@@ -1,0 +1,64 @@
+CHECKER SELFTEST PASS first/middle/last mismatches, NaN, infinity, guards, control
+draws1000/50000 mismatch0 finite1.000000 controls1000/1000 poison0 guard0
+draws2000/50000 mismatch0 finite1.000000 controls2000/2000 poison0 guard0
+draws3000/50000 mismatch0 finite1.000000 controls3000/3000 poison0 guard0
+draws4000/50000 mismatch0 finite1.000000 controls4000/4000 poison0 guard0
+draws5000/50000 mismatch0 finite1.000000 controls5000/5000 poison0 guard0
+draws6000/50000 mismatch0 finite1.000000 controls6000/6000 poison0 guard0
+draws7000/50000 mismatch0 finite1.000000 controls7000/7000 poison0 guard0
+draws8000/50000 mismatch0 finite1.000000 controls8000/8000 poison0 guard0
+draws9000/50000 mismatch0 finite1.000000 controls9000/9000 poison0 guard0
+draws10000/50000 mismatch0 finite1.000000 controls10000/10000 poison0 guard0
+draws11000/50000 mismatch0 finite1.000000 controls11000/11000 poison0 guard0
+draws12000/50000 mismatch0 finite1.000000 controls12000/12000 poison0 guard0
+draws13000/50000 mismatch0 finite1.000000 controls13000/13000 poison0 guard0
+draws14000/50000 mismatch0 finite1.000000 controls14000/14000 poison0 guard0
+draws15000/50000 mismatch0 finite1.000000 controls15000/15000 poison0 guard0
+draws16000/50000 mismatch0 finite1.000000 controls16000/16000 poison0 guard0
+draws17000/50000 mismatch0 finite1.000000 controls17000/17000 poison0 guard0
+draws18000/50000 mismatch0 finite1.000000 controls18000/18000 poison0 guard0
+draws19000/50000 mismatch0 finite1.000000 controls19000/19000 poison0 guard0
+draws20000/50000 mismatch0 finite1.000000 controls20000/20000 poison0 guard0
+draws21000/50000 mismatch0 finite1.000000 controls21000/21000 poison0 guard0
+draws22000/50000 mismatch0 finite1.000000 controls22000/22000 poison0 guard0
+draws23000/50000 mismatch0 finite1.000000 controls23000/23000 poison0 guard0
+draws24000/50000 mismatch0 finite1.000000 controls24000/24000 poison0 guard0
+draws25000/50000 mismatch0 finite1.000000 controls25000/25000 poison0 guard0
+draws26000/50000 mismatch0 finite1.000000 controls26000/26000 poison0 guard0
+draws27000/50000 mismatch0 finite1.000000 controls27000/27000 poison0 guard0
+draws28000/50000 mismatch0 finite1.000000 controls28000/28000 poison0 guard0
+draws29000/50000 mismatch0 finite1.000000 controls29000/29000 poison0 guard0
+draws30000/50000 mismatch0 finite1.000000 controls30000/30000 poison0 guard0
+draws31000/50000 mismatch0 finite1.000000 controls31000/31000 poison0 guard0
+draws32000/50000 mismatch0 finite1.000000 controls32000/32000 poison0 guard0
+draws33000/50000 mismatch0 finite1.000000 controls33000/33000 poison0 guard0
+draws34000/50000 mismatch0 finite1.000000 controls34000/34000 poison0 guard0
+draws35000/50000 mismatch0 finite1.000000 controls35000/35000 poison0 guard0
+draws36000/50000 mismatch0 finite1.000000 controls36000/36000 poison0 guard0
+draws37000/50000 mismatch0 finite1.000000 controls37000/37000 poison0 guard0
+draws38000/50000 mismatch0 finite1.000000 controls38000/38000 poison0 guard0
+draws39000/50000 mismatch0 finite1.000000 controls39000/39000 poison0 guard0
+draws40000/50000 mismatch0 finite1.000000 controls40000/40000 poison0 guard0
+draws41000/50000 mismatch0 finite1.000000 controls41000/41000 poison0 guard0
+draws42000/50000 mismatch0 finite1.000000 controls42000/42000 poison0 guard0
+draws43000/50000 mismatch0 finite1.000000 controls43000/43000 poison0 guard0
+draws44000/50000 mismatch0 finite1.000000 controls44000/44000 poison0 guard0
+draws45000/50000 mismatch0 finite1.000000 controls45000/45000 poison0 guard0
+draws46000/50000 mismatch0 finite1.000000 controls46000/46000 poison0 guard0
+draws47000/50000 mismatch0 finite1.000000 controls47000/47000 poison0 guard0
+draws48000/50000 mismatch0 finite1.000000 controls48000/48000 poison0 guard0
+draws49000/50000 mismatch0 finite1.000000 controls49000/49000 poison0 guard0
+draws50000/50000 mismatch0 finite1.000000 controls50000/50000 poison0 guard0
+PASS draws50000 words1536200000 finite1.000000 controls50000 determinism1000/1000
+TIMING rotate1 folded1 tail1 nsg2 nr04 run0 arm0 us80.389588
+TIMING rotate1 folded1 tail1 nsg2 nr04 run1 arm1 us71.034371
+TIMING rotate1 folded1 tail1 nsg2 nr04 run2 arm1 us70.122909
+TIMING rotate1 folded1 tail1 nsg2 nr04 run3 arm0 us79.732295
+TIMING rotate1 folded1 tail1 nsg2 nr04 run4 arm0 us80.399995
+TIMING rotate1 folded1 tail1 nsg2 nr04 run5 arm1 us70.807291
+TIMING rotate1 folded1 tail1 nsg2 nr04 run6 arm1 us70.937502
+TIMING rotate1 folded1 tail1 nsg2 nr04 run7 arm0 us80.267712
+TIMING rotate1 folded1 tail1 nsg2 nr04 run8 arm0 us80.781255
+TIMING rotate1 folded1 tail1 nsg2 nr04 run9 arm1 us70.496870
+TIMING rotate1 folded1 tail1 nsg2 nr04 run10 arm1 us70.678128
+TIMING rotate1 folded1 tail1 nsg2 nr04 run11 arm0 us80.196874

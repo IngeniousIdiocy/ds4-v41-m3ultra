@@ -116,4 +116,4 @@ groups. What moved:
 | `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` (dense attention up to 1,024 compressed rows) | Main changed this on purpose: it selects the model's top-k as soon as there are more than 512 index rows, because attending to more rows changes the output. The branch keeps main's rule. It matters only between about 2K and 4K tokens. |
 | The first-expert offset fix in the two-Mac batch MoE call | A fix to main's own code that can only be checked on two Macs; left for a separate fix to main. |
 | `DS4_METAL_ENABLE_V41_ROWS_ATTENTION` | Its verify half is the row-by-row verify with VERIFY_INDEXED off; its short-prefill half showed no speedup and changes prefill logits. |
-| The release's history, receipts and reproduction scripts | They describe the old runtime on the old base. This branch's commit messages and these docs replace them. |
+| The release's history, receipts and reproduction scripts, as working docs | They describe the old runtime on the old base, and this branch's commit messages and these docs replace them. They are kept unchanged as the record in [history/previous-release](history/previous-release/README.md). |

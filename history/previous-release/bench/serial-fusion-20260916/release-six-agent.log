@@ -1,0 +1,16 @@
+8192 0 control 38.0427 quiet 95.68 hash 37499efba41f
+8192 0 all_kv_mix 38.7178 quiet 98.1 hash 37499efba41f
+PAIR EXACT 8192 0
+8192 1 all_kv_mix 38.8127 quiet 98.16 hash 37499efba41f
+8192 1 control 38.1493 quiet 97.87 hash 37499efba41f
+PAIR EXACT 8192 1
+8192 2 control 38.1272 quiet 95.62 hash 37499efba41f
+8192 2 all_kv_mix 38.7547 quiet 95.64 hash 37499efba41f
+PAIR EXACT 8192 2
+8192 3 all_kv_mix 38.7249 quiet 95.77 hash 37499efba41f
+8192 3 control 38.1465 quiet 98.16 hash 37499efba41f
+PAIR EXACT 8192 3
+8192 4 control 38.1854 quiet 97.27 hash 37499efba41f
+8192 4 all_kv_mix 38.7601 quiet 98.2 hash 37499efba41f
+PAIR EXACT 8192 4
+SUMMARY 8192 {'control': {'values': [38.1493, 38.1272, 38.1465, 38.1854], 'best': 38.1854, 'mean': 38.152100000000004, 'delta': 0.0, 'se': 0.0}, 'all_kv_mix': {'values': [38.8127, 38.7547, 38.7249, 38.7601], 'best': 38.8127, 'mean': 38.7631, 'delta': 0.6109999999999989, 'se': 0.021210178374231396}}

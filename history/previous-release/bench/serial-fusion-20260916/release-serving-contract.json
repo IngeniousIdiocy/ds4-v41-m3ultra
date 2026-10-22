@@ -1,0 +1,480 @@
+{
+  "passed": true,
+  "controller_policy_changed": false,
+  "request_costs_remeasured": true,
+  "cases": [
+    {
+      "label": "smoke-code-warm-A",
+      "arm": "A",
+      "usage": {
+        "prompt_tokens": 205,
+        "completion_tokens": 132,
+        "total_tokens": 337,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 205
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 17,
+          "dspark_committed": 94,
+          "dspark_serial_rows": 32,
+          "dspark_tokens_per_cycle": 5.5294,
+          "dspark_attempts": 17,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 7,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 2,
+          "dspark_declines": 6,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 1,
+          "dspark_fault_attempts": 23,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 28.862,
+          "dspark_cycle_ms": 96.5581,
+          "dspark_net_ms": -996.923
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": "635dbeb053c6f02deda84f100f4f3ffd703133b159734aadf4e1937fdc9d9e12",
+        "tool_calls": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "decode_seconds": 2.796188957989216,
+      "reasoning_seconds": 0.0,
+      "answer_seconds": 2.796188957989216,
+      "server_final_decode_tps": 46.59,
+      "text_sha256": "9659a5ed0c5db80c719a5e3de546be2e20298fa1ac575e6b19ef515b6e4af95a"
+    },
+    {
+      "label": "smoke-code-warm-B",
+      "arm": "B",
+      "usage": {
+        "prompt_tokens": 205,
+        "completion_tokens": 132,
+        "total_tokens": 337,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 205
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 17,
+          "dspark_committed": 94,
+          "dspark_serial_rows": 0,
+          "dspark_tokens_per_cycle": 5.5294,
+          "dspark_attempts": 17,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 7,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 2,
+          "dspark_declines": 6,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 2,
+          "dspark_fault_attempts": 46,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 27.349,
+          "dspark_cycle_ms": 94.0791,
+          "dspark_net_ms": -905.292
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": "635dbeb053c6f02deda84f100f4f3ffd703133b159734aadf4e1937fdc9d9e12",
+        "tool_calls": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "decode_seconds": 2.6793776671402156,
+      "reasoning_seconds": 0.0,
+      "answer_seconds": 2.6793776671402156,
+      "server_final_decode_tps": 48.75,
+      "text_sha256": "9659a5ed0c5db80c719a5e3de546be2e20298fa1ac575e6b19ef515b6e4af95a"
+    },
+    {
+      "label": "smoke-code-0-A",
+      "arm": "A",
+      "usage": {
+        "prompt_tokens": 205,
+        "completion_tokens": 132,
+        "total_tokens": 337,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 205
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 17,
+          "dspark_committed": 94,
+          "dspark_serial_rows": 0,
+          "dspark_tokens_per_cycle": 5.5294,
+          "dspark_attempts": 17,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 7,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 2,
+          "dspark_declines": 6,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 3,
+          "dspark_fault_attempts": 69,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 29.122,
+          "dspark_cycle_ms": 95.6675,
+          "dspark_net_ms": -1044.491
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": "635dbeb053c6f02deda84f100f4f3ffd703133b159734aadf4e1937fdc9d9e12",
+        "tool_calls": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "decode_seconds": 2.7720827092416584,
+      "reasoning_seconds": 0.0,
+      "answer_seconds": 2.7720827092416584,
+      "server_final_decode_tps": 47.1,
+      "text_sha256": "9659a5ed0c5db80c719a5e3de546be2e20298fa1ac575e6b19ef515b6e4af95a"
+    },
+    {
+      "label": "smoke-code-1-B",
+      "arm": "B",
+      "usage": {
+        "prompt_tokens": 205,
+        "completion_tokens": 132,
+        "total_tokens": 337,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 205
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 17,
+          "dspark_committed": 94,
+          "dspark_serial_rows": 0,
+          "dspark_tokens_per_cycle": 5.5294,
+          "dspark_attempts": 17,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 7,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 2,
+          "dspark_declines": 6,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 4,
+          "dspark_fault_attempts": 92,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 27.31,
+          "dspark_cycle_ms": 94.3653,
+          "dspark_net_ms": -900.496
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": "635dbeb053c6f02deda84f100f4f3ffd703133b159734aadf4e1937fdc9d9e12",
+        "tool_calls": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "decode_seconds": 2.679748250171542,
+      "reasoning_seconds": 0.0,
+      "answer_seconds": 2.679748250171542,
+      "server_final_decode_tps": 48.74,
+      "text_sha256": "9659a5ed0c5db80c719a5e3de546be2e20298fa1ac575e6b19ef515b6e4af95a"
+    },
+    {
+      "label": "smoke-code-2-B",
+      "arm": "B",
+      "usage": {
+        "prompt_tokens": 205,
+        "completion_tokens": 132,
+        "total_tokens": 337,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 205
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 17,
+          "dspark_committed": 94,
+          "dspark_serial_rows": 0,
+          "dspark_tokens_per_cycle": 5.5294,
+          "dspark_attempts": 17,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 7,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 2,
+          "dspark_declines": 6,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 5,
+          "dspark_fault_attempts": 115,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 27.264,
+          "dspark_cycle_ms": 94.2992,
+          "dspark_net_ms": -894.279
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": "635dbeb053c6f02deda84f100f4f3ffd703133b159734aadf4e1937fdc9d9e12",
+        "tool_calls": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "decode_seconds": 2.6809894582256675,
+      "reasoning_seconds": 0.0,
+      "answer_seconds": 2.6809894582256675,
+      "server_final_decode_tps": 48.72,
+      "text_sha256": "9659a5ed0c5db80c719a5e3de546be2e20298fa1ac575e6b19ef515b6e4af95a"
+    },
+    {
+      "label": "smoke-code-3-A",
+      "arm": "A",
+      "usage": {
+        "prompt_tokens": 205,
+        "completion_tokens": 132,
+        "total_tokens": 337,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 205
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 17,
+          "dspark_committed": 94,
+          "dspark_serial_rows": 0,
+          "dspark_tokens_per_cycle": 5.5294,
+          "dspark_attempts": 17,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 7,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 2,
+          "dspark_declines": 6,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 6,
+          "dspark_fault_attempts": 138,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 29.133,
+          "dspark_cycle_ms": 95.8213,
+          "dspark_net_ms": -1047.805
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": "635dbeb053c6f02deda84f100f4f3ffd703133b159734aadf4e1937fdc9d9e12",
+        "tool_calls": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "decode_seconds": 2.7706655003130436,
+      "reasoning_seconds": 0.0,
+      "answer_seconds": 2.7706655003130436,
+      "server_final_decode_tps": 47.13,
+      "text_sha256": "9659a5ed0c5db80c719a5e3de546be2e20298fa1ac575e6b19ef515b6e4af95a"
+    },
+    {
+      "label": "smoke-agent-A10-0-A",
+      "arm": "A",
+      "usage": {
+        "prompt_tokens": 107006,
+        "completion_tokens": 438,
+        "total_tokens": 107444,
+        "prompt_tokens_details": {
+          "cached_tokens": 107006,
+          "cache_write_tokens": 0
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 47,
+          "dspark_committed": 257,
+          "dspark_serial_rows": 137,
+          "dspark_tokens_per_cycle": 5.4681,
+          "dspark_attempts": 47,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 19,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 3,
+          "dspark_declines": 12,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 7,
+          "dspark_fault_attempts": 197,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 30.008,
+          "dspark_cycle_ms": 103.2078,
+          "dspark_net_ms": -2677.92
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e9fa9853dccfed67020b0f0a4e14c6de87abf0310c10118b9123fd28173eace5",
+        "content": "9cc5da16d6293968240504f698598b4198005e045ce3808073d26c361bcfceac",
+        "tool_calls": "4c718d5dd9b948951157ee8b3e44f5fd5079ab2beb45c78eb8aa555a6848543f"
+      },
+      "decode_seconds": 10.321863459423184,
+      "reasoning_seconds": 5.506789500359446,
+      "answer_seconds": 4.815073959063739,
+      "server_final_decode_tps": 41.75,
+      "text_sha256": "0a64bb6f4347d5c2aaaf978fc8109d011d42fbef067fa9af0ce282f1eef20b12"
+    },
+    {
+      "label": "smoke-agent-A10-1-B",
+      "arm": "B",
+      "usage": {
+        "prompt_tokens": 107006,
+        "completion_tokens": 438,
+        "total_tokens": 107444,
+        "prompt_tokens_details": {
+          "cached_tokens": 107006,
+          "cache_write_tokens": 0
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 47,
+          "dspark_committed": 257,
+          "dspark_serial_rows": 0,
+          "dspark_tokens_per_cycle": 5.4681,
+          "dspark_attempts": 47,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 19,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 3,
+          "dspark_declines": 12,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 8,
+          "dspark_fault_attempts": 256,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 28.35,
+          "dspark_cycle_ms": 102.1806,
+          "dspark_net_ms": -2323.746
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e9fa9853dccfed67020b0f0a4e14c6de87abf0310c10118b9123fd28173eace5",
+        "content": "9cc5da16d6293968240504f698598b4198005e045ce3808073d26c361bcfceac",
+        "tool_calls": "4c718d5dd9b948951157ee8b3e44f5fd5079ab2beb45c78eb8aa555a6848543f"
+      },
+      "decode_seconds": 9.935144958086312,
+      "reasoning_seconds": 5.196919790934771,
+      "answer_seconds": 4.7382251671515405,
+      "server_final_decode_tps": 43.35,
+      "text_sha256": "0a64bb6f4347d5c2aaaf978fc8109d011d42fbef067fa9af0ce282f1eef20b12"
+    },
+    {
+      "label": "smoke-agent-A10-2-A",
+      "arm": "A",
+      "usage": {
+        "prompt_tokens": 107006,
+        "completion_tokens": 438,
+        "total_tokens": 107444,
+        "prompt_tokens_details": {
+          "cached_tokens": 107006,
+          "cache_write_tokens": 0
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 47,
+          "dspark_committed": 257,
+          "dspark_serial_rows": 0,
+          "dspark_tokens_per_cycle": 5.4681,
+          "dspark_attempts": 47,
+          "dspark_skipped_steps": 16,
+          "dspark_windows": 19,
+          "dspark_backoffs": 1,
+          "dspark_losing_cycles": 3,
+          "dspark_declines": 12,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 9,
+          "dspark_fault_attempts": 315,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 29.932,
+          "dspark_cycle_ms": 103.8297,
+          "dspark_net_ms": -2656.444
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e9fa9853dccfed67020b0f0a4e14c6de87abf0310c10118b9123fd28173eace5",
+        "content": "9cc5da16d6293968240504f698598b4198005e045ce3808073d26c361bcfceac",
+        "tool_calls": "4c718d5dd9b948951157ee8b3e44f5fd5079ab2beb45c78eb8aa555a6848543f"
+      },
+      "decode_seconds": 10.305607915855944,
+      "reasoning_seconds": 5.483620082959533,
+      "answer_seconds": 4.821987832896411,
+      "server_final_decode_tps": 41.8,
+      "text_sha256": "0a64bb6f4347d5c2aaaf978fc8109d011d42fbef067fa9af0ce282f1eef20b12"
+    },
+    {
+      "label": "smoke-prose-A",
+      "arm": "A",
+      "usage": {
+        "prompt_tokens": 100,
+        "completion_tokens": 512,
+        "total_tokens": 612,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 100
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 0,
+          "dspark_committed": 0,
+          "dspark_serial_rows": 325,
+          "dspark_tokens_per_cycle": 0.0,
+          "dspark_attempts": 0,
+          "dspark_skipped_steps": 478,
+          "dspark_windows": 6,
+          "dspark_backoffs": 6,
+          "dspark_losing_cycles": 0,
+          "dspark_declines": 18,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 10,
+          "dspark_fault_attempts": 333,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 29.265,
+          "dspark_cycle_ms": 0.0,
+          "dspark_net_ms": 219.252
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": "38db86d25ab1525adbd988e3702960d4c0efebd0defcf5bb373ac58b3358f0c2",
+        "tool_calls": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "decode_seconds": 15.163426708895713,
+      "reasoning_seconds": 0.0,
+      "answer_seconds": 15.163426708895713,
+      "server_final_decode_tps": 33.68,
+      "text_sha256": "e98f676ff1b05a66d771be618b6cfa5e3c31575ff80df60830ea6c4f12337895"
+    },
+    {
+      "label": "smoke-prose-B",
+      "arm": "B",
+      "usage": {
+        "prompt_tokens": 100,
+        "completion_tokens": 512,
+        "total_tokens": 612,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 100
+        },
+        "ds4_dspark": {
+          "dspark_cycles": 0,
+          "dspark_committed": 0,
+          "dspark_serial_rows": 0,
+          "dspark_tokens_per_cycle": 0.0,
+          "dspark_attempts": 0,
+          "dspark_skipped_steps": 478,
+          "dspark_windows": 6,
+          "dspark_backoffs": 6,
+          "dspark_losing_cycles": 0,
+          "dspark_declines": 18,
+          "dspark_fault_latched": 0,
+          "dspark_fault_requests": 11,
+          "dspark_fault_attempts": 351,
+          "dspark_fault_failures": 0,
+          "dspark_fault_skips": 0,
+          "dspark_serial_ms": 27.439,
+          "dspark_cycle_ms": 0.0,
+          "dspark_net_ms": 197.64
+        }
+      },
+      "phase_hashes": {
+        "reasoning": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "content": "38db86d25ab1525adbd988e3702960d4c0efebd0defcf5bb373ac58b3358f0c2",
+        "tool_calls": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "decode_seconds": 14.224309250246733,
+      "reasoning_seconds": 0.0,
+      "answer_seconds": 14.224309250246733,
+      "server_final_decode_tps": 35.92,
+      "text_sha256": "e98f676ff1b05a66d771be618b6cfa5e3c31575ff80df60830ea6c4f12337895"
+    }
+  ]
+}

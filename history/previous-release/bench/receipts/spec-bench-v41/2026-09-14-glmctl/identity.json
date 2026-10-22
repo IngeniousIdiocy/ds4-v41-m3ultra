@@ -1,0 +1,23 @@
+{
+  "utc": "2026-09-14T13:17:21Z",
+  "spec_bench_commit": "fd2c1cd7d2201ef71db4c5f4e455008f017967bf",
+  "spec_bench_root": "Spec-Bench",
+  "question_file_sha256": "4b6d33e79484f9841c487ee87d1cf6aa8c6066f61d5d482ff09e5a007fafdf04",
+  "server_sha256": "cfeb2c4d186d6000e2687de88df228272eaff7d86a28ef16405a9480f3f188b6",
+  "model": "DeepSeek-V4.1-Flash-Q4.gguf",
+  "model_bytes": 518596067328,
+  "modes": [
+    "serial",
+    "six",
+    "controller"
+  ],
+  "ctx": 32768,
+  "resident_server": true,
+  "prime_prefixes": true,
+  "preflight_smoke": false,
+  "mtp_model": "DeepSeek-V4.1-Flash-DSpark-Q4.gguf",
+  "mtp_model_bytes": 8328937472,
+  "spec_bench_LICENSE_sha256": "50e6751797c50dedd75ef1b8a0d9e42f5f8472e9fbce91f34718e9f97b0c780a",
+  "spec_bench_Readme.md_sha256": "94b5c4141dd46658277ff1f3b0c78e82030f6ad0169d1ea8337bf9a6a1cd086a",
+  "spec_bench_README.md_sha256": "94b5c4141dd46658277ff1f3b0c78e82030f6ad0169d1ea8337bf9a6a1cd086a"
+}

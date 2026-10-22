@@ -1,0 +1,49 @@
+{
+  "control": {
+    "values": [
+      33.7526,
+      33.7439,
+      33.7219,
+      33.6533
+    ],
+    "best": 33.7526,
+    "mean": 33.717925,
+    "delta": 0.0,
+    "se": 0.0
+  },
+  "arp": {
+    "values": [
+      34.8713,
+      34.8158,
+      34.7574,
+      34.7814
+    ],
+    "best": 34.8713,
+    "mean": 34.806475,
+    "delta": 1.0885499999999997,
+    "se": 0.02153437174998653
+  },
+  "arp_qboth": {
+    "values": [
+      34.9323,
+      34.9141,
+      34.8466,
+      34.8759
+    ],
+    "best": 34.9323,
+    "mean": 34.892224999999996,
+    "delta": 1.1743000000000006,
+    "se": 0.02008112712639973
+  },
+  "interpretation": "q8_virtual_query was requested but not executed: runtime hc_stream_layout=2; guard required0. Actual candidate is ARP+Q1 shared-down only.",
+  "shared_down_increment": {
+    "mean": 0.08575000000000088,
+    "se": 0.00845837848920608,
+    "values": [
+      0.06099999999999994,
+      0.09829999999999472,
+      0.08920000000000528,
+      0.09450000000000358
+    ]
+  }
+}

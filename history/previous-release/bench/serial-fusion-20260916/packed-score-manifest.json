@@ -1,0 +1,17 @@
+{
+  "runtime_source": {
+    "Makefile": "5a514d09194e1615f1d52fc15f4b494adb3d6c2a9d5ebf1951b4f302e80137c1",
+    "ds4.c": "181e170bf85a7ade71b9c0dd39ae7b1d84cd2ea1ac3fea69497aed301d30601c",
+    "ds4.h": "037749331a751c6627028ce8ee23a9eeed4d6a10f36383ff15d5b2d2338c750e",
+    "ds4_gpu.h": "cb45d1742f450e61833893f2550beee1f2ea45539822e8215da4603838f3a3e8",
+    "ds4_metal.m": "4586deab3cd9138a4cb323e12191f5bbc2b59dc474dba7d3456a867b0f92982a",
+    "ds4_server.c": "036ab87e6a3fc9be7ee0eac93d10d5cb8e6545b7a5ef0d1396494af63ac8e23a",
+    "ds4_score.c": "28b99f05d03305a1f901b26fe98e0c31c1827cdf61007c5b9e4f8d50e452f71a",
+    "ds4_score.h": "8a0154de19aaac7013297d8f4b954de8856e56f052ccc1947a86dd8f2b4558d6",
+    "metal/dsv41.metal": "67356540fe3d1071b398d1bae57043800e88ab97d3aba1335e0ffc649e69bc22"
+  },
+  "reference_commits": {
+    "production": "bbaebc1",
+    "P1_per_lane": "51042f6"
+  }
+}

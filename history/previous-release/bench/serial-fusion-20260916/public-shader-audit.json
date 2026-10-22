@@ -1,0 +1,122 @@
+{
+  "metal/argsort.metal": {
+    "uat_tokens": 4201,
+    "public_tokens": 4201,
+    "retained_tokens_unchanged": true
+  },
+  "metal/bin.metal": {
+    "uat_tokens": 1428,
+    "public_tokens": 1428,
+    "retained_tokens_unchanged": true
+  },
+  "metal/concat.metal": {
+    "uat_tokens": 436,
+    "public_tokens": 436,
+    "retained_tokens_unchanged": true
+  },
+  "metal/cpy.metal": {
+    "uat_tokens": 1956,
+    "public_tokens": 1956,
+    "retained_tokens_unchanged": true
+  },
+  "metal/deepseek4_vision.metal": {
+    "uat_tokens": 1536,
+    "public_tokens": 1536,
+    "retained_tokens_unchanged": true
+  },
+  "metal/dense.metal": {
+    "uat_tokens": 29908,
+    "public_tokens": 29157,
+    "retained_tokens_unchanged": true
+  },
+  "metal/dsv41.metal": {
+    "uat_tokens": 30650,
+    "public_tokens": 29371,
+    "retained_tokens_unchanged": true
+  },
+  "metal/dsv4_hc.metal": {
+    "uat_tokens": 14706,
+    "public_tokens": 14706,
+    "retained_tokens_unchanged": true
+  },
+  "metal/dsv4_kv.metal": {
+    "uat_tokens": 3873,
+    "public_tokens": 3873,
+    "retained_tokens_unchanged": true
+  },
+  "metal/dsv4_misc.metal": {
+    "uat_tokens": 58482,
+    "public_tokens": 58482,
+    "retained_tokens_unchanged": true
+  },
+  "metal/dsv4_rope.metal": {
+    "uat_tokens": 6075,
+    "public_tokens": 6075,
+    "retained_tokens_unchanged": true
+  },
+  "metal/flash_attn.metal": {
+    "uat_tokens": 14307,
+    "public_tokens": 14307,
+    "retained_tokens_unchanged": true
+  },
+  "metal/get_rows.metal": {
+    "uat_tokens": 1801,
+    "public_tokens": 1801,
+    "retained_tokens_unchanged": true
+  },
+  "metal/glm53_bf16.metal": {
+    "uat_tokens": 1066,
+    "public_tokens": 1066,
+    "retained_tokens_unchanged": true
+  },
+  "metal/glm53_kda.metal": {
+    "uat_tokens": 2885,
+    "public_tokens": 2885,
+    "retained_tokens_unchanged": true
+  },
+  "metal/glm53_vision.metal": {
+    "uat_tokens": 2506,
+    "public_tokens": 2506,
+    "retained_tokens_unchanged": true
+  },
+  "metal/glu.metal": {
+    "uat_tokens": 650,
+    "public_tokens": 650,
+    "retained_tokens_unchanged": true
+  },
+  "metal/moe.metal": {
+    "uat_tokens": 112123,
+    "public_tokens": 112123,
+    "retained_tokens_unchanged": true
+  },
+  "metal/norm.metal": {
+    "uat_tokens": 2984,
+    "public_tokens": 2984,
+    "retained_tokens_unchanged": true
+  },
+  "metal/repeat.metal": {
+    "uat_tokens": 305,
+    "public_tokens": 305,
+    "retained_tokens_unchanged": true
+  },
+  "metal/set_rows.metal": {
+    "uat_tokens": 354,
+    "public_tokens": 354,
+    "retained_tokens_unchanged": true
+  },
+  "metal/softmax.metal": {
+    "uat_tokens": 1618,
+    "public_tokens": 1618,
+    "retained_tokens_unchanged": true
+  },
+  "metal/sum_rows.metal": {
+    "uat_tokens": 536,
+    "public_tokens": 536,
+    "retained_tokens_unchanged": true
+  },
+  "metal/unary.metal": {
+    "uat_tokens": 2041,
+    "public_tokens": 2041,
+    "retained_tokens_unchanged": true
+  }
+}

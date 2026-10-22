@@ -1,0 +1,18 @@
+PASS shape0 64draws four logical K groups/one physical SIMD initial screen exact finite
+shape0 rep0 arm0 us26.259
+shape0 rep0 arm1 us22.949
+shape0 rep1 arm1 us22.934
+shape0 rep1 arm0 us24.016
+shape0 rep2 arm0 us21.953
+shape0 rep2 arm1 us20.454
+shape0 rep3 arm1 us20.412
+shape0 rep3 arm0 us21.941
+PASS shape1 64draws four logical K groups/one physical SIMD initial screen exact finite
+shape1 rep0 arm0 us65.660
+shape1 rep0 arm1 us63.987
+shape1 rep1 arm1 us63.982
+shape1 rep1 arm0 us65.578
+shape1 rep2 arm0 us65.208
+shape1 rep2 arm1 us64.134
+shape1 rep3 arm1 us64.088
+shape1 rep3 arm0 us65.438

@@ -1,0 +1,13 @@
+PASS draws128 alias1 words131072 finite1.000000 controls128 determinism1000/1000 ring/guards exact
+rep0 arm0 us15.608
+rep0 arm1 us42.366
+rep1 arm1 us42.151
+rep1 arm0 us17.358
+rep2 arm0 us15.502
+rep2 arm1 us42.340
+rep3 arm1 us42.039
+rep3 arm0 us17.095
+rep4 arm0 us15.786
+rep4 arm1 us41.911
+rep5 arm1 us42.643
+rep5 arm0 us16.991

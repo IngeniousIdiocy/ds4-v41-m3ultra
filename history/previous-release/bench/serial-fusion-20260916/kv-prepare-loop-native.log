@@ -1,0 +1,21 @@
+8192 0 control 33.9282 quiet 98.1 hash c21119215ff8
+8192 0 arp_qboth 35.0059 quiet 97.74 hash c21119215ff8
+8192 0 arp_qboth_kv 35.6109 quiet 98.16 hash c21119215ff8
+PAIR EXACT 8192 0
+8192 1 arp_qboth_kv 35.5945 quiet 98.9 hash c21119215ff8
+8192 1 arp_qboth 34.9278 quiet 97.13 hash c21119215ff8
+8192 1 control 33.6817 quiet 98.15 hash c21119215ff8
+PAIR EXACT 8192 1
+8192 2 control 33.6687 quiet 97.92 hash c21119215ff8
+8192 2 arp_qboth 34.9251 quiet 98.2 hash c21119215ff8
+8192 2 arp_qboth_kv 35.5142 quiet 98.18 hash c21119215ff8
+PAIR EXACT 8192 2
+8192 3 arp_qboth_kv 35.5728 quiet 96.5 hash c21119215ff8
+8192 3 arp_qboth 34.9989 quiet 98.14 hash c21119215ff8
+8192 3 control 33.7309 quiet 95.53 hash c21119215ff8
+PAIR EXACT 8192 3
+8192 4 control 33.7834 quiet 95.45 hash c21119215ff8
+8192 4 arp_qboth 35.0364 quiet 98.33 hash c21119215ff8
+8192 4 arp_qboth_kv 35.5417 quiet 98.1 hash c21119215ff8
+PAIR EXACT 8192 4
+SUMMARY 8192 {'control': {'values': [33.6817, 33.6687, 33.7309, 33.7834], 'best': 33.7834, 'mean': 33.716175, 'delta': 0.0, 'se': 0.0}, 'arp_qboth': {'values': [34.9278, 34.9251, 34.9989, 35.0364], 'best': 35.0364, 'mean': 34.972049999999996, 'delta': 1.2558749999999996, 'se': 0.004574453519274605}, 'arp_qboth_kv': {'values': [35.5945, 35.5142, 35.5728, 35.5417], 'best': 35.5945, 'mean': 35.5558, 'delta': 1.8396249999999998, 'se': 0.03163335199332063}}

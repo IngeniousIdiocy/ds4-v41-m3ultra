@@ -1,0 +1,157 @@
+{
+  "passed": true,
+  "tag": "kv-query",
+  "cases": [
+    {
+      "file": "kv-query-8192-0-control.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 33.7892,
+      "warmup": true
+    },
+    {
+      "file": "kv-query-8192-0-arp_qboth_kv.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.6249,
+      "warmup": true
+    },
+    {
+      "file": "kv-query-8192-0-kv_wide.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.6979,
+      "warmup": true
+    },
+    {
+      "file": "kv-query-8192-0-kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.9274,
+      "warmup": true
+    },
+    {
+      "file": "kv-query-8192-1-control.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 33.684,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-1-arp_qboth_kv.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.4973,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-1-kv_wide.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.6388,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-1-kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.9347,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-2-control.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 33.6556,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-2-arp_qboth_kv.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.4701,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-2-kv_wide.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.5982,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-2-kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.9083,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-3-control.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 33.7219,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-3-arp_qboth_kv.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.6311,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-3-kv_wide.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.6527,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-3-kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.8735,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-4-control.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 33.7136,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-4-arp_qboth_kv.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.5632,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-4-kv_wide.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.6597,
+      "warmup": false
+    },
+    {
+      "file": "kv-query-8192-4-kv_mix.json",
+      "tokens": 512,
+      "text_sha256": "c21119215ff84cc0887f6cd0ac00fbbb8f9f5f1b1c8d99636f8b434cf3a92481",
+      "steady_tps": 35.9105,
+      "warmup": false
+    }
+  ],
+  "mtp_work_fields": [
+    "dspark_cycles",
+    "dspark_committed",
+    "dspark_verified_rows",
+    "dspark_processed_rows",
+    "dspark_serial_rows",
+    "dspark_attempts",
+    "dspark_skipped_steps",
+    "dspark_declines",
+    "dspark_accept_hist"
+  ]
+}

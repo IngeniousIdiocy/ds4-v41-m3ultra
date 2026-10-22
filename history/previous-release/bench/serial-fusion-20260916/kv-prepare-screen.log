@@ -1,0 +1,13 @@
+PASS 128 fresh input/weight draws, 131072 exact finite KV/ring words, untouched ring and guards; screening only
+rep0 arm0 us15.545
+rep0 arm1 us10.544
+rep1 arm1 us9.458
+rep1 arm0 us16.268
+rep2 arm0 us15.208
+rep2 arm1 us10.505
+rep3 arm1 us9.632
+rep3 arm0 us17.484
+rep4 arm0 us15.303
+rep4 arm1 us10.438
+rep5 arm1 us9.179
+rep5 arm0 us14.693

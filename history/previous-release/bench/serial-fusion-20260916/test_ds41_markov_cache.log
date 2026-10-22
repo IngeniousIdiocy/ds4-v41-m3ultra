@@ -1,0 +1,15 @@
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+draw0 exact words1285
+draw5000 exact words6426285
+draw10000 exact words12851285
+draw15000 exact words19276285
+draw20000 exact words25701285
+draw25000 exact words32126285
+draw30000 exact words38551285
+draw35000 exact words44976285
+draw40000 exact words51401285
+draw45000 exact words57826285
+PASS determinism1000/1000
+PASS draws50000 words64250000 controls50000 independent models, cache hit/eviction/bypass

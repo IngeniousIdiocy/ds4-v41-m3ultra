@@ -1,0 +1,1 @@
+PASS 10000 finite draws: accumulated NLL and greedy bit-exact to immutable score_official math; NaN/Inf/invalid targets rejected

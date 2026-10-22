@@ -1,0 +1,258 @@
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_batch_round tests/test_ds41_batch_round.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_pointwise_batch tests/test_ds41_pointwise_batch.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_f16_compact tests/test_ds41_f16_compact.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_f32_rows tests/test_ds41_f32_rows.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_f16_trio tests/test_ds41_f16_trio.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_material_paths tests/test_ds41_material_paths.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_q8_trio tests/test_ds41_q8_trio.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_score_layout tests/test_ds41_score_layout.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_moe_order tests/test_ds41_moe_order.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_q8_order tests/test_ds41_q8_order.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_ffn_expand tests/test_ds41_ffn_expand.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -fno-fast-math -I. -o tests/test_ds41_hc_layout tests/test_ds41_hc_layout.c ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o -lm -pthread -framework Foundation -framework Metal
+./tests/test_ds41_batch_round
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.026 ms, residency requested in 0.100 ms, warmup 7.479 ms (mapped 6.66 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=1280 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.016 ms, residency requested in 0.294 ms, warmup 7.168 ms (mapped 42.52 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=1280 n=32768 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.010 ms, residency requested in 0.071 ms, warmup 8.312 ms (mapped 2.67 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=512 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.013 ms, residency requested in 0.305 ms, warmup 7.122 ms (mapped 42.52 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=8192 n=5120 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.014 ms, residency requested in 0.144 ms, warmup 10.306 ms (mapped 11.97 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=2304 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.016 ms, residency requested in 0.185 ms, warmup 11.207 ms (mapped 11.97 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=2304 n=5120 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+PASS shared SwiGLU BF16 host path
+PASS 1271808 exact Q8 output words
+./tests/test_ds41_pointwise_batch
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+PASS pointwise batching: 64 draws each heads1/64, both frequencies/directions, wrap/deep positions, offsets and guards exact
+./tests/test_ds41_f32_rows
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.023 ms, residency requested in 0.151 ms, warmup 10.067 ms (mapped 7.52 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS router F32 rows1..8, 64 draws, offsets and guard words exact
+./tests/test_ds41_f16_compact
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.025 ms, residency requested in 2.007 ms, warmup 7.240 ms (mapped 300.02 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS F16 compact production shape rows1..8, tensor offsets/tails, 18432000 finite exact output words
+./tests/test_ds41_f16_trio
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.026 ms, residency requested in 2.007 ms, warmup 6.677 ms (mapped 300.02 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS F16 trio production shape rows1..8, tensor offsets/tails, 18432000 finite exact output words
+./tests/test_ds41_material_paths
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.037 ms, residency requested in 0.323 ms, warmup 9.952 ms (mapped 34.02 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS router 1..8 rows 1425600 exact words
+PASS grouped Q8 2/6 rows, F32 and BF16 outputs
+PASS collapse + norm exact host paths
+./tests/test_ds41_q8_trio
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.032 ms, residency requested in 0.152 ms, warmup 11.928 ms (mapped 6.66 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=1280 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.016 ms, residency requested in 0.317 ms, warmup 7.031 ms (mapped 42.52 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=1280 n=32768 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.009 ms, residency requested in 0.076 ms, warmup 7.933 ms (mapped 2.67 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=512 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.013 ms, residency requested in 0.316 ms, warmup 7.010 ms (mapped 42.52 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=8192 n=5120 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.011 ms, residency requested in 0.114 ms, warmup 7.775 ms (mapped 11.97 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=2304 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.017 ms, residency requested in 0.203 ms, warmup 11.316 ms (mapped 11.97 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=2304 n=5120 all row controls
+PASS 1271808 exact Q8 output words
+./tests/test_ds41_score_layout
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+PASS n=1 all five masks/layouts
+PASS n=7 all five masks/layouts
+PASS n=33 all five masks/layouts
+PASS n=511 all five masks/layouts
+PASS n=512 all five masks/layouts
+PASS n=513 all five masks/layouts
+PASS n=8193 all five masks/layouts
+PASS n=16385 all five masks/layouts
+PASS n=32769 all five masks/layouts
+PASS n=131073 all five masks/layouts
+PASS n=300005 all five masks/layouts
+PASS 2450010 exact score words
+./tests/test_ds41_moe_order
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.233 ms, residency requested in 53.699 ms, warmup 7.372 ms (mapped 7290.00 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+V4.1 Q4 static batch rank=-1 rows=8 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=1 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=2 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=3 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=4 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=5 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=6 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=7 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=8 exact: PASS
+DS4_DS41_MTP_GU_EXPERT_SORT=1 ./tests/test_ds41_moe_order
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.406 ms, residency requested in 51.951 ms, warmup 7.118 ms (mapped 7290.00 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+V4.1 Q4 static batch rank=-1 rows=8 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=1 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=2 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=3 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=4 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=5 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=6 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=7 exact: PASS
+V4.1 Q4 static batch rank=-1 rows=8 exact: PASS
+./tests/test_ds41_q8_order
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.032 ms, residency requested in 0.151 ms, warmup 10.113 ms (mapped 6.66 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=1280 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.014 ms, residency requested in 0.299 ms, warmup 6.921 ms (mapped 42.52 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=1280 n=32768 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.009 ms, residency requested in 0.076 ms, warmup 8.116 ms (mapped 2.67 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=512 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.015 ms, residency requested in 0.323 ms, warmup 6.998 ms (mapped 42.52 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=8192 n=5120 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.012 ms, residency requested in 0.129 ms, warmup 8.089 ms (mapped 11.97 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=5120 n=2304 all row controls
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.020 ms, residency requested in 0.187 ms, warmup 11.371 ms (mapped 11.97 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS Q8 k=2304 n=5120 all row controls
+PASS 1271808 exact Q8 output words
+./tests/test_ds41_ffn_expand
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+q4_wide=0
+ds4: Metal model views created in 0.453 ms, residency requested in 51.223 ms, warmup 7.450 ms (mapped 7290.00 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS 1966336 exact producer-chain words
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+q4_wide=1
+ds4: Metal model views created in 0.353 ms, residency requested in 51.966 ms, warmup 7.213 ms (mapped 7290.00 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+PASS 1966336 exact producer-chain words
+./tests/test_ds41_hc_layout
+ds4: Metal device Apple M3 Ultra, 512.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.021 ms, residency requested in 0.536 ms, warmup 7.085 ms (mapped 67.38 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+[q8-virtual-query] 4108 groups, eight query rows/group plus unchanged HC
+PASS 1266048 exact output, HC mix and Sinkhorn words
+shared=0 rep=0 layout=0 us=81.390
+shared=0 rep=0 layout=1 us=90.850
+shared=0 rep=0 layout=2 us=56.810
+shared=0 rep=0 layout=3 us=50.620
+shared=0 rep=1 layout=3 us=50.720
+shared=0 rep=1 layout=2 us=57.310
+shared=0 rep=1 layout=1 us=90.550
+shared=0 rep=1 layout=0 us=56.950
+shared=0 rep=2 layout=0 us=56.900
+shared=0 rep=2 layout=1 us=90.480
+shared=0 rep=2 layout=2 us=56.340
+shared=0 rep=2 layout=3 us=50.950
+shared=1 rep=0 layout=0 us=39.980
+shared=1 rep=0 layout=1 us=39.790
+shared=1 rep=0 layout=2 us=40.020
+shared=1 rep=0 layout=3 us=39.380
+shared=1 rep=1 layout=3 us=38.280
+shared=1 rep=1 layout=2 us=37.010
+shared=1 rep=1 layout=1 us=39.030
+shared=1 rep=1 layout=0 us=38.070
+shared=1 rep=2 layout=0 us=39.710
+shared=1 rep=2 layout=1 us=38.490
+shared=1 rep=2 layout=2 us=38.270
+shared=1 rep=2 layout=3 us=38.380

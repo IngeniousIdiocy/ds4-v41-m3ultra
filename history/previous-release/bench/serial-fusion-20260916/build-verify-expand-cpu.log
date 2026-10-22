@@ -1,0 +1,1 @@
+cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 -Wno-unused-function -DDS4_NO_GPU -c -o ds4_cpu.o ds4.c

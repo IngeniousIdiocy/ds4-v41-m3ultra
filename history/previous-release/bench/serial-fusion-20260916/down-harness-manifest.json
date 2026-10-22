@@ -1,0 +1,16 @@
+{
+  "reference_commit": "bbaebc1",
+  "reference_assembly": "prepare_tail_harness.py",
+  "sha256": {
+    "tail-harness.m": "681cf6bdf6a3f4fa1477fc6abf6a8fd7adddf9235068c0cce6d423f38909312c",
+    "tail-support.metal": "80333131d9bacc13b3d69308aad4c96e6db535de2aec7aa4297c21caa7be20a7",
+    "tail9-candidate.metal": "86f8c0799b95476824178cdb8d74f5756b5b8476eb11adaa58753e779c202f36",
+    "geometry-harness.m": "51d0b0a2dad53ffe3cc7ba5c24a5c7acff75054cec149c7c1cf1557192f18f02",
+    "down-nr4-candidate.metal": "dd24dd5e9a7a5ba40f4c9dc72cafc64d05897c50e90220157aa472b86fe5f3cf",
+    "geometry-compare.metal": "2080ad5e82c4e09505e929e4aac3aca2493cba1b2194ecf27b6750da22200542"
+  },
+  "folded_t1_gate": "tail-folded-tier1.log",
+  "plain_t1_gate": "tail-plain-tier1.log",
+  "geometry_status": "64-draw screens passed; full gates/native pending",
+  "production_model_source_unchanged_since": "server-manifest.json in raw artifacts"
+}

@@ -1,0 +1,3 @@
+draws1000/2000 exact finite1.000000 controls1000
+draws2000/2000 exact finite1.000000 controls2000
+PASS draws2000 alias1 words2048000 finite1.000000 controls2000 determinism1000/1000 ring/guards exact

@@ -1,0 +1,7 @@
+{
+  "passed": true,
+  "change": "Removed only redundant 128-thread standalone KV kernel; all retained shader source bytes unchanged. Wider fallback and mixed query kernel are exactly those gated and benchmarked.",
+  "preimage_sha256": "98a8639390d6e4a759399c7e7f0dccfee4ce9c3c1571b4fb9bdc4b812483f81a",
+  "release_shader_sha256": "76e7771125890473b5493d4ad4a2383ab148e81f1f3df32427e15900c7bcdb4a",
+  "removed_source_sha256": "b65808e62ab2829a4749c9e85f4b138b51eb9fbf050ecb915335e12120888872"
+}

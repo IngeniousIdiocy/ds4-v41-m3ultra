@@ -1,0 +1,9 @@
+8192 0 control 33.7773 quiet 97.35 hash c21119215ff8
+8192 0 arp_qdown 34.9387 quiet 95.42 hash c21119215ff8
+8192 0 arp_qboth 35.0421 quiet 95.61 hash c21119215ff8
+8192 0 arp_qboth_kv 35.6266 quiet 97.6 hash 267e542c7b8c
+Traceback (most recent call last):
+  File "LOCAL_CHECKOUTS/ds4-v41-wt-serial-fusion/bench/serial-fusion-20260916/native_ab.py", line 39, in <module>
+    assert len(set(hashes))==1,f'Fidelity divergence ctx{ctx} pair{pair}'
+           ^^^^^^^^^^^^^^^^^^^
+AssertionError: Fidelity divergence ctx8192 pair0
