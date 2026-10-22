@@ -666,6 +666,12 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+/* FNV-1a of the GGUF header region (metadata + tensor table); which 0 main, 1 drafter. */
+uint64_t ds4_engine_model_fingerprint(ds4_engine *e, int which);
+/* Weight representation consumed by prefill; part of the persisted-state identity. */
+const char *ds4_engine_prefill_repr(ds4_engine *e);
+/* Value source of the narrow copies prefill reads: none | public | src:<sha256-16>. */
+const char *ds4_engine_prefill_values(ds4_engine *e);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);

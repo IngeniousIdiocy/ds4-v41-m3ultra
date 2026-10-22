@@ -4822,6 +4822,16 @@ static bool agent_kv_write_title_trailer(FILE *fp, const char *title,
            fwrite(title ? title : "", 1, title_len, fp) == title_len;
 }
 
+static bool agent_kv_title_trailer_hook(void *ud, FILE *fp, const char *text,
+                                        uint64_t *written_bytes) {
+    (void)text;
+    const char *title = ud;
+    char err[96];
+    if (!agent_kv_write_title_trailer(fp, title, err, sizeof(err))) return false;
+    if (written_bytes) *written_bytes = 4u + (title ? strlen(title) : 0u);
+    return true;
+}
+
 /* Read the optional agent title trailer without disturbing the payload cursor.
  * The caller is positioned just after rendered text, which is also the payload
  * start expected by ds4_session_load_payload(). */
@@ -4960,6 +4970,11 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
             ok = false;
         }
         ds4_tokens_free(&rebuilt);
+    } else if (ok && ds4_kvstore_verify_payload(fp, &hdr, load_err, sizeof(load_err)) != 0) {
+        /* Verified content before any restore, as ds4-server does: the
+         * session is not touched. */
+        snprintf(err, err_len, "KV checkpoint refused: %s; nothing restored", load_err);
+        ok = false;
     } else if (ok &&
                ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
                                         load_err, sizeof(load_err)) != 0)
@@ -5085,18 +5100,20 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
                             (uint32_t)tokens->len, 0,
                             (uint32_t)ds4_session_ctx(w->session),
                             created_at, now, payload_bytes);
-    uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, (uint32_t)text_len);
+    /* The payload is digested on the way into the file and the digest goes
+     * into the header, as ds4-server's entries do; the title is the trailer. */
+    const ds4_kvstore_trailer_hooks title_hooks = {
+        .ud = (void *)session_title,
+        .write = agent_kv_title_trailer_hook,
+    };
+    uint64_t trailer_bytes = 0, payload_hash = 0;
 
     errno = 0;
-    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-              fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-              fwrite(text, 1, text_len, fp) == text_len &&
-              (text_only || ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0) &&
-              (!session_identity ||
-               agent_kv_write_title_trailer(fp, session_title,
-                                            save_err, sizeof(save_err))) &&
+    bool ok = ds4_kvstore_write_entry(fp, h, text, text_len,
+                                      text_only ? NULL : &staged,
+                                      session_identity ? &title_hooks : NULL,
+                                      &trailer_bytes, &payload_hash,
+                                      save_err, sizeof(save_err)) &&
               fflush(fp) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
@@ -13566,6 +13583,9 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
+    /* Saved sessions bind to these weights and this prefill representation,
+     * as ds4-server's entries do; others are refused on load. */
+    ds4_kvstore_set_identity(ds4_kvstore_engine_identity(engine));
     if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
         fprintf(stderr, "ds4-agent: --think-level requires a DeepSeek V4.1 model\n");
         ds4_engine_close(engine);

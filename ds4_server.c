@@ -5778,8 +5778,9 @@ static long long wall_ms(void) {
 static bool send_all(int fd, const void *p, size_t n) {
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
+    /* No shutdown check here: the drain must still answer its requests. A
+     * stalled peer is bounded by the deadline, so shutdown cannot hang on it. */
     while (n) {
-        if (g_stop_requested) return false;
         ssize_t w = send(fd, s, n, 0);
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -10211,6 +10212,9 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
+    bool canary_pending;        /* jobs stay queued until the numerics canary's verdict (mu) */
+    pthread_t canary_thread;
+    bool canary_started;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
@@ -11246,6 +11250,33 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
     return ds4_kvstore_continued_store_target(kc, live_tokens);
 }
 
+/* The prefix a request persists as a "cold" checkpoint (0: none). With nothing
+ * restored it is the chat anchor, or the aligned prompt length. A request that
+ * restored a shorter prefix from disk persists the aligned prompt length (or a
+ * later anchor) too, once that extends the restored prefix by at least one
+ * continued interval: V4.1 prefill cannot stage mid-sync (its chunks have no
+ * logits until the output head runs), so without this the new depth is never
+ * written and every later request re-prefills it from the restored prefix. A
+ * live continuation is not stored here: its state stays in the session. */
+static int kv_cache_cold_store_target(const kv_disk_cache *kc,
+                                      const ds4_tokens *prompt,
+                                      int user_token_id,
+                                      int assistant_token_id,
+                                      int cached,
+                                      bool disk_hit) {
+    if (!kc || !prompt || prompt->len < kc->opt.min_tokens) return 0;
+    if (kc->opt.cold_max_tokens <= 0 || prompt->len > kc->opt.cold_max_tokens) return 0;
+    if (cached > 0 && !disk_hit) return 0;
+    const int anchor = kv_cache_chat_anchor_pos(kc, prompt, user_token_id,
+                                                assistant_token_id);
+    if (cached == 0)
+        return anchor >= kc->opt.min_tokens ? anchor : kv_cache_store_len(kc, prompt->len);
+    const int len = anchor > cached ? anchor : kv_cache_store_len(kc, prompt->len);
+    const int gain = kc->opt.continued_interval_tokens > kc->opt.min_tokens ?
+                     kc->opt.continued_interval_tokens : kc->opt.min_tokens;
+    return len - cached >= gain ? len : 0;
+}
+
 /* A same-text-prefix file can be reused by a larger context, but not by a
  * smaller one: the payload was validated against the context capacity recorded
  * in the file.  If the existing file cannot be used by this server, replace it
@@ -11426,9 +11457,24 @@ static void kv_cache_slot_restore_suppressed(server_slot *slot,
     }
 }
 
+/* A prefill that started from a disk entry did not finish. Only a genuine
+ * failure evicts the entry (it may be what breaks the prefill, and it would
+ * otherwise be reloaded by every request). A prefill interrupted by shutdown
+ * or by the client says nothing about the entry: it stays on disk. Either way
+ * the session's partial state is dropped. */
 static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
-                                                const char *path) {
+                                                const char *path, int sync_rc) {
     if (!s || !slot || !path) return;
+    if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache kept reason=prefill-interrupted (%s) file=%s",
+                   g_stop_requested ? "shutdown" : "client disconnected", path);
+        slot->continued_last_store_tokens = 0;
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        return;
+    }
     pthread_mutex_lock(&s->kv_mu);
     if (unlink(path) == 0) {
         server_log(DS4_LOG_KVCACHE,
@@ -12800,10 +12846,14 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
 }
 
+/* sync_rc DS4_SESSION_SYNC_INTERRUPTED during shutdown answers 503 (retry
+ * after the restart); every other failure 500. */
 static void send_prefill_failure_response(server *s, const job *j,
                                           const server_prefill_progress *progress,
                                           const char *ctx, const char *flags,
-                                          const char *err) {
+                                          const char *err, int sync_rc) {
+    const bool stopping = sync_rc == DS4_SESSION_SYNC_INTERRUPTED && g_stop_requested;
+    if (stopping) err = "server is shutting down";
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
@@ -12821,7 +12871,7 @@ static void send_prefill_failure_response(server *s, const job *j,
         }
         return;
     }
-    http_error(j->fd, s->enable_cors, 500, err);
+    http_error(j->fd, s->enable_cors, stopping ? 503 : 500, err);
 }
 
 /* The bytes render_qwen_chat_prompt_text() appends after this turn's
@@ -13754,17 +13804,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
-        kv_cache_slot_enabled(s, slot) &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
-    {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
+    if (!multimodal && kv_cache_slot_enabled(s, slot)) {
+        cold_store_len = kv_cache_cold_store_target(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+                                                    ds4_token_assistant(s->engine),
+                                                    cached, disk_cached > 0);
+        if (cached > 0 && cold_store_len > 0)
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache extends restored prefix cached=%d store=%d prompt=%d",
+                       cached, cold_store_len, prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -13784,14 +13832,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        const int cold_sync_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
+        if (cold_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path, cold_sync_rc);
             free(disk_cache_path);
             if (job_cancelled(j)) {
                 request_live_state_clear(s, slot);
@@ -13799,7 +13848,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 return;
             }
             trace_event(s, trace_id, "prefill failed: %s", err);
-            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err, cold_sync_rc);
             return;
         }
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
@@ -13825,7 +13874,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path, prompt_sync_rc);
         free(disk_cache_path);
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
@@ -13833,7 +13882,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             return;
         }
         trace_event(s, trace_id, "prefill failed: %s", err);
-        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err, prompt_sync_rc);
         return;
     }
     free(disk_cache_path);
@@ -14803,13 +14852,25 @@ decode_again:
 /* Keep cancellation installed for the entire request, including every early
  * return in the large protocol/generation path. The callback is cleared before
  * the client thread can destroy its stack-owned job. */
+/* A queued job that a worker takes after shutdown was requested: its prefill
+ * could not run (the sync stops at once), and loading a disk entry for it would
+ * be wasted. Answer 503 so the client retries after the restart. */
+static void server_refuse_stopping(server *s, const job *j) {
+    server_log(DS4_LOG_DEFAULT, "ds4-server: %s request refused: server is shutting down",
+               j->req.kind == REQ_CHAT ? "chat" : "completion");
+    http_error(j->fd, s->enable_cors, 503, "server is shutting down");
+}
+
 static void generate_job(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->model_mu);
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
 
     ds4_session_set_cancel(slot->session, job_cancelled, j);
-    if (!job_cancelled(j)) generate_job_inner(s, slot, j);
+    if (!job_cancelled(j)) {
+        if (g_stop_requested) server_refuse_stopping(s, j);
+        else generate_job_inner(s, slot, j);
+    }
     ds4_session_set_cancel(slot->session, NULL, NULL);
 
     pthread_mutex_lock(&s->model_mu);
@@ -14904,7 +14965,7 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
 }
 
 static void dispatch_jobs_locked(server *s) {
-    if (!s || !s->batched_mode) return;
+    if (!s || !s->batched_mode || s->canary_pending) return;
     const time_t now = time(NULL);
     for (;;) {
         job *chosen = NULL;
@@ -14986,7 +15047,7 @@ static bool enqueue(server *s, job *j) {
 
 static job *dequeue(server *s) {
     pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+    while ((!s->head && !s->stopping) || s->canary_pending) pthread_cond_wait(&s->cv, &s->mu);
     if (!s->head) {
         pthread_mutex_unlock(&s->mu);
         return NULL;
@@ -15019,6 +15080,70 @@ static void *worker_main(void *arg) {
         slot_refresh_live_text(s, &s->slots[0]);
         s->slots[0].last_used = time(NULL);
     }
+    return NULL;
+}
+
+/* The verdict releases the queued jobs. The store's state is set first, so a
+ * released request finds the disk cache on (or off for good), never pending. */
+static void server_canary_finish(server *s, uint64_t canary, const char *err, double secs) {
+    if (canary) {
+        ds4_kvstore_set_canary(canary);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: KV disk cache on: canary %016llx (%d tokens, %.2fs; requests queued until now)",
+                   (unsigned long long)canary, DS4_KVSTORE_CANARY_TOKENS, secs);
+    } else {
+        ds4_kvstore_canary_failed();
+        server_log(DS4_LOG_WARNING, "ds4-server: KV disk cache stays off: numerics canary failed: %s",
+                   err && err[0] ? err : "unknown error");
+    }
+    pthread_mutex_lock(&s->mu);
+    s->canary_pending = false;
+    dispatch_jobs_locked(s);
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
+#ifdef DS4_TEST_HOOKS
+/* Test builds only (make ds4-server-testhooks; release builds never read it):
+ * DS4_KV_CANARY_FAIL_TEST=1 turns a completed canary into a failed verdict, to
+ * exercise the cache-off path. The canary value and the engine identity are
+ * computed exactly as in a release build, so both share cache entries. */
+static bool server_canary_forced_failure(char *err, size_t err_len) {
+    const char *v = getenv("DS4_KV_CANARY_FAIL_TEST");
+    if (!v || strcmp(v, "1") != 0) return false;
+    snprintf(err, err_len, "forced by DS4_KV_CANARY_FAIL_TEST");
+    return true;
+}
+#endif
+
+/* The numerics canary verifies this build's prefill before the disk cache is
+ * used. It runs once, one-shot, as soon as the server listens: requests are
+ * accepted and queued meanwhile (the workers take none until the verdict), so
+ * it runs ahead of them and a request with a saved prefix restores it instead
+ * of prefilling cold. Nothing that waits for it holds a lock it needs: workers
+ * wait on cv, which releases mu, and it takes only inference_mu, then mu. */
+static void *server_canary_main(void *arg) {
+    server *s = arg;
+    char err[192] = {0};
+    uint64_t canary = 0;
+    const double t0 = now_sec();
+    if (g_stop_requested) {
+        snprintf(err, sizeof(err), "the server is stopping");
+    } else {
+        pthread_mutex_lock(&s->inference_mu);
+        if (ds4_kvstore_engine_canary(s->engine, DS4_KVSTORE_CANARY_TOKENS, &canary,
+                                      err, sizeof(err)) != 0)
+            canary = 0;
+        pthread_mutex_unlock(&s->inference_mu);
+    }
+#ifdef DS4_TEST_HOOKS
+    if (canary && server_canary_forced_failure(err, sizeof(err))) {
+        server_log(DS4_LOG_WARNING, "ds4-server: test hook: canary %016llx computed; reporting failure",
+                   (unsigned long long)canary);
+        canary = 0;
+    }
+#endif
+    server_canary_finish(s, canary, err, now_sec() - t0);
     return NULL;
 }
 
@@ -16116,8 +16241,18 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.kv_disk_dir) {
+        /* Entries bind to the engine identity and to this build's prefill
+         * numerics (canary). The canary runs once, right after the server
+         * starts listening; requests queue until its verdict, and if it fails
+         * the cache stays off. */
+        const uint64_t identity = ds4_kvstore_engine_identity(engine);
+        ds4_kvstore_set_identity(identity);
+        ds4_kvstore_canary_pending();
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: KV disk cache identity %016llx; requests queue until the numerics canary "
+                   "(%d tokens, one-shot) completes", (unsigned long long)identity, DS4_KVSTORE_CANARY_TOKENS);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -16198,6 +16333,17 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    if (s.kv.enabled) {
+        /* Set before the first accept, so no request runs ahead of the canary. */
+        pthread_mutex_lock(&s.mu);
+        s.canary_pending = true;
+        pthread_mutex_unlock(&s.mu);
+        if (pthread_create(&s.canary_thread, NULL, server_canary_main, &s) == 0) {
+            s.canary_started = true;
+        } else {
+            server_canary_finish(&s, 0, "cannot start the canary thread", 0.0);
+        }
+    }
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
@@ -16250,6 +16396,7 @@ int main(int argc, char **argv) {
     pthread_mutex_lock(&s.mu);
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
+    if (s.canary_started) pthread_join(s.canary_thread, NULL);
 
     for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
@@ -17316,6 +17463,78 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+/* Shutdown during a disk-cache-hit prefill: the interrupted prefill keeps the
+ * entry (only a genuine failure evicts it), and the drain still answers, with
+ * 503, both a request whose prefill was interrupted and one it never started. */
+static void test_shutdown_prefill_keeps_kv_and_answers(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.kv_mu, NULL);
+    pthread_mutex_init(&s.inference_mu, NULL);
+    server_slot slot;
+    test_server_bind_slot(&s, &slot);
+
+    char path[] = "/tmp/ds4-test-kvkeep-XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd >= 0) close(fd);
+
+    g_stop_requested = 1;
+    slot.continued_last_store_tokens = 4096;
+    kv_cache_discard_failed_disk_entry(&s, &slot, path, DS4_SESSION_SYNC_INTERRUPTED);
+    TEST_ASSERT(access(path, F_OK) == 0);   /* kept */
+    TEST_ASSERT(slot.continued_last_store_tokens == 0);
+
+    job j;
+    memset(&j, 0, sizeof(j));
+    request_init(&j.req, REQ_CHAT, 128);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {   /* interrupted prefill: 503, sent during shutdown */
+        j.fd = sv[0];
+        send_prefill_failure_response(&s, &j, NULL, "0..1:1", "", "interrupted",
+                                      DS4_SESSION_SYNC_INTERRUPTED);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 503") != NULL);
+        TEST_ASSERT(strstr(out, "server is shutting down") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {   /* a queued job taken after shutdown: 503 */
+        j.fd = sv[0];
+        server_refuse_stopping(&s, &j);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 503") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    g_stop_requested = 0;
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {   /* a genuine failure outside shutdown: 500 */
+        j.fd = sv[0];
+        send_prefill_failure_response(&s, &j, NULL, "0..1:1", "", "prefill made no progress", 1);
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 500") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    request_free(&j.req);
+
+    kv_cache_discard_failed_disk_entry(&s, &slot, path, 1);
+    TEST_ASSERT(access(path, F_OK) != 0);   /* a genuine failure evicts */
+    if (access(path, F_OK) == 0) unlink(path);
+    pthread_mutex_destroy(&s.kv_mu);
+    pthread_mutex_destroy(&s.inference_mu);
 }
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
@@ -21881,9 +22100,73 @@ static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(voi
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 }
 
+static void test_kv_cache_extending_a_disk_hit_stores_the_new_depth(void) {
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    kc.opt.cold_max_tokens = 393216;          /* the README server line */
+    kc.opt.continued_interval_tokens = 4096;
+
+    /* One user turn over a long document, as R1 dd sent it: 8K then 64K. */
+    ds4_tokens p8 = {0}, p64 = {0}, p300 = {0};
+    ds4_tokens *ps[] = {&p8, &p64, &p300};
+    const int lens[] = {8242, 67314, 303912};
+    for (int k = 0; k < 3; k++) {
+        ds4_tokens_push(ps[k], 1);
+        ds4_tokens_push(ps[k], user);
+        for (int i = 2; i < lens[k] - 1; i++) ds4_tokens_push(ps[k], 100 + i % 50);
+        ds4_tokens_push(ps[k], assistant);
+        TEST_ASSERT(ps[k]->len == lens[k]);
+    }
+
+    /* Cold: unchanged (the 8K request stores 8192). */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p8, user, assistant, 0, false) == 8192);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 0, false) == 65536);
+
+    /* Restored 8192 from disk, extended to 64K / 300K: the aligned new depth is stored. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 8192, true) == 65536);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p300, user, assistant, 8192, true) == 303104);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p300, user, assistant, 65536, true) == 303104);
+
+    /* The stored entry is what a resend restores: a prefix of the prompt, past the old hit. */
+    const int stored = kv_cache_cold_store_target(&kc, &p64, user, assistant, 8192, true);
+    TEST_ASSERT(stored > 8192 && stored <= p64.len);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, stored, true) == 0);
+
+    /* Nothing new worth a file: a resend of the same prompt, or a short extension. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 65536, true) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 63488, true) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 61440, true) == 65536);
+
+    /* A live continuation keeps its state in the session; past cold_max nothing is stored. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 8192, false) == 0);
+    kc.opt.cold_max_tokens = 65536;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 8192, true) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &p64, user, assistant, 0, false) == 0);
+
+    /* A later turn of a restored conversation: its anchor is the first turn, so the aligned length counts. */
+    ds4_tokens conv = {0};
+    ds4_tokens_push(&conv, 1);
+    ds4_tokens_push(&conv, user);
+    for (int i = 2; i < 9000; i++) ds4_tokens_push(&conv, 100 + i % 50);
+    ds4_tokens_push(&conv, assistant);
+    for (int i = 0; i < 20; i++) ds4_tokens_push(&conv, 7);
+    ds4_tokens_push(&conv, user);
+    for (int i = 0; i < 12000; i++) ds4_tokens_push(&conv, 100 + i % 50);
+    ds4_tokens_push(&conv, assistant);
+    kc.opt.cold_max_tokens = 393216;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, &conv, user, assistant, 9021, true) ==
+                kv_cache_store_len(&kc, conv.len));
+
+    for (int k = 0; k < 3; k++) ds4_tokens_free(ps[k]);
+    ds4_tokens_free(&conv);
+}
+
 static void test_kv_cache_file_size_must_fit_budget(void) {
     kv_disk_cache kc = {0};
-    kc.budget_bytes = 1100;
+    kc.budget_bytes = 1100 + (KV_CACHE_FIXED_HEADER - 48u);   /* boundaries written for the 48-byte v1 header */
 
     TEST_ASSERT(kv_cache_file_size_fits(&kc, 100, 930, 0, NULL, NULL));
     TEST_ASSERT(!kv_cache_file_size_fits(&kc, 100, 938, 0, NULL, NULL));
@@ -22071,6 +22354,433 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
                                              0, 2, 32768) < 0);
 
     kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+/* KV v2: entries bind to verified content (engine identity, numerics canary,
+ * payload digest). */
+static void test_kv_cache_payload_hash_vectors(void) {
+    uint8_t buf[1000];
+    for (int i = 0; i < 1000; i++) buf[i] = (uint8_t)(i * 37 + 11);
+    /* Fixed vectors: a changed digest would refuse every stored entry. */
+    TEST_ASSERT(ds4_kvstore_payload_hash("abc", 3) == UINT64_C(0xd5ae3d1b0d54b173));
+    TEST_ASSERT(ds4_kvstore_payload_hash(buf, sizeof(buf)) == UINT64_C(0x7c47d8383fd6d07d));
+    ds4_kvstore_hash s;
+    ds4_kvstore_hash_init(&s);
+    for (size_t o = 0; o < sizeof(buf); o += 7)
+        ds4_kvstore_hash_update(&s, buf + o, o + 7 > sizeof(buf) ? sizeof(buf) - o : 7);
+    TEST_ASSERT(ds4_kvstore_hash_final(&s) == UINT64_C(0x7c47d8383fd6d07d));
+}
+
+static void test_kv_cache_refuses_identity_and_canary_mismatch(void) {
+    char tmpl[] = "/tmp/ds4-kv-identity-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "identity bound prefix";
+    const char *prompt = "identity bound prefix and tail";
+    ds4_kvstore_set_identity(0x1111);
+    ds4_kvstore_set_canary(0xc1);
+    test_kv_text_stub_file(dir, text, KV_REASON_COLD, 512, 0);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768) >= 0);
+
+    /* Other weights or prefill representation: refused, never a candidate. */
+    ds4_kvstore_set_identity(0x2222);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768) < 0);
+    TEST_ASSERT(kc.len == 1 && kc.entry[0].refusal &&
+                strstr(kc.entry[0].refusal, "identity"));
+    TEST_ASSERT(kc.len == 1 && kc.entry[0].identity == 0x1111);
+
+    /* Same identity, other prefill numerics: refused on the canary. */
+    ds4_kvstore_set_identity(0x1111);
+    ds4_kvstore_set_canary(0xc2);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768) < 0);
+    TEST_ASSERT(kc.len == 1 && kc.entry[0].refusal &&
+                strstr(kc.entry[0].refusal, "canary"));
+    ds4_kvstore_entry e = {0};
+    TEST_ASSERT(!ds4_kvstore_read_entry_file(path, sha, &e));
+
+    /* No canary bound (ds4-agent): the identity alone decides. */
+    ds4_kvstore_set_canary(0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 0, 2, 32768) >= 0);
+
+    /* Refused entries still count against the budget and are reclaimed. */
+    ds4_kvstore_set_canary(0xc2);
+    kc.budget_bytes = 1;
+    ds4_kvstore_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(access(path, F_OK) != 0);
+
+    ds4_kvstore_set_identity(0);
+    ds4_kvstore_set_canary(0);
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_v1_entries_refused_and_evictable(void) {
+    char tmpl[] = "/tmp/ds4-kv-v1-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "v1 rendered prefix";
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        /* The v1 layout is the first 48 bytes of v2 with version 1. */
+        uint8_t h[KV_CACHE_FIXED_HEADER];
+        kv_fill_header(h, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
+        h[3] = 1;
+        uint8_t text_len[4];
+        le_put32(text_len, (uint32_t)strlen(text));
+        TEST_ASSERT(fwrite(h, 1, DS4_KVSTORE_V1_HEADER, fp) == DS4_KVSTORE_V1_HEADER);
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "v1 rendered prefix and tail",
+                                             0, 2, 32768) < 0);
+    TEST_ASSERT(kc.len == 1 && kc.entry[0].version == 1 && kc.entry[0].refusal &&
+                kc.entry[0].tokens == 512);
+    kc.budget_bytes = 1;
+    ds4_kvstore_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(access(path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+/* 0 when the payload after the header and text verifies and fp is left at
+ * the payload start. */
+static int test_kv_verify_file(const char *path, char *why, size_t why_len) {
+    FILE *fp = fopen(path, "rb");
+    ds4_kvstore_entry e = {0};
+    uint32_t text_bytes = 0;
+    int rc = 1;
+    if (fp && ds4_kvstore_read_header(fp, &e, &text_bytes) &&
+        fseeko(fp, (off_t)text_bytes, SEEK_CUR) == 0)
+    {
+        const off_t at = ftello(fp);
+        rc = ds4_kvstore_verify_payload(fp, &e, why, why_len);
+        if (rc == 0 && ftello(fp) != at) rc = 2;
+    }
+    if (fp) fclose(fp);
+    return rc;
+}
+
+static bool test_kv_patch_file(const char *path, long off, const void *bytes, size_t n) {
+    FILE *fp = fopen(path, "r+b");
+    if (!fp) return false;
+    bool ok = fseek(fp, off, SEEK_SET) == 0 && fwrite(bytes, 1, n, fp) == n;
+    return fclose(fp) == 0 && ok;
+}
+
+static void test_kv_cache_payload_hash_round_trip(void) {
+    char tmpl[] = "/tmp/ds4-kv-payload-hash-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* A staged payload as ds4_session_stage_payload leaves it: spans two
+     * copy chunks and ends in a partial word. */
+    const size_t n = ((size_t)9 << 20) + 5;
+    uint8_t *payload = malloc(n);
+    TEST_ASSERT(payload != NULL);
+    if (!payload) return;
+    for (size_t i = 0; i < n; i++) payload[i] = (uint8_t)(i * 131u + (i >> 13));
+    char *staged_path = path_join(dir, "staged.payload");
+    FILE *sp = fopen(staged_path, "wb");
+    TEST_ASSERT(sp != NULL && fwrite(payload, 1, n, sp) == n);
+    if (sp) TEST_ASSERT(fclose(sp) == 0);
+    ds4_session_payload_file staged = {.path = staged_path, .bytes = n};
+
+    const char *text = "verified content prefix";
+    const long payload_at = (long)KV_CACHE_FIXED_HEADER + 4 + (long)strlen(text);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    ds4_kvstore_set_identity(0x3333);
+    ds4_kvstore_set_canary(0xc3);
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 0, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, n);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    uint64_t trailer = 0, ph = 0;
+    char err[160] = {0}, why[160] = {0};
+    if (fp) {
+        TEST_ASSERT(ds4_kvstore_write_entry(fp, h, text, strlen(text), &staged, NULL,
+                                            &trailer, &ph, err, sizeof(err)));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    TEST_ASSERT(ph == ds4_kvstore_payload_hash(payload, n));
+
+    /* The header carries the identity, the canary and the digest. */
+    ds4_kvstore_entry e = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.identity == 0x3333 && e.canary == 0xc3 && e.payload_hash == ph);
+    ds4_kvstore_entry_free(&e);
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 0);
+
+    /* A cache hit's touch keeps the binding. */
+    TEST_ASSERT(ds4_kvstore_touch_file(path, 7));
+    memset(&e, 0, sizeof(e));
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.hits == 7 && e.identity == 0x3333 && e.canary == 0xc3 && e.payload_hash == ph);
+    ds4_kvstore_entry_free(&e);
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 0);
+
+    /* One flipped payload byte is refused before any restore. */
+    uint8_t flipped = (uint8_t)(payload[n / 2] ^ 0x40);
+    TEST_ASSERT(test_kv_patch_file(path, payload_at + (long)(n / 2), &flipped, 1));
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 1 && strstr(why, "corrupt"));
+    TEST_ASSERT(test_kv_patch_file(path, payload_at + (long)(n / 2), &payload[n / 2], 1));
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 0);
+
+    /* A short payload and a missing digest are refused too. */
+    TEST_ASSERT(truncate(path, (off_t)(payload_at + (long)n - 100)) == 0);
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 1 && strstr(why, "shorter"));
+    uint8_t zero[8] = {0};
+    TEST_ASSERT(test_kv_patch_file(path, 64, zero, sizeof(zero)));
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 1 && strstr(why, "no payload hash"));
+
+    ds4_kvstore_set_identity(0);
+    ds4_kvstore_set_canary(0);
+    free(payload);
+    unlink(staged_path);
+    free(staged_path);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+/* The disk cache refuses loads and stores until the canary completes (and for
+ * good if it fails). ds4-server keeps requests queued meanwhile, so a pending
+ * canary never reaches this gate as a miss there; ds4-agent never sets one. */
+static void test_kv_cache_canary_gate(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    ds4_tokens tokens = {0};
+    for (int i = 0; i < 600; i++) ds4_tokens_push(&tokens, 1);
+
+    /* The gate returns before any engine or session call (both NULL here). */
+    ds4_kvstore_canary_pending();
+    TEST_ASSERT(!ds4_kvstore_canary_ready());
+    TEST_ASSERT(!ds4_kvstore_store_live_prefix_text(&kc, NULL, NULL, &tokens, 600, "cold",
+                                                     NULL, 0, NULL, NULL, NULL, 0));
+    TEST_ASSERT(ds4_kvstore_try_load_text(&kc, NULL, NULL, "prompt", NULL, NULL, NULL, false) == 0);
+
+    ds4_kvstore_canary_failed();
+    TEST_ASSERT(!ds4_kvstore_canary_ready());
+    TEST_ASSERT(!ds4_kvstore_store_live_prefix_text(&kc, NULL, NULL, &tokens, 600, "cold",
+                                                     NULL, 0, NULL, NULL, NULL, 0));
+    TEST_ASSERT(ds4_kvstore_try_load_text(&kc, NULL, NULL, "prompt", NULL, NULL, NULL, false) == 0);
+
+    ds4_kvstore_set_canary(0xc0ffee);
+    TEST_ASSERT(ds4_kvstore_canary_ready());
+    ds4_kvstore_set_canary(0);   /* ready, no canary bound: later tests check identity only */
+    ds4_tokens_free(&tokens);
+}
+
+typedef struct {
+    server *s;
+    job *got[3];
+    int n;
+    volatile int done;
+} canary_dequeue_probe;
+
+static void *canary_dequeue_probe_main(void *arg) {
+    canary_dequeue_probe *p = arg;
+    for (;;) {
+        job *j = dequeue(p->s);
+        if (!j) break;
+        if (p->n < 3) p->got[p->n] = j;
+        p->n++;
+    }
+    p->done = 1;
+    return NULL;
+}
+
+static void canary_test_enqueue(server *s, job *j) {
+    TEST_ASSERT(enqueue(s, j));
+}
+
+/* As server_request_worker_stop (not built into the test binary). */
+static void canary_test_stop(server *s) {
+    pthread_mutex_lock(&s->mu);
+    s->stopping = true;
+    dispatch_jobs_locked(s);
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Requests queue while the canary runs; its verdict (pass or fail) releases
+ * them in arrival order with the store's state already final; shutdown during
+ * verification waits for the verdict and still serves what was queued. */
+static void test_server_jobs_wait_for_canary(void) {
+    server s = {0};
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    job j1 = {0}, j2 = {0}, j3 = {0};
+
+    /* Non-batched, canary passes: two arrivals wait, then run in order. */
+    ds4_kvstore_canary_pending();
+    s.canary_pending = true;
+    canary_dequeue_probe p = {.s = &s};
+    pthread_t t;
+    TEST_ASSERT(pthread_create(&t, NULL, canary_dequeue_probe_main, &p) == 0);
+    canary_test_enqueue(&s, &j1);
+    canary_test_enqueue(&s, &j2);
+    usleep(50000);
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(p.n == 0 && s.head == &j1 && s.tail == &j2);
+    pthread_mutex_unlock(&s.mu);
+    server_canary_finish(&s, 0xc0ffee, NULL, 0.0);
+    TEST_ASSERT(ds4_kvstore_canary_ready() && !s.canary_pending);
+    canary_test_stop(&s);   /* the worker drains both, then exits */
+    pthread_join(t, NULL);
+    TEST_ASSERT(p.done && p.n == 2 && p.got[0] == &j1 && p.got[1] == &j2);
+
+    /* Shutdown during verification, canary fails: the worker waits for the
+     * verdict, then drains the queued arrival and exits. */
+    s.stopping = false;
+    ds4_kvstore_canary_pending();
+    s.canary_pending = true;
+    canary_dequeue_probe q = {.s = &s};
+    TEST_ASSERT(pthread_create(&t, NULL, canary_dequeue_probe_main, &q) == 0);
+    canary_test_enqueue(&s, &j3);
+    canary_test_stop(&s);
+    TEST_ASSERT(!enqueue(&s, &j1));   /* stopping: no new arrivals */
+    usleep(50000);
+    TEST_ASSERT(!q.done);
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(q.n == 0 && s.head == &j3);
+    pthread_mutex_unlock(&s.mu);
+    server_canary_finish(&s, 0, "test failure", 0.0);
+    pthread_join(t, NULL);
+    TEST_ASSERT(!ds4_kvstore_canary_ready());
+    TEST_ASSERT(q.done && q.n == 1 && q.got[0] == &j3);
+
+    /* Batched: dispatch holds arrivals back until the verdict. (Both slots
+     * are busy at the verdict, so dispatch scores no session here.) */
+    server_slot slots[2];
+    memset(slots, 0, sizeof(slots));
+    s.stopping = false;
+    s.head = s.tail = NULL;
+    j1.next = j2.next = j3.next = NULL;
+    s.batched_mode = true;
+    s.slots = slots;
+    s.slot_count = 2;
+    s.canary_pending = true;
+    canary_test_enqueue(&s, &j1);
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(s.head == &j1 && !slots[0].assigned && !slots[1].assigned);
+    pthread_mutex_unlock(&s.mu);
+    slots[0].busy = slots[1].busy = true;
+    server_canary_finish(&s, 0xc0ffee, NULL, 0.0);
+    pthread_mutex_lock(&s.mu);
+    TEST_ASSERT(!s.canary_pending && s.head == &j1);
+    pthread_mutex_unlock(&s.mu);
+
+#ifdef DS4_TEST_HOOKS
+    /* The forced-failure hook fires only on DS4_KV_CANARY_FAIL_TEST=1, and its
+     * verdict releases waiters with the cache off. */
+    char herr[96] = {0};
+    unsetenv("DS4_KV_CANARY_FAIL_TEST");
+    TEST_ASSERT(!server_canary_forced_failure(herr, sizeof(herr)));
+    setenv("DS4_KV_CANARY_FAIL_TEST", "0", 1);
+    TEST_ASSERT(!server_canary_forced_failure(herr, sizeof(herr)));
+    setenv("DS4_KV_CANARY_FAIL_TEST", "1", 1);
+    TEST_ASSERT(server_canary_forced_failure(herr, sizeof(herr)) &&
+                strstr(herr, "DS4_KV_CANARY_FAIL_TEST"));
+    unsetenv("DS4_KV_CANARY_FAIL_TEST");
+    s.batched_mode = false;
+    s.stopping = false;
+    s.head = s.tail = NULL;
+    j1.next = NULL;
+    ds4_kvstore_canary_pending();
+    s.canary_pending = true;
+    canary_dequeue_probe h = {.s = &s};
+    TEST_ASSERT(pthread_create(&t, NULL, canary_dequeue_probe_main, &h) == 0);
+    canary_test_enqueue(&s, &j1);
+    server_canary_finish(&s, 0, herr, 0.0);
+    canary_test_stop(&s);
+    pthread_join(t, NULL);
+    TEST_ASSERT(!ds4_kvstore_canary_ready() && h.n == 1 && h.got[0] == &j1);
+#endif
+
+    ds4_kvstore_set_canary(0);   /* ready, no canary bound: later tests check identity only */
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* ds4-agent writes text-only entries (no staged payload) and its title as a
+ * trailer through ds4_kvstore_write_entry: the empty payload still gets a
+ * digest, the trailer follows the (empty) payload, and the entry verifies. */
+static bool test_kv_title_hook(void *ud, FILE *fp, const char *text, uint64_t *written) {
+    (void)text;
+    const char *title = ud;
+    uint8_t tb[4];
+    le_put32(tb, (uint32_t)strlen(title));
+    *written = 4u + strlen(title);
+    return fwrite(tb, 1, 4, fp) == 4 && fwrite(title, 1, strlen(title), fp) == strlen(title);
+}
+
+static void test_kv_cache_text_only_entry_verifies(void) {
+    char tmpl[] = "/tmp/ds4-kv-text-only-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    char *path = path_join(dir, "session.kv");
+    const char *text = "a transcript too long to resume";
+    const ds4_kvstore_trailer_hooks hooks = {.ud = (void *)"title", .write = test_kv_title_hook};
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 0, 2, DS4_KVSTORE_REASON_AGENT_SESSION, DS4_KVSTORE_EXT_SESSION_TITLE,
+                            512, 0, 32768, 100, 100, 0);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    uint64_t trailer = 0, ph = 0;
+    char err[160] = {0}, why[160] = {0};
+    if (fp) {
+        TEST_ASSERT(ds4_kvstore_write_entry(fp, h, text, strlen(text), NULL, &hooks, &trailer, &ph,
+                                            err, sizeof(err)));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    TEST_ASSERT(trailer == 9 && ph == ds4_kvstore_payload_hash(NULL, 0) && ph != 0);
+    TEST_ASSERT(test_kv_verify_file(path, why, sizeof(why)) == 0);
+    struct stat st;
+    TEST_ASSERT(stat(path, &st) == 0 &&
+                (uint64_t)st.st_size == KV_CACHE_FIXED_HEADER + 4u + strlen(text) + trailer);
     unlink(path);
     free(path);
     rmdir(dir);
@@ -23256,6 +23966,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
+    test_shutdown_prefill_keeps_kv_and_answers();
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
@@ -23352,11 +24063,19 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
+    test_kv_cache_extending_a_disk_hit_stores_the_new_depth();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_kv_cache_payload_hash_vectors();
+    test_kv_cache_refuses_identity_and_canary_mismatch();
+    test_kv_cache_v1_entries_refused_and_evictable();
+    test_kv_cache_payload_hash_round_trip();
+    test_kv_cache_canary_gate();
+    test_server_jobs_wait_for_canary();
+    test_kv_cache_text_only_entry_verifies();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

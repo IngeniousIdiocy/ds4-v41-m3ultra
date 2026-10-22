@@ -25,7 +25,12 @@
 #define KV_CACHE_MAGIC0 'K'
 #define KV_CACHE_MAGIC1 'V'
 #define KV_CACHE_MAGIC2 'C'
-#define KV_CACHE_VERSION 1u
+/* v2: the header grew to 80 bytes and binds the entry to verified
+ * content: the producing weights/representation (ds4_kvstore_engine_identity),
+ * the prefill numerics canary and the payload hash, which the loader checks
+ * before restoring anything. v1 files carry none of these: they are refused,
+ * and stay visible to eviction so their space is reclaimed. */
+#define KV_CACHE_VERSION 2u
 /* Header byte 20 carries the graph-payload ABI.  It is separate from the outer
  * file version because the KVC envelope can remain stable while the serialized
  * ds4_session internals become unsafe to restore across runtime changes. */
@@ -390,6 +395,254 @@ static void kv_cache_push(ds4_kvstore *kc, ds4_kvstore_entry e) {
     kc->entry[kc->len++] = e;
 }
 
+/* Process-wide identity of the engine whose state this store holds, and its
+ * numerics canary (0 = not bound yet / not computed: identity is then bound
+ * by the first store or load, and the canary is not checked). */
+static uint64_t g_kv_identity;
+static uint64_t g_kv_canary;
+/* Canary gate, read by request threads while the canary thread completes it. */
+enum { KV_CANARY_NONE, KV_CANARY_PENDING, KV_CANARY_READY, KV_CANARY_FAILED };
+static int g_kv_canary_state;
+
+static uint64_t kv_canary(void) { return __atomic_load_n(&g_kv_canary, __ATOMIC_ACQUIRE); }
+
+static uint64_t kv_mix64(uint64_t h, uint64_t v) {
+    for (int i = 0; i < 8; i++) { h ^= (uint8_t)(v >> (8 * i)); h *= 1099511628211ull; }
+    return h;
+}
+
+uint64_t ds4_kvstore_engine_identity(ds4_engine *engine) {
+    uint64_t h = 1469598103934665603ull;
+    h = kv_mix64(h, ds4_engine_model_fingerprint(engine, 0));   /* GGUF header: metadata, tokenizer, tensor table */
+    h = kv_mix64(h, ds4_engine_model_fingerprint(engine, 1));   /* drafter (capture-state producer), 0 = none */
+    h = kv_mix64(h, (uint64_t)ds4_engine_routed_quant_bits(engine));
+    h = kv_mix64(h, (uint64_t)ds4_engine_model_id(engine));
+    for (const char *r = ds4_engine_prefill_repr(engine); r && *r; r++) { h ^= (uint8_t)*r; h *= 1099511628211ull; }
+    h ^= 0x1f; h *= 1099511628211ull;   /* field separator */
+    for (const char *r = ds4_engine_prefill_values(engine); r && *r; r++) { h ^= (uint8_t)*r; h *= 1099511628211ull; }
+    return h ? h : 1;
+}
+
+void ds4_kvstore_set_identity(uint64_t identity) { g_kv_identity = identity; }
+void ds4_kvstore_canary_pending(void) {
+    __atomic_store_n(&g_kv_canary_state, KV_CANARY_PENDING, __ATOMIC_RELEASE);
+}
+
+void ds4_kvstore_set_canary(uint64_t canary) {
+    __atomic_store_n(&g_kv_canary, canary, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_kv_canary_state, KV_CANARY_READY, __ATOMIC_RELEASE);
+}
+
+void ds4_kvstore_canary_failed(void) {
+    __atomic_store_n(&g_kv_canary_state, KV_CANARY_FAILED, __ATOMIC_RELEASE);
+}
+
+bool ds4_kvstore_canary_ready(void) {
+    const int st = __atomic_load_n(&g_kv_canary_state, __ATOMIC_ACQUIRE);
+    return st == KV_CANARY_NONE || st == KV_CANARY_READY;
+}
+
+/* One line per gate state per process: why the disk cache is not used yet. */
+static bool kv_canary_gate(ds4_kvstore *kc, const char *what) {
+    if (ds4_kvstore_canary_ready()) return true;
+    static int logged = -1;
+    const int st = __atomic_load_n(&g_kv_canary_state, __ATOMIC_ACQUIRE);
+    if (__atomic_exchange_n(&logged, st, __ATOMIC_ACQ_REL) != st)
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE, "%s: kv cache %s refused: %s", kv_log_name(kc), what,
+                st == KV_CANARY_PENDING ? "the numerics canary has not completed yet (the cache turns on when it does)" :
+                                          "the numerics canary failed (the cache stays off)");
+    return false;
+}
+
+/* ---- payload digest: a word-wise FNV-style mix ---- */
+
+#define KV_HASH_PRIME UINT64_C(0x100000001b3)
+#define KV_HASH_BASIS UINT64_C(0xcbf29ce484222325)
+
+static inline uint64_t kv_hash_mix(uint64_t h, uint64_t w) {
+    h ^= w;
+    h *= KV_HASH_PRIME;
+    h ^= h >> 29;
+    return h;
+}
+
+static inline uint64_t kv_load64(const uint8_t *p) {
+    uint64_t w;
+    memcpy(&w, p, 8);
+    return w;
+}
+
+void ds4_kvstore_hash_init(ds4_kvstore_hash *s) {
+    memset(s, 0, sizeof(*s));
+    s->h = KV_HASH_BASIS;
+}
+
+void ds4_kvstore_hash_update(ds4_kvstore_hash *s, const void *p, size_t n) {
+    const uint8_t *b = p;
+    s->n += n;
+    while (s->tl && n) {
+        s->tail[s->tl++] = *b++;
+        n--;
+        if (s->tl == 8) { s->h = kv_hash_mix(s->h, kv_load64(s->tail)); s->tl = 0; }
+    }
+    while (n >= 8) { s->h = kv_hash_mix(s->h, kv_load64(b)); b += 8; n -= 8; }
+    while (n) { s->tail[s->tl++] = *b++; n--; }
+}
+
+uint64_t ds4_kvstore_hash_final(const ds4_kvstore_hash *s) {
+    uint64_t h = s->h;
+    if (s->tl) {
+        uint8_t t[8] = {0};
+        memcpy(t, s->tail, s->tl);
+        h = kv_hash_mix(h, kv_load64(t));
+    }
+    return kv_hash_mix(h, s->n);
+}
+
+uint64_t ds4_kvstore_payload_hash(const void *p, size_t n) {
+    ds4_kvstore_hash s;
+    ds4_kvstore_hash_init(&s);
+    ds4_kvstore_hash_update(&s, p, n);
+    return ds4_kvstore_hash_final(&s);
+}
+
+enum { KV_HASH_CHUNK = 8 << 20 };
+
+int ds4_kvstore_verify_payload(FILE *fp, const ds4_kvstore_entry *e,
+                               char *why, size_t why_len) {
+    const off_t start = ftello(fp);
+    if (start < 0) {
+        snprintf(why, why_len, "cannot locate the payload");
+        return 1;
+    }
+    if (e->payload_hash == 0) {
+        snprintf(why, why_len, "entry records no payload hash");
+        return 1;
+    }
+    uint8_t *buf = malloc(KV_HASH_CHUNK);
+    if (!buf) {
+        snprintf(why, why_len, "out of memory verifying the payload");
+        return 1;
+    }
+    ds4_kvstore_hash s;
+    ds4_kvstore_hash_init(&s);
+    uint64_t left = e->payload_bytes;
+    while (left > 0) {
+        const size_t want = left < KV_HASH_CHUNK ? (size_t)left : KV_HASH_CHUNK;
+        if (fread(buf, 1, want, fp) != want) break;
+        ds4_kvstore_hash_update(&s, buf, want);
+        left -= want;
+    }
+    free(buf);
+    if (left > 0) {
+        snprintf(why, why_len, "payload is shorter than the %llu bytes the header records",
+                 (unsigned long long)e->payload_bytes);
+        return 1;
+    }
+    const uint64_t got = ds4_kvstore_hash_final(&s);
+    if (got != e->payload_hash) {
+        snprintf(why, why_len, "payload hash %016llx, header records %016llx (corrupt payload)",
+                 (unsigned long long)got, (unsigned long long)e->payload_hash);
+        return 1;
+    }
+    if (fseeko(fp, start, SEEK_SET) != 0) {
+        snprintf(why, why_len, "cannot rewind to the payload");
+        return 1;
+    }
+    return 0;
+}
+
+/* Copies the staged payload into fp, digesting it on the way. */
+static int kv_copy_staged_hashed(const ds4_session_payload_file *staged, FILE *fp,
+                                 uint64_t *hash, char *err, size_t err_len) {
+    FILE *src = staged && staged->path ? fopen(staged->path, "rb") : NULL;
+    if (!src) {
+        snprintf(err, err_len, "failed to open staged session payload");
+        return 1;
+    }
+    uint8_t *buf = malloc(KV_HASH_CHUNK);
+    ds4_kvstore_hash s;
+    ds4_kvstore_hash_init(&s);
+    uint64_t left = staged->bytes;
+    int rc = buf ? 0 : 1;
+    while (rc == 0 && left > 0) {
+        const size_t want = left < KV_HASH_CHUNK ? (size_t)left : KV_HASH_CHUNK;
+        if (fread(buf, 1, want, src) != want || fwrite(buf, 1, want, fp) != want) {
+            rc = 1;
+        } else {
+            ds4_kvstore_hash_update(&s, buf, want);
+            left -= want;
+        }
+    }
+    if (rc) snprintf(err, err_len, "%s", buf ? "failed to copy staged session payload" :
+                                               "out of memory copying staged session payload");
+    free(buf);
+    fclose(src);
+    if (rc == 0) *hash = ds4_kvstore_hash_final(&s);
+    return rc;
+}
+
+/* Header bytes 64..71, written once the payload digest is known. */
+static bool kv_put_payload_hash(FILE *fp, uint64_t hash) {
+    uint8_t b[8];
+    kv_le_put64(b, hash);
+    return fflush(fp) == 0 && fseeko(fp, 64, SEEK_SET) == 0 &&
+           fwrite(b, 1, sizeof(b), fp) == sizeof(b);
+}
+
+int ds4_kvstore_engine_canary(ds4_engine *engine, int tokens, uint64_t *out,
+                              char *err, size_t err_len) {
+    if (out) *out = 0;
+    if (!engine || !out || tokens <= 0) {
+        snprintf(err, err_len, "invalid canary request");
+        return 1;
+    }
+    /* Fixed prompt: decimal numbers from a 32-bit LCG, each at least one
+     * token, through the bound tokenizer (part of the identity). */
+    kv_buf text = {0};
+    uint32_t x = 0x9e3779b9u;
+    for (int i = 0; i < tokens; i++) {
+        x = x * 1664525u + 1013904223u;
+        kv_buf_printf(&text, "%05u ", (unsigned)(x % 100000u));
+    }
+    char *t = kv_buf_take(&text);
+    ds4_tokens prompt = {0};
+    ds4_tokenize_text(engine, t, &prompt);
+    free(t);
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = vocab > 0 ? malloc((size_t)vocab * sizeof(float)) : NULL;
+    ds4_session *cs = NULL;
+    char serr[160] = {0};
+    int rc = 1;
+    if (prompt.len >= tokens) prompt.len = tokens;
+    if (prompt.len < tokens) {
+        snprintf(err, err_len, "canary prompt tokenized to %d of %d tokens", prompt.len, tokens);
+    } else if (!logits) {
+        snprintf(err, err_len, "no vocabulary for the canary logits");
+    } else if (ds4_session_create(&cs, engine, tokens + 64) != 0) {
+        snprintf(err, err_len, "canary session (ctx %d) could not be created", tokens + 64);
+    } else if (ds4_session_sync(cs, &prompt, serr, sizeof(serr)) != 0) {
+        snprintf(err, err_len, "canary prefill failed: %s", serr[0] ? serr : "unknown error");
+    } else {
+        const int n = ds4_session_copy_logits(cs, logits, vocab);
+        if (n <= 0) {
+            snprintf(err, err_len, "canary prefill produced no logits");
+        } else {
+            ds4_kvstore_hash s;
+            ds4_kvstore_hash_init(&s);
+            ds4_kvstore_hash_update(&s, prompt.v, (size_t)tokens * sizeof(prompt.v[0]));
+            ds4_kvstore_hash_update(&s, logits, (size_t)n * sizeof(float));
+            const uint64_t h = ds4_kvstore_hash_final(&s);
+            *out = h ? h : 1;
+            rc = 0;
+        }
+    }
+    if (cs) ds4_session_free(cs);
+    free(logits);
+    ds4_tokens_free(&prompt);
+    return rc;
+}
+
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
                              uint8_t reason, uint8_t ext_flags,
@@ -412,6 +665,9 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     kv_le_put64(h + 24, created_at);
     kv_le_put64(h + 32, last_used);
     kv_le_put64(h + 40, payload_bytes);
+    kv_le_put64(h + 48, g_kv_identity);
+    kv_le_put64(h + 56, kv_canary());
+    /* 64..71: payload hash, written after the payload; 72..79 reserved */
 }
 
 /* routed-expert quantizations whose checkpoints the store keys on */
@@ -420,13 +676,18 @@ bool ds4_kvstore_quant_bits_supported(int quant_bits) {
            quant_bits == 6 || quant_bits == 8;
 }
 
-bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
-                             uint32_t *text_bytes) {
+/* Header and text length at the file start. false: not an entry this code
+ * can read. true with e->refusal set: readable, but this engine must not load
+ * it (the fields are still valid for eviction). */
+static bool kv_parse_header(FILE *fp, ds4_kvstore_entry *e,
+                            uint32_t *text_bytes) {
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
-    if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 ||
-        h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
-    if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
+    if (fread(h, 1, 4, fp) != 4) return false;
+    if (h[0] != KV_CACHE_MAGIC0 || h[1] != KV_CACHE_MAGIC1 || h[2] != KV_CACHE_MAGIC2) return false;
+    if (h[3] != 1u && h[3] != KV_CACHE_VERSION) return false;
+    const size_t hb = h[3] == 1u ? DS4_KVSTORE_V1_HEADER : DS4_KVSTORE_FIXED_HEADER;
+    if (fread(h + 4, 1, hb - 4, fp) != hb - 4) return false;
+    e->version = h[3];
     e->quant_bits = h[4];
     e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
                 DS4_KVSTORE_REASON_UNKNOWN;
@@ -438,27 +699,70 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     e->created_at = kv_le_get64(h + 24);
     e->last_used = kv_le_get64(h + 32);
     e->payload_bytes = kv_le_get64(h + 40);
+    e->identity = e->canary = e->payload_hash = 0;
+    if (hb == DS4_KVSTORE_FIXED_HEADER) {
+        e->identity = kv_le_get64(h + 48);
+        e->canary = kv_le_get64(h + 56);
+        e->payload_hash = kv_le_get64(h + 64);
+    }
     uint8_t tb[4];
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = ds4_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
+    e->refusal = NULL;
+    if (e->version == 1u)
+        e->refusal = "v1 entry (no engine identity, canary or payload hash)";
+    else if (h[20] != KV_CACHE_PAYLOAD_ABI)
+        e->refusal = "graph payload ABI differs";
+    else if (g_kv_identity && e->identity != g_kv_identity)
+        e->refusal = "engine identity differs (other weights or prefill representation)";
+    else if (kv_canary() && e->canary != kv_canary())
+        e->refusal = e->canary ? "prefill numerics canary differs" : "entry records no numerics canary";
     return e->tokens != 0 && ds4_kvstore_quant_bits_supported(e->quant_bits);
 }
 
-bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
-                                 ds4_kvstore_entry *out) {
+/* One stderr line per refusal kind per process (callers outside the indexed
+ * lookup, such as ds4-agent, see refused entries only through this). */
+static void kv_note_refusal(const ds4_kvstore_entry *e) {
+    static const char *seen[8];
+    for (int i = 0; i < 8; i++) {
+        if (seen[i] == e->refusal) return;
+        if (!seen[i]) { seen[i] = e->refusal; break; }
+    }
+    fprintf(stderr, "ds4: kv cache entries refused: %s (entry identity %016llx canary %016llx, "
+                    "this engine %016llx %016llx); they re-prefill\n",
+            e->refusal, (unsigned long long)e->identity, (unsigned long long)e->canary,
+            (unsigned long long)g_kv_identity, (unsigned long long)kv_canary());
+}
+
+bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
+                             uint32_t *text_bytes) {
+    if (!kv_parse_header(fp, e, text_bytes)) return false;
+    if (e->refusal) {
+        kv_note_refusal(e);
+        return false;
+    }
+    return true;
+}
+
+static bool kv_read_entry(const char *path, const char sha[41],
+                          ds4_kvstore_entry *out, bool keep_refused) {
     struct stat st;
     if (stat(path, &st) != 0 ||
-        st.st_size < (off_t)(DS4_KVSTORE_FIXED_HEADER + 4))
+        st.st_size < (off_t)(DS4_KVSTORE_V1_HEADER + 4))
         return false;
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
     ds4_kvstore_entry e = {0};
     uint32_t text_bytes = 0;
-    bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
+    bool ok = kv_parse_header(fp, &e, &text_bytes);
     fclose(fp);
     if (!ok) return false;
-    const uint64_t fixed = DS4_KVSTORE_FIXED_HEADER + 4ull;
+    if (e.refusal && !keep_refused) {
+        kv_note_refusal(&e);
+        return false;
+    }
+    const uint64_t fixed = (e.version == 1u ? DS4_KVSTORE_V1_HEADER : DS4_KVSTORE_FIXED_HEADER) + 4ull;
     if (UINT64_MAX - fixed < (uint64_t)text_bytes ||
         UINT64_MAX - fixed - (uint64_t)text_bytes < e.payload_bytes)
         return false;
@@ -471,6 +775,13 @@ bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
     return true;
 }
 
+bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
+                                 ds4_kvstore_entry *out) {
+    return kv_read_entry(path, sha, out, false);
+}
+
+/* Indexes every readable entry, refused ones included: lookups skip those,
+ * eviction still counts and reclaims their space. */
 static void kv_cache_refresh(ds4_kvstore *kc) {
     if (!kc->enabled) return;
     ds4_kvstore_clear(kc);
@@ -482,12 +793,14 @@ static void kv_cache_refresh(ds4_kvstore *kc) {
         if (!ds4_kvstore_sha_hex_name(de->d_name, sha)) continue;
         char *path = ds4_kvstore_path_join(kc->dir, de->d_name);
         ds4_kvstore_entry e = {0};
-        if (ds4_kvstore_read_entry_file(path, sha, &e)) kv_cache_push(kc, e);
+        if (kv_read_entry(path, sha, &e, true)) kv_cache_push(kc, e);
         free(path);
     }
     closedir(d);
 }
 
+/* Only the hit count (12..15) and last use (32..39) change; the identity,
+ * canary and payload hash stay as written. */
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     FILE *fp = fopen(path, "r+b");
     if (!fp) return false;
@@ -495,13 +808,11 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     uint32_t text_bytes = 0;
     bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
     if (ok) {
-        uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-        uint64_t now = (uint64_t)time(NULL);
-        ds4_kvstore_fill_header(h, e.model_id, e.quant_bits, e.reason, e.ext_flags,
-                                e.tokens, hits, e.ctx_size,
-                                e.created_at, now, e.payload_bytes);
-        ok = fseek(fp, 0, SEEK_SET) == 0 &&
-             fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+        uint8_t hb[4], tb[8];
+        ds4_kvstore_le_put32(hb, hits);
+        kv_le_put64(tb, (uint64_t)time(NULL));
+        ok = fseek(fp, 12, SEEK_SET) == 0 && fwrite(hb, 1, sizeof(hb), fp) == sizeof(hb) &&
+             fseek(fp, 32, SEEK_SET) == 0 && fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb);
     }
     fclose(fp);
     return ok;
@@ -910,20 +1221,35 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
         uint64_t ignored = 0;
         ok = kv_trailer_write(hooks, fp, text, &ignored) && fflush(fp) == 0;
         if (ok && ignored > 0) {
-            uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-            uint64_t now = (uint64_t)time(NULL);
-            ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
-                                    (uint8_t)(hdr.ext_flags | hooks->ext_flag),
-                                    hdr.tokens, hdr.hits, hdr.ctx_size,
-                                    hdr.created_at, now, hdr.payload_bytes);
-            ok = fseeko(fp, 0, SEEK_SET) == 0 &&
-                 fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+            /* ext flags (6) and last use (32..39) only: the identity, canary
+             * and payload hash stay as written */
+            uint8_t ext = (uint8_t)(hdr.ext_flags | hooks->ext_flag), tb[8];
+            kv_le_put64(tb, (uint64_t)time(NULL));
+            ok = fseeko(fp, 6, SEEK_SET) == 0 && fwrite(&ext, 1, 1, fp) == 1 &&
+                 fseeko(fp, 32, SEEK_SET) == 0 && fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
                  fflush(fp) == 0;
         }
     }
     fclose(fp);
     (void)kc;
     (void)ok;
+}
+
+bool ds4_kvstore_write_entry(FILE *fp, const uint8_t h[DS4_KVSTORE_FIXED_HEADER],
+                             const char *text, size_t text_len,
+                             const ds4_session_payload_file *staged,
+                             const ds4_kvstore_trailer_hooks *hooks,
+                             uint64_t *trailer_bytes, uint64_t *payload_hash,
+                             char *err, size_t err_len) {
+    uint8_t tb[4];
+    ds4_kvstore_le_put32(tb, (uint32_t)text_len);
+    return fwrite(h, 1, DS4_KVSTORE_FIXED_HEADER, fp) == DS4_KVSTORE_FIXED_HEADER &&
+           fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
+           fwrite(text, 1, text_len, fp) == text_len &&
+           (staged ? kv_copy_staged_hashed(staged, fp, payload_hash, err, err_len) == 0 :
+                     (*payload_hash = ds4_kvstore_payload_hash(NULL, 0), true)) &&
+           kv_trailer_write(hooks, fp, text, trailer_bytes) &&
+           kv_put_payload_hash(fp, *payload_hash);
 }
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
@@ -940,11 +1266,13 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         size_t err_len) {
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
+    if (!kv_canary_gate(kc, "store")) return false;
     const int original_len = tokens->len;
 
     ds4_tokens store_tokens = {0};
     ds4_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
+    if (!g_kv_identity) g_kv_identity = ds4_kvstore_engine_identity(engine);
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) {
         ds4_tokens_free(&store_tokens);
@@ -1084,17 +1412,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                             (uint32_t)store_tokens.len, 0,
                             (uint32_t)ds4_session_ctx(session),
                             now, now, payload_bytes);
-    uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, (uint32_t)text_len);
-    uint64_t trailer_bytes = 0;
+    uint64_t trailer_bytes = 0, payload_hash = 0;
     errno = 0;
-    bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
-              fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-              fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
-              kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
-              fflush(fp) == 0;
+    bool ok = ds4_kvstore_write_entry(fp, h, text, text_len, &staged, hooks,
+                                      &trailer_bytes, &payload_hash,
+                                      save_err, sizeof(save_err)) &&
+              fflush(fp) == 0 && fsync(fileno(fp)) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
         if (!saved_errno) saved_errno = errno;
@@ -1143,14 +1466,14 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         unlink(tmp);
     } else {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
+                "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms payload_hash=%016llx",
                 kv_log_name(kc),
                 store_tokens.len,
                 original_len - store_tokens.len,
                 reason,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
-                save_ms);
+                save_ms, (unsigned long long)payload_hash);
     }
     ds4_session_payload_file_free(&staged);
     free(tmp);
@@ -1201,6 +1524,7 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
+        if (e->refusal) continue;
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
@@ -1214,6 +1538,22 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         char sha[41];
         ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
         if (!strcmp(sha, e->sha)) best = i;
+    }
+    /* Name each refused entry that would have served a longer prefix. */
+    for (int i = 0; i < kc->len; i++) {
+        ds4_kvstore_entry *e = &kc->entry[i];
+        if (!e->refusal || e->model_id != (uint8_t)model_id) continue;
+        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
+        if (best >= 0 && e->text_bytes <= kc->entry[best].text_bytes) continue;
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        if (strcmp(sha, e->sha)) continue;
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache refused %s tokens=%u: %s (entry identity %016llx canary %016llx, "
+                "this engine %016llx %016llx); nothing restored from it",
+                kv_log_name(kc), e->path, e->tokens, e->refusal,
+                (unsigned long long)e->identity, (unsigned long long)e->canary,
+                (unsigned long long)g_kv_identity, (unsigned long long)kv_canary());
     }
     return best;
 }
@@ -1229,6 +1569,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
+    if (!kv_canary_gate(kc, "load")) return 0;
+    if (!g_kv_identity) g_kv_identity = ds4_kvstore_engine_identity(engine);
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
@@ -1248,7 +1590,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     uint32_t text_bytes = 0;
     ds4_kvstore_entry hdr = {0};
     const char *fail_reason = "invalid header";
-    bool header_ok = ds4_kvstore_read_header(fp, &hdr, &text_bytes);
+    bool header_ok = kv_parse_header(fp, &hdr, &text_bytes);
+    if (header_ok && hdr.refusal) {
+        header_ok = false;
+        fail_reason = hdr.refusal;
+    }
     char *cached_text = NULL;
     if (header_ok) {
         if (hdr.model_id != (uint8_t)model_id) {
@@ -1277,7 +1623,16 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             }
         }
     }
-    char err[160] = {0};
+    /* Verified content before any restore: a payload that does not hash to
+     * the header's digest is refused whole and removed; the session is not
+     * touched. */
+    char err[160] = {0}, why[160] = {0};
+    bool corrupt = false;
+    if (header_ok && ds4_kvstore_verify_payload(fp, &hdr, why, sizeof(why)) != 0) {
+        header_ok = false;
+        corrupt = true;
+        fail_reason = why;
+    }
     int loaded = 0;
     if (header_ok &&
         ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
@@ -1309,13 +1664,16 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         }
     } else {
         if (header_ok) ds4_session_invalidate(session);
+        if (corrupt) unlink(path);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
+                "%s: kv cache %s%s%s %s: %s%s load=%.1f ms",
                 kv_log_name(kc),
+                header_ok ? "load failed" : "refused",
                 responses_protocol ? " " : "",
                 responses_protocol ? "RESPPROTO" : "",
                 path,
                 header_ok ? err : fail_reason,
+                header_ok ? "" : corrupt ? "; nothing restored, file removed" : "; nothing restored",
                 (kv_now_sec() - load_t0) * 1000.0);
     }
     fclose(fp);
