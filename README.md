@@ -27,17 +27,17 @@ a cold prompt in an empty session, without the drafter.
 | --- | ---: | ---: |
 | Serial decode, 8K | 19.9 t/s | **41.4 t/s** |
 | Serial decode, 131K | 17.9 t/s | **40.5 t/s** |
-| DSpark, prose, 8K | 18.1 t/s | **40.5 t/s** |
-| DSpark, code, 8K | 26.9 t/s | **59.0 t/s** |
+| DSpark, prose, 8K | 18.6 t/s | **40.5 t/s** |
+| DSpark, code, 8K | 26.5 t/s | **59.0 t/s** |
 | Cold prefill, 32K | 45.0 s | **37.9 s** |
-| Cold prefill, 131K | 190.0 s | **151.6 s** |
+| Cold prefill, 131K | 189.5 s | **151.6 s** |
 
 The prose prompt is `speed-bench/promessi_sposi.txt` (an Italian novel); the
 code prompt is DwarfStar's own C and Python source. The model continues each
 one. Main's serial and 32K figures come from the same session as the branch's.
-Main's DSpark figures and its 131K prefill come from an earlier session; its
-DSpark figures had light background GPU load and decoded 256 tokens after a
-warm-up, from main's own caches. The previous release, our
+Main's DSpark figures and its 131K prefill come from a later quiet session;
+main cannot restore the branch's saved drafter state, so its DSpark runs start
+with a warm-up from main's own caches. The previous release, our
 earlier build of this work on an older DwarfStar, stays available as the tag
 `v41-oct-release` of this repository.
 [docs/REPRODUCE-V41.md](docs/REPRODUCE-V41.md) says how each number was taken.
@@ -334,7 +334,7 @@ Decode, in tokens per second:
 
 | Step | Groups added | Serial 8K | Serial 131K | DSpark code 8K | DSpark prose 8K |
 | --- | --- | ---: | ---: | ---: | ---: |
-| main | | 19.9 | 17.9 | 26.9 | 18.1 |
+| main | | 19.9 | 17.9 | 26.5 | 18.6 |
 | 1 | MODEL_TRACKED | 20.2 | 18.2 | 30.1 | 19.2 |
 | 2 | COMPUTE_TENSOR_COPY | 20.6 | 18.6 | 31.3 | 19.6 |
 | 3 | DECODE_QUEUE | 27.6 | 24.3 | 32.0 | 23.1 |
@@ -373,7 +373,7 @@ Cold prefill of 32K tokens, in seconds:
 | 8 | SHORT_SWEEP, ENGRAM_READAHEAD and the decode groups PREENCODE through VERIFY_INDEXED | 40.4 |
 | 9, all on | ENGRAM_READERS | 37.9 |
 
-A cold 131K prefill takes 190.0 s on main (an earlier session), 189.4 s with
+A cold 131K prefill takes 189.5 s on main (a later quiet session), 189.4 s with
 every group off and 151.6 s with every group on.
 
 After the progression session, ROWS_MMA and VERIFY_KERNELS were limited to
@@ -388,8 +388,8 @@ Groups that share a row were measured together: they have little or no effect on
 that row's measurements alone, and the TP groups and SAMPLER_GPU cannot change
 greedy decoding on one Mac. Every serial step gave main's digest of 128 steps of
 tokens and full logits at both depths, and every prefill step gave main's logits.
-Main's DSpark row comes from main's own caches with a warm-up and 256 tokens in
-an earlier session, while the steps run from caches that carry the drafter window
+Main's DSpark row comes from main's own caches with a warm-up, in a later quiet
+session, while the steps run from caches that carry the drafter window
 with no warm-up, so the jump from main to step 1 is partly a change of method.
 
 ### Tests
