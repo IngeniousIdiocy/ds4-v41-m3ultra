@@ -64,6 +64,7 @@ typedef struct {
 #define DS4_GPU_V41_TOPK (1ull << 16)   /* the index top-k by radix select, or a shorter sort and merge */
 #define DS4_GPU_V41_INDEX_CANDIDATES (1ull << 17)   /* past layer 20, decode scores and picks among layer 20's blocks */
 #define DS4_GPU_V41_DECODE_ATTENTION (1ull << 18)   /* decode attention stages its selected rows straight from the cache */
+#define DS4_GPU_V41_FIXED_SHAPES (1ull << 19)   /* decode kernels built for V4.1's exact shapes */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

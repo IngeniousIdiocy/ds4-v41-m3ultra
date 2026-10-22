@@ -41750,7 +41750,13 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
 #else
     const bool fused = false;
 #endif
-    if (!fused &&
+#ifdef __APPLE__
+    const bool fixed = !fused && rope_il < 0 &&
+        ds4_gpu_dsv41_attention_low_static(g->low, m->map, m->size, offset, 4096, 1024, groups, g->heads);
+#else
+    const bool fixed = false;
+#endif
+    if (!fused && !fixed &&
         ((rope_il >= 0 && !ds41_heads_unrope(g->heads, DS4_N_HEAD / g->tp_world, (uint32_t)rope_il, g->pos)) ||
          !ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size, offset, 4096, 1024, groups, g->heads)))
         return false;

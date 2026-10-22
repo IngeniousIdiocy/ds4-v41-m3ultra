@@ -1719,6 +1719,7 @@ static int check_hc_fusion(void) {
                             "kernel_dsv41_deferred_collapse", "kernel_dsv41_query_deferred_hc"};
     uint64_t runs[4];
     for (int k = 0; k < 4; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_FIXED_SHAPES);   /* the general expand; check_fixed_shapes has the V4.1 ones */
     /* the block input: one row with pre as 4 weights and as a split row, then three rows (split rows) */
     for (int step = 0; step < 3; step++) {
         const int n = step == 2;
@@ -1787,6 +1788,7 @@ static int check_hc_fusion(void) {
     }
     CHECK(ds4_gpu_test_kernel_runs(names[0]) == runs[0] + 3 + 8 && ds4_gpu_test_kernel_runs(names[1]) == runs[1] + 2 &&
           ds4_gpu_test_kernel_runs(names[2]) == runs[2] + 8 && ds4_gpu_test_kernel_runs(names[3]) == runs[3] + 8);
+    ds4_gpu_test_set_v41_off(0);
     ds4_gpu_test_set_flags(0);
     ds4_gpu_tensor *tensors[] = {res1, flat1, pre4, pre24, res, pre, flat, xin, add, block, ref, got,
                                  qr, kv, q[0], q[1], cache[0], cache[1]};
@@ -2142,12 +2144,110 @@ static int check_decode_attention(void) {
     return 1;
 }
 
+/* FIXED_SHAPES: each V4.1-shape kernel against the general kernel it replaces (the bit off), bit for bit: the routed
+ * MoE on the fixed-route kernels and the literal pair, the four short-K projections, the q_b projection with RoPE, the
+ * q_a/kv pair, the shared down and output-B expands, the FFN join, the low projection and the concurrent shared down. */
+static int check_fixed_shapes(void) {
+    enum { D = 5120, FF = 2304, NE = 384, NU = 6, MXFP4 = 39 /* the tensor type */ };
+    const uint64_t mx_gate_row = D / 32 * 17, mx_down_row = FF / 32 * 17;
+    const uint64_t q8 = 5120ull * 256 * 34;   /* the widest Q8_0 matrix here (8192 -> 5120, also 1280 -> 32768) */
+    const uint64_t eg_o = q8, eu_o = eg_o + (uint64_t)NE * FF * mx_gate_row,
+                   ed_o = eu_o + (uint64_t)NE * FF * mx_gate_row, wb = ed_o + (uint64_t)NE * D * mx_down_row;
+    uint8_t *map = NULL;
+    CHECK(posix_memalign((void **)&map, getpagesize(), wb) == 0);
+    for (uint64_t b = 0; b < q8 / 34; b++) {   /* Q8_0 blocks: f16 scale, 32 int8 */
+        const uint16_t d = (uint16_t)(0x2000u + random_bits() % 0x1800u);
+        memcpy(map + b * 34, &d, 2);
+        for (int j = 0; j < 32; j++) map[b * 34 + 2 + j] = (uint8_t)random_bits();
+    }
+    for (uint64_t b = eg_o; b < wb; b += 17) {   /* MXFP4 blocks: e8m0 scale, 16 bytes of nibbles */
+        map[b] = (uint8_t)(118u + random_bits() % 8u);
+        for (int j = 1; j < 17; j++) map[b + j] = (uint8_t)random_bits();
+    }
+    CHECK(ds4_gpu_set_model_map(map, wb));
+    enum { X = 8 * 4096 };
+    ds4_gpu_tensor *x = upload(NULL, X * 4), *add = upload(NULL, D * 4), *res = upload(NULL, 4 * D * 4);
+    ds4_gpu_tensor *split = upload(NULL, 24 * 4), *out = upload(NULL, 32768 * 4), *out2 = upload(NULL, 512 * 4);
+    ds4_gpu_tensor *gate = upload(NULL, NU * FF * 4), *up = upload(NULL, NU * FF * 4), *emid = upload(NULL, NU * FF * 4);
+    ds4_gpu_tensor *experts = upload(NULL, NU * D * 4), *sel = upload(NULL, NU * 4), *weights = upload(NULL, NU * 4);
+    ds4_gpu_tensor *sg = upload(NULL, FF * 4), *su = upload(NULL, FF * 4), *mid = upload(NULL, FF * 4);
+    ds4_gpu_tensor *routed = upload(NULL, D * 4);
+    float *want = malloc(32768 * 4);
+    CHECK(x && add && res && split && out && out2 && gate && up && emid && experts && sel && weights && sg && su &&
+          mid && routed && want);
+    float *xv = ds4_gpu_tensor_contents(x), *av = ds4_gpu_tensor_contents(add), *rv = ds4_gpu_tensor_contents(res);
+    for (int i = 0; i < X; i++) xv[i] = bf16(random_value());
+    for (int i = 0; i < D; i++) av[i] = bf16(random_value());
+    for (int i = 0; i < 4 * D; i++) rv[i] = bf16(random_value());
+    for (int i = 0; i < 24; i++) ((float *)ds4_gpu_tensor_contents(split))[i] = fabsf(random_value()) / 4;
+    for (int i = 0; i < NU; i++) {
+        ((int32_t *)ds4_gpu_tensor_contents(sel))[i] = (int32_t)(i * 61 + 7);
+        ((float *)ds4_gpu_tensor_contents(weights))[i] = fabsf(random_value()) / 4;
+    }
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    /* the call with the bit off, then on: the same bits, and the fixed-shape kernel ran once */
+#define FIXED_CASE(kernel, t, n, call) do { \
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_FIXED_SHAPES); \
+        CHECK(call); \
+        memcpy(want, ds4_gpu_tensor_contents(t), (size_t)(n) * 4); \
+        ds4_gpu_test_set_v41_off(0); \
+        const uint64_t before = ds4_gpu_test_kernel_runs(kernel); \
+        CHECK(call); \
+        CHECK(ds4_gpu_test_kernel_runs(kernel) == before + 1 && !memcmp(want, ds4_gpu_tensor_contents(t), (size_t)(n) * 4)); \
+    } while (0)
+    FIXED_CASE("kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32", routed, D,
+        ds4_gpu_routed_moe_one_tensor(routed, gate, up, emid, experts, map, wb, eg_o, eu_o, ed_o, MXFP4, MXFP4,
+            mx_gate_row * FF, mx_gate_row, mx_down_row * D, mx_down_row, D, FF, D, sel, weights, NE, NU, 10.0f, x,
+            NULL, 3, 1));
+    FIXED_CASE("kernel_mul_mv_q8_0_short40_bf16", out, 32768, ds4_gpu_matmul_q8_0_bf16_tensor(out, map, wb, 0, 1280, 32768, x));
+    FIXED_CASE("kernel_mul_mv_q8_0_short40_bf16io", out, 32768, ds4_gpu_matmul_q8_0_bf16io_tensor(out, map, wb, 0, 1280, 32768, x));
+    FIXED_CASE("kernel_mul_mv_q8_0_short72_bf16", out, D, ds4_gpu_matmul_q8_0_bf16_tensor(out, map, wb, 0, FF, D, x));
+    FIXED_CASE("kernel_mul_mv_q8_0_short72_bf16io", out, D, ds4_gpu_matmul_q8_0_bf16io_tensor(out, map, wb, 0, FF, D, x));
+    FIXED_CASE("kernel_mul_mv_q8_0_short40_bf16_rope", out, 32768,
+        ds4_gpu_dsv41_project_q(out, map, wb, 0, 1280, 32768, x, 1000, true));
+    FIXED_CASE("kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv", out, 1280,
+        ds4_gpu_dsv41_project_pair_q8(out, out2, map, wb, 0, 34 * 160, D, 1280, 512, x));
+    CHECK(ds4_gpu_dsv41_project_pair_q8(out, out2, map, wb, 0, 34 * 160, D, 1280, 512, x));
+    memcpy(want, ds4_gpu_tensor_contents(out2), 512 * 4);
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_FIXED_SHAPES);
+    CHECK(ds4_gpu_dsv41_project_pair_q8(out, out2, map, wb, 0, 34 * 160, D, 1280, 512, x));
+    ds4_gpu_test_set_v41_off(0);
+    CHECK(!memcmp(want, ds4_gpu_tensor_contents(out2), 512 * 4));   /* the second matrix's rows too */
+    FIXED_CASE("kernel_mul_mv_q8_0_short72_bf16io_hc_expand4", out, 4 * D,
+        ds4_gpu_dsv41_matmul_expand(out, map, wb, 0, FF, D, x, add, res, split, 4));
+    FIXED_CASE("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static", out, 4 * D,
+        ds4_gpu_dsv41_matmul_expand(out, map, wb, 0, 8192, D, x, NULL, res, split, 4));
+    ds4_gpu_tensor *hc_out = ds4_gpu_tensor_view(out, 0, 4 * D * 4);   /* a whole-token output for the join */
+    CHECK(hc_out);
+    FIXED_CASE("kernel_dsv4_hc_expand4_serial_add_bf16", hc_out, 4 * D,
+        ds4_gpu_hc_expand_add_split_bf16_tensor(hc_out, x, add, res, split, D, 4));
+    ds4_gpu_tensor_free(hc_out);
+    FIXED_CASE("kernel_dsv4_attn_out_low_q8_0_f32_static", out, 8 * 1024,
+        ds4_gpu_dsv41_attention_low_static(out, map, wb, 0, 4096, 1024, 8, x) ||
+        ds4_gpu_attention_output_low_q8_tensor(out, map, wb, 0, 4096, 1024, 8, x));
+    FIXED_CASE("kernel_mul_mv_q8_0_short72_bf16io", out, D,
+        ds4_gpu_begin_commands() &&
+        ds4_gpu_parallel_ffn_start_bf16(sg, su, mid, out, map, wb, 0, 0, 0, D, FF, x, 10.0f) &&
+        ds4_gpu_routed_moe_one_tensor(routed, gate, up, emid, experts, map, wb, eg_o, eu_o, ed_o, MXFP4, MXFP4,
+            mx_gate_row * FF, mx_gate_row, mx_down_row * D, mx_down_row, D, FF, D, sel, weights, NE, NU, 10.0f, x,
+            NULL, 3, 1) &&
+        ds4_gpu_parallel_ffn_finish() && ds4_gpu_end_commands() && ds4_gpu_synchronize());
+#undef FIXED_CASE
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {x, add, res, split, out, out2, gate, up, emid, experts, sel, weights, sg, su, mid, routed};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(want);
+    free(map);
+    fprintf(stderr, "V4.1 fixed shapes: each fixed-shape kernel == the general kernel it replaces\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
         check_index_bf16() && check_topk() && check_index_candidates() &&
-        check_decode_attention();
+        check_decode_attention() && check_fixed_shapes();
 }
 #else
 static int check_v41_groups(void) { return 1; }

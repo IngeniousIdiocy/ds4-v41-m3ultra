@@ -494,6 +494,109 @@ static inline float ds4_q8_short_value(
     const float value = simd_sum(slot);
     return ds4_bf16_round(value);
 }
+/* FIXED_SHAPES: the short-K V4.1 projections (1280 -> 32768 and 2304 -> 5120) on ds4_q8_short_value. */
+#define DS4_Q8_SHORT(NAME, NB, INPUT_ROUND) \
+kernel void NAME(constant ds4_metal_args_mul_mv &args [[buffer(0)]], \
+        device const char *w [[buffer(1)]], device const char *x [[buffer(2)]], \
+        device char *out [[buffer(3)]], uint3 group [[threadgroup_position_in_grid]], \
+        ushort lane [[thread_index_in_simdgroup]], ushort simd [[simdgroup_index_in_threadgroup]]) { \
+    const float value = ds4_q8_short_value<NB, INPUT_ROUND>(args, w, x, group, lane, simd); \
+    if (lane == 0) ((device float *)out)[group.x * 4u + simd] = value; \
+}
+DS4_Q8_SHORT(kernel_mul_mv_q8_0_short40_bf16, 40, false)
+DS4_Q8_SHORT(kernel_mul_mv_q8_0_short40_bf16io, 40, true)
+DS4_Q8_SHORT(kernel_mul_mv_q8_0_short72_bf16, 72, false)
+DS4_Q8_SHORT(kernel_mul_mv_q8_0_short72_bf16io, 72, true)
+#undef DS4_Q8_SHORT
+
+/* Preserve the reference projection's BF16 boundary and exact RoPE expression.
+ * Four SIMD groups exchange only four completed row values for the two pairs. */
+kernel void kernel_mul_mv_q8_0_short40_bf16_rope(
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]],
+        device const char *w [[buffer(1)]], device const char *x [[buffer(2)]],
+        device float *out [[buffer(3)]], constant ds4_metal_args_mv_rope &rope [[buffer(4)]],
+        threadgroup float *pairs [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simd [[simdgroup_index_in_threadgroup]]) {
+    const float value = ds4_q8_short_value<40, false>(args, w, x, group, lane, simd);
+    if (lane == 0) pairs[simd] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0 && (simd & 1u) == 0) {
+        const uint row = group.x * 4u + simd;
+        const uint col = row % rope.width;
+        const float re = pairs[simd], im = pairs[simd + 1u];
+        if (col >= rope.width - 64u) {
+            const float theta = float(rope.start) * rope.frequencies[(col - (rope.width - 64u)) >> 1u];
+            const float c = precise::cos(theta);
+            const float s = rope.inverse ? -precise::sin(theta) : precise::sin(theta);
+            out[row] = ds4_bf16_round(fma(re, c, -(im * s)));
+            out[row + 1u] = ds4_bf16_round(fma(im, c, re * s));
+        } else {
+            out[row] = re; out[row + 1u] = im;
+        }
+    }
+}
+
+/* The short-K shared down projection with the routed add and the HC expansion (kernel_mul_mv_q8_0_f32_bf16io_hc_expand4
+ * at 2304 -> 5120). */
+kernel void kernel_mul_mv_q8_0_short72_bf16io_hc_expand4(
+        constant ds4_metal_args_mul_mv &args [[buffer(0)]],
+        device const char *w [[buffer(1)]], device const char *x [[buffer(2)]],
+        device float *out [[buffer(3)]], constant ds4_metal_args_mv_hc_expand4 &hc [[buffer(4)]],
+        device const float *add [[buffer(5)]], device const float *residual [[buffer(6)]],
+        device const float *post [[buffer(7)]], device const float *comb [[buffer(8)]],
+        uint3 group [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
+        ushort simd [[simdgroup_index_in_threadgroup]]) {
+    float block_v = ds4_q8_short_value<72, true>(args, w, x, group, lane, simd);
+    if (lane == 0) {
+        const uint d = group.x * 4u + simd;
+        if (hc.has_add) { block_v += add[d]; block_v = ds4_bf16_round(block_v); }
+        const float r0v = residual[d];
+        const float r1v = residual[d + hc.n_embd];
+        const float r2v = residual[d + 2*hc.n_embd];
+        const float r3v = residual[d + 3*hc.n_embd];
+        for (int dst_hc = 0; dst_hc < 4; ++dst_hc) {
+            float acc = block_v * post[dst_hc];
+            acc += comb[dst_hc + 0*4] * r0v;
+            acc += comb[dst_hc + 1*4] * r1v;
+            acc += comb[dst_hc + 2*4] * r2v;
+            acc += comb[dst_hc + 3*4] * r3v;
+            out[d + dst_hc*hc.n_embd] = ds4_bf16_round(acc);
+        }
+    }
+}
+
+/* A one-row Q8_0 matvec's arguments (nr0 2); called with literals, they fold into the address arithmetic. */
+static inline ds4_metal_args_mul_mv ds4_q8_0_static_args(int in, int out) {
+    const ulong row = (ulong)(in / 32) * 34;
+    return ds4_metal_args_mul_mv{in, out, 1, 34, row, row * out, row * out, in, 1, 1, 4,
+                                 (ulong)in * 4, (ulong)in * 4, (ulong)in * 4, out, 1, 2, 1, 1};
+}
+
+/* Attention output-B into the HC streams at its V4.1 shape (8192 -> 5120) as literals. */
+constant ds4_metal_args_mv_hc_expand4 ds4_hc_static_8192_5120 = { /*.n_embd =*/ 5120, /*.has_add =*/ 0, /*.split_stride =*/ 24 };
+
+[[host_name("kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_static(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        constant ds4_metal_args_mv_hc_expand4 & hc,
+        device const float * add,
+        device const float * residual,
+        device const float * post,
+        device const float * comb,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)args; (void)hc;
+    ds4_metal_args_mul_mv sa = ds4_q8_0_static_args(8192, 5120);
+    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true, true, false, false, true>(
+        sa, src0, src1, dst, shmem, tgpig, tiisg, sgitg, nullptr, &ds4_hc_static_8192_5120, add, residual, post, comb);
+}
+
 /* Two Q8_0 matrices over one activation row in one dispatch: the leading
  * threadgroups take the first matrix's row groups, the rest the second's. */
 [[host_name("kernel_mul_mv_q8_0_f32_bf16_pair")]]
@@ -515,6 +618,31 @@ kernel void kernel_mul_mv_q8_0_f32_bf16_pair(
     } else {
         tgpig.x -= groups_a;
         kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args_b, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
+/* The q_a/kv pair at its V4.1 decode shape (5120 -> 1280, 5120 -> 512) as literals. */
+[[host_name("kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv")]]
+kernel void kernel_mul_mv_q8_0_f32_bf16_pair_qa_kv(
+        constant ds4_metal_args_mul_mv & args_a,
+        constant ds4_metal_args_mul_mv & args_b,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)args_a; (void)args_b;
+    if (tgpig.x < 640u) {
+        ds4_metal_args_mul_mv sa = ds4_q8_0_static_args(5120, 1280);
+        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true>(sa, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
+    } else {
+        ds4_metal_args_mul_mv sa = ds4_q8_0_static_args(5120, 512);
+        tgpig.x -= 640u;
+        kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &, true>(sa, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
     }
 }
 

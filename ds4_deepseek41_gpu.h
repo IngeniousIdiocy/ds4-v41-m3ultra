@@ -96,6 +96,11 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* FIXED_SHAPES: ds4_gpu_attention_output_low_q8_tensor at V4.1's decode shape (8 groups of 4096 -> 1024) with that
+ * shape as literals; 0 for any other shape. */
+int ds4_gpu_dsv41_attention_low_static(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                       uint64_t out_a_offset, uint32_t group_dim, uint32_t rank, uint32_t n_groups,
+                                       const ds4_gpu_tensor *heads);
 /* DECODE_ATTENTION: ds4_gpu_attention_decode_heads_tensor of one row over the raw window and the `attended` rows of
  * the f32 compressed cache that ids picks, staged straight from the cache. 0: not run, gather and attend as before. */
 int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
