@@ -472,6 +472,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_MOE_DEDUP",
             "DS4_METAL_DISABLE_V41_VERIFY_BATCH",
             "DS4_METAL_DISABLE_V41_FLASH_HEAD_SHARE",
+            "DS4_METAL_DISABLE_V41_PREFILL_MATMUL",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -20121,6 +20122,18 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     return ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, false, 0, NULL);
+}
+
+/* PREFILL_MATMUL: V4.1's prefill Q8 matmuls of 32 or more rows on the M3 Ultra unpack their weights to F16 once and
+ * run the F16 tiles. The half weights are the ones the Q8 tiles dequantize, so the results are the same bits. */
+int ds4_gpu_dsv41_matmul_q8_0_prefill(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                      uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                      const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (n_tok < 32u || !ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_MATMUL) || !ds4_gpu_device_name_contains("M3 Ultra"))
+        return 0;
+    DS4_TEST_NOTE("ds4_gpu_dsv41_matmul_q8_0_prefill");
+    return ds4_gpu_matmul_q8_0_tensor_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok,
+                                           true, 0, NULL);
 }
 
 /* One row with its outputs rounded to bf16 in the matvec where the plain single-row kernel applies; any other path

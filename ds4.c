@@ -41315,7 +41315,13 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     } else if (count == 1 && round) {
         return ds41_matmul(out, m, weight, in, true);
     } else {
+#ifdef __APPLE__
+        ok = (weight->type == DS4_TENSOR_Q8_0 &&
+              ds4_gpu_dsv41_matmul_q8_0_prefill(out, m->map, m->size, weight->abs_offset, width, outputs, in, count)) ||
+            metal_graph_matmul_plain_tensor(out, m, weight, width, outputs, in, count);
+#else
         ok = metal_graph_matmul_plain_tensor(out, m, weight, width, outputs, in, count);
+#endif
     }
     return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
 }

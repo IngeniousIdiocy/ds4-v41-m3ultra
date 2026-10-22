@@ -76,6 +76,7 @@ typedef struct {
 #define DS4_GPU_V41_MOE_DEDUP (1ull << 28)   /* 2-8 MXFP4 rows read each selected expert once (any MXFP4 model) */
 #define DS4_GPU_V41_VERIFY_BATCH (1ull << 29)   /* one session's 2-8 consecutive rows attend together and expand their outputs into the streams */
 #define DS4_GPU_V41_FLASH_HEAD_SHARE (1ull << 30)   /* multi-row flash attention runs eight heads per threadgroup over shared key reads (any model) */
+#define DS4_GPU_V41_PREFILL_MATMUL (1ull << 31)   /* wide prefill Q8 matmuls unpack their weights to F16 once on the M3 Ultra */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

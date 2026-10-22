@@ -2883,6 +2883,36 @@ static int check_verify_batch(void) {
     return 1;
 }
 
+/* PREFILL_MATMUL: 33 and 300 rows of a Q8 matmul through the F16 unpack against the Q8 tiles, bit for bit. */
+static int check_prefill_matmul(void) {
+    enum { K = 4096, N = 1024, ROWS = 300 };
+    uint64_t wb = 0;
+    void *map = q8_weights(N, K, &wb);
+    CHECK(map && ds4_gpu_set_model_map(map, wb));
+    ds4_gpu_tensor *x = upload(NULL, (size_t)ROWS * K * 4), *ref = upload(NULL, (size_t)ROWS * N * 4),
+                   *got = upload(NULL, (size_t)ROWS * N * 4);
+    CHECK(x && ref && got);
+    float *xv = ds4_gpu_tensor_contents(x);
+    for (size_t i = 0; i < (size_t)ROWS * K; i++) xv[i] = bf16(random_value());
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t runs = ds4_gpu_test_kernel_runs("ds4_gpu_dsv41_matmul_q8_0_prefill");
+    const uint32_t counts[] = {33, ROWS};
+    for (int c = 0; c < 2; c++) {
+        CHECK(ds4_gpu_matmul_q8_0_tensor(ref, map, wb, 0, K, N, x, counts[c]));
+        CHECK(ds4_gpu_dsv41_matmul_q8_0_prefill(got, map, wb, 0, K, N, x, counts[c]));
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)counts[c] * N));
+    }
+    CHECK(ds4_gpu_test_kernel_runs("ds4_gpu_dsv41_matmul_q8_0_prefill") == runs + 2);
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_PREFILL_MATMUL);
+    CHECK(!ds4_gpu_dsv41_matmul_q8_0_prefill(got, map, wb, 0, K, N, x, ROWS));
+    ds4_gpu_test_set_v41_off(0);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {x, ref, got};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    fprintf(stderr, "V4.1 prefill matmul: Q8 rows through the F16 unpack == the Q8 tiles\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -2893,7 +2923,8 @@ static int check_v41_groups(void) {
         check_public_controller() && check_prefill_index() && check_prefill_attention() &&
         check_prefill_folds() &&
         check_moe_dedup() &&
-        check_verify_batch();
+        check_verify_batch() &&
+        check_prefill_matmul();
 }
 #else
 static int check_v41_groups(void) { return 1; }

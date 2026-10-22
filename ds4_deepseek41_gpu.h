@@ -163,6 +163,9 @@ int ds4_gpu_dsv41_hc_block_input(ds4_gpu_tensor *mix, ds4_gpu_tensor *x, ds4_gpu
                                  uint64_t fn_offset, uint64_t scale_offset, uint64_t base_offset,
                                  uint64_t norm_offset, uint32_t n, uint32_t mix_dim, uint32_t n_embd,
                                  uint32_t n_hc, uint32_t sinkhorn_iters, float hc_eps, float norm_eps);
+int ds4_gpu_dsv41_matmul_q8_0_prefill(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                      uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                      const ds4_gpu_tensor *x, uint64_t n_tok);
 int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size,
                                      uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
                                      const ds4_gpu_tensor *x, const ds4_gpu_tensor *add,
