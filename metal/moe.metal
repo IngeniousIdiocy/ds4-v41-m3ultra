@@ -4569,8 +4569,10 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     (void)tiitg;
 }
 
+/* The pair/SwiGLU walk of one simdgroup for the N_R0_MXFP4 rows at
+ * first_row; the LUT is already in threadgroup memory. */
 template<typename args_t>
-void kernel_mul_mv_mxfp4_pair_swiglu_impl(
+static inline void ds4_mxfp4_pair_swiglu_walk(
         args_t args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
         device const char *src0_gate,
@@ -4580,21 +4582,13 @@ void kernel_mul_mv_mxfp4_pair_swiglu_impl(
         device char *dst_up,
         device char *dst_mid,
         float route_weight,
-        threadgroup char *shmem,
-        uint3 tgpig,
-        ushort tiisg,
-        ushort sgitg) {
-    const short NSG = FC_mul_mv_nsg;
-    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_MXFP4;
+        threadgroup float *lut,
+        const int first_row,
+        ushort tiisg) {
     const int nb = args.ne00 / QK_MXFP4;
     const int row_blocks = (int)(args.nb01 / sizeof(block_mxfp4));
     const short ix = tiisg / 2;
     const short it = tiisg & 1;
-
-    threadgroup float *lut = (threadgroup float *)shmem;
-    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     device const block_mxfp4 *xg =
         (device const block_mxfp4 *)(src0_gate + (uint64_t)first_row * args.nb01);
     device const block_mxfp4 *xu =
@@ -4665,6 +4659,32 @@ void kernel_mul_mv_mxfp4_pair_swiglu_impl(
     }
 }
 
+template<typename args_t>
+void kernel_mul_mv_mxfp4_pair_swiglu_impl(
+        args_t args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        float route_weight,
+        threadgroup char *shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_MXFP4;
+
+    threadgroup float *lut = (threadgroup float *)shmem;
+    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ds4_mxfp4_pair_swiglu_walk(args, act, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+                               route_weight, lut, first_row, tiisg);
+}
+
 kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_f32(
         constant ds4_metal_args_mul_mv_id &args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
@@ -4703,6 +4723,79 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_f32(
                                          x_cur, gate_cur, up_cur, mid_cur,
                                          route[0], shmem, tgpig, tiisg, sgitg);
     (void)tiitg;
+}
+
+/* MOE_DEDUP: a few rows' pair/SwiGLU with every distinct expert read once: threadgroup z
+ * handles one distinct expert and simdgroup s its s-th (row, slot) pair, each
+ * pair with the single-simdgroup walk above.  The plan lists the distinct
+ * experts in first-use order. */
+struct ds4_metal_dsv41_moe_plan {
+    uint n_distinct;
+    uint expert[64];
+    uint count[64];
+    uint pair[64 * 8];
+};
+
+kernel void kernel_dsv41_moe_dedup_plan(
+        constant ds4_metal_args_mul_mv_id &args,
+        device const char *ids,
+        device ds4_metal_dsv41_moe_plan *plan,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    uint n = 0;
+    for (int row = 0; row < args.nei1; row++) {
+        device const int32_t *sel = (device const int32_t *)(ids + (uint64_t)row * args.nbi1);
+        for (int idx = 0; idx < args.nei0; idx++) {
+            const uint e = (uint)sel[idx];
+            uint d = 0;
+            while (d < n && plan->expert[d] != e) d++;
+            if (d == n) { plan->expert[n] = e; plan->count[n] = 0; n++; }
+            plan->pair[d * 8 + plan->count[d]] = (uint)(row * args.nei0 + idx);
+            plan->count[d]++;
+        }
+    }
+    plan->n_distinct = n;
+}
+
+kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        device const char *ids,
+        device const char *weights,
+        device const ds4_metal_dsv41_moe_plan *plan,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float *lut = (threadgroup float *)shmem;
+    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint d = tgpig.z;
+    if (d >= plan->n_distinct || sgitg >= plan->count[d]) return;
+    const int32_t expert = (int32_t)plan->expert[d];
+    if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) return;
+    const uint pair_row = plan->pair[d * 8 + sgitg];
+    const int iid1 = (int)(pair_row / (uint)args.nei0);
+    const int idx = (int)(pair_row % (uint)args.nei0);
+    device const float *route =
+        (device const float *)(weights + (uint64_t)pair_row * act.weight_stride);
+    device char *gate_cur = dst_gate + (uint64_t)pair_row * args.ne0 * sizeof(float);
+    device char *up_cur = dst_up + (uint64_t)pair_row * args.ne0 * sizeof(float);
+    device char *mid_cur = dst_mid + (uint64_t)pair_row * act.mid_row_stride;
+    device const char *x_cur = src1 + (uint64_t)(idx % args.ne11) * args.nb11 +
+        (uint64_t)iid1 * args.nb12;
+    device const char *gate_expert = src0_gate +
+        (int64_t)(expert - args.tp_expert_base) * args.nb02;
+    device const char *up_expert = src0_up +
+        (int64_t)(expert - args.tp_expert_base) * args.nb02;
+    ds4_mxfp4_pair_swiglu_walk(args, act, gate_expert, up_expert, x_cur, gate_cur, up_cur, mid_cur,
+                               route[0], lut, (int)tgpig.x * N_R0_MXFP4, tiisg);
 }
 
 kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_f32(

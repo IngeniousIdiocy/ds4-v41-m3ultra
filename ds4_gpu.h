@@ -73,6 +73,7 @@ typedef struct {
 #define DS4_GPU_V41_PREFILL_INDEX (1ull << 25)   /* prefill index scores of 8 or more rows on simdgroup matrices */
 #define DS4_GPU_V41_PREFILL_ATTENTION (1ull << 26)   /* prefill attention stages 16 rows per barrier */
 #define DS4_GPU_V41_PREFILL_FOLDS (1ull << 27)   /* large prefills fold bf16 rounding and glue into their producers */
+#define DS4_GPU_V41_MOE_DEDUP (1ull << 28)   /* 2-8 MXFP4 rows read each selected expert once (any MXFP4 model) */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

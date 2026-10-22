@@ -2701,6 +2701,59 @@ static int check_prefill_folds(void) {
     return 1;
 }
 
+/* MOE_DEDUP: 2-8 MXFP4 rows sharing experts, each distinct expert read once, against the per-pair kernel, bit for
+ * bit (6-8 rows take this path only in a DSpark verify block, through the verify kernels). */
+static int check_moe_dedup(void) {
+    enum { D = 5120, FF = 2304, NE = 384, NU = 6, ROWS = 8, MXFP4 = 39 /* the tensor type */ };
+    const uint64_t gate_row = D / 32 * 17, down_row = FF / 32 * 17;
+    const uint64_t eg = 0, eu = eg + (uint64_t)NE * FF * gate_row, ed = eu + (uint64_t)NE * FF * gate_row,
+                   bytes = ed + (uint64_t)NE * D * down_row;
+    uint8_t *map = NULL;
+    CHECK(posix_memalign((void **)&map, getpagesize(), bytes) == 0);
+    for (uint64_t b = 0; b < bytes; b += 17) {   /* MXFP4 blocks: e8m0 scale, 16 bytes of nibbles */
+        map[b] = (uint8_t)(118u + random_bits() % 8u);
+        for (int j = 1; j < 17 && b + j < bytes; j++) map[b + j] = (uint8_t)random_bits();
+    }
+    CHECK(ds4_gpu_set_model_map(map, bytes));
+    ds4_gpu_tensor *x = upload(NULL, ROWS * D * 4), *sel = upload(NULL, ROWS * NU * 4), *w = upload(NULL, ROWS * NU * 4);
+    ds4_gpu_tensor *gate = upload(NULL, ROWS * NU * FF * 4), *up = upload(NULL, ROWS * NU * FF * 4),
+                   *mid = upload(NULL, ROWS * NU * FF * 4), *experts = upload(NULL, ROWS * NU * D * 4);
+    ds4_gpu_tensor *ref = upload(NULL, ROWS * D * 4), *got = upload(NULL, ROWS * D * 4);
+    CHECK(x && sel && w && gate && up && mid && experts && ref && got);
+    float *xv = ds4_gpu_tensor_contents(x), *wv = ds4_gpu_tensor_contents(w);
+    int32_t *sv = ds4_gpu_tensor_contents(sel);
+    for (int i = 0; i < ROWS * D; i++) xv[i] = bf16(random_value());
+    for (int r = 0; r < ROWS; r++)
+        for (int k = 0; k < NU; k++) {   /* rows share some experts, as verify rows do */
+            sv[r * NU + k] = (int32_t)((r * 37 + k * 61 + (k & 1) * 5) % NE);
+            wv[r * NU + k] = fabsf(random_value()) / 4;
+        }
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32");
+    ds4_gpu_dsv41_dspark_rows(1);
+    for (uint32_t rows = 2; rows <= ROWS; rows++) {
+        bool mid_f16 = false;
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_MOE_DEDUP);
+        CHECK(ds4_gpu_routed_moe_batch_tensor(ref, gate, up, mid, experts, map, bytes, eg, eu, ed, MXFP4, MXFP4,
+                  gate_row * FF, gate_row, down_row * D, down_row, D, FF, D, sel, w, NE, NU, 10.0f, x, 3, rows,
+                  &mid_f16, true));
+        ds4_gpu_test_set_v41_off(0);
+        CHECK(ds4_gpu_routed_moe_batch_tensor(got, gate, up, mid, experts, map, bytes, eg, eu, ed, MXFP4, MXFP4,
+                  gate_row * FF, gate_row, down_row * D, down_row, D, FF, D, sel, w, NE, NU, 10.0f, x, 3, rows,
+                  &mid_f16, true));
+        ds4_gpu_test_set_v41_off(0);
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, rows * D));
+    }
+    ds4_gpu_dsv41_dspark_rows(0);
+    CHECK(ds4_gpu_test_kernel_runs("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32") == runs + 7);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {x, sel, w, gate, up, mid, experts, ref, got};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(map);
+    fprintf(stderr, "V4.1 MoE dedup: 2-8 MXFP4 rows, each distinct expert read once == the per-pair kernel\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -2709,7 +2762,8 @@ static int check_v41_groups(void) {
         check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
         check_row_matmuls() && check_rows_mma() && check_verify_kernels() &&
         check_public_controller() && check_prefill_index() && check_prefill_attention() &&
-        check_prefill_folds();
+        check_prefill_folds() &&
+        check_moe_dedup();
 }
 #else
 static int check_v41_groups(void) { return 1; }

@@ -469,6 +469,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_PREFILL_INDEX",
             "DS4_METAL_DISABLE_V41_PREFILL_ATTENTION",
             "DS4_METAL_DISABLE_V41_PREFILL_FOLDS",
+            "DS4_METAL_DISABLE_V41_MOE_DEDUP",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -32943,6 +32944,60 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
     return 1;
 }
 
+/* MOE_DEDUP: a few rows' pair/SwiGLU with the distinct experts read once: the plan
+ * dispatch, then one threadgroup per distinct expert with a simdgroup per
+ * (row, slot) pair (kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32). */
+static int ds4_gpu_encode_mul_mv_id_pair_swiglu_dedup(
+        id<MTLCommandBuffer>        cb,
+        const ds4_gpu_mul_mv_id_args *args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+        id<MTLBuffer> src0_a, NSUInteger src0_a_off,
+        id<MTLBuffer> src0_b, NSUInteger src0_b_off,
+        id<MTLBuffer> src1, NSUInteger src1_off,
+        id<MTLBuffer> dst_a, NSUInteger dst_a_off,
+        id<MTLBuffer> dst_b, NSUInteger dst_b_off,
+        id<MTLBuffer> dst_mid, NSUInteger dst_mid_off,
+        id<MTLBuffer> ids, NSUInteger ids_off,
+        id<MTLBuffer> weights, NSUInteger weights_off,
+        NSUInteger threadgroup_bytes, uint32_t rows) {
+    static id<MTLComputePipelineState> plan_pipeline, pair_pipeline;
+    static id<MTLBuffer> plan;
+    if (!cb || !args || !act || !rows || rows > 8u || args->nei0 <= 0 || args->nei0 > 8 ||
+        args->nei1 != (int32_t)rows || (uint64_t)args->nei0 * rows > 64u) return 0;
+    if (!plan_pipeline) plan_pipeline = ds4_gpu_get_pipeline("kernel_dsv41_moe_dedup_plan");
+    if (!pair_pipeline) pair_pipeline = ds4_gpu_get_pipeline("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32");
+    if (!plan) plan = [g_device newBufferWithLength:4096 options:MTLResourceStorageModePrivate];
+    if (!plan_pipeline || !pair_pipeline || !plan) return 0;
+    const NSUInteger nr0 = (NSUInteger)args->nr0;
+    const NSUInteger row_groups = ((NSUInteger)args->ne01 + nr0 - 1u) / nr0;
+    const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:plan_pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBuffer:ids offset:ids_off atIndex:1];
+    [enc setBuffer:plan offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pair_pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBytes:act  length:sizeof(*act)  atIndex:1];
+    [enc setBuffer:src0_a  offset:src0_a_off  atIndex:2];
+    [enc setBuffer:src0_b  offset:src0_b_off  atIndex:3];
+    [enc setBuffer:src1    offset:src1_off    atIndex:4];
+    [enc setBuffer:dst_a   offset:dst_a_off   atIndex:5];
+    [enc setBuffer:dst_b   offset:dst_b_off   atIndex:6];
+    [enc setBuffer:dst_mid offset:dst_mid_off atIndex:7];
+    [enc setBuffer:ids     offset:ids_off     atIndex:8];
+    [enc setBuffer:weights offset:weights_off atIndex:9];
+    [enc setBuffer:plan    offset:0           atIndex:10];
+    if (threadgroup_bytes != 0) [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+         threadsPerThreadgroup:MTLSizeMake(32, rows, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_mul_mv_table_q4_pair_swiglu(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -45215,7 +45270,17 @@ int ds4_gpu_routed_moe_batch_tensor(
                 .write_clamped = 0,
                 .clamp_value = clamp,
             };
-            ok = ds4_gpu_encode_mul_mv_id_pair_swiglu(cb,
+            /* MOE_DEDUP: a few single-node MXFP4 rows read every distinct expert once */
+            const bool dedup = gate_type == DS4_METAL_TENSOR_MXFP4 && n_tokens >= 2u && n_tokens <= 8u &&
+                !use_tp_mxfp4_static_batch && g_tp_split_world == 1 && ds4_gpu_v41_on(DS4_GPU_V41_MOE_DEDUP);
+            if (dedup) DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32");
+            ok = dedup ? ds4_gpu_encode_mul_mv_id_pair_swiglu_dedup(cb, &gate_args, &act_args,
+                    gate_buf, (NSUInteger)gate_inner, up_buf, (NSUInteger)up_inner,
+                    xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+                    upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
+                    selectedbuf, ds4_gpu_tensor_offset(selected), weightsbuf, ds4_gpu_tensor_offset(weights),
+                    gate_smem, n_tokens) :
+                 ds4_gpu_encode_mul_mv_id_pair_swiglu(cb,
                                                        tiny_pair_swiglu_pipeline,
                                                        &gate_args,
                                                        &act_args,
