@@ -2015,6 +2015,99 @@ kernel void kernel_glm_indexer_score_one_direct(
     }
 }
 
+/* One key per thread with the query in threadgroup memory: a SIMD group walks
+ * 32 keys together, so the query reads broadcast and each key row streams once
+ * instead of one threadgroup, sixteen barriers and eight reductions per key. */
+kernel void kernel_glm_indexer_score_one_wide(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        uint3 ntg_u [[threads_per_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    const uint ntg = ntg_u.x;
+    threadgroup float *qs = shared;           /* [32][128] */
+    threadgroup float *ws = shared + 4096u;   /* [32] */
+    device const float *qf = (device const float *)q;
+    for (uint i = tid; i < 4096u; i += ntg) qs[i] = qf[i];
+    if (tid < 32u) ws[tid] = weights[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgpig.x * ntg + tid;
+    if (row >= args.n_rows) return;
+    float acc[32];
+    FOR_UNROLL (uint h = 0; h < 32u; h++) acc[h] = 0.0f;
+    const uint64_t base = (uint64_t)row * 128u;
+    for (uint d0 = 0; d0 < 128u; d0 += 16u) {
+        float4 k[4];
+        if (args.cache_f16 != 0u) {
+            device const half4 *kh = (device const half4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = float4(kh[i]);
+        } else {
+            device const float4 *kf = (device const float4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = kf[i];
+        }
+        FOR_UNROLL (uint h = 0; h < 32u; h++) {
+            threadgroup const float4 *q4 = (threadgroup const float4 *)(qs + h * 128u + d0);
+            acc[h] += dot(q4[0], k[0]) + dot(q4[1], k[1]) + dot(q4[2], k[2]) + dot(q4[3], k[3]);
+        }
+    }
+    float score = 0.0f;
+    FOR_UNROLL (uint h = 0; h < 32u; h++) score += max(acc[h] * args.scale, 0.0f) * ws[h];
+    scores[row] = score;
+}
+
+/* Keep the wide scorer arithmetic unchanged; skip blocks already excluded by
+ * layer 20. The per-thread exit must follow the shared-query barrier. */
+kernel void kernel_dsv41_indexer_score_wide_masked(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        device const float *block_mask,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        uint3 ntg_u [[threads_per_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+    const uint ntg = ntg_u.x;
+    threadgroup float *qs = shared;           /* [32][128] */
+    threadgroup float *ws = shared + 4096u;   /* [32] */
+    device const float *qf = (device const float *)q;
+    for (uint i = tid; i < 4096u; i += ntg) qs[i] = qf[i];
+    if (tid < 32u) ws[tid] = weights[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgpig.x * ntg + tid;
+    if (row >= args.n_rows) return;
+    if (block_mask[row / 8u] != 0.0f) { scores[row] = -INFINITY; return; }
+    float acc[32];
+    FOR_UNROLL (uint h = 0; h < 32u; h++) acc[h] = 0.0f;
+    const uint64_t base = (uint64_t)row * 128u;
+    for (uint d0 = 0; d0 < 128u; d0 += 16u) {
+        float4 k[4];
+        if (args.cache_f16 != 0u) {
+            device const half4 *kh = (device const half4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = float4(kh[i]);
+        } else {
+            device const float4 *kf = (device const float4 *)indexer_key_cache + ((base + d0) >> 2);
+            FOR_UNROLL (uint i = 0; i < 4u; i++) k[i] = kf[i];
+        }
+        FOR_UNROLL (uint h = 0; h < 32u; h++) {
+            threadgroup const float4 *q4 = (threadgroup const float4 *)(qs + h * 128u + d0);
+            acc[h] += dot(q4[0], k[0]) + dot(q4[1], k[1]) + dot(q4[2], k[2]) + dot(q4[3], k[3]);
+        }
+    }
+    float score = 0.0f;
+    FOR_UNROLL (uint h = 0; h < 32u; h++) score += max(acc[h] * args.scale, 0.0f) * ws[h];
+    scores[row] = score;
+}
+
 kernel void kernel_glm_indexer_scores_batch(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,

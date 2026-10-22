@@ -1951,10 +1951,48 @@ static int check_concurrent_ffn(void) {
     return 1;
 }
 
+/* INDEX_SCORE_WIDE: the wide one-token scorer against the per-key kernel (bit off) within float rounding, on
+ * 8,192 and 9,000 keys; its masked form gives the wide scores where the block mask keeps a block and -inf where
+ * it excludes one, bit for bit. */
+static int check_index_score_wide(void) {
+    enum { MAXR = 9000 };
+    ds4_gpu_tensor *q = upload(NULL, 4096 * 4), *w = upload(NULL, 32 * 4), *keys = upload(NULL, MAXR * 128 * 4);
+    ds4_gpu_tensor *mask = upload(NULL, (MAXR + 7) / 8 * 4), *s[3] = {upload(NULL, MAXR * 4), upload(NULL, MAXR * 4),
+                                                                      upload(NULL, MAXR * 4)};
+    CHECK(q && w && keys && mask && s[0] && s[1] && s[2]);
+    float *qv = ds4_gpu_tensor_contents(q), *wv = ds4_gpu_tensor_contents(w), *kv = ds4_gpu_tensor_contents(keys);
+    float *mv = ds4_gpu_tensor_contents(mask);
+    for (int i = 0; i < 4096; i++) qv[i] = bf16(random_value());
+    for (int i = 0; i < 32; i++) wv[i] = random_value() / 8;
+    for (int i = 0; i < MAXR * 128; i++) kv[i] = bf16(random_value());
+    for (int i = 0; i < (MAXR + 7) / 8; i++) mv[i] = i % 3 == 1 ? 1.0f : 0.0f;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t wide = ds4_gpu_test_kernel_runs("kernel_glm_indexer_score_one_wide");
+    for (uint32_t rows = 8192; rows <= MAXR; rows += MAXR - 8192) {
+        CHECK(ds4_gpu_glm_indexer_score_one_tensor(s[0], q, w, keys, rows, 32, 128, 1.0f / 64.0f, false));
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_INDEX_SCORE_WIDE);
+        const int direct = ds4_gpu_glm_indexer_score_one_tensor(s[1], q, w, keys, rows, 32, 128, 1.0f / 64.0f, false);
+        ds4_gpu_test_set_v41_off(0);
+        CHECK(direct && ds4_gpu_dsv41_indexer_score_masked(s[2], q, w, keys, mask, rows));
+        const float *a = ds4_gpu_tensor_contents(s[0]), *b = ds4_gpu_tensor_contents(s[1]), *c = ds4_gpu_tensor_contents(s[2]);
+        for (uint32_t i = 0; i < rows; i++) {
+            CHECK(fabsf(a[i] - b[i]) <= 1e-4f * (1.0f + fabsf(b[i])));
+            if (mv[i / 8]) CHECK(isinf(c[i]) && c[i] < 0);
+            else CHECK(!memcmp(&a[i], &c[i], 4));
+        }
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_glm_indexer_score_one_wide") == wide + 2);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {q, w, keys, mask, s[0], s[1], s[2]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    fprintf(stderr, "V4.1 wide index scorer: per-key kernel within rounding, masked form == wide scores and -inf\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
-        check_shared_expert() && check_concurrent_ffn();
+        check_shared_expert() && check_concurrent_ffn() && check_index_score_wide();
 }
 #else
 static int check_v41_groups(void) { return 1; }

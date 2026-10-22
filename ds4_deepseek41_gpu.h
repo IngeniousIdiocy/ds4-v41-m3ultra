@@ -96,6 +96,10 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* INDEX_SCORE_WIDE: one token's index scores over `rows` f32 keys (32 heads of 128, scale 1/64) with the wide
+ * scorer, the keys of blocks of 8 that the block mask excludes set to -inf unread. */
+int ds4_gpu_dsv41_indexer_score_masked(ds4_gpu_tensor *scores, const ds4_gpu_tensor *q, const ds4_gpu_tensor *weights,
+                                       const ds4_gpu_tensor *cache, const ds4_gpu_tensor *mask, uint32_t rows);
 /* CONCURRENT_FFN: ds4_gpu_parallel_ffn_start with the shared expert's bf16 boundaries (gate and up rounded before
  * the SwiGLU, the down projection bf16 in and out). */
 int ds4_gpu_parallel_ffn_start_bf16(ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,

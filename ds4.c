@@ -41839,8 +41839,13 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
             !ds41_index_q_rope_quantize(g, il, pos) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
 #ifdef __APPLE__
-            !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
-                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
+            /* past layer 20, with more blocks than layer 20 keeps, only its kept blocks are scored */
+            !((il > 20u && (n_comp + 7u) / 8u > 2048u && DS4_N_INDEXER_HEAD == 32u &&
+               ds41_on(DS4_GPU_V41_INDEX_SCORE_WIDE) &&
+               ds4_gpu_dsv41_indexer_score_masked(g->index_scores, g->index_q, g->index_weights,
+                   g->index_cache[owner], g->block_mask, n_comp)) ||
+              ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
+                g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false))) return false;
 #else
             !ds4_gpu_dsv41_indexer_scores_batch(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, 1, pos, ratio)) return false;
