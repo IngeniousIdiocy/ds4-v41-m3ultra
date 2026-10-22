@@ -450,6 +450,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_NARROW_WEIGHTS",
             "DS4_METAL_DISABLE_V41_QKV_FUSION",
             "DS4_METAL_DISABLE_V41_ROPE",
+            "DS4_METAL_DISABLE_V41_FFN_JOIN",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -5824,6 +5825,7 @@ typedef struct {
     uint64_t nb2;
     int32_t has_add;
     int32_t round_bf16;
+    int32_t round_block_in;
 } ds4_gpu_hc_expand_args;
 
 typedef struct {
@@ -46486,14 +46488,16 @@ int ds4_gpu_hc_expand_split_half_tensor(
     return 0;
 }
 
-int ds4_gpu_hc_expand_add_split_tensor(
+/* round_bf16: the block (block_out + block_add) and the outputs round to bf16. */
+static int ds4_gpu_hc_expand_add_split_impl(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *block_add,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        int                     round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out_hc || !block_out || !block_add || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
 
@@ -46561,6 +46565,8 @@ int ds4_gpu_hc_expand_add_split_tensor(
             .nb1 = (uint64_t)n_embd * sizeof(float),
             .nb2 = (uint64_t)n_hc * n_embd * sizeof(float),
             .has_add = 1,
+            .round_bf16 = round_bf16 != 0,
+            .round_block_in = round_bf16 != 0,
         };
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
@@ -46593,6 +46599,28 @@ int ds4_gpu_hc_expand_add_split_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_hc_expand_add_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return ds4_gpu_hc_expand_add_split_impl(out_hc, block_out, block_add, residual_hc, split, n_embd, n_hc, 0);
+}
+
+int ds4_gpu_hc_expand_add_split_bf16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return ds4_gpu_hc_expand_add_split_impl(out_hc, block_out, block_add, residual_hc, split, n_embd, n_hc, 1);
 }
 
 int ds4_gpu_hc_expand_add_split_half_add_tensor(

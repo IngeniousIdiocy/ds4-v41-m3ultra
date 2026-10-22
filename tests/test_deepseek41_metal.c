@@ -1649,9 +1649,31 @@ static int check_rope(void) {
     return 1;
 }
 
+/* FFN_JOIN: the joined expand against the add, the bf16 rounding, the expand and its rounding, bit for bit. */
+static int check_ffn_join(void) {
+    enum { N = 5120, HC = 4, SPLIT = 24 };
+    float *v = malloc((size_t)(2 * N + HC * N + SPLIT) * sizeof(float));
+    CHECK(v);
+    for (int i = 0; i < 2 * N + HC * N; i++) v[i] = random_value();
+    for (int i = 0; i < SPLIT; i++) v[2 * N + HC * N + i] = fabsf(random_value()) / 4;
+    ds4_gpu_tensor *routed = upload(v, N * 4), *shared = upload(v + N, N * 4), *res = upload(v + 2 * N, HC * N * 4);
+    ds4_gpu_tensor *split = upload(v + 2 * N + HC * N, SPLIT * 4), *block = upload(NULL, N * 4);
+    ds4_gpu_tensor *a = upload(NULL, HC * N * 4), *b = upload(NULL, HC * N * 4);
+    CHECK(routed && shared && res && split && block && a && b);
+    CHECK(ds4_gpu_add_tensor(block, routed, shared, N) && ds4_gpu_dsv41_quantize(block, N, 1, DS4_V41_BF16) &&
+          ds4_gpu_hc_expand_split_tensor(a, block, res, split, N, HC) && ds4_gpu_dsv41_quantize(a, HC * N, 1, DS4_V41_BF16));
+    CHECK(ds4_gpu_hc_expand_add_split_bf16_tensor(b, routed, shared, res, split, N, HC));
+    CHECK(same_bits(a, b, HC * N));
+    ds4_gpu_tensor *tensors[] = {routed, shared, res, split, block, a, b};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(v);
+    fprintf(stderr, "V4.1 FFN join: add, bf16, expand and rounding in one dispatch == separate kernels\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
-        check_qkv_fusion() && check_rope();
+        check_qkv_fusion() && check_rope() && check_ffn_join();
 }
 #else
 static int check_v41_groups(void) { return 1; }

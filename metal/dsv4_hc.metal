@@ -83,6 +83,7 @@ struct ds4_metal_args_dsv4_hc_expand {
     uint64_t nb2;
     int32_t  has_add;
     int32_t  round_bf16;
+    int32_t  round_block_in;
 };
 
 // Numerically stable sigmoid for the standalone split/sinkhorn path. The naive
@@ -636,6 +637,7 @@ kernel void kernel_dsv4_hc_expand(
     if (args.has_add) {
         block_v += *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
     }
+    if (args.round_block_in) block_v = ds4_bf16_round(block_v);
     const float post_v  = *((device const float *) (post      + dst_hc*args.nb_post0 + t*args.nb_post1));
 
     float acc = block_v * post_v;
@@ -676,6 +678,7 @@ kernel void kernel_dsv4_hc_expand4(
     if (args.has_add) {
         block_v += *((device const float *) (block_add + d*args.nb_add0 + t*args.nb_add1));
     }
+    if (args.round_block_in) block_v = ds4_bf16_round(block_v);
 
     const float r0 = *((device const float *) (residual + d*args.nb_res0 + 0*args.nb_res1 + t*args.nb_res2));
     const float r1 = *((device const float *) (residual + d*args.nb_res0 + 1*args.nb_res1 + t*args.nb_res2));

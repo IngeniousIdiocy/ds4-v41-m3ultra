@@ -41603,6 +41603,13 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
         ds41_bf16(out, (uint32_t)weight->dim[0]);
 }
 
+/* FFN_JOIN (one host): a decode layer's routed sum, shared expert, bf16 rounding and HC expand in one dispatch. The
+ * next layer then reads its pre weights straight from ffn_split (their first DS4_N_HC values), so only the last layer
+ * copies them into pre for the output head. */
+static bool ds41_ffn_join(const ds41_gpu_graph *g) {
+    return g->tp_world != 2 && ds41_on(DS4_GPU_V41_FFN_JOIN);
+}
+
 static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                         const ds4_gpu_tensor *weights, bool split) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -42088,7 +42095,8 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
     }
     return ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1) &&
         ds41_hc_mix(g, m, l, false) &&
-        ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        ds41_hc_sum(g->x, g->residual, il && ds41_ffn_join(g) ? g->ffn_split : g->pre, false) &&
+        ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
@@ -42402,8 +42410,15 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    if (!ds41_graph_before_moe(g, m, l, il)) return false;
+#ifdef __APPLE__
+    if (ds41_ffn_join(g))
+        return ds41_moe_partial(g, m, l, il, (uint32_t)token) &&
+            ds4_gpu_hc_expand_add_split_bf16_tensor(g->residual, g->routed, g->shared, g->after_attn, g->ffn_split,
+                                                    DS4_N_EMBD, DS4_N_HC) &&
+            (il + 1u < DS4_N_LAYER || ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float)));
+#endif
+    return ds41_moe(g, m, l, il, (uint32_t)token) && ds41_graph_after_moe(g);
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)

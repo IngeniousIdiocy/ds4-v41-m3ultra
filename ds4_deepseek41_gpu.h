@@ -96,6 +96,10 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* FFN_JOIN: the HC expand of bf16(block_out + block_add), its outputs rounded to bf16. */
+int ds4_gpu_hc_expand_add_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+                                            const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,
+                                            const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc);
 /* Weights built at load: the model views' storage options, and a residency set of their own (requested at once and
  * added to the queue); ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
