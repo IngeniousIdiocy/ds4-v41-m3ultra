@@ -79,6 +79,7 @@ typedef struct {
 #define DS4_GPU_V41_PREFILL_MATMUL (1ull << 31)   /* wide prefill Q8 matmuls unpack their weights to F16 once on the M3 Ultra */
 #define DS4_GPU_V41_PREFILL_INDEX_BATCH (1ull << 32)   /* the prefill indexer picks candidates, short rows and top-k as batches; candidates are skipped while every block is kept */
 #define DS4_GPU_V41_SHORT_SWEEP (1ull << 33)   /* prefills of 3072 to 8191 tokens run as one sweep that rebuilds only the decoder suffix */
+#define DS4_GPU_V41_ENGRAM_READAHEAD (1ull << 34)   /* a prefill sweep reads the next sweep's Engram rows from disk while its last layers run */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
