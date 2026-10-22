@@ -1429,8 +1429,82 @@ static int check_fused_rounding(void) {
     return 1;
 }
 
+/* NARROW_WEIGHTS: the narrow readers against the wide matvecs they replace, bit for bit: the BF16 router copy against
+ * the F32 router (gates whose low halves are zero), and the E4M3 Engram and indexer q_b copies against their F16
+ * projections rounded to bf16 (weights that are E4M3 codes at their block's scale, exact in F16). */
+static int check_narrow_weights(void) {
+    enum { R_IN = 4096, R_OUT = 384, X_MAX = 6144 };
+    const uint32_t ins[2] = {6144, 1280}, outs[2] = {256, 4096};   /* Engram, indexer q_b */
+    const size_t page = (size_t)getpagesize(), r_bytes = (size_t)R_IN * R_OUT * 4;
+    size_t off[2], bytes = (r_bytes + page - 1) / page * page;
+    for (int k = 0; k < 2; k++) { off[k] = bytes; bytes += ((size_t)ins[k] * outs[k] * 2 + page - 1) / page * page; }
+    unsigned char *model = NULL;
+    CHECK(posix_memalign((void **)&model, page, bytes) == 0);
+    float *gates = (float *)model;
+    uint16_t *gates16 = malloc((size_t)R_IN * R_OUT * 2);
+    CHECK(gates16);
+    for (size_t i = 0; i < (size_t)R_IN * R_OUT; i++) {
+        const float v = random_value() / 64;
+        uint32_t bits;
+        memcpy(&bits, &v, 4);
+        bits &= 0xffff0000u;
+        memcpy(&gates[i], &bits, 4);
+        gates16[i] = (uint16_t)(bits >> 16);
+    }
+    ds4_gpu_tensor *codes[2], *scales[2];
+    for (int k = 0; k < 2; k++) {
+        const uint32_t in = ins[k], out = outs[k];
+        unsigned char *c = malloc((size_t)in * out), *e = malloc((size_t)(in / 32) * (out / 32));
+        CHECK(c && e);
+        for (size_t i = 0; i < (size_t)(in / 32) * (out / 32); i++) { (void)random_value(); e[i] = (unsigned char)(112u + seed % 8u); }
+        _Float16 *w16 = (_Float16 *)(model + off[k]);
+        for (size_t i = 0; i < (size_t)in * out; i++) {
+            (void)random_value();
+            unsigned char b = (unsigned char)(seed >> 3);
+            if ((b & 0x7f) == 0x7f) b ^= 1;   /* no NaN codes */
+            c[i] = b;
+            const unsigned char a = b & 0x7f;
+            const uint32_t ex = (a >> 3) & 15u, mm = a & 7u;
+            float v = a == 0 ? 0.0f : ex == 0 ? ldexpf((float)mm, -9) : ldexpf(1.0f + mm / 8.0f, (int)ex - 7);
+            if (b & 0x80) v = -v;
+            w16[i] = (_Float16)(v * ldexpf(1.0f, (int)e[(i / in / 32) * (in / 32) + i % in / 32] - 127));
+        }
+        codes[k] = upload(c, (size_t)in * out); scales[k] = upload(e, (size_t)(in / 32) * (out / 32));
+        CHECK(codes[k] && scales[k]);
+        free(c); free(e);
+    }
+    CHECK(ds4_gpu_set_model_map(model, bytes));
+    float x[X_MAX];
+    for (int i = 0; i < X_MAX; i++) x[i] = random_value() / 4;
+    ds4_gpu_tensor *xt = upload(x, sizeof(x)), *rt = upload(gates16, (size_t)R_IN * R_OUT * 2);
+    ds4_gpu_tensor *a = upload(NULL, 4096 * 4), *b = upload(NULL, 4096 * 4);
+    CHECK(xt && rt && a && b);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const char *names[3] = {"kernel_router_blend_r1", "kernel_engram_blend_r2_bf16", "kernel_indexer_blend_r2"};
+    uint64_t runs[3];
+    for (int k = 0; k < 3; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
+    CHECK(ds4_gpu_matmul_f32_tensor(a, model, bytes, 0, R_IN, R_OUT, xt, 1) &&
+          ds4_gpu_matmul_bf16_router_weights(b, rt, R_IN, R_OUT, xt));
+    CHECK(same_bits(a, b, R_OUT));
+    for (int k = 0; k < 2; k++) {
+        CHECK(ds4_gpu_matmul_f16_tensor(a, model, bytes, off[k], ins[k], outs[k], xt, 1) &&
+              ds4_gpu_dsv41_quantize(a, outs[k], 1, DS4_V41_BF16));
+        CHECK(k == 0 ? ds4_gpu_matmul_engram_fp8_weights(b, codes[k], scales[k], ins[k], outs[k], xt) :
+                       ds4_gpu_dsv41_project_fp8_bf16_weights(b, codes[k], scales[k], ins[k], outs[k], xt));
+        CHECK(same_bits(a, b, outs[k]));
+    }
+    for (int k = 0; k < 3; k++) CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs[k] + 1);
+    ds4_gpu_test_set_flags(0);
+    for (int k = 0; k < 2; k++) { ds4_gpu_tensor_free(codes[k]); ds4_gpu_tensor_free(scales[k]); }
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(rt); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b);
+    free(gates16);
+    /* model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 narrow readers == wide matvecs: BF16 router, E4M3 Engram and indexer q_b\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
-    return check_compute_copy() && check_router_select() && check_fused_rounding();
+    return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights();
 }
 #else
 static int check_v41_groups(void) { return 1; }

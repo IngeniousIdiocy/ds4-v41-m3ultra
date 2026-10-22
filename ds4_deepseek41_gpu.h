@@ -63,6 +63,18 @@ int ds4_gpu_hc_expand_split_bf16_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_te
 /* The whole head rounded to bf16, then the RoPE. */
 int ds4_gpu_dsv41_rope_bf16(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                             uint32_t rows, uint32_t start, bool compressed, bool inverse);
+/* Weights built at load: the model views' storage options, and a residency set of their own (requested at once and
+ * added to the queue); ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);
+int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
+/* The decode router over BF16 gates, and the Engram projection and indexer q_b over E4M3 codes with E8M0 32x32 block
+ * bytes (outputs rounded to bf16): the wide matvecs' bits. 0, encoding nothing, when the shape does not fit. */
+int ds4_gpu_matmul_bf16_router_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights,
+                                       uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x);
+int ds4_gpu_matmul_engram_fp8_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
+                                      uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
+int ds4_gpu_dsv41_project_fp8_bf16_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
+                                           uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Same reductions as the ordinary kernels, with the required BF16 store
