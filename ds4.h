@@ -478,6 +478,17 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* The checkpoint's image identities for the disk KV cache: token_start, row
+ * count and fingerprint per image (embedding data stays NULL). Returns the
+ * count, or -1 when the state cannot be persisted by identity: no valid
+ * checkpoint, a sync still conditioning on images, more than cap images, or
+ * a backend whose image state is more than its payload rows. */
+int ds4_session_vision_identities(const ds4_session *s, ds4_vision_span *out, int cap);
+/* Attach the identities stored with a disk payload just loaded into s, so a
+ * multimodal sync can extend it. Spans must cover image placeholder tokens in
+ * order; false leaves the checkpoint's identities unchanged. n = 0 clears them. */
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_span *images, size_t n);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -674,7 +685,7 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
-/* FNV-1a of the GGUF header region (metadata + tensor table); which 0 main, 1 drafter. */
+/* FNV-1a of the GGUF header region (metadata + tensor table); which 0 main, 1 drafter, 2 vision. */
 uint64_t ds4_engine_model_fingerprint(ds4_engine *e, int which);
 /* Weight representation consumed by prefill; part of the persisted-state identity. */
 const char *ds4_engine_prefill_repr(ds4_engine *e);

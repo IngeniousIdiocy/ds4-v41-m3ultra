@@ -65273,11 +65273,12 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 
 /* 64-bit FNV-1a of a GGUF's header region [0, tensor data): metadata (tokenizer,
  * templates, hyperparameters) and the tensor table (names, types, shapes,
- * offsets). which: 0 main model, 1 drafter. 0 when absent. Binds state to the
- * model layout without hashing hundreds of GB. */
+ * offsets). which: 0 main model, 1 drafter, 2 vision encoder. 0 when absent.
+ * Binds state to the model layout without hashing hundreds of GB. */
 uint64_t ds4_engine_model_fingerprint(ds4_engine *e, int which) {
     if (!e) return 0;
-    const ds4_model *m = which == 0 ? &e->model : which == 1 ? &e->mtp_model : NULL;
+    const ds4_model *m = which == 0 ? &e->model : which == 1 ? &e->mtp_model :
+                         which == 2 ? &e->vision_model : NULL;
     if (!m || !m->map || !m->tensor_data_pos || m->tensor_data_pos > m->file_size) return 0;
     uint64_t h = UINT64_C(1469598103934665603);
     for (uint64_t i = 0; i < m->tensor_data_pos; i++) { h ^= m->map[i]; h *= UINT64_C(1099511628211); }
@@ -78415,6 +78416,78 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 
 bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
+}
+
+/* A V4.1 graph payload is the whole image-conditioned state: the embeddings
+ * enter only as prefill input rows, and what they leave behind is in the saved
+ * KV, compressor, indexer and drafter rows. The one derived exception is the
+ * Engram history, which ds41_load_payload rebuilds from tokens; see below.
+ * Other backends keep more (for example rope positions shifted by an image),
+ * and a TP load re-prefills the saved tokens as text, so neither persists. */
+static bool ds4_session_vision_restorable(const ds4_session *s) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    return ds4_session_is_ds41(s) && s->ds41_graph_ready && !s->distributed &&
+           !s->engine->tp.active;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+int ds4_session_vision_identities(const ds4_session *s, ds4_vision_span *out, int cap) {
+    if (!s || !s->checkpoint_valid || s->sync_image_count != 0 || cap < 0 ||
+        s->checkpoint_image_count > (size_t)cap ||
+        (s->checkpoint_image_count && (!out || !ds4_session_vision_restorable(s))))
+        return -1;
+    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
+        memset(&out[i], 0, sizeof(out[i]));
+        out[i].token_start = s->checkpoint_images[i].token_start;
+        out[i].embedding.token_count = s->checkpoint_images[i].token_count;
+        memcpy(out[i].embedding.fingerprint, s->checkpoint_images[i].fingerprint,
+               sizeof(out[i].embedding.fingerprint));
+    }
+    return (int)s->checkpoint_image_count;
+}
+
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_span *images, size_t n) {
+    if (!s || !s->checkpoint_valid || (n && (!images || !ds4_session_vision_restorable(s))))
+        return false;
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t start = images[i].token_start;
+        const uint64_t end = start + images[i].embedding.token_count;
+        if (images[i].embedding.token_count == 0 || start < previous_end ||
+            end > (uint64_t)s->checkpoint.len) return false;
+        for (uint64_t p = start; p < end; p++)
+            if (s->checkpoint.v[p] != s->engine->vision_image_token) return false;
+        previous_end = end;
+    }
+    ds4_vision_identity *copy = n ? xcalloc(n, sizeof(copy[0])) : NULL;
+    for (size_t i = 0; i < n; i++) {
+        copy[i].token_start = images[i].token_start;
+        copy[i].token_count = images[i].embedding.token_count;
+        memcpy(copy[i].fingerprint, images[i].embedding.fingerprint, sizeof(copy[i].fingerprint));
+    }
+    free(s->checkpoint_images);
+    s->checkpoint_images = copy;
+    s->checkpoint_image_count = n;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* Live prefill hashes image rows as dead Engram ids (ds41_text_mask), but
+     * the payload load rebuilt the history tail from the placeholder tokens.
+     * Match the live tail when the frontier is within an n-gram of an image. */
+    if (n && ds4_session_is_ds41(s)) {
+        const uint32_t pos = s->ds41_graph.pos;
+        for (uint32_t i = 0; i < DS4_ENGRAM_NGRAM - 1 && i < pos; i++) {
+            const uint32_t p = pos - 1u - i;
+            for (size_t k = 0; k < n; k++)
+                if (p >= images[k].token_start &&
+                    p - images[k].token_start < images[k].embedding.token_count)
+                    s->ds41_graph.history.tail[i] = DS4_ENGRAM_DEAD;
+        }
+    }
+#endif
+    return true;
 }
 
 static bool ds4_session_vision_range_overlaps(

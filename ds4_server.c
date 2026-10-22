@@ -436,6 +436,9 @@ static char *json_minify_raw_value(const char *json) {
 }
 
 #define SERVER_IMAGE_MARKER_BYTES 64
+/* \036DS4_IMAGE_, 24 nonce hex digits, \x1f. Disk keys write a stored image
+ * as this many \036 bytes, the form request markers are normalized to. */
+#define SERVER_IMAGE_MARKER_LEN 36
 
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
@@ -11325,24 +11328,52 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+/* The identity of the slot's image-conditioned checkpoint, for its disk entry:
+ * per image the live fingerprint and token rows, and where its marker sits in
+ * the key (offsets from a visible-transcript key, else found while rendering
+ * the tokens). False while a sync still conditions on images, or when the
+ * backend cannot restore image state from identities. */
+static bool kv_cache_session_images(server *s, server_slot *slot,
+                                    const visible_image_key *visible,
+                                    ds4_kvstore_images *out) {
+    memset(out, 0, sizeof(*out));
+    if (!ds4_session_has_vision_state(slot->session)) return true;
+    ds4_vision_span spans[DS4_KVSTORE_IMAGES_MAX];
+    const int n = ds4_session_vision_identities(slot->session, spans,
+                                                DS4_KVSTORE_IMAGES_MAX);
+    if (n < 0 || (n && visible && visible->count != (size_t)n)) return false;
+    out->len = (uint32_t)n;
+    out->encoder = ds4_engine_model_fingerprint(s->engine, 2);
+    for (int i = 0; i < n; i++) {
+        ds4_kvstore_image *im = &out->v[i];
+        im->text_offset = visible ? (uint32_t)visible->offsets[i] : 0;
+        im->text_len = SERVER_IMAGE_MARKER_LEN;
+        im->token_start = spans[i].token_start;
+        im->token_count = spans[i].embedding.token_count;
+        memcpy(im->fingerprint, spans[i].embedding.fingerprint, sizeof(im->fingerprint));
+    }
+    return n == 0 || out->encoder != 0;
+}
+
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const visible_image_key *visible) {
     /* The utility session is one-shot scratch: every store reason (cold,
      * continued, evict, shutdown) funnels through here and stops. */
     if (!s || !slot || slot->utility) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
-    /* The payload contains image-conditioned KV rows, but the disk key and
-     * trailer do not contain image fingerprints. Never let generic image
-     * placeholder tokens become a cache hit for a different image.
-     * sync_image_count covers progress-callback writes during prefill;
-     * checkpoint_image_count covers completed sessions. */
-    if (ds4_session_has_vision_state(slot->session)) {
+    /* Image-conditioned rows go to disk only with the images' identity, which
+     * a later load must match (fingerprints at the same marker offsets). A
+     * prefill still conditioning on images (progress-callback writes) or a
+     * backend that cannot restore image state from identities stores nothing. */
+    ds4_kvstore_images images;
+    if (!kv_cache_session_images(s, slot, cache_text_override ? visible : NULL, &images)) {
         pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
@@ -11353,6 +11384,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_override,
                                                   cache_text_ext,
                                                   cache_text_key,
+                                                  images.len ? &images : NULL,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
@@ -11367,7 +11399,7 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
 static void kv_cache_store_current(server *s, server_slot *slot,
@@ -11379,6 +11411,7 @@ static void kv_cache_store_current(server *s, server_slot *slot,
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
     const char *visible_key = NULL;
+    visible_image_key visible_images = {0};
     pthread_mutex_lock(&s->tool_mu);
     if (slot->responses_live.valid &&
         slot->responses_live.live_tokens == tokens->len &&
@@ -11388,6 +11421,7 @@ static void kv_cache_store_current(server *s, server_slot *slot,
         visible_text = xstrdup(slot->responses_live.visible_text);
         visible_ext = KV_EXT_RESPONSES_VISIBLE;
         visible_key = "responses-visible";
+        visible_images = slot->responses_live.images;
     } else if (slot->thinking_live.valid &&
                !slot->thinking_live.token_text_disk_key &&
                slot->thinking_live.live_tokens == tokens->len &&
@@ -11397,6 +11431,7 @@ static void kv_cache_store_current(server *s, server_slot *slot,
         visible_text = xstrdup(slot->thinking_live.visible_text);
         visible_ext = KV_EXT_THINKING_VISIBLE;
         visible_key = "thinking-visible";
+        visible_images = slot->thinking_live.images;
     }
     pthread_mutex_unlock(&s->tool_mu);
 
@@ -11407,7 +11442,8 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key,
+                                        &visible_images);
         free(visible_text);
     } else {
         kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
@@ -11512,12 +11548,14 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
 }
 #endif
 
-static int kv_cache_try_load_text(server *s, server_slot *slot,
-                                  const char *prompt_text,
-                                  ds4_tokens *effective_prompt,
-                                  char **loaded_path_out,
-                                  uint8_t *loaded_ext_flags_out,
-                                  bool responses_protocol) {
+static int kv_cache_try_load_key(server *s, server_slot *slot,
+                                 const char *prompt_text,
+                                 const ds4_kvstore_images *images,
+                                 ds4_tokens *effective_prompt,
+                                 char **loaded_path_out,
+                                 uint8_t *loaded_ext_flags_out,
+                                 uint32_t *loaded_text_bytes_out,
+                                 bool responses_protocol) {
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
@@ -11525,35 +11563,94 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
-    /* Disk payloads intentionally carry no image identity. If this slot held
-     * vision state, discard it before restoring a text-only checkpoint so the
-     * next sync does not reject the fresh payload as a stale image match. */
+    /* A load replaces the live state, image identities included: drop the
+     * slot's vision state first so nothing stale survives a failed load. */
     if (ds4_session_has_vision_state(slot->session)) {
         ds4_session_invalidate(slot->session);
     }
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
-                                           &hooks, responses_protocol);
+                                           &hooks, responses_protocol, images);
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        if (loaded_text_bytes_out) *loaded_text_bytes_out = lr.text_bytes;
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
 }
 
+static int kv_cache_try_load_text(server *s, server_slot *slot,
+                                  const char *prompt_text,
+                                  ds4_tokens *effective_prompt,
+                                  char **loaded_path_out,
+                                  uint8_t *loaded_ext_flags_out,
+                                  bool responses_protocol) {
+    return kv_cache_try_load_key(s, slot, prompt_text, NULL, effective_prompt,
+                                 loaded_path_out, loaded_ext_flags_out, NULL,
+                                 responses_protocol);
+}
+
+static bool build_live_prompt_suffix(server *s, server_slot *slot,
+                                      const request *req, const char *suffix,
+                                      ds4_tokens *out);
+
+/* An image request is looked up in the normalized form disk keys are stored
+ * in (markers as \036 runs), carrying each image's fingerprint and marker
+ * offset; the store serves only an entry holding exactly those images in its
+ * prefix. The restored tokens then take the request's later text and images
+ * through the same splice as a live continuation. */
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
-                                  effective_prompt,
-                                  loaded_path_out,
-                                  loaded_ext_flags_out,
-                                  req && req->api == API_RESPONSES);
+    const bool responses = req && req->api == API_RESPONSES;
+    if (!req || req->image_count == 0)
+        return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
+                                      effective_prompt, loaded_path_out,
+                                      loaded_ext_flags_out, responses);
+    visible_image_key marks;
+    char *key = visible_prompt_key(req, req->prompt_text, &marks);
+    if (!key) return 0;
+    ds4_kvstore_images images = {
+        .len = (uint32_t)req->image_count,
+        .encoder = ds4_engine_model_fingerprint(s->engine, 2),
+    };
+    for (size_t i = 0; i < req->image_count; i++) {
+        ds4_kvstore_image *im = &images.v[i];
+        im->text_offset = (uint32_t)marks.offsets[i];
+        im->text_len = (uint32_t)strlen(req->image_markers[i]);
+        im->token_count = req->images[i].embedding.token_count;
+        memcpy(im->fingerprint, req->images[i].embedding.fingerprint, sizeof(im->fingerprint));
+    }
+    uint32_t text_bytes = 0;
+    int loaded = kv_cache_try_load_key(s, slot, key, &images, NULL, loaded_path_out,
+                                       loaded_ext_flags_out, &text_bytes, responses);
+    free(key);
+    if (loaded > 0 &&
+        !build_live_prompt_suffix(s, slot, req, req->prompt_text + text_bytes,
+                                  effective_prompt)) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: multimodal disk kv dropped images=%zu tokens=%d reason=suffix-does-not-extend-restored-images",
+                   req->image_count, loaded);
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        if (loaded_path_out) {
+            free(*loaded_path_out);
+            *loaded_path_out = NULL;
+        }
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+        return 0;
+    }
+    if (loaded > 0)
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: multimodal disk kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
+                   req->image_count, loaded, effective_prompt->len);
+    return loaded;
 }
 
 /* A text-only suffix tokenizer would turn image markers into literal text.
@@ -13701,14 +13798,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && kv_cache_slot_enabled(s, slot) && cached == 0 &&
+    if (kv_cache_slot_enabled(s, slot) && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
     }
-    if (!multimodal && cached == 0) {
+    /* Image requests load too: kv_cache_try_load matches the images'
+     * fingerprints and marker offsets against the entry's stored identity. */
+    if (cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -22600,14 +22699,14 @@ static void test_kv_cache_canary_gate(void) {
     ds4_kvstore_canary_pending();
     TEST_ASSERT(!ds4_kvstore_canary_ready());
     TEST_ASSERT(!ds4_kvstore_store_live_prefix_text(&kc, NULL, NULL, &tokens, 600, "cold",
-                                                     NULL, 0, NULL, NULL, NULL, 0));
-    TEST_ASSERT(ds4_kvstore_try_load_text(&kc, NULL, NULL, "prompt", NULL, NULL, NULL, false) == 0);
+                                                     NULL, 0, NULL, NULL, NULL, NULL, 0));
+    TEST_ASSERT(ds4_kvstore_try_load_text(&kc, NULL, NULL, "prompt", NULL, NULL, NULL, false, NULL) == 0);
 
     ds4_kvstore_canary_failed();
     TEST_ASSERT(!ds4_kvstore_canary_ready());
     TEST_ASSERT(!ds4_kvstore_store_live_prefix_text(&kc, NULL, NULL, &tokens, 600, "cold",
-                                                     NULL, 0, NULL, NULL, NULL, 0));
-    TEST_ASSERT(ds4_kvstore_try_load_text(&kc, NULL, NULL, "prompt", NULL, NULL, NULL, false) == 0);
+                                                     NULL, 0, NULL, NULL, NULL, NULL, 0));
+    TEST_ASSERT(ds4_kvstore_try_load_text(&kc, NULL, NULL, "prompt", NULL, NULL, NULL, false, NULL) == 0);
 
     ds4_kvstore_set_canary(0xc0ffee);
     TEST_ASSERT(ds4_kvstore_canary_ready());
