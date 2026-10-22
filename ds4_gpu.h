@@ -71,6 +71,7 @@ typedef struct {
 #define DS4_GPU_V41_VERIFY_KERNELS (1ull << 23)   /* a V4.1 DSpark verify block's 6-8 MXFP4 rows through the fused decode MoE kernels */
 #define DS4_GPU_V41_PUBLIC_CONTROLLER (1ull << 24)   /* DSpark drafts by measured cost (ds4_deepseek41_admission.h) */
 #define DS4_GPU_V41_PREFILL_INDEX (1ull << 25)   /* prefill index scores of 8 or more rows on simdgroup matrices */
+#define DS4_GPU_V41_PREFILL_ATTENTION (1ull << 26)   /* prefill attention stages 16 rows per barrier */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

@@ -467,6 +467,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_VERIFY_KERNELS",
             "DS4_METAL_DISABLE_V41_PUBLIC_CONTROLLER",
             "DS4_METAL_DISABLE_V41_PREFILL_INDEX",
+            "DS4_METAL_DISABLE_V41_PREFILL_ATTENTION",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -31500,11 +31501,16 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const uint32_t decode_splits =
             decode_one_token && !g_quality_mode ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
+        /* PREFILL_ATTENTION: V4.1's prefill rows (ratio 1 and 2) stage sixteen rows per barrier, as decode does */
+        const bool prefill_rb16 = n_tokens > 8u && ratio <= 2u && !prefill_dual_heads && !g_quality_mode &&
+            !g_ssd_streaming_mode && !ds4_gpu_tp_world_is_two() && ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_ATTENTION);
+        if (prefill_rb16) DS4_TEST_NOTE("kernel_dsv41_prefill_attention_rb16");
         id<MTLComputePipelineState> attn_pipeline =
             split_decode ?
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_pipeline,
                 "kernel_dsv4_indexed_mixed_attention_heads8_split") :
+            prefill_rb16 ? ds4_gpu_get_pipeline("kernel_dsv41_prefill_attention_rb16") :
             decode_one_token ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
@@ -31645,7 +31651,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
+            [enc setThreadgroupMemoryLength:(decode_one_token || prefill_rb16 ? 16u : 1u) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
             [enc dispatchThreadgroups:

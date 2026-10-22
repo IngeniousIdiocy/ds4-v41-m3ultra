@@ -2575,6 +2575,54 @@ static int check_prefill_index(void) {
     return 1;
 }
 
+/* PREFILL_ATTENTION: 9 to 129 prefill rows with ratios 1 and 2, every or only some top-k entries selected, staged
+ * sixteen rows per barrier against the eight-head kernel, bit for bit. */
+static int check_prefill_attention(void) {
+    enum { D = 512, H = 64, K = 512, C = 2048 };
+    float *sinks = NULL;
+    CHECK(posix_memalign((void **)&sinks, getpagesize(), getpagesize()) == 0);
+    for (int h = 0; h < H; h++) sinks[h] = random_value();
+    CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv41_prefill_attention_rb16");
+    const uint32_t counts[] = {9, 33, 129};
+    for (uint32_t c = 0; c < 3; c++)
+        for (uint32_t ratio = 1; ratio <= 2; ratio++)
+            for (uint32_t sparse = 0; sparse <= 1; sparse++) {
+                const uint32_t n = counts[c], nr = n + 127, start = 3073;
+                const size_t nq = (size_t)n * H * D;
+                ds4_gpu_tensor *qt = upload(NULL, nq * 4), *rt = upload(NULL, (size_t)nr * D * 4);
+                ds4_gpu_tensor *ct = upload(NULL, (size_t)C * D * 4), *it = upload(NULL, (size_t)n * K * 4);
+                ds4_gpu_tensor *ref = upload(NULL, nq * 4), *got = upload(NULL, nq * 4);
+                CHECK(qt && rt && ct && it && ref && got);
+                float *q = ds4_gpu_tensor_contents(qt), *raw = ds4_gpu_tensor_contents(rt);
+                float *comp = ds4_gpu_tensor_contents(ct);
+                int32_t *ids = ds4_gpu_tensor_contents(it);
+                for (size_t i = 0; i < nq; i++) q[i] = bf16(random_value() / 4);
+                for (uint32_t i = 0; i < nr * D; i++) raw[i] = bf16(random_value() / 4);
+                for (uint32_t i = 0; i < C * D; i++) comp[i] = bf16(random_value() / 4);
+                for (uint32_t t = 0; t < n; t++)
+                    for (uint32_t j = 0; j < K; j++)
+                        ids[t * K + j] = sparse && (j % 7 == 3 || j % 29 == 0) ? -1 :
+                            (int32_t)((j * 127u + t * 17u) % C);
+                ds4_gpu_test_set_v41_off(DS4_GPU_V41_PREFILL_ATTENTION);
+                CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(ref, sinks, getpagesize(),
+                    0, qt, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H, D));
+                ds4_gpu_test_set_v41_off(0);
+                CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(got, sinks, getpagesize(),
+                    0, qt, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H, D));
+                CHECK(ds4_gpu_synchronize());
+                CHECK(same_bits(ref, got, nq));
+                ds4_gpu_tensor *tensors[] = {qt, rt, ct, it, ref, got};
+                for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+            }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_prefill_attention_rb16") == runs + 12);
+    ds4_gpu_test_set_flags(0);
+    free(sinks);
+    fprintf(stderr, "V4.1 prefill attention: 16 rows per barrier == the eight-head kernel\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -2582,7 +2630,7 @@ static int check_v41_groups(void) {
         check_index_bf16() && check_topk() && check_index_candidates() &&
         check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
         check_row_matmuls() && check_rows_mma() && check_verify_kernels() &&
-        check_public_controller() && check_prefill_index();
+        check_public_controller() && check_prefill_index() && check_prefill_attention();
 }
 #else
 static int check_v41_groups(void) { return 1; }
