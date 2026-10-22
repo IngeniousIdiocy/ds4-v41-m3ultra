@@ -495,7 +495,7 @@ static int check_candidates(void) {
             CHECK(ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, start, ratio));
             CHECK(ds4_gpu_indexer_topk_tensor(t, b, blocks, rows, top));
             CHECK(ds4_gpu_dsv4_topk_mask_tensor(m, t, blocks, rows, top));
-            CHECK(ds4_gpu_dsv41_candidate_filter(s, m, n, rows, start, ratio));
+            CHECK(ds4_gpu_dsv41_candidate_filter(s, m, n, rows, start, ratio, 0));
             CHECK(ds4_gpu_end_commands());
             CHECK(ds4_gpu_tensor_read(b, 0, maxima, (size_t)blocks * rows * 4));
             CHECK(ds4_gpu_tensor_read(s, 0, got, (size_t)n * rows * 4));
@@ -522,7 +522,7 @@ static int check_candidates(void) {
         }
         CHECK(!ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, UINT32_MAX, 1));
         CHECK(!ds4_gpu_dsv41_candidate_blocks(b, s, n, rows, 0, 0));
-        CHECK(!ds4_gpu_dsv41_candidate_filter(s, m, n, rows + 1, 0, 1));
+        CHECK(!ds4_gpu_dsv41_candidate_filter(s, m, n, rows + 1, 0, 1, 0));
         ds4_gpu_tensor_free(s); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(t); ds4_gpu_tensor_free(m);
         free(scores); free(got); free(maxima); free(sorted); free(kept);
     }
@@ -2913,6 +2913,84 @@ static int check_prefill_matmul(void) {
     return 1;
 }
 
+/* PREFILL_INDEX_BATCH: the batch top-k from 513 visible keys against per-row top-k (the same ids in the same order),
+ * select-all for rows that see at most 512 keys, and a batch of ratio-1 rows past 2048 blocks through the batched
+ * block top-k and strided masks against the per-row candidates, bit for bit on the filtered scores. */
+static int check_prefill_index_batch(void) {
+    enum { ROWS = 5, K = 512 };
+    for (uint32_t ratio = 1; ratio <= 2; ratio++) {
+        const uint32_t start = 600u * ratio - 1u, width = (start + ROWS) / ratio;
+        ds4_gpu_tensor *scores = upload(NULL, (size_t)width * ROWS * 4), *sel = upload(NULL, ROWS * K * 4);
+        ds4_gpu_tensor *want = upload(NULL, ROWS * K * 4);
+        CHECK(scores && sel && want);
+        float *s = ds4_gpu_tensor_contents(scores);
+        for (uint32_t t = 0; t < ROWS; t++)
+            for (uint32_t j = 0; j < width; j++)
+                s[(size_t)t * width + j] = j < (start + t + 1u) / ratio ? random_value() : 12345.0f;
+        for (uint32_t t = 0; t < ROWS; t++) {
+            const uint32_t visible = (start + t + 1u) / ratio;
+            ds4_gpu_tensor *sr = ds4_gpu_tensor_view(scores, (size_t)t * width * 4, visible * 4);
+            ds4_gpu_tensor *out = ds4_gpu_tensor_view(want, (size_t)t * K * 4, K * 4);
+            CHECK(sr && out && ds4_gpu_indexer_topk_tensor(out, sr, visible, 1, K));
+            ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(sr);
+        }
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_PREFILL_INDEX_BATCH);
+        CHECK(!ds4_gpu_dsv41_indexer_topk_batch(sel, scores, width, ROWS, start, ratio));
+        ds4_gpu_test_set_v41_off(0);
+        CHECK(ds4_gpu_dsv41_indexer_topk_batch(sel, scores, width, ROWS, start, ratio));
+        CHECK(ds4_gpu_synchronize() && same_bits(sel, want, ROWS * K));
+        ds4_gpu_tensor_free(want); ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(scores);
+    }
+    ds4_gpu_tensor *all = upload(NULL, 8 * K * 4);
+    CHECK(all);
+    int32_t *ids = ds4_gpu_tensor_contents(all);
+    for (uint32_t i = 0; i < 8 * K; i++) ids[i] = -7;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv41_indexer_all");
+    CHECK(ds4_gpu_dsv41_indexer_all_batch(all, 8, 1015, 2) && ds4_gpu_synchronize());
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_indexer_all") == runs + 1);
+    ds4_gpu_test_set_flags(0);
+    for (uint32_t t = 0; t < 8; t++)
+        for (uint32_t k = 0; k < K; k++)
+            CHECK(ids[t * K + k] == (k < (1015u + t + 1u) / 2u ? (int32_t)k : -7));
+    CHECK(!ds4_gpu_dsv41_indexer_all_batch(all, 8, 1020, 2));
+    ds4_gpu_tensor_free(all);
+
+    enum { R = 4 };
+    const uint32_t start = 16389, n = start + R, blocks = (n + 7u) / 8u, stride = blocks + 3u;
+    ds4_gpu_tensor *a = upload(NULL, (size_t)n * R * 4), *b = upload(NULL, (size_t)n * R * 4);
+    ds4_gpu_tensor *bs = upload(NULL, (size_t)blocks * R * 4), *bsel = upload(NULL, 2048 * R * 4);
+    ds4_gpu_tensor *mask = upload(NULL, (size_t)stride * R * 4);
+    ds4_gpu_tensor *rbs = upload(NULL, blocks * 4), *rsel = upload(NULL, 2048 * 4), *rmask = upload(NULL, blocks * 4);
+    CHECK(a && b && bs && bsel && mask && rbs && rsel && rmask);
+    float *av = ds4_gpu_tensor_contents(a), *bv = ds4_gpu_tensor_contents(b);
+    for (uint32_t t = 0; t < R; t++)
+        for (uint32_t j = 0; j < n; j++)
+            av[(size_t)t * n + j] = bv[(size_t)t * n + j] = j <= start + t ? random_value() : 12345.0f;
+    CHECK(ds4_gpu_dsv41_candidate_blocks(bs, a, n, R, start, 1) &&
+          ds4_gpu_dsv41_candidate_topk_batch(bsel, bs, blocks, R, start) &&
+          ds4_gpu_dsv41_candidate_mask_batch(mask, bsel, blocks, R, stride) &&
+          ds4_gpu_dsv41_candidate_filter(a, mask, n, R, start, 1, stride));
+    for (uint32_t t = 0; t < R; t++) {
+        const uint32_t visible = start + t + 1u, vb = (visible + 7u) / 8u;
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(b, (size_t)t * n * 4, (size_t)visible * 4);
+        CHECK(row && ds4_gpu_dsv41_candidate_blocks(rbs, row, visible, 1, start + t, 1) &&
+              ds4_gpu_indexer_topk_tensor(rsel, rbs, vb, 1, 2048) &&
+              ds4_gpu_dsv4_topk_mask_tensor(rmask, rsel, vb, 1, 2048) &&
+              ds4_gpu_dsv41_candidate_filter(row, rmask, visible, 1, start + t, 1, 0));
+        CHECK(ds4_gpu_synchronize());
+        for (uint32_t j = 0; j < n; j++) {
+            const float x = av[(size_t)t * n + j];
+            CHECK(j < visible ? memcmp(&x, &bv[(size_t)t * n + j], 4) == 0 : x == -INFINITY);
+        }
+        ds4_gpu_tensor_free(row);
+    }
+    ds4_gpu_tensor *tensors[] = {a, b, bs, bsel, mask, rbs, rsel, rmask};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    fprintf(stderr, "V4.1 prefill index batch: batch top-k, select-all and batched candidates == per row\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
@@ -2924,7 +3002,8 @@ static int check_v41_groups(void) {
         check_prefill_folds() &&
         check_moe_dedup() &&
         check_verify_batch() &&
-        check_prefill_matmul();
+        check_prefill_matmul() &&
+        check_prefill_index_batch();
 }
 #else
 static int check_v41_groups(void) { return 1; }

@@ -40960,7 +40960,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(index_scores, DS41_INDEX_BATCH * g->ctx) X(selected_comp, DS4_N_INDEXER_TOP_K) \
     X(index_packed, ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u) \
     X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
-    X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
+    X(block_scores, DS41_INDEX_BATCH * ((g->ctx + 7u) / 8u)) X(block_selected, DS41_INDEX_BATCH * 2048u) \
     X(block_mask, (g->ctx + 7u) / 8u) X(block_list, 2048) \
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
     X(route_logits, DS4_N_EXPERT) X(route_probs, DS4_N_EXPERT) \
@@ -41872,7 +41872,8 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
-    if (n_comp && ds41_index_source(il)) {
+    /* PREFILL_INDEX_BATCH: up to 2048 blocks every block is a candidate, so nothing is selected or filtered */
+    if (n_comp && ds41_index_source(il) && ((n_comp + 7u) / 8u > 2048u || !ds41_on(DS4_GPU_V41_PREFILL_INDEX_BATCH))) {
         if (il == 20) {
             const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
             g->block_list_mask = NULL;
@@ -41883,7 +41884,7 @@ static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
                 !ds4_gpu_dsv41_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, top) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, top)) return false;
         } else if (il > 20 &&
-            !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio)) return false;
+            !ds4_gpu_dsv41_candidate_filter(g->index_scores, g->block_mask, n_comp, 1, pos, ratio, 0)) return false;
     }
     return true;
 }
@@ -42566,6 +42567,31 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
             b->latent, 0, (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float));
 }
 
+/* PREFILL_INDEX_BATCH: layer 20's candidate masks and the later layers' filters for a batch of ratio-1 rows; rows that
+ * see at most 2048 blocks keep every block. */
+static bool ds41_candidates_batch(ds41_gpu_graph *g, uint32_t il, uint32_t n_comp,
+                                  uint32_t start, uint32_t off, uint32_t rows) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t blocks = (n_comp + 7u) / 8u, mask_width = (g->ctx + 7u) / 8u;
+    const uint32_t skip = start + 1u < 16385u * ratio ? 16385u * ratio - start - 1u : 0u;
+    if (skip >= rows) return true;
+    rows -= skip; start += skip; off += skip;
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_view(g->index_scores,
+        (uint64_t)skip * n_comp * sizeof(float), (uint64_t)rows * n_comp * sizeof(float));
+    ds4_gpu_tensor *mask = ds4_gpu_tensor_view(g->batch.block_mask,
+        (uint64_t)off * mask_width * sizeof(float), (uint64_t)rows * mask_width * sizeof(float));
+    bool ok = scores && mask;
+    if (ok && il == 20u)
+        ok = ds4_gpu_dsv41_candidate_blocks(g->block_scores, scores, n_comp, rows, start, ratio) &&
+            ds4_gpu_dsv41_candidate_topk_batch(g->block_selected, g->block_scores, blocks, rows, start) &&
+            ds4_gpu_dsv41_candidate_mask_batch(mask, g->block_selected, blocks, rows, mask_width);
+    else if (ok && il > 20u)
+        ok = ds4_gpu_dsv41_candidate_filter(scores, mask, n_comp, rows, start, ratio, mask_width);
+    ds4_gpu_tensor_free(mask);
+    ds4_gpu_tensor_free(scores);
+    return ok;
+}
+
 static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -42595,6 +42621,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_PACKED_INDEX");
     if (packed && !ds4_gpu_dsv41_indexer_pack(g->index_packed, b->index_q,
         g->index_cache[owner], n_comp, count)) return false;
+    const bool batched = ds41_on(DS4_GPU_V41_PREFILL_INDEX_BATCH);
     for (uint32_t off = 0; off < count; off += DS41_INDEX_BATCH) {
         const uint32_t rows = count - off < DS41_INDEX_BATCH ? count - off : DS41_INDEX_BATCH;
         const uint64_t q_bytes = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
@@ -42608,9 +42635,13 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                 q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio));
         ds4_gpu_tensor_free(weights);
         ds4_gpu_tensor_free(q);
-        const bool batch_topk = (start + off + 1u) / ratio >= 1024u &&
+        /* PREFILL_INDEX_BATCH: every batch of two or more rows sorts as a batch and runs its candidates as one;
+         * off, only rows past 1024 visible keys sort as a batch and the candidates go row by row. */
+        const bool batch_topk = (batched ? count > 1u : (start + off + 1u) / ratio >= 1024u) &&
             !getenv("DS4_METAL_DISABLE_V41_BATCH_TOPK");
-        for (uint32_t t = 0; ok && (!batch_topk || il >= 20u) && t < rows; t++) {
+        if (ok && batched && batch_topk && il >= 20u)
+            ok = ds41_candidates_batch(g, il, n_comp, start + off, off, rows);
+        for (uint32_t t = 0; ok && (!batch_topk || (!batched && il >= 20u)) && t < rows; t++) {
             row.pos = start + off + t;
             row.selected_comp = g->rows_view[off + t].selected_comp;
             row.block_mask = g->rows_view[off + t].block_mask;
@@ -42621,10 +42652,24 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
             ds4_gpu_tensor_free(row.index_scores);
         }
         if (ok && batch_topk) {
+            /* The batch sorts its selection by key later, so (PREFILL_INDEX_BATCH) rows with at most top_k
+             * visible keys just take all of them. */
             const uint64_t id_bytes = DS4_N_INDEXER_TOP_K * sizeof(int32_t);
+            const uint32_t limit = (DS4_N_INDEXER_TOP_K + 1u) * ratio;
+            const uint32_t all = batched && start + off + 1u < limit ? limit - 1u - start - off : 0u;
+            const uint32_t whole = all < rows ? all : rows;
             ds4_gpu_tensor *ids = ds4_gpu_tensor_view(b->selected_comp, off * id_bytes, rows * id_bytes);
-            ok = ids && ds4_gpu_dsv41_indexer_topk_batch(ids, g->index_scores,
-                                                       n_comp, rows, start + off, ratio);
+            ds4_gpu_tensor *rest = ids && whole < rows ? ds4_gpu_tensor_view(b->selected_comp,
+                (off + whole) * id_bytes, (rows - whole) * id_bytes) : NULL;
+            ds4_gpu_tensor *scores = rest ? ds4_gpu_tensor_view(g->index_scores,
+                (uint64_t)whole * n_comp * sizeof(float),
+                (uint64_t)(rows - whole) * n_comp * sizeof(float)) : NULL;
+            ok = ids && (whole == rows || (rest && scores)) &&
+                (!whole || ds4_gpu_dsv41_indexer_all_batch(ids, whole, start + off, ratio)) &&
+                (whole == rows || ds4_gpu_dsv41_indexer_topk_batch(rest, scores, n_comp,
+                    rows - whole, start + off + whole, ratio));
+            ds4_gpu_tensor_free(scores);
+            ds4_gpu_tensor_free(rest);
             ds4_gpu_tensor_free(ids);
         }
         if (!ok) return false;
@@ -42661,7 +42706,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX");
     const bool batch_publish = ds41_kv_source(il) &&
 #ifdef __APPLE__
-        ratio == 2u &&
+        (ratio == 2u || ds41_on(DS4_GPU_V41_PREFILL_INDEX_BATCH)) &&
 #endif
         !getenv("DS4_METAL_DISABLE_V41_BATCH_COMPRESS");
     if (batch_publish && !ds41_attention_publish_batch(g, b, m, l, il, start, count)) return false;

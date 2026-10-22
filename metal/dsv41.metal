@@ -805,11 +805,30 @@ kernel void kernel_dsv41_pool2(
     out[(ulong)index.y * args.width + index.x] = dsv41_bf16((ka * ea + kv[b] * eb) / (ea + eb));
 }
 
+struct ds4_metal_args_dsv41_indexer_all {
+    uint rows;
+    uint start;
+    uint ratio;
+    uint top_k;
+};
+
+// PREFILL_INDEX_BATCH: rows with at most top_k visible keys attend to all of them.
+kernel void kernel_dsv41_indexer_all(
+        constant ds4_metal_args_dsv41_indexer_all &args,
+        device int *ids,
+        uint2 index [[thread_position_in_grid]]) {
+    if (index.x >= args.top_k || index.y >= args.rows) return;
+    const uint visible = (args.start + index.y + 1u) / args.ratio;
+    if (index.x < min(visible, args.top_k))
+        ids[(ulong)index.y * args.top_k + index.x] = (int)index.x;
+}
+
 struct ds4_metal_args_dsv41_candidates {
     uint width;
     uint rows;
     uint start;
     uint ratio;
+    uint mask_stride;
 };
 
 kernel void kernel_dsv41_candidate_blocks(
@@ -837,10 +856,9 @@ kernel void kernel_dsv41_candidate_filter(
         uint2 index [[thread_position_in_grid]]) {
     if (index.x >= args.width || index.y >= args.rows) return;
     const ulong offset = (ulong)index.y * args.width + index.x;
-    const uint blocks = (args.width + 7u) / 8u;
     const uint visible = min(args.width, (args.start + index.y + 1u) / args.ratio);
     out[offset] = index.x < visible &&
-        block_mask[(ulong)index.y * blocks + index.x / 8u] == 0.0f
+        block_mask[(ulong)index.y * args.mask_stride + index.x / 8u] == 0.0f
         ? scores[offset] : -INFINITY;
 }
 

@@ -473,6 +473,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_VERIFY_BATCH",
             "DS4_METAL_DISABLE_V41_FLASH_HEAD_SHARE",
             "DS4_METAL_DISABLE_V41_PREFILL_MATMUL",
+            "DS4_METAL_DISABLE_V41_PREFILL_INDEX_BATCH",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -19658,8 +19659,33 @@ int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_ten
                                     uint32_t width, uint32_t rows, uint32_t start, uint32_t ratio) {
     if ((ratio != 1u && ratio != 2u) || !rows || rows > UINT32_MAX - start ||
         width > INT32_MAX || rows > INT32_MAX || (start + rows) / ratio > width ||
-        (start + 1u) / ratio < 1024u) return 0;
+        (start + 1u) / ratio < (ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_INDEX_BATCH) ? 513u : 1024u)) return 0;
     return ds4_gpu_indexer_topk_tensor_impl(selected, scores, width, rows, 512u, start, ratio, false);
+}
+
+/* PREFILL_INDEX_BATCH */
+int ds4_gpu_dsv41_indexer_all_batch(ds4_gpu_tensor *selected, uint32_t rows,
+                                   uint32_t start, uint32_t ratio) {
+    if (!ratio || !rows || rows > UINT32_MAX - start || (start + rows) / ratio > 512u ||
+        !selected || ds4_gpu_tensor_bytes(selected) < (uint64_t)rows * 512u * sizeof(int32_t)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_indexer_all");
+        if (!pipeline) return 0;
+        DS4_TEST_NOTE("kernel_dsv41_indexer_all");
+        const uint32_t args[] = {rows, start, ratio, 512u};
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(512u, rows, 1)
+             threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 indexer select all");
+    }
 }
 
 int ds4_gpu_argmax_tensor(
@@ -19676,18 +19702,19 @@ int ds4_gpu_argmax_tensor(
     return ds4_gpu_indexer_topk_tensor(out_idx, logits, n_vocab, 1, 1);
 }
 
-int ds4_gpu_dsv4_topk_mask_tensor(
+static int ds4_gpu_dsv4_topk_mask_tensor_impl(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
         uint32_t                n_comp,
         uint32_t                n_tokens,
-        uint32_t                top_k) {
+        uint32_t                top_k,
+        uint32_t                mask_stride) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!mask || !topk || n_comp == 0 || n_tokens == 0 || top_k == 0) return 0;
+    if (!mask || !topk || n_comp == 0 || n_tokens == 0 || top_k == 0 || mask_stride < n_comp) return 0;
 
     @autoreleasepool {
         const uint64_t topk_bytes = (uint64_t)top_k * n_tokens * sizeof(int32_t);
-        const uint64_t mask_bytes = (uint64_t)n_comp * n_tokens * sizeof(float);
+        const uint64_t mask_bytes = ((uint64_t)mask_stride * (n_tokens - 1u) + n_comp) * sizeof(float);
         id<MTLBuffer> topkbuf = ds4_gpu_tensor_buffer(topk);
         id<MTLBuffer> maskbuf = ds4_gpu_tensor_buffer(mask);
         if (!topkbuf || !maskbuf ||
@@ -19705,7 +19732,7 @@ int ds4_gpu_dsv4_topk_mask_tensor(
             .ne0 = (int64_t)n_comp,
             .ne1 = (int64_t)n_tokens,
             .nb0 = sizeof(float),
-            .nb1 = (uint64_t)n_comp * sizeof(float),
+            .nb1 = (uint64_t)mask_stride * sizeof(float),
         };
 
         int owned = 0;
@@ -19734,6 +19761,16 @@ int ds4_gpu_dsv4_topk_mask_tensor(
     }
 
     return 1;
+}
+
+
+int ds4_gpu_dsv4_topk_mask_tensor(
+        ds4_gpu_tensor       *mask,
+        const ds4_gpu_tensor *topk,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                top_k) {
+    return ds4_gpu_dsv4_topk_mask_tensor_impl(mask, topk, n_comp, n_tokens, top_k, n_comp);
 }
 
 static int ds4_gpu_matmul_q8_0_legacy_tensor(
@@ -50380,20 +50417,24 @@ int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
 
 static int dsv41_candidates(ds4_gpu_tensor *out, const ds4_gpu_tensor *scores,
                             const ds4_gpu_tensor *mask, uint32_t width,
-                            uint32_t rows, uint32_t start, uint32_t ratio) {
+                            uint32_t rows, uint32_t start, uint32_t ratio,
+                            uint32_t mask_stride) {
     if (!width || width > UINT32_MAX - 7u || !rows || !ratio ||
         rows > UINT32_MAX - start) return 0;
     const uint32_t blocks = (width + 7u) / 8u;
     const uint32_t output_width = mask ? width : blocks;
-    if (!dsv41_tensor_has_floats(scores, (uint64_t)width * rows) ||
+    if (!mask_stride) mask_stride = blocks;
+    if (mask_stride < blocks ||
+        !dsv41_tensor_has_floats(scores, (uint64_t)width * rows) ||
         !dsv41_tensor_has_floats(out, (uint64_t)output_width * rows) ||
-        (mask && !dsv41_tensor_has_floats(mask, (uint64_t)blocks * rows))) return 0;
+        (mask && !dsv41_tensor_has_floats(mask, (uint64_t)mask_stride * (rows - 1u) + blocks)))
+        return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(mask ?
             "kernel_dsv41_candidate_filter" : "kernel_dsv41_candidate_blocks");
         if (!pipeline) return 0;
-        const uint32_t args[] = {width, rows, start, ratio};
+        const uint32_t args[] = {width, rows, start, ratio, mask_stride};
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
@@ -50415,15 +50456,34 @@ int ds4_gpu_dsv41_candidate_blocks(ds4_gpu_tensor *blocks,
                                   const ds4_gpu_tensor *scores,
                                   uint32_t width, uint32_t rows,
                                   uint32_t start, uint32_t ratio) {
-    return dsv41_candidates(blocks, scores, NULL, width, rows, start, ratio);
+    return dsv41_candidates(blocks, scores, NULL, width, rows, start, ratio, 0);
 }
 
 int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
                                   const ds4_gpu_tensor *block_mask,
                                   uint32_t width, uint32_t rows,
-                                  uint32_t start, uint32_t ratio) {
+                                  uint32_t start, uint32_t ratio,
+                                  uint32_t mask_stride) {
     if (!block_mask) return 0;
-    return dsv41_candidates(scores, scores, block_mask, width, rows, start, ratio);
+    return dsv41_candidates(scores, scores, block_mask, width, rows, start, ratio, mask_stride);
+}
+
+/* PREFILL_INDEX_BATCH: each ratio-1 row's top 2048 blocks over its own causal block count, and their 0/-inf masks at
+ * mask_stride floats per row. */
+int ds4_gpu_dsv41_candidate_topk_batch(ds4_gpu_tensor *selected,
+                                      const ds4_gpu_tensor *blocks,
+                                      uint32_t width, uint32_t rows, uint32_t start) {
+    if (!rows || start > UINT32_MAX - 8u || rows > UINT32_MAX - 8u - start ||
+        width > INT32_MAX || rows > INT32_MAX ||
+        (start + rows + 7u) / 8u > width || (start + 8u) / 8u <= 2048u) return 0;
+    return ds4_gpu_indexer_topk_tensor_impl(selected, blocks, width, rows, 2048u, start + 7u, 8u, false);
+}
+
+int ds4_gpu_dsv41_candidate_mask_batch(ds4_gpu_tensor *mask,
+                                      const ds4_gpu_tensor *selected,
+                                      uint32_t width, uint32_t rows,
+                                      uint32_t mask_stride) {
+    return ds4_gpu_dsv4_topk_mask_tensor_impl(mask, selected, width, rows, 2048u, mask_stride);
 }
 
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,

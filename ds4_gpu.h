@@ -77,6 +77,7 @@ typedef struct {
 #define DS4_GPU_V41_VERIFY_BATCH (1ull << 29)   /* one session's 2-8 consecutive rows attend together and expand their outputs into the streams */
 #define DS4_GPU_V41_FLASH_HEAD_SHARE (1ull << 30)   /* multi-row flash attention runs eight heads per threadgroup over shared key reads (any model) */
 #define DS4_GPU_V41_PREFILL_MATMUL (1ull << 31)   /* wide prefill Q8 matmuls unpack their weights to F16 once on the M3 Ultra */
+#define DS4_GPU_V41_PREFILL_INDEX_BATCH (1ull << 32)   /* the prefill indexer picks candidates, short rows and top-k as batches; candidates are skipped while every block is kept */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
