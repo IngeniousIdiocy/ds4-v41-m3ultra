@@ -72,10 +72,15 @@ the drafter resident; the target and its verification run across both GPUs.
 
 Up to five drafts are checked together. The sampling choices below apply;
 `--mtp-exact-sampling` uses sampled proposals and the full acceptance/correction
-rule for V4.1. Restored sessions warm the draft window with 128 ordinary tokens
-before speculation resumes. Measure speed on your prompts: acceptance and SSD
-cache size both matter. V4.1 DSpark can still be slower than ordinary decoding,
-including in TP mode.
+rule for V4.1. A session saved with the drafter loaded carries the draft window,
+so it drafts as soon as it is restored; older payloads warm the window with 128
+ordinary tokens before speculation resumes. Measure speed on your prompts:
+acceptance and SSD cache size both matter. On one Mac, Metal drafts only where
+drafting has measured faster than ordinary decoding (see
+[RUNTIME-V41.md](RUNTIME-V41.md#dspark-verify)); elsewhere, including in TP
+mode, V4.1 DSpark can still be slower than ordinary decoding. The MXFP4 drafter
+written by `deepseek41_prepare.py` or `deepseek41_quantize.py --dspark-out`
+(7.4 GiB) works with the same options.
 
 ## GLM: built-in MTP
 
