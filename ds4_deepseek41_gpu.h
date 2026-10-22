@@ -76,6 +76,26 @@ int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0,
 int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                             uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
                             const ds4_gpu_tensor *x, uint32_t pos, bool compressed);
+/* ROPE. rope_quantize: one row's RoPE and quantization stored into dst at dst_offset bytes, x unchanged.
+ * rope_coeff_table: one decode step's RoPE coefficients (64 float2: (cos, sin) of float(pos) * frequency, entries
+ * 0..31 raw, 32..63 compressed). rope_quantize_heads_tab: RoPE + quantization of heads rows of width in place, in one
+ * dispatch reading it. attention_low: the attention output low projection with the heads' bf16 rounding and inverse
+ * RoPE applied as it loads them. heads_once_arm: the next single-row decode reduce of 64 heads x 512 writes its heads
+ * already bf16-rounded and inverse-roped with the table; take returns 1 when it did (and disarms), and the plain low
+ * projection then reads them. reduce_check (test entry): that reduce on tmp's partials, plain or transformed. */
+int ds4_gpu_dsv41_rope_quantize(const ds4_gpu_tensor *x, ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                uint32_t width, uint32_t start, bool compressed,
+                                ds4_v41_activation_format format);
+int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos);
+int ds4_gpu_dsv41_rope_quantize_heads_tab(ds4_gpu_tensor *x, uint32_t width, uint32_t heads, uint32_t start,
+                                          bool compressed, ds4_v41_activation_format format, const ds4_gpu_tensor *tab);
+int ds4_gpu_dsv41_attention_low(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+                                uint64_t out_a_offset, uint32_t group_dim, uint32_t rank,
+                                uint32_t n_groups, ds4_gpu_tensor *heads, uint32_t pos, bool compressed);
+void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
+int ds4_gpu_dsv41_heads_once_take(void);
+int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
+                                          int transform, const ds4_gpu_tensor *tab, bool compressed);
 /* Weights built at load: the model views' storage options, and a residency set of their own (requested at once and
  * added to the queue); ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);

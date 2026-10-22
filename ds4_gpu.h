@@ -53,6 +53,7 @@ typedef struct {
 #define DS4_GPU_V41_FUSED_ROUNDING (1ull << 5)   /* producers write bf16 directly, no separate rounding pass */
 #define DS4_GPU_V41_NARROW_WEIGHTS (1ull << 6)   /* decode reads narrow router, Engram and indexer copies built at load */
 #define DS4_GPU_V41_QKV_FUSION (1ull << 7)   /* q_a and kv in one pass, their norms in one dispatch, RoPE in q_b */
+#define DS4_GPU_V41_ROPE (1ull << 8)   /* cache rows roped as they store; the heads' inverse RoPE in the reduce or the low */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

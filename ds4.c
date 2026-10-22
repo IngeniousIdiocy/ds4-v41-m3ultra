@@ -40973,7 +40973,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(engram_rows, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_rows_b, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
-    X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
+    X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB) \
+    X(rope_tab, 128)
 
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
@@ -41003,6 +41004,8 @@ typedef struct {
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
     ds41_dspark *dspark;
+    /* Metal: rope_tab holds the RoPE coefficients of position rope_tab_pos - 1 while that decode step runs (0: none) */
+    uint32_t rope_tab_pos;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -41656,6 +41659,19 @@ static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width,
                               ds4_layer_compress_ratio(il) != 0, inverse);
 }
 
+/* One key row roped, quantized and stored into its cache row (with ROPE in one dispatch). */
+static bool ds41_rope_store(ds4_gpu_tensor *x, ds4_gpu_tensor *cache, uint64_t offset, uint32_t width,
+                            uint32_t il, uint32_t pos, ds4_v41_activation_format format) {
+#ifdef __APPLE__
+    if (ds41_on(DS4_GPU_V41_ROPE) &&
+        ds4_gpu_dsv41_rope_quantize(x, cache, offset, width, pos, ds4_layer_compress_ratio(il) != 0, format))
+        return true;
+#endif
+    return ds41_rope(x, 1, width, il, pos, false) &&
+        ds4_gpu_dsv41_quantize(x, width, 1, format) &&
+        ds4_gpu_tensor_copy(cache, offset, x, 0, (uint64_t)width * sizeof(float));
+}
+
 /* The attention heads rounded to bf16, then their inverse RoPE. */
 static bool ds41_heads_unrope(ds4_gpu_tensor *x, uint32_t heads, uint32_t il, uint32_t pos) {
 #ifdef __APPLE__
@@ -41680,15 +41696,27 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
 
+/* rope_il >= 0: the heads still carry that layer's RoPE; its inverse (and their bf16 rounding) folds into the
+ * projection's load, else it runs first. */
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
-                               const ds4_layer_weights *l, bool round) {
+                               const ds4_layer_weights *l, int rope_il, bool round) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
-    return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
-        ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
-            l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
-            4096, 1024, groups, g->heads) && (!round || ds41_bf16(g->low, groups * DS4_N_LORA_O));
+    if (!tensor_nbytes(l->attn_output_a->type, 4096, &output_row)) return false;
+    const uint64_t offset = l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row;
+#ifdef __APPLE__
+    const bool fused = rope_il >= 0 &&
+        ds4_gpu_dsv41_attention_low(g->low, m->map, m->size, offset, 4096, 1024, groups, g->heads, g->pos,
+                                    ds4_layer_compress_ratio((uint32_t)rope_il) != 0);
+#else
+    const bool fused = false;
+#endif
+    if (!fused &&
+        ((rope_il >= 0 && !ds41_heads_unrope(g->heads, DS4_N_HEAD / g->tp_world, (uint32_t)rope_il, g->pos)) ||
+         !ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size, offset, 4096, 1024, groups, g->heads)))
+        return false;
+    return !round || ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
 
 /* At tp 1 with fused rounding, the Q8 attention output projection rounds the low rows to bf16 as it loads them
@@ -41698,15 +41726,15 @@ static bool ds41_output_rounds(const ds41_gpu_graph *g, const ds4_layer_weights 
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
-                                  const ds4_layer_weights *l) {
+                                  const ds4_layer_weights *l, int rope_il) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
 #ifdef __APPLE__
     if (ds41_output_rounds(g, l))
-        return ds41_attention_low(g, m, l, false) &&
+        return ds41_attention_low(g, m, l, rope_il, false) &&
             ds4_gpu_matmul_q8_0_bf16io_tensor(g->block, m->map, m->size, l->attn_output_b->abs_offset,
                 l->attn_output_b->dim[0], l->attn_output_b->dim[1], g->low) != 0;
 #endif
-    if (!ds41_attention_low(g, m, l, true)) return false;
+    if (!ds41_attention_low(g, m, l, rope_il, true)) return false;
     return g->tp_world == 2 ?
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
@@ -41735,14 +41763,10 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
             if (!ds41_norm(g->latent, g->latent, m, l->attn_compressor_norm) ||
                 !ds41_matmul(g->index_k, m, l->indexer_attn_k, g->latent, true) ||
                 !ds41_norm(g->index_k, g->index_k, m, l->indexer_k_norm) ||
-                !ds41_rope(g->index_k, 1, DS4_N_INDEXER_HEAD_DIM, il, rope_pos, false) ||
-                !ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0) ||
-                !ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
-                                     g->index_k, 0, 128u * 4u) ||
-                !ds41_rope(g->latent, 1, 512, il, rope_pos, false) ||
-                !ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
-                !ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
-                                     g->latent, 0, 512u * 4u)) return false;
+                !ds41_rope_store(g->index_k, g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
+                                 DS4_N_INDEXER_HEAD_DIM, il, rope_pos, DS4_V41_FP4_E8M0) ||
+                !ds41_rope_store(g->latent, g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
+                                 512, il, rope_pos, DS4_V41_FP4_E4M3)) return false;
         }
     }
     return true;
@@ -41774,6 +41798,19 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
         ds4_gpu_indexer_topk_tensor(g->selected_comp, g->index_scores, n_comp, 1, top));
 }
 
+/* The index query's RoPE + FP4_E8M0 quantization: one dispatch on a compressed layer with this step's RoPE table,
+ * else the RoPE and the quantization. */
+static bool ds41_index_q_rope_quantize(ds41_gpu_graph *g, uint32_t il, uint32_t pos) {
+#ifdef __APPLE__
+    if (ds4_layer_compress_ratio(il) != 0 && g->rope_tab_pos == pos + 1u && g->tp_world == 1 &&
+        ds4_gpu_dsv41_rope_quantize_heads_tab(g->index_q, 128, DS4_N_INDEXER_HEAD, pos, true, DS4_V41_FP4_E8M0,
+                                              g->rope_tab))
+        return true;
+#endif
+    return ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) &&
+        ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0);
+}
+
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
                                             const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41781,8 +41818,7 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
         if ((!ds41_narrow_indexer_mv(g, m, l, il) && !ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true)) ||
-            !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
-            !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
+            !ds41_index_q_rope_quantize(g, il, pos) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
 #ifdef __APPLE__
             !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
@@ -41853,23 +41889,34 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     bool q_roped = false;
     if (!projected && !ds41_attention_project(g, m, l, (int)il, &q_roped)) return false;
     if ((!q_roped && !ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false)) ||
-        !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
-        !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                             g->kv, 0, 512u * 4u) ||
+        !ds41_rope_store(g->kv, g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+                         DS4_N_HEAD_DIM, il, pos, DS4_V41_FP8_E8M0) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+#ifdef __APPLE__
+    /* with this step's RoPE table the decode reduce writes the heads bf16-rounded and inverse-roped */
+    const bool arm = !projected && g->tp_world == 1 && g->rope_tab_pos == pos + 1u;
+    if (arm) ds4_gpu_dsv41_heads_once_arm(g->rope_tab, ratio != 0);
+#endif
+    const bool done = ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_heads_unrope(g->heads, heads, il, pos)) return false;
+            heads, DS4_N_HEAD_DIM);
+#ifdef __APPLE__
+    const bool transformed = arm && ds4_gpu_dsv41_heads_once_take();
+#else
+    const bool transformed = false;
+#endif
+    if (!done) return false;
+    /* else the low projection applies them as it loads the heads (ROPE), or they run here */
+    const int rope_il = !transformed && !projected && ds41_on(DS4_GPU_V41_ROPE) ? (int)il : -1;
+    if (!transformed && rope_il < 0 && !ds41_heads_unrope(g->heads, heads, il, pos)) return false;
     if (projected) return true;
-    return ds41_attention_output(g, m, l) &&
+    return ds41_attention_output(g, m, l, rope_il) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
            (ds41_output_rounds(g, l) || ds41_bf16(g->block, DS4_N_EMBD));
 }
@@ -42375,7 +42422,7 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
         if (state == 1) return true;
         const bool ok = island == 0 ?
             ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l, -1, NULL) :
-            island == 2 ? ds41_attention_output(g, m, l) :
+            island == 2 ? ds41_attention_output(g, m, l, -1) :
             ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
         if (state != 0) return ok;
         if (!ok) ds4_gpu_decode_graph_abort(&key);
@@ -42519,6 +42566,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
+#ifdef __APPLE__
+    /* One RoPE coefficient table per decode step, encoded before layer 0, read by the attention reduce and the index
+     * query in place of their own sin and cos. */
+    if (ok && logits && g->tp_world == 1 && !g->streaming && !g->quality && ds41_on(DS4_GPU_V41_ROPE) &&
+        ds4_gpu_dsv41_rope_coeff_table(g->rope_tab, g->pos))
+        g->rope_tab_pos = g->pos + 1u;
+#endif
     /* On one Mac the layers queue into one command stream, committed every two layers, so the GPU starts while the
      * host keeps encoding, and the head follows the last layer in the same stream. */
     const bool queued = g->tp_world == 1 && !g->imatrix && !layer_resident && ds41_on(DS4_GPU_V41_DECODE_QUEUE);
@@ -42563,6 +42617,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && queued && !drain && (il == 0 || (il + 1u) % DS41_DECODE_FLUSH_LAYERS == 0))
             ok = ds4_gpu_flush_commands() != 0;
     }
+    g->rope_tab_pos = 0;   /* the table never outlives its step */
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
@@ -43156,7 +43211,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     for (uint32_t t = 0; ok && t < count; t++) {
                         row.heads = g->rows_view[t].heads;
                         row.low = g->rows_view[t].low;
-                        ok = ds41_attention_low(&row, m, l, true);
+                        ok = ds41_attention_low(&row, m, l, -1, true);
                     }
                     if (ok) ok = ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
                                                    g->batch.low, count, true);
@@ -43381,7 +43436,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             row.q = queries[i];
             row.heads = heads[i];
             ok = ds41_attention(&row, model, l, il, true) &&
-                (batch_output || ds41_attention_output(&row, model, l));
+                (batch_output || ds41_attention_output(&row, model, l, -1));
         }
         if (ok && batch_output)
             ok = g->tp_world == 2 ?

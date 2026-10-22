@@ -1557,9 +1557,101 @@ static int check_qkv_fusion(void) {
     return 1;
 }
 
+static void *q8_weights(uint32_t rows, uint32_t cols, uint64_t *bytes) {
+    typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
+    *bytes = (uint64_t)rows * cols / 32 * sizeof(q8_block);
+    void *model = NULL;
+    if (posix_memalign(&model, getpagesize(), *bytes) != 0) return NULL;
+    q8_block *w = model;
+    for (uint64_t i = 0; i < *bytes / sizeof(*w); i++) {
+        w[i].d = (uint16_t)(0x1c00 + (int)(random_value() * 8192) % 1024);
+        for (int j = 0; j < 32; j++) w[i].qs[j] = (int8_t)((int)(random_value() * 8192) % 127);
+    }
+    return model;
+}
+
+/* ROPE, bit for bit. A cache row roped, quantized and stored in one dispatch against RoPE, quantization and the copy
+ * (three formats, raw and compressed, through 1M positions). With the step's RoPE table, from the same attention
+ * partials: the transforming reduce against the plain reduce, bf16 rounding and inverse RoPE; the plain low on its
+ * heads and the rope low on the plain heads against the low after the separate RoPE; the index query's one-dispatch
+ * rope + quantize against the two. */
+static int check_rope(void) {
+    enum { GROUP = 4096, RANK = 1024, GROUPS = 8, NROWS = 64, DV = 512, NWG = 32, QN = 32 * 128 };
+    const uint64_t hb = (uint64_t)NROWS * DV * 4, lb = (uint64_t)GROUPS * RANK * 4;
+    const uint64_t tn = (uint64_t)NROWS * (DV * NWG + 2u * NWG);
+    ds4_gpu_tensor *a = upload(NULL, 512 * 4), *b = upload(NULL, 512 * 4), *dst = upload(NULL, 512 * 4);
+    CHECK(a && b && dst);
+    float *x = ds4_gpu_tensor_contents(a), *y = ds4_gpu_tensor_contents(b);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    for (uint32_t t = 0; t < 48; t++) {
+        const ds4_v41_activation_format format = (ds4_v41_activation_format)(DS4_V41_FP8_E8M0 + t % 3);
+        const uint32_t width = format == DS4_V41_FP4_E8M0 ? 128 : 512, pos = (t * 104729u) % 1048576u;
+        const bool compressed = (t / 3) & 1;
+        const float scale = t % 7 == 0 ? 0.02f : t % 5 == 0 ? 12.0f : 1.0f;
+        for (uint32_t i = 0; i < width; i++) x[i] = y[i] = random_value() * scale;
+        memset(ds4_gpu_tensor_contents(dst), 0xff, 512 * 4);
+        const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv41_rope_quantize");
+        CHECK(ds4_gpu_dsv41_rope(a, width, 1, 1, pos, compressed, false) &&
+              ds4_gpu_dsv41_quantize(a, width, 1, format) &&
+              ds4_gpu_dsv41_rope_quantize(b, dst, 0, width, pos, compressed, format));
+        CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_rope_quantize") == runs + 1);
+        CHECK(!memcmp(x, ds4_gpu_tensor_contents(dst), width * 4));
+    }
+    uint64_t wb = 0;
+    void *model = q8_weights(GROUPS * RANK, GROUP, &wb);
+    float *t = malloc(tn * 4), *qref = malloc(QN * 4);
+    CHECK(model && t && qref && ds4_gpu_set_model_map(model, wb));
+    for (uint64_t i = 0; i < (uint64_t)NROWS * DV * NWG; i++) t[i] = random_value();
+    for (uint64_t i = (uint64_t)NROWS * DV * NWG; i < tn; i += 2) {
+        t[i] = fabsf(random_value()) + 0.25f;   /* S */
+        t[i + 1] = random_value();              /* M */
+    }
+    ds4_gpu_tensor *tmp = upload(t, tn * 4), *plain = upload(NULL, hb), *once = upload(NULL, hb), *roped = upload(NULL, hb);
+    ds4_gpu_tensor *q = upload(NULL, QN * 4), *tab = upload(NULL, 512);
+    ds4_gpu_tensor *low[3] = {upload(NULL, lb), upload(NULL, lb), upload(NULL, lb)};
+    CHECK(tmp && plain && once && roped && q && tab && low[0] && low[1] && low[2]);
+    const char *names[4] = {"kernel_dsv41_rope_coeff_table", "kernel_dsv41_flash_attn_vec_reduce_heads",
+                            "kernel_dsv4_attn_out_low_q8_0_f32_rope", "kernel_dsv41_rope_quantize_heads_tab"};
+    const uint32_t positions[] = {0, 1, 7, 4095, 8191, 65535, 131071, 300000, 1048575};
+    for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) for (int compressed = 0; compressed < 2; compressed++) {
+        const uint32_t pos = positions[pi];
+        uint64_t runs[4];
+        for (int k = 0; k < 4; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
+        CHECK(ds4_gpu_dsv41_rope_coeff_table(tab, pos));
+        CHECK(ds4_gpu_dsv41_flash_attn_reduce_check(plain, tmp, NROWS, 0, NULL, false));
+        CHECK(ds4_gpu_dsv41_flash_attn_reduce_check(once, tmp, NROWS, 1, tab, compressed));
+        /* the separate path: bf16 rounding, inverse RoPE, then the plain low */
+        CHECK(ds4_gpu_tensor_write(roped, 0, ds4_gpu_tensor_contents(plain), hb));
+        CHECK(ds4_gpu_dsv41_quantize(roped, NROWS * DV, 1, DS4_V41_BF16) &&
+              ds4_gpu_dsv41_rope(roped, DV, NROWS, 1, pos, compressed, true));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(roped), ds4_gpu_tensor_contents(once), hb));
+        CHECK(ds4_gpu_attention_output_low_q8_tensor(low[0], model, wb, 0, GROUP, RANK, GROUPS, roped) &&
+              ds4_gpu_attention_output_low_q8_tensor(low[1], model, wb, 0, GROUP, RANK, GROUPS, once) &&
+              ds4_gpu_dsv41_attention_low(low[2], model, wb, 0, GROUP, RANK, GROUPS, plain, pos, compressed));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(low[0]), ds4_gpu_tensor_contents(low[1]), lb));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(low[0]), ds4_gpu_tensor_contents(low[2]), lb));
+        /* the index query from the plain heads */
+        CHECK(ds4_gpu_tensor_write(q, 0, ds4_gpu_tensor_contents(plain), QN * 4));
+        CHECK(ds4_gpu_dsv41_rope(q, 128, 32, 1, pos, compressed, false) &&
+              ds4_gpu_dsv41_quantize(q, 128, 32, DS4_V41_FP4_E8M0) && ds4_gpu_tensor_read(q, 0, qref, QN * 4));
+        CHECK(ds4_gpu_tensor_write(q, 0, ds4_gpu_tensor_contents(plain), QN * 4));
+        CHECK(ds4_gpu_dsv41_rope_quantize_heads_tab(q, 128, 32, pos, compressed, DS4_V41_FP4_E8M0, tab));
+        CHECK(!memcmp(qref, ds4_gpu_tensor_contents(q), QN * 4));
+        for (int k = 0; k < 4; k++) CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs[k] + 1);
+    }
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {a, b, dst, tmp, plain, once, roped, q, tab, low[0], low[1], low[2]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(t); free(qref);
+    /* model stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 RoPE: cache-row rope + quantize, transforming reduce, rope low, table index query == "
+            "separate kernels\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
-        check_qkv_fusion();
+        check_qkv_fusion() && check_rope();
 }
 #else
 static int check_v41_groups(void) { return 1; }

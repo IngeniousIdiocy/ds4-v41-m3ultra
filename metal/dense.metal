@@ -127,7 +127,8 @@ static inline void helper_mv_reduce_and_write(
 }
 
 /* Rope folded into a matvec: the last 64 columns of every `width`-wide head
- * rotate at position `start`, on the bf16 outputs before they store (ROPE_OUT). */
+ * rotate at position `start` (ROPE_IN on the activation as it loads, after
+ * rounding it to bf16; ROPE_OUT on the bf16 outputs before they store). */
 struct ds4_metal_args_mv_rope {
     uint  width;
     uint  start;
@@ -193,7 +194,8 @@ static inline void helper_mv_reduce_and_write_rope(
     }
 }
 
-template<short NR0, typename args_t, bool ROUND = false, bool ROUND_IN = false, bool ROPE_OUT = false>
+template<short NR0, typename args_t, bool ROUND = false, bool ROUND_IN = false,
+         bool ROPE_IN = false, bool ROPE_OUT = false>
 void kernel_mul_mv_q8_0_f32_rope_impl(
         args_t args,
         device const char * src0,
@@ -243,6 +245,22 @@ void kernel_mul_mv_q8_0_f32_rope_impl(
     for (int ib = ib0; ib < nb; ib += NSG*NQ) {
         for (short i = 0; i < NQ; ++i) {
             yl[i] = ROUND_IN ? ds4_bf16_round(yb[i]) : yb[i];
+        }
+
+        if (ROPE_IN) {
+            const uint col = (uint)(ib*QK8_0 + il*NQ) % rope->width;
+            if (col >= rope->width - 64u) {
+                const uint pair0 = (col - (rope->width - 64u)) >> 1u;
+                FOR_UNROLL (short p = 0; p < NQ/2; ++p) {
+                    const float theta = float(rope->start) * rope->frequencies[pair0 + p];
+                    float c;
+                    const float sn = precise::sincos(theta, c);
+                    const float s = rope->inverse ? -sn : sn;
+                    const float re = yl[2*p], im = yl[2*p + 1];
+                    yl[2*p] = ds4_bf16_round(fma(re, c, -(im * s)));
+                    yl[2*p + 1] = ds4_bf16_round(fma(im, c, re * s));
+                }
+            }
         }
 
         for (short row = 0; row < NR0; row++) {
@@ -337,7 +355,7 @@ kernel void kernel_mul_mv_q8_0_f32_bf16_rope(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true, false, true>(
+    kernel_mul_mv_q8_0_f32_rope_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true, false, false, true>(
         args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, &rope);
 }
 
