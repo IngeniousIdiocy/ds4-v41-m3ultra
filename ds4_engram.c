@@ -210,7 +210,7 @@ static int request_order(const void *a, const void *b) {
     return (x->row > y->row) - (x->row < y->row);
 }
 
-enum { ENGRAM_READERS = 16 };
+enum { ENGRAM_READERS = 16, ENGRAM_READERS_MAX = 32 };
 #ifdef __APPLE__
 enum { ENGRAM_PARALLEL_MIN_ROWS = 8 };
 #else
@@ -223,7 +223,7 @@ typedef struct {
     const engram_request *request;
     float *out;
     size_t count, readers;
-    int error[ENGRAM_READERS];
+    int error[ENGRAM_READERS_MAX];
 } engram_batch;
 
 static void read_batch_part(void *context, size_t part) {
@@ -261,7 +261,13 @@ static void *read_batch_thread(void *context) {
 
 bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out) {
-    if (!t || t->fd < 0 || (tokens && (!rows || !out || stride < DS4_ENGRAM_COLS)) ||
+    return ds4_engram_read_batch_readers(t, rows, tokens, stride, out, ENGRAM_READERS);
+}
+
+bool ds4_engram_read_batch_readers(const ds4_engram_table *t, const uint32_t *rows,
+                                   size_t tokens, size_t stride, float *out, unsigned readers) {
+    if (!t || t->fd < 0 || readers < 1 || readers > ENGRAM_READERS_MAX ||
+        (tokens && (!rows || !out || stride < DS4_ENGRAM_COLS)) ||
         tokens > SIZE_MAX / (DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(*out)) ||
         (tokens && tokens - 1 > (SIZE_MAX / sizeof(*rows) - DS4_ENGRAM_COLS) / stride)) {
         errno = EINVAL;
@@ -296,18 +302,18 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= ENGRAM_PARALLEL_MIN_ROWS) {
-            batch.readers = ENGRAM_READERS;
+            batch.readers = readers;
 #ifdef __APPLE__
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
 #else
-            pthread_t threads[ENGRAM_READERS - 1];
-            engram_reader readers[ENGRAM_READERS - 1];
+            pthread_t threads[ENGRAM_READERS_MAX - 1];
+            engram_reader workers[ENGRAM_READERS_MAX - 1];
             size_t started = 0;
             for (size_t part = 1; part < batch.readers; part++) {
-                readers[started] = (engram_reader){&batch, part};
+                workers[started] = (engram_reader){&batch, part};
                 if (pthread_create(&threads[started], NULL, read_batch_thread,
-                                   &readers[started])) break;
+                                   &workers[started])) break;
                 started++;
             }
             read_batch_part(&batch, 0);

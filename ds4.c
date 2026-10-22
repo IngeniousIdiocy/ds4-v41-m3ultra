@@ -41010,7 +41010,7 @@ typedef struct {
     const ds4_engram_table *table;
     const uint32_t *ids;
     float *out;
-    uint32_t count, ready;
+    uint32_t count, ready, readers;
     bool active, ok, cancel, done;
 } ds41_engram_prefetch;
 
@@ -43859,15 +43859,20 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
     return ok;
 }
 
+/* ENGRAM_READERS: a prefill sweep's Engram rows come from disk through 32 concurrent readers instead of 16 */
+static uint32_t ds41_engram_readers(void) {
+    return ds41_on(DS4_GPU_V41_ENGRAM_READERS) ? 32u : 16u;
+}
+
 static void *ds41_engram_prefetch_read(void *arg) {
     ds41_engram_prefetch *p = arg;
     p->ok = true;
     for (uint32_t off = 0; off < p->count; off += 2048u) {
         const uint32_t count = p->count - off < 2048u ? p->count - off : 2048u;
         if (__atomic_load_n(&p->cancel, __ATOMIC_RELAXED) ||
-            !ds4_engram_read_batch(p->table, p->ids + (size_t)off * 2u * DS4_ENGRAM_COLS,
+            !ds4_engram_read_batch_readers(p->table, p->ids + (size_t)off * 2u * DS4_ENGRAM_COLS,
                 count, 2u * DS4_ENGRAM_COLS,
-                p->out + (size_t)off * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM)) {
+                p->out + (size_t)off * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, p->readers)) {
             p->ok = false;
             break;
         }
@@ -43905,7 +43910,7 @@ static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *
                                       uint32_t row_off) {
     float *slab = ds4_gpu_tensor_contents(g->engram_prefetch);
     *p = (ds41_engram_prefetch){.table = &g->table[table], .count = count,
-        .ids = ids[0][table],
+        .ids = ids[0][table], .readers = ds41_engram_readers(),
         .out = slab ? slab + (size_t)row_off * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM : NULL};
     if (!p->out || pthread_create(&p->thread, NULL, ds41_engram_prefetch_read, p))
         return false;
@@ -44205,8 +44210,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         ok = ds4_engram_read(&g->table[engram], ids[off + t][engram], DS4_ENGRAM_COLS,
                                              ds4_gpu_tensor_contents(g->rows_view[t].engram_rows));
                 } else {
-                    ok = ds4_engram_read_batch(&g->table[engram], ids[off][engram], count,
-                        2u * DS4_ENGRAM_COLS, ds4_gpu_tensor_contents(g->batch.engram_rows));
+                    ok = ds4_engram_read_batch_readers(&g->table[engram], ids[off][engram], count,
+                        2u * DS4_ENGRAM_COLS, ds4_gpu_tensor_contents(g->batch.engram_rows), ds41_engram_readers());
                 }
             }
             const double t_engram = profile ? now_sec() : 0;
