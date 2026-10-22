@@ -457,6 +457,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_CONCURRENT_FFN",
             "DS4_METAL_DISABLE_V41_INDEX_SCORE_WIDE",
             "DS4_METAL_DISABLE_V41_INDEX_BF16",
+            "DS4_METAL_DISABLE_V41_TOPK",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -927,6 +928,13 @@ static NSUInteger g_router_selection_bytes;
 static NSUInteger g_router_weight_sum_bytes;
 static NSUInteger g_indexer_head_scores_bytes;
 static NSUInteger g_indexer_topk_bytes;
+/* TOPK: the radix select's histograms and counts, its pass-0 slot parity, and the one-row gather's counters, keys
+ * and fallback grids */
+static id<MTLBuffer> g_topk_select_buffer;
+static NSUInteger g_topk_select_bytes;
+static uint32_t g_topk_select_parity;
+static id<MTLBuffer> g_topk_gather_buffer;
+static NSUInteger g_topk_gather_bytes;
 static NSUInteger g_indexed_topk_bytes;
 static NSUInteger g_f16_round_scratch_bytes;
 static NSUInteger g_q8_prefill_scratch_bytes;
@@ -6491,6 +6499,15 @@ typedef struct {
     uint32_t block_width;
     uint32_t block_top_k;
 } ds4_gpu_kargs_argsort_merge;
+
+typedef struct {
+    uint32_t n;
+    uint32_t rows;
+    uint32_t top_k;
+    uint32_t pass;
+    uint32_t parity;
+    uint32_t n_tg;
+} ds4_gpu_kargs_topk_select;
 
 typedef struct {
     int64_t  ne00;
@@ -19240,6 +19257,153 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
                                                  scale);
 }
 
+/* Radix select, deterministic compaction and one in-place sort of the winners
+ * (kernel_topk_select_*): every dispatch spans the GPU, where the merge ladder
+ * ends on two or three threadgroups.  Returns 0 without encoding anything when
+ * the pipelines are unavailable, so the caller keeps the ladder. */
+/* top_k <= 512 sorts the winners with kernel_topk_select_sort512 (one key per thread, 512 threads; the same order:
+ * score descending, ids ascending is a total order), and one row finishes from one gathered pass. */
+static int ds4_gpu_indexer_topk_select(id<MTLBuffer> selbuf, NSUInteger sel_off,
+                                       id<MTLBuffer> scorebuf, NSUInteger score_off,
+                                       uint32_t n, uint32_t rows, uint32_t top_k) {
+    id<MTLComputePipelineState> hist = ds4_gpu_get_pipeline("kernel_topk_select_hist");
+    id<MTLComputePipelineState> count = ds4_gpu_get_pipeline("kernel_topk_select_count");
+    id<MTLComputePipelineState> write = ds4_gpu_get_pipeline("kernel_topk_select_write");
+    id<MTLComputePipelineState> sort = ds4_gpu_get_pipeline("kernel_topk_select_sort");
+    id<MTLComputePipelineState> zero = ds4_gpu_get_pipeline("kernel_topk_select_zero");
+    if (!hist || !count || !write || !sort || !zero ||
+        hist.maxTotalThreadsPerThreadgroup < 1024u || count.maxTotalThreadsPerThreadgroup < 1024u ||
+        write.maxTotalThreadsPerThreadgroup < 1024u || sort.maxTotalThreadsPerThreadgroup < 1024u) return 0;
+    const uint32_t n_tg = (n + 2047u) / 2048u;
+    /* sized for the widest row (2^23 keys), so the scratch is allocated once per row count */
+    const NSUInteger state_off = (NSUInteger)rows * 4u * 2048u * sizeof(uint32_t);
+    const NSUInteger counts_off = state_off + (NSUInteger)rows * 4u * sizeof(uint32_t);
+    const NSUInteger bytes = counts_off + (NSUInteger)rows * 4096u * 2u * sizeof(uint32_t);
+    id<MTLBuffer> before = g_topk_select_buffer;
+    if (!ds4_gpu_ensure_scratch_buffer(&g_topk_select_buffer, &g_topk_select_bytes, bytes,
+                                         "ds4_topk_select")) return 0;
+    ds4_gpu_kargs_topk_select args = {n, rows, top_k, 0, g_topk_select_parity, n_tg};
+    g_topk_select_parity ^= 1u;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc;
+    if (g_topk_select_buffer != before) {   /* a fresh scratch starts with empty histograms */
+        const uint32_t words = (uint32_t)(g_topk_select_bytes / sizeof(uint32_t));
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:zero];
+        [enc setBuffer:g_topk_select_buffer offset:0 atIndex:0];
+        [enc setBytes:&words length:sizeof(words) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake((words + 255u) / 256u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+    }
+    /* One row, k <= 512: after histogram pass 0 one pass gathers the keys above and inside the k-th key's bin and one
+     * threadgroup finishes from those; the remaining radix passes run through indirect grids that it zeroes unless
+     * the bin overflowed (then they finish as before). */
+    id<MTLComputePipelineState> gather = rows == 1u && top_k <= 512u ?
+        ds4_gpu_get_pipeline("kernel_topk_select_gather") : nil;
+    id<MTLComputePipelineState> finish = gather ? ds4_gpu_get_pipeline("kernel_topk_select_finish") : nil;
+    if (!finish || gather.maxTotalThreadsPerThreadgroup < 1024u || finish.maxTotalThreadsPerThreadgroup < 1024u) gather = nil;
+    const NSUInteger gather_bytes = (4u + 2u * 512u + 2u * 4096u + 16u) * sizeof(uint32_t), grid_off = gather_bytes - 16u * 4u;
+    if (gather) {
+        id<MTLBuffer> gather_before = g_topk_gather_buffer;
+        if (!ds4_gpu_ensure_scratch_buffer(&g_topk_gather_buffer, &g_topk_gather_bytes, gather_bytes, "ds4_topk_gather"))
+            gather = nil;
+        else if (g_topk_gather_buffer != gather_before) {   /* fresh counters start at zero */
+            const uint32_t words = (uint32_t)(g_topk_gather_bytes / sizeof(uint32_t));
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:zero];
+            [enc setBuffer:g_topk_gather_buffer offset:0 atIndex:0];
+            [enc setBytes:&words length:sizeof(words) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((words + 255u) / 256u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+    }
+    uint32_t next_grid = 0;
+#define DS4_TOPK_SELECT_DISPATCH(enc, grid) do { \
+        if (gather) [(enc) dispatchThreadgroupsWithIndirectBuffer:g_topk_gather_buffer \
+            indirectBufferOffset:grid_off + (NSUInteger)(next_grid++) * 12u threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)]; \
+        else [(enc) dispatchThreadgroups:(grid) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)]; \
+    } while (0)
+    for (args.pass = 0; args.pass < 3u; args.pass++) {
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:hist];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:scorebuf offset:score_off atIndex:1];
+        [enc setBuffer:g_topk_select_buffer offset:0 atIndex:2];
+        [enc setThreadgroupMemoryLength:2048u * sizeof(uint32_t) atIndex:0];
+        if (args.pass == 0u) [enc dispatchThreadgroups:MTLSizeMake(n_tg, rows, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        else DS4_TOPK_SELECT_DISPATCH(enc, MTLSizeMake(n_tg, rows, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (args.pass == 0u && gather) {
+            DS4_TEST_NOTE("kernel_topk_select_gather");
+            const struct { uint32_t n, top_k, parity, n_tg; } gargs = {n, top_k, args.parity, n_tg};
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:gather];
+            [enc setBytes:&gargs length:sizeof(gargs) atIndex:0];
+            [enc setBuffer:scorebuf offset:score_off atIndex:1];
+            [enc setBuffer:g_topk_select_buffer offset:0 atIndex:2];
+            [enc setBuffer:g_topk_gather_buffer offset:0 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:finish];
+            [enc setBytes:&gargs length:sizeof(gargs) atIndex:0];
+            [enc setBuffer:g_topk_gather_buffer offset:0 atIndex:1];
+            [enc setBuffer:selbuf offset:sel_off atIndex:2];
+            [enc setBuffer:g_topk_gather_buffer offset:grid_off atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+    }
+    enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:count];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:scorebuf offset:score_off atIndex:1];
+    [enc setBuffer:g_topk_select_buffer offset:0 atIndex:2];
+    [enc setBuffer:g_topk_select_buffer offset:state_off atIndex:3];
+    [enc setBuffer:g_topk_select_buffer offset:counts_off atIndex:4];
+    DS4_TOPK_SELECT_DISPATCH(enc, MTLSizeMake(n_tg, rows, 1));
+    ds4_gpu_end_compute_encoder(cb, enc);
+    enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:write];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:scorebuf offset:score_off atIndex:1];
+    [enc setBuffer:g_topk_select_buffer offset:state_off atIndex:2];
+    [enc setBuffer:g_topk_select_buffer offset:counts_off atIndex:3];
+    [enc setBuffer:selbuf offset:sel_off atIndex:4];
+    DS4_TOPK_SELECT_DISPATCH(enc, MTLSizeMake(n_tg, rows, 1));
+    ds4_gpu_end_compute_encoder(cb, enc);
+    id<MTLComputePipelineState> sort512 = top_k <= 512u ?
+        ds4_gpu_get_pipeline("kernel_topk_select_sort512") : nil;
+    if (sort512 && sort512.maxTotalThreadsPerThreadgroup < 512u) sort512 = nil;
+    enc = ds4_gpu_compute_encoder(cb);
+    if (sort512) {
+        DS4_TEST_NOTE("kernel_topk_select_sort512");
+        [enc setComputePipelineState:sort512];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:scorebuf offset:score_off atIndex:1];
+        [enc setBuffer:selbuf offset:sel_off atIndex:2];
+        if (gather) [enc dispatchThreadgroupsWithIndirectBuffer:g_topk_gather_buffer
+            indirectBufferOffset:grid_off + (NSUInteger)(next_grid++) * 12u threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        else [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    } else {
+        [enc setComputePipelineState:sort];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:scorebuf offset:score_off atIndex:1];
+        [enc setBuffer:selbuf offset:sel_off atIndex:2];
+        [enc setThreadgroupMemoryLength:2u * 2048u * sizeof(uint32_t) atIndex:0];
+        DS4_TOPK_SELECT_DISPATCH(enc, MTLSizeMake(rows, 1, 1));
+    }
+#undef DS4_TOPK_SELECT_DISPATCH
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "indexer top-k select") ? 1 : 0;
+}
+
+/* radix: the V4.1 index top-k, which TOPK runs as the radix select on wide rows and as a shorter sort and merge on
+ * one decode row's 512 */
 static int ds4_gpu_indexer_topk_tensor_impl(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -19247,11 +19411,17 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         uint32_t                n_tokens,
         uint32_t                top_k,
         uint32_t                causal_start,
-        uint32_t                causal_ratio) {
+        uint32_t                causal_ratio,
+        bool                    radix) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 || top_k > n_comp) return 0;
 
     @autoreleasepool {
+        /* TOPK, one decode row with k = 512: the SIMD-shuffle block sort, then a merge ladder that keeps only each
+         * merged pair's ordered top 512 (the staged merge, then the fused one). The same ids in the same order on
+         * every NaN-free row; a NaN row may order its ties differently than the full merge. */
+        const bool decode_k512 = radix && !causal_ratio && n_tokens == 1u && top_k == 512u &&
+            ds4_gpu_v41_on(DS4_GPU_V41_TOPK);
         id<MTLComputePipelineState> sort_pipeline = causal_ratio ?
             ds4_gpu_get_pipeline(getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") ?
                 "kernel_argsort_f32_i32_desc_causal" : "kernel_argsort_f32_i32_desc_causal_shuffle") :
@@ -19259,7 +19429,9 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         id<MTLComputePipelineState> merge_pipeline = causal_ratio ?
             ds4_gpu_get_pipeline(top_k == 512u && !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") ?
                 "kernel_argsort_merge_f32_i32_desc_causal_prefix" :
-                "kernel_argsort_merge_f32_i32_desc_causal") : g_argsort_merge_f32_i32_desc_pipeline;
+                "kernel_argsort_merge_f32_i32_desc_causal") :
+            decode_k512 ? ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix_staged") :
+                g_argsort_merge_f32_i32_desc_pipeline;
         if (!sort_pipeline || !merge_pipeline) return 0;
         const uint64_t score_bytes = (uint64_t)n_comp * n_tokens * sizeof(float);
         const uint64_t selected_bytes = (uint64_t)top_k * n_tokens * sizeof(uint32_t);
@@ -19271,6 +19443,11 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             fprintf(stderr, "ds4: Metal graph indexer top-k received undersized buffers\n");
             return 0;
         }
+        /* TOPK, wide rows: where the merge ladder's last rounds would run on two or three threadgroups */
+        if (radix && !causal_ratio && top_k <= 2048u && n_comp >= 16384u && n_comp <= (1u << 23) &&
+            ds4_gpu_v41_on(DS4_GPU_V41_TOPK) &&
+            ds4_gpu_indexer_topk_select(selbuf, ds4_gpu_tensor_offset(selected), scorebuf,
+                                        ds4_gpu_tensor_offset(scores), n_comp, n_tokens, top_k)) return 1;
         NSUInteger max_threads = g_argsort_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
         if (max_threads == 0) max_threads = 256;
         int32_t nth = 1;
@@ -19279,6 +19456,13 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         }
         if (causal_ratio && (sort_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)nth ||
             (causal_start + 1u) / causal_ratio <= (uint32_t)nth / 2u)) return 0;
+        if (decode_k512 && nth >= 32) {   /* else the shared-memory network */
+            id<MTLComputePipelineState> sp = ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_shuffle");
+            if (sp && sp.maxTotalThreadsPerThreadgroup >= (NSUInteger)nth) {
+                sort_pipeline = sp;
+                DS4_TEST_NOTE("kernel_argsort_f32_i32_desc_shuffle");
+            }
+        }
         const int32_t npr = (int32_t)((n_comp + (uint32_t)nth - 1u) / (uint32_t)nth);
         const int32_t block_top_k = (int32_t)(top_k < (uint32_t)nth ? top_k : (uint32_t)nth);
         int32_t work_width = (int32_t)top_k;
@@ -19336,6 +19520,10 @@ static int ds4_gpu_indexer_topk_tensor_impl(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        /* the decode ladder's last levels (at most ten runs) in one threadgroup */
+        id<MTLComputePipelineState> fused_pipeline = decode_k512 && nth == 1024 && block_top_k == 512 &&
+            n_comp <= 65536u ? ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_prefix_fused") : nil;
+        if (fused_pipeline && fused_pipeline.maxTotalThreadsPerThreadgroup < 1024u) fused_pipeline = nil;
         int32_t len = block_top_k;
         while (len < work_width) {
             const int32_t nm = (work_width + 2 * len - 1) / (2 * len);
@@ -19366,8 +19554,27 @@ static int ds4_gpu_indexer_topk_tensor_impl(
                 .block_top_k = (uint32_t)block_top_k,
             };
 
+            const int32_t runs = (work_width + len - 1) / len;
+            if (fused_pipeline && merge_threads == 512u && runs <= 10) {
+                const uint32_t mt = 512u;
+                DS4_TEST_NOTE("kernel_argsort_merge_f32_i32_desc_prefix_fused");
+                merge_args.top_k = (int32_t)top_k;
+                enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:fused_pipeline];
+                [enc setBytes:&merge_args length:sizeof(merge_args) atIndex:0];
+                [enc setBytes:&mt length:sizeof(mt) atIndex:1];
+                [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:2];
+                [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:3];
+                [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+                [enc setThreadgroupMemoryLength:((NSUInteger)runs * 512u * 6u + 15u) & ~(NSUInteger)15u atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                break;
+            }
+
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:merge_pipeline];
+            if (decode_k512) [enc setThreadgroupMemoryLength:8192 atIndex:0];   /* the staged runs */
             [enc setBytes:&merge_args length:sizeof(merge_args) atIndex:0];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
             [enc setBuffer:g_indexer_topk_buffer offset:cur_off atIndex:2];
@@ -19392,7 +19599,12 @@ static int ds4_gpu_indexer_topk_tensor_impl(
 
 int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
                                uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
-    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, n_comp, n_tokens, top_k, 0, 0);
+    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, n_comp, n_tokens, top_k, 0, 0, false);
+}
+
+int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
+                                      uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, n_comp, n_tokens, top_k, 0, 0, true);
 }
 
 int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
@@ -19400,7 +19612,7 @@ int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_ten
     if ((ratio != 1u && ratio != 2u) || !rows || rows > UINT32_MAX - start ||
         width > INT32_MAX || rows > INT32_MAX || (start + rows) / ratio > width ||
         (start + 1u) / ratio < 1024u) return 0;
-    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, width, rows, 512u, start, ratio);
+    return ds4_gpu_indexer_topk_tensor_impl(selected, scores, width, rows, 512u, start, ratio, false);
 }
 
 int ds4_gpu_argmax_tensor(

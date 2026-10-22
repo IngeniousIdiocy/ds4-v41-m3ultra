@@ -2026,11 +2026,43 @@ static int check_index_bf16(void) {
     return 1;
 }
 
+/* TOPK: the V4.1 index top-k against the merge ladder (bit off). One row's top 512 of 4,000 and 12,000 scores
+ * (shuffle sort, staged and fused merges) gives the same ids in the same order, ties included. The radix select, on
+ * the top 512 of 20,000 and 300,000 (with the gather and the 512-wide sort) and the top 2,048 of 20,000 (its full
+ * sort), gives the same scores by rank: exactly tied keys can change places (300,000 scores of 65,537 values tie). */
+static int check_topk(void) {
+    enum { MAXN = 300000 };
+    ds4_gpu_tensor *scores = upload(NULL, MAXN * 4), *sel[2] = {upload(NULL, 2048 * 4), upload(NULL, 2048 * 4)};
+    CHECK(scores && sel[0] && sel[1]);
+    float *sv = ds4_gpu_tensor_contents(scores);
+    const uint32_t n[5] = {4000, 12000, 20000, MAXN, 20000}, k[5] = {512, 512, 512, 512, 2048};
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t radix = ds4_gpu_test_kernel_runs("kernel_topk_select_gather");
+    const uint64_t fused = ds4_gpu_test_kernel_runs("kernel_argsort_merge_f32_i32_desc_prefix_fused");
+    for (int c = 0; c < 5; c++) {
+        for (uint32_t i = 0; i < n[c]; i++) sv[i] = c == 1 && i % 7 == 0 ? 1.0f : random_value();   /* ties */
+        CHECK(ds4_gpu_dsv41_indexer_topk_tensor(sel[0], scores, n[c], 1, k[c]));
+        ds4_gpu_test_set_v41_off(DS4_GPU_V41_TOPK);
+        const int ladder = ds4_gpu_dsv41_indexer_topk_tensor(sel[1], scores, n[c], 1, k[c]);
+        ds4_gpu_test_set_v41_off(0);
+        const int32_t *a = ds4_gpu_tensor_contents(sel[0]), *b = ds4_gpu_tensor_contents(sel[1]);
+        CHECK(ladder);
+        for (uint32_t i = 0; i < k[c]; i++) CHECK(c < 2 ? a[i] == b[i] : sv[a[i]] == sv[b[i]]);
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_topk_select_gather") == radix + 2 &&
+          ds4_gpu_test_kernel_runs("kernel_argsort_merge_f32_i32_desc_prefix_fused") == fused + 2);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {scores, sel[0], sel[1]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    fprintf(stderr, "V4.1 index top-k: radix select and short merge == merge ladder\n");
+    return 1;
+}
+
 static int check_v41_groups(void) {
     return check_compute_copy() && check_router_select() && check_fused_rounding() && check_narrow_weights() &&
         check_qkv_fusion() && check_rope() && check_ffn_join() && check_hc_fusion() && check_split_reduce() &&
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
-        check_index_bf16();
+        check_index_bf16() && check_topk();
 }
 #else
 static int check_v41_groups(void) { return 1; }

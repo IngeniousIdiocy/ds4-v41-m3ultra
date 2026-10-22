@@ -96,6 +96,10 @@ void ds4_gpu_dsv41_heads_once_arm(const ds4_gpu_tensor *tab, bool compressed);
 int ds4_gpu_dsv41_heads_once_take(void);
 int ds4_gpu_dsv41_flash_attn_reduce_check(ds4_gpu_tensor *heads, const ds4_gpu_tensor *tmp, uint32_t nrows,
                                           int transform, const ds4_gpu_tensor *tab, bool compressed);
+/* The index top-k of V4.1's attention (ds4_gpu_indexer_topk_tensor's ids in its order), which TOPK runs as a radix
+ * select on rows of 16,384 scores or more and as a shorter sort and merge on one row's top 512. */
+int ds4_gpu_dsv41_indexer_topk_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
+                                      uint32_t n_comp, uint32_t n_tokens, uint32_t top_k);
 /* INDEX_BF16: index_keys_bf16 writes rows [first, first + rows) of the f32 index keys into their bf16 view (with
  * flag, a key that is not bf16-exact sets *flag); indexer_score_row scores one token over `rows` keys, from the view
  * where the wide scorer runs, else from the f32 keys. */
