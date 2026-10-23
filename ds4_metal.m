@@ -498,6 +498,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_MOE_SHORT_TILES",
             "DS4_METAL_DISABLE_V41_PREFILL_PIPELINE",
             "DS4_METAL_DISABLE_V41_HC_NARROW",
+            "DS4_METAL_DISABLE_V41_CTX_RESIDENCY",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -9399,6 +9400,43 @@ void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
 }
 
+/* CTX_RESIDENCY: every tensor the engine allocates (context, KV and prefill scratch) joins one residency set on the
+ * queue, committed before the next command batch. Without it the driver re-establishes these allocations' residency
+ * when a request's first command buffers use them: 60-80 ms of driver time with the GPU idle at the head of every
+ * prefill. Same bits. */
+static id g_ctx_residency_set;
+static int g_ctx_residency_dirty;
+static void ds4_gpu_ctx_residency_note(id<MTLBuffer> buf, int add) {
+#if TARGET_OS_OSX
+    if (!buf || (add && !ds4_gpu_v41_on(DS4_GPU_V41_CTX_RESIDENCY)) || (!add && !g_ctx_residency_set)) return;
+    if (@available(macOS 15.0, *)) {
+        if (!g_ctx_residency_set) {
+            MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+            desc.label = @"ds4_context";
+            desc.initialCapacity = 4096;
+            NSError *error = nil;
+            g_ctx_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+            if (!g_ctx_residency_set) return;
+            if (g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)])
+                [g_queue addResidencySet:g_ctx_residency_set];
+        }
+        if (add) [g_ctx_residency_set addAllocation:buf];
+        else [g_ctx_residency_set removeAllocation:buf];
+        g_ctx_residency_dirty = 1;
+    }
+#endif
+}
+static void ds4_gpu_ctx_residency_flush(void) {
+#if TARGET_OS_OSX
+    if (!g_ctx_residency_dirty) return;
+    if (@available(macOS 15.0, *)) {
+        g_ctx_residency_dirty = 0;
+        [g_ctx_residency_set commit];
+        [g_ctx_residency_set requestResidency];
+    }
+#endif
+}
+
 static ds4_gpu_tensor *ds4_gpu_tensor_alloc_options(uint64_t bytes, MTLResourceOptions options) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
@@ -9413,6 +9451,7 @@ static ds4_gpu_tensor *ds4_gpu_tensor_alloc_options(uint64_t bytes, MTLResourceO
         tensor.offset = 0;
         tensor.bytes = bytes;
         tensor.owner = 1;
+        ds4_gpu_ctx_residency_note(tensor.buffer, 1);
         uint64_t live_snap = 0;
         uint64_t peak_snap = 0;
         pthread_mutex_lock(&g_tensor_mu);
@@ -9558,6 +9597,7 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
                         (double)peak_snap / (1024.0 * 1024.0));
             }
         }
+        if (owner) ds4_gpu_ctx_residency_note(obj.buffer, 0);
         obj.buffer = nil;
         obj.offset = 0;
         obj.bytes = 0;
@@ -9781,6 +9821,7 @@ int ds4_gpu_begin_commands(void) {
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_PRE_M5_HEAD_RMS_ROPE_PIPELINE_STATIC") == NULL;
     g_batch_cb_created_ms = ds4_gpu_now_ms();
+    ds4_gpu_ctx_residency_flush();
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
