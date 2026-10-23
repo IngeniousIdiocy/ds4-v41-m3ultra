@@ -281,6 +281,22 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     ds4_vision_embedding *out,
                                     char *error,
                                     size_t error_cap);
+/* V4.1 only: the embedding of an image without running the encoder (data NULL;
+ * fingerprint, rows and layout filled). ds4_prompt_append_vision accepts it, and
+ * ds4_vision_span_fill adds the rows from the encoder output when a prefill needs
+ * them. Returns 0 for other models, which must encode. */
+int ds4_engine_vision_describe_memory(ds4_engine *e,
+                                      const uint8_t *encoded,
+                                      size_t encoded_len,
+                                      ds4_vision_embedding *out,
+                                      char *error,
+                                      size_t error_cap);
+/* Fill a described span's rows from the same image's encoder output (consumed). */
+int ds4_vision_span_fill(ds4_engine *e,
+                         ds4_vision_span *span,
+                         ds4_vision_embedding *encoded,
+                         char *error,
+                         size_t error_cap);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
 int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_tokens *tokens,
@@ -447,6 +463,10 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* The first prompt position a sync would prefill (the kept prefix length). An
+ * image span ending at or before it needs no rows; images may pass data NULL. */
+int ds4_session_prefill_start(const ds4_session *s, const ds4_tokens *prompt,
+                              const ds4_vision_span *images, size_t image_count);
 int ds4_session_sync_multimodal(ds4_session *s,
                                 const ds4_tokens *prompt,
                                 const ds4_vision_span *images,
@@ -478,6 +498,17 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* The checkpoint's image identities for the disk KV cache: token_start, row
+ * count and fingerprint per image (embedding data stays NULL). Returns the
+ * count, or -1 when the state cannot be persisted by identity: no valid
+ * checkpoint, a sync still conditioning on images, more than cap images, or
+ * a backend whose image state is more than its payload rows. */
+int ds4_session_vision_identities(const ds4_session *s, ds4_vision_span *out, int cap);
+/* Attach the identities stored with a disk payload just loaded into s, so a
+ * multimodal sync can extend it. Spans must cover image placeholder tokens in
+ * order; false leaves the checkpoint's identities unchanged. n = 0 clears them. */
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_span *images, size_t n);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -674,8 +705,12 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
-/* FNV-1a of the GGUF header region (metadata + tensor table); which 0 main, 1 drafter. */
+/* FNV-1a of the GGUF header region (metadata + tensor table); which 0 main, 1 drafter, 2 vision. */
 uint64_t ds4_engine_model_fingerprint(ds4_engine *e, int which);
+/* Identity of the numerics that build image state: the vision GGUF's fingerprint, tagged when the encoder's
+ * output is not the exact one (V4.1 flash attention on Metal) and when image prompts prefill with IMAGE_CED.
+ * 0 without a vision model. */
+uint64_t ds4_engine_vision_encoder_identity(ds4_engine *e);
 /* Weight representation consumed by prefill; part of the persisted-state identity. */
 const char *ds4_engine_prefill_repr(ds4_engine *e);
 /* Value source of the narrow copies prefill reads: none | public | src:<sha256-16>. */

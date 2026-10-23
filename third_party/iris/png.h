@@ -109,6 +109,9 @@ png_image *png_clone(const png_image *img);
  * ======================================================================== */
 
 #ifdef PNG_IMPLEMENTATION
+#ifdef __APPLE__
+#include <compression.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,13 +166,18 @@ png_image *png_clone(const png_image *img) {
  * ======================================================================== */
 
 static uint32_t png_update_crc(uint32_t crc, const uint8_t *buf, size_t len) {
-    uint32_t c = crc;
-    for (size_t n = 0; n < len; n++) {
-        c ^= buf[n];
-        for (int bit = 0; bit < 8; bit++) {
-            c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
+    static uint32_t table[256];
+    static int table_ready;
+    if (!table_ready) {   /* idempotent: concurrent first callers write the same values */
+        for (uint32_t n = 0; n < 256; n++) {
+            uint32_t c = n;
+            for (int bit = 0; bit < 8; bit++) c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
+            table[n] = c;
         }
+        table_ready = 1;
     }
+    uint32_t c = crc;
+    for (size_t n = 0; n < len; n++) c = table[(c ^ buf[n]) & 0xffu] ^ (c >> 8);
     return c;
 }
 
@@ -182,10 +190,17 @@ static uint32_t png_crc(const uint8_t *buf, size_t len) {
  * ======================================================================== */
 
 static uint32_t png_adler32(const uint8_t *data, size_t len) {
+    /* zlib's deferred reduction: 5552 bytes is the longest run whose sums cannot overflow 32 bits. */
     uint32_t a = 1, b = 0;
-    for (size_t i = 0; i < len; i++) {
-        a = (a + data[i]) % 65521;
-        b = (b + a) % 65521;
+    while (len) {
+        size_t n = len < 5552 ? len : 5552;
+        len -= n;
+        while (n--) {
+            a += *data++;
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
     }
     return (b << 16) | a;
 }
@@ -602,9 +617,22 @@ static uint8_t *png_inflate_zlib(const uint8_t *data, size_t len, size_t expecte
     size_t deflate_len = len - pos - 4;
     png_bitstream bs = {data + pos, deflate_len, 0, 0, 0};
 
-    uint8_t *out = (uint8_t *)malloc(expected_len);
+    uint8_t *out = (uint8_t *)malloc(expected_len + 1);
     if (!out) return NULL;
     size_t out_pos = 0;
+
+#ifdef __APPLE__
+    /* The system DEFLATE decoder (COMPRESSION_ZLIB is raw DEFLATE), accepted only when it yields exactly
+     * expected_len bytes with a matching Adler-32; anything else falls through to the bit decoder below.
+     * DS4_DISABLE_PNG_SYSTEM_INFLATE=1 always uses the bit decoder. */
+    if (getenv("DS4_DISABLE_PNG_SYSTEM_INFLATE") == NULL) {
+        const size_t n = compression_decode_buffer(out, expected_len + 1, data + pos, deflate_len,
+                                                   NULL, COMPRESSION_ZLIB);
+        const uint32_t adler = ((uint32_t)data[len - 4] << 24) | ((uint32_t)data[len - 3] << 16) |
+                               ((uint32_t)data[len - 2] << 8) | (uint32_t)data[len - 1];
+        if (n == expected_len && png_adler32(out, expected_len) == adler) return out;
+    }
+#endif
 
     static const int len_base[29] = {
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13,

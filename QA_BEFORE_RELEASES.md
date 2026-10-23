@@ -1165,6 +1165,17 @@ clients.
   images must not reuse incompatible KV. Include visible-history replay that
   omits hidden reasoning, concurrent requests, and a roughly 50K-token prefix
   (`--archive-lines 4200 --append-only`, with a sufficiently large `--ctx`).
+- For a served V4.1 vision model, run `python3 tests/test_server_vision_disk_cache.py
+  --output /tmp/vision-disk-qa -- -m MODEL --vision VISION [production flags]`
+  with no other model process running; it starts `./ds4-server` itself on a fresh
+  `--kv-disk-dir`. An image chat in dsh's shape (a `read_image` tool result
+  resent every turn on `/v1/messages`) must be checkpointed with its image
+  identity at shutdown, restored after the restart with no full re-read
+  (`multimodal disk kv hit`) and no encoder run for the restored image (`vision
+  encoder skipped`), and still answer from the image. The same text with
+  another image must miss (`multimodal disk kv miss`) and re-read. Run it again
+  with `--text-only` on this build and the previous one: text checkpoint save
+  and restore times must not regress.
 - Run `python3 tests/test_server_vision_agent.py --url http://127.0.0.1:8000
   --pi /path/to/pi --output /tmp/vision-agent-qa` for both vision models. Pi must
   actually read the two images, edit the program and pass the independent

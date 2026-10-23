@@ -7355,16 +7355,17 @@ static void deepseek4_vision_weights_bind(
         ds4_deepseek4_vision_weights *w,
         const ds4_model *m) {
     const bool v41 = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
-    const char *revision = v41 ? "df42c109f1defefcbfcedbe7d905718a12266e40" :
-                                "e46e16bf6035c6f317eb2ac7458eb0362926d402";
     const uint32_t projection = v41 ? 5120u : 4096u;
     ds4_str arch = {0}, source_revision = {0}, variant = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
         !ds4_streq(arch, "deepseek4-vision")) {
         ds4_die("--vision file is not a DeepSeek V4 vision encoder GGUF");
     }
+    /* V4.1 has several released checkpoints; engine open pairs the sidecar
+     * with the language GGUF by source revision instead. */
     if (!model_get_string(m, "general.source.revision", &source_revision) ||
-        !ds4_streq(source_revision, revision) ||
+        (!v41 && !ds4_streq(source_revision,
+                            "e46e16bf6035c6f317eb2ac7458eb0362926d402")) ||
         !model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) ||
         !ds4_streq(variant, v41 ? "v4.1-flash" : "vision-exp")) {
         ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
@@ -41016,6 +41017,11 @@ typedef struct {
 
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
+    /* SUFFIX_TRIM: the rows the untrimmed chunk would run here; the F32 router picks its kernel for these. 0: the
+     * batch's own. */
+    uint32_t plan_rows;
+    /* CED: a prefill sweep's decoder rows see no window keys before this position (0: all of them) */
+    uint32_t window_floor;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
@@ -41463,6 +41469,7 @@ static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights 
     const ds4_vision_span *image = ds41_image_at(g, pos);
     if (!image) return ds4_gpu_embed_token_hc_tensor(out, m->map, m->size,
         w->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token, DS4_N_EMBD, DS4_N_HC);
+    if (!image->embedding.data) return false;
     const float *data = image->embedding.data + (uint64_t)(pos - image->token_start) * DS4_N_EMBD;
     return ds4_gpu_tensor_write(scratch, 0, data, (uint64_t)DS4_N_EMBD * sizeof(float)) &&
         ds4_gpu_repeat_hc_tensor(out, scratch, DS4_N_EMBD, DS4_N_HC);
@@ -42928,7 +42935,9 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, ds41_gpu_graph *const *graph
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (start + count) / ratio : 0;
-    const uint32_t previous = start < 127u ? start : 127u;
+    /* CED: window keys before window_floor are not visible */
+    const uint32_t visible = start > g->window_floor ? start - g->window_floor : 0u;
+    const uint32_t previous = visible < 127u ? visible : 127u;
     const uint32_t raw_start = (start - previous) % 128u;
     const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
     const uint32_t n_raw = previous + count;
@@ -43242,6 +43251,16 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+/* Router logits for a batch; inside a trimmed sweep the F32 router picks the kernel the whole chunk would use. */
+static bool ds41_router_batch(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t count) {
+#ifdef __APPLE__
+    if (g->plan_rows > count && count > DS4_TP_BATCH_MAX_ROWS && l->ffn_gate_inp->type == DS4_TENSOR_F32)
+        return ds4_gpu_matmul_f32_plan_tensor(g->batch.route_logits, m->map, m->size,
+            l->ffn_gate_inp->abs_offset, DS4_N_EMBD, DS4_N_EXPERT, g->batch.norm, count, g->plan_rows) != 0;
+#endif
+    return ds41_matmul_batch(g->batch.route_logits, m, l->ffn_gate_inp, g->batch.norm, count, false);
+}
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner, bool shared_down) {
@@ -43261,7 +43280,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_EXPERT_WEIGHT_SCALE, count);
 #endif
     return (routed ||
-            (ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+            (ds41_router_batch(g, m, l, count) &&
              ds41_route_batch(g, m, l, count))) &&
         ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         ((ds41_shared_swiglu(b->shared_mid, m, l, b->norm, count) ||
@@ -43977,16 +43996,37 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               bool encoder_only, bool resume_encoder,
                               const int *next_tokens, uint32_t next_count) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
+    /* CED (the V4.1 report's causal encoder-decoder with SWA bounded replay): decoder layers 20-39 read the global
+     * keys the encoder layers publish and only a 128-row window of their own, so a sweep replays just its last 256
+     * rows through them (the last 128 see full windows), their windows truncated to the replayed segment. DeepSeek
+     * post-trained the model for this mode; it is not bit-identical to the full forward. */
+    const uint32_t ced_tail = 256u;
+    const bool ced = ds41_on(DS4_GPU_V41_CED) && !g->quality && !g->streaming &&
+        (!g->image_count || ds41_on(DS4_GPU_V41_IMAGE_CED)) &&
+        total_count >= ced_tail + 256u && total_count <= g->carry_cap;
+    /* SUFFIX_TRIM: sweeps of 1,024-8,191 rows trim the decoder suffix inside the plain schedule's chunks, with each
+     * kept row on the kernels the untrimmed chunk would use, so the output is unchanged. Below 1,024 rows it does not
+     * pay. */
+    const bool trim = !ced && ds41_on(DS4_GPU_V41_SUFFIX_TRIM) && !g->quality && g->tp_world == 1 && !g->streaming &&
+        (!g->image_count || ds41_on(DS4_GPU_V41_IMAGE_TRIM)) &&
+        total_count >= 1024u && total_count < 8192u && total_count <= g->carry_cap;
     /* DS4_V41_SUFFIX_ALL: the exact dependency suffix for short sweeps too, without
      * tile rounding; same math, other kernels for the smaller row counts. */
-    const bool suffix_all = getenv("DS4_V41_SUFFIX_ALL") && g->tp_world == 1 && !g->streaming &&
+    const bool suffix_all = !ced && !trim && getenv("DS4_V41_SUFFIX_ALL") && g->tp_world == 1 && !g->streaming &&
         !g->image_count && total_count >= 384u && total_count <= g->carry_cap;
-    const bool wide = total_count > encoder_chunk || suffix_all;
+    const bool wide = total_count > encoder_chunk || suffix_all || trim || ced;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
+    /* PREFILL_PIPELINE: a layer whose rows run as one chunk commits without waiting, and the host encodes the next
+     * layer while the GPU runs it. The host writes the next layer's token ids and image mask unchanged, so it waits
+     * only where it writes or reads GPU memory the earlier layers use: before the Engram layers 1 and 14 and the
+     * read-ahead that starts at layer 2 and after 14, and where the decoder starts (layer 20). The streaming
+     * expert cache seed reads each layer's routing on the host, so streaming keeps every wait. */
+    const bool pipeline_layers = ds41_on(DS4_GPU_V41_PREFILL_PIPELINE) && g->tp_world == 1 && !g->streaming &&
+        !profile && !stage_profile;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
     const bool batch_attention = !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN");
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
@@ -43996,7 +44036,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * window of every layer's stream. SHORT_SWEEP rebuilds that suffix from as many rows, not from 8192. */
     const uint32_t kept = g->dspark ? 128u : 1u;
     const uint32_t suffix_rows = kept + (DS4_N_LAYER - 20u) * 127u;
-    const bool decoder_suffix = suffix_all || (wide && total_count >= (ds41_on(DS4_GPU_V41_SHORT_SWEEP) ? suffix_rows : 8192u) &&
+    const bool decoder_suffix = ced || trim || suffix_all || (wide && total_count >= (ds41_on(DS4_GPU_V41_SHORT_SWEEP) ? suffix_rows : 8192u) &&
                                                !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX"));
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
@@ -44044,6 +44084,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     }
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
     metal_graph_stream_prepare_slot prepare = {0};
+    /* CARRY_KEEP: rows a one-chunk layer stored to the carry are still in the batch buffers when the next layer
+     * starts on the same rows, so it does not load them back. */
+    const bool carry_keep = pipeline_layers && ds41_on(DS4_GPU_V41_CARRY_KEEP);
+    uint32_t kept_off = UINT32_MAX, kept_count = 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
         if (encoder_only && il == 20u) {
@@ -44114,15 +44158,34 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         }
         const double t_map = profile ? now_sec() : 0;
         uint32_t first = 0;
+        /* Keep the decoder suffix's established matrix partitions; unlike
+         * the encoder, its shrinking tail is not aligned to large tiles. */
+        const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
         if (ok && decoder_suffix && il >= 20u) {
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
+            if (ced) {
+                first = total_count - ced_tail;
+                g->window_floor = initial_start + first;
+            }
+        }
+        if (ok && decoder_suffix && il >= 20u && !ced) {
             const uint32_t needed = kept + (DS4_N_LAYER - 1u - il) * 127u;
             first = needed < total_count ? total_count - needed : 0u;
+            if (trim) {
+                /* SUFFIX_TRIM: skip the plain schedule's chunks before the cut and start the cut chunk at a 128-row
+                 * boundary of the sequence (the compressor blocks), keeping 256 or more rows: below that, router and
+                 * expert kernels change. Its rows pick kernels as the whole chunk would (plan_rows below). */
+                const uint32_t cs = first - first % chunk;
+                const uint32_t ce = total_count - cs < chunk ? total_count : cs + chunk;
+                if (ce - first < 256u) first = ce - cs > 256u ? ce - 256u : cs;
+                const uint32_t over = (initial_start + first) % 128u;
+                first = first - cs >= over ? first - over : cs;
+            }
             /* SHORT_SWEEP: short sweeps prune whole tiles and warm a complete one, keeping the partitions the
              * plain schedule would have used */
-            const bool short_sweep = total_count < 8192u && ds41_on(DS4_GPU_V41_SHORT_SWEEP) && !suffix_all;
+            const bool short_sweep = total_count < 8192u && ds41_on(DS4_GPU_V41_SHORT_SWEEP) && !suffix_all && !trim;
             if (short_sweep) first -= first % 2048u;
             uint32_t warm = short_sweep ? 128u : 127u;
             /* rows before the sweep are already in the window ring */
@@ -44130,12 +44193,14 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ok && first) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                 first - warm, warm, false, batch_hc, batch_attention, cancel, cancel_ud);
         }
-        /* Keep the decoder suffix's established matrix partitions; unlike
-         * the encoder, its shrinking tail is not aligned to large tiles. */
-        const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
-        for (uint32_t off = first; ok && off < total_count; off += chunk) {
+        for (uint32_t off = first; ok && off < total_count;
+             off += trim ? chunk - off % chunk : chunk) {
             if (cancel && cancel(cancel_ud)) { ok = false; break; }
-            const uint32_t count = total_count - off < chunk ? total_count - off : chunk;
+            const uint32_t span = trim ? chunk - off % chunk : chunk;
+            const uint32_t count = total_count - off < span ? total_count - off : span;
+            const uint32_t chunk_rows = total_count - (off - off % chunk) < chunk ?
+                total_count - (off - off % chunk) : chunk;
+            g->plan_rows = trim ? chunk_rows : 0u;
             const uint32_t start = initial_start + off;
             g->pos = start;
             ds41_prefill_row active = {0};
@@ -44195,9 +44260,19 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     }
                 }
             } else if (wide) {
-                if (ok) ok = ds41_carry_copy(g, off, count, false);
+                /* the decoder's prepare loads its warm rows into the batch buffers */
+                const bool kept = carry_keep && off == kept_off && count == kept_count &&
+                    !(decoder_suffix && il >= 20u && (il == 20u || !ced));
+                if (ok && !kept)
+                    ok = ds41_carry_copy(g, off, count, false);
             }
-            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+            /* PREFILL_PIPELINE: the layer's rows run as one chunk. The layer's start (embedding or carry copy)
+             * never waits; the layer's end waits before the host-side work named above. */
+            const bool one_chunk = pipeline_layers && off == first && off + count == total_count;
+            const bool layer_async = one_chunk && il + 1u < DS4_N_LAYER &&
+                il != 0u && il != 1u && il != 13u && il != 14u && il != 19u;
+            if (ds4_gpu_commands_active() &&
+                !(one_chunk ? ds4_gpu_end_commands_async() : ds4_gpu_end_commands())) ok = false;
             const double t_ready = profile ? now_sec() : 0;
             if (ok && ds41_engram_layer(il)) {
                 const uint32_t engram = il == 1 ? 0 : 1;
@@ -44311,8 +44386,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ok && wide && il + 1u < DS4_N_LAYER) {
                 ok = ds41_carry_copy(g, off, count, true);
             }
+            kept_off = off == first && off + count == total_count ? off : UINT32_MAX;
+            kept_count = count;
             const double t_encoded = profile ? now_sec() : 0;
-            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+            if (ds4_gpu_commands_active() &&
+                !(layer_async ? ds4_gpu_end_commands_async() : ds4_gpu_end_commands())) ok = false;
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
             if (ok && !encoder_only && off + count == total_count)
@@ -44348,7 +44426,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 row.pre = g->rows_view[count - 1u].ffn_split;
             }
         }
+        g->plan_rows = 0;
     }
+    g->plan_rows = 0;
+    g->window_floor = 0;
     if (!ds41_engram_prefetch_join(engram_pf, !ok)) ok = false;
     if (!ok) ds41_engram_carry_drop(g);
 #ifdef DS4_ROCM_BUILD
@@ -44751,6 +44832,16 @@ struct ds4_engine {
     int vision_image_token;
     int vision_start_token;
     int vision_end_token;
+    /* VISION_PREP_REUSE: patches a V4.1 describe built, for the encode of the same encoded bytes */
+    struct {
+        uint8_t *encoded;
+        size_t encoded_len;
+        uint32_t width, height;
+        uint8_t fingerprint[32];
+        ds4_deepseek4_image_patches patches;
+        uint64_t tick;
+    } vision_prep[4];
+    uint64_t vision_prep_tick;
     ds4_backend backend;
     ds4_support_kind support_kind;
     int dspark_exec_tier;
@@ -65273,17 +65364,44 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 
 /* 64-bit FNV-1a of a GGUF's header region [0, tensor data): metadata (tokenizer,
  * templates, hyperparameters) and the tensor table (names, types, shapes,
- * offsets). which: 0 main model, 1 drafter. 0 when absent. Binds state to the
- * model layout without hashing hundreds of GB. */
+ * offsets). which: 0 main model, 1 drafter, 2 vision encoder. 0 when absent.
+ * Binds state to the model layout without hashing hundreds of GB. */
 uint64_t ds4_engine_model_fingerprint(ds4_engine *e, int which) {
     if (!e) return 0;
-    const ds4_model *m = which == 0 ? &e->model : which == 1 ? &e->mtp_model : NULL;
+    const ds4_model *m = which == 0 ? &e->model : which == 1 ? &e->mtp_model :
+                         which == 2 ? &e->vision_model : NULL;
     if (!m || !m->map || !m->tensor_data_pos || m->tensor_data_pos > m->file_size) return 0;
     uint64_t h = UINT64_C(1469598103934665603);
     for (uint64_t i = 0; i < m->tensor_data_pos; i++) { h ^= m->map[i]; h *= UINT64_C(1099511628211); }
     h ^= m->file_size;
     h *= UINT64_C(1099511628211);
     return h ? h : 1;
+}
+
+uint64_t ds4_engine_vision_encoder_identity(ds4_engine *e) {
+    uint64_t h = ds4_engine_model_fingerprint(e, 2);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Flash attention's embeddings are accurate but not the exact encoder's, so state built
+     * from them must never restore under the exact encoder, nor the other way round. */
+    if (h && e->vision_kind == DS4_VISION_DEEPSEEK4 &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds4_gpu_deepseek41_vision_attn_flash()) {
+        /* "flash4": lazy, 16-key tiles; "flash3": lazy, 64-key tiles; "flash2": every tile rescales (flash v2) */
+        h ^= !ds4_gpu_deepseek41_vision_attn_lazy() ? UINT64_C(0x666c61736832) :
+             ds4_gpu_deepseek41_vision_attn_kt16() ? UINT64_C(0x666c61736834) : UINT64_C(0x666c61736833);
+        h *= UINT64_C(1099511628211);
+        if (!h) h = 1;
+    }
+    /* IMAGE_CED replays only a sweep's tail through the decoder layers on prompts with images, so image state
+     * built with it must never restore where image prompts run the full replay (DS4_V41_EXACT=1, or either
+     * switch off), nor the other way round. The text canary cannot tell these apart: it holds no image. */
+    if (h && e->vision_kind == DS4_VISION_DEEPSEEK4 && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        ds41_on(DS4_GPU_V41_CED) && ds41_on(DS4_GPU_V41_IMAGE_CED)) {
+        h ^= UINT64_C(0x696d67636564);   /* "imgced" */
+        h *= UINT64_C(1099511628211);
+        if (!h) h = 1;
+    }
+#endif
+    return h;
 }
 
 /* The weight representation the prefill path consumes, family by family:
@@ -73702,7 +73820,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->glm_mtp = opt->glm_mtp;
     e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;
-    e->dspark_strict = opt->dspark_strict;
+    const char *exact = getenv("DS4_V41_EXACT");   /* the exact shortcut: DSpark keeps target-only decode */
+    e->dspark_strict = opt->dspark_strict || (exact && exact[0] && strcmp(exact, "0") != 0);
+    if (exact && exact[0] && strcmp(exact, "0") != 0)
+        fprintf(stderr, "ds4: exact: V4.1 groups that are not bit-identical to main's serial decode are off; "
+                "DSpark keeps target-only decode\n");
     e->dspark_exact_sampling = opt->dspark_exact_sampling;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
@@ -73931,8 +74053,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     DS4_DEEPSEEK4_IMAGE;
             e->vision_end_token = DS4_N_VOCAB +
                                   DS4_DEEPSEEK4_IMAGE_END;
-            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
+            if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+                ds4_str language = {0}, vision = {0};
+                if (!model_get_string(&e->model, "general.source.revision", &language) ||
+                    !model_get_string(&e->vision_model, "general.source.revision", &vision) ||
+                    !ds4_str_eq(language, vision)) {
+                    ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
+                }
                 e->vision_start_token = e->vision_image_token = e->vision_end_token = 129264;
+            }
             e->vision_kind = DS4_VISION_DEEPSEEK4;
         }
         e->vision_ready = true;
@@ -75323,6 +75452,30 @@ static int ds4_prompt_append_deepseek4_vision(
             snprintf(error, error_cap, "DeepSeek vision prompt is too large");
         return 0;
     }
+    if (!embedding->data) {
+        /* A described V4.1 image (ds4_engine_vision_describe_memory): its tokens
+         * do not depend on the rows, which ds4_vision_span_fill adds when a
+         * prefill needs them. V4 tokens are typed by row, so V4 never defers. */
+        if (!v41) {
+            ds4_deepseek4_image_layout_free(&layout);
+            if (error && error_cap)
+                snprintf(error, error_cap, "invalid vision prompt input");
+            return 0;
+        }
+        const uint32_t token_start = (uint32_t)tokens->len;
+        for (uint32_t i = 0; i < layout.token_count; i++)
+            ds4_tokens_push(tokens, e->vision_image_token);
+        memset(span, 0, sizeof(*span));
+        span->token_start = token_start;
+        span->embedding = *embedding;
+        span->embedding.token_count = layout.token_count;
+        span->embedding.layout = 0;
+        span->embedding.grid_width = 0;
+        span->embedding.grid_height = 0;
+        memset(embedding, 0, sizeof(*embedding));
+        ds4_deepseek4_image_layout_free(&layout);
+        return 1;
+    }
     const uint64_t values = (uint64_t)layout.token_count * DS4_N_EMBD;
     if (values > SIZE_MAX / sizeof(float)) {
         ds4_deepseek4_image_layout_free(&layout);
@@ -75430,7 +75583,9 @@ int ds4_prompt_append_vision(
         ds4_vision_embedding *embedding,
         char *error,
         size_t error_cap) {
-    if (!e || !tokens || !span || !embedding || !embedding->data ||
+    const bool described = e && e->vision_kind == DS4_VISION_DEEPSEEK4 &&
+                           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
+    if (!e || !tokens || !span || !embedding || (!embedding->data && !described) ||
         embedding->token_count == 0 || !e->vision_ready) {
         if (error && error_cap) snprintf(error, error_cap, "invalid vision prompt input");
         return 0;
@@ -75573,13 +75728,78 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+/* VISION_PREP_REUSE (default on; DS4_DISABLE_V41_VISION_PREP_REUSE=1 off). The server describes every new V4.1
+ * image before the prompt (decode + patchify, for its token count and fingerprint), and the prefill then encoded the
+ * same bytes again from scratch. The describe step keeps its patches here, keyed by a copy of the encoded bytes
+ * (compared in full), and the encode of the same bytes takes them: the same pixels and patches, one decode. Four
+ * entries, oldest replaced; an entry is consumed by its encode. */
+static pthread_mutex_t g_vision_prep_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void vision_prep_put(ds4_engine *e, const uint8_t *encoded, size_t encoded_len, const ds4_image *image,
+                            ds4_deepseek4_image_patches *patches) {
+    if (getenv("DS4_DISABLE_V41_VISION_PREP_REUSE")) return;
+    uint8_t *copy = malloc(encoded_len ? encoded_len : 1);
+    if (!copy) return;
+    memcpy(copy, encoded, encoded_len);
+    pthread_mutex_lock(&g_vision_prep_mutex);
+    int slot = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!e->vision_prep[i].encoded) { slot = i; break; }
+        if (e->vision_prep[i].tick < e->vision_prep[slot].tick) slot = i;
+    }
+    free(e->vision_prep[slot].encoded);
+    ds4_deepseek4_image_patches_free(&e->vision_prep[slot].patches);
+    e->vision_prep[slot].encoded = copy;
+    e->vision_prep[slot].encoded_len = encoded_len;
+    e->vision_prep[slot].width = image->width;
+    e->vision_prep[slot].height = image->height;
+    memcpy(e->vision_prep[slot].fingerprint, image->fingerprint, sizeof(image->fingerprint));
+    e->vision_prep[slot].patches = *patches;
+    e->vision_prep[slot].tick = ++e->vision_prep_tick;
+    memset(patches, 0, sizeof(*patches));
+    pthread_mutex_unlock(&g_vision_prep_mutex);
+}
+
+static int vision_prep_take(ds4_engine *e, const uint8_t *encoded, size_t encoded_len, ds4_image *image,
+                            ds4_deepseek4_image_patches *patches) {
+    int found = 0;
+    pthread_mutex_lock(&g_vision_prep_mutex);
+    for (int i = 0; i < 4 && !found; i++) {
+        if (!e->vision_prep[i].encoded || e->vision_prep[i].encoded_len != encoded_len ||
+            memcmp(e->vision_prep[i].encoded, encoded, encoded_len)) continue;
+        memset(image, 0, sizeof(*image));
+        image->width = e->vision_prep[i].width;
+        image->height = e->vision_prep[i].height;
+        memcpy(image->fingerprint, e->vision_prep[i].fingerprint, sizeof(image->fingerprint));
+        *patches = e->vision_prep[i].patches;
+        free(e->vision_prep[i].encoded);
+        memset(&e->vision_prep[i], 0, sizeof(e->vision_prep[i]));
+        found = 1;
+    }
+    pthread_mutex_unlock(&g_vision_prep_mutex);
+    return found;
+}
+
+static void vision_prep_free_all(ds4_engine *e) {
+    pthread_mutex_lock(&g_vision_prep_mutex);
+    for (int i = 0; i < 4; i++) {
+        free(e->vision_prep[i].encoded);
+        ds4_deepseek4_image_patches_free(&e->vision_prep[i].patches);
+        memset(&e->vision_prep[i], 0, sizeof(e->vision_prep[i]));
+    }
+    pthread_mutex_unlock(&g_vision_prep_mutex);
+}
+
+/* prepared: V4.1 patches from vision_prep_take (consumed; image then carries only size and fingerprint), or NULL */
 static int ds4_engine_vision_encode_image(
         ds4_engine            *e,
         const ds4_image       *image,
+        ds4_deepseek4_image_patches *prepared,
         ds4_vision_embedding  *out,
         char                  *error,
         size_t                 error_cap) {
     if (!e || !image || !out || !e->vision_ready) {
+        if (prepared) ds4_deepseek4_image_patches_free(prepared);
         if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
         return 0;
     }
@@ -75605,6 +75825,7 @@ static int ds4_engine_vision_encode_image(
 #endif
     }
     if (!e->metal_ready || !e->vision_map_ready) {
+        if (prepared) ds4_deepseek4_image_patches_free(prepared);
         if (error && error_cap) {
             snprintf(error, error_cap, "unable to map vision weights on %s",
                      ds4_backend_name(e->backend));
@@ -75620,9 +75841,16 @@ static int ds4_engine_vision_encode_image(
     int ok = 0;
     if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
         ds4_deepseek4_image_patches patches = {0};
-        const bool preprocessed = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
-            ds4_image_preprocess_deepseek41(&patches, image, error, error_cap) :
-            ds4_image_preprocess_deepseek4(&patches, image, error, error_cap);
+        bool preprocessed;
+        if (prepared) {
+            patches = *prepared;
+            memset(prepared, 0, sizeof(*prepared));
+            preprocessed = true;
+        } else {
+            preprocessed = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
+                ds4_image_preprocess_deepseek41(&patches, image, error, error_cap) :
+                ds4_image_preprocess_deepseek4(&patches, image, error, error_cap);
+        }
         if (!preprocessed) return 0;
         token_count = patches.llm_grid_height * patches.llm_grid_width;
         embedding = malloc((size_t)token_count * DS4_N_EMBD * sizeof(float));
@@ -75751,7 +75979,7 @@ int ds4_engine_vision_encode_file(
         size_t error_cap) {
     ds4_image image = {0};
     if (!ds4_image_decode_file(&image, path, error, error_cap)) return 0;
-    int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
+    int ok = ds4_engine_vision_encode_image(e, &image, NULL, out, error, error_cap);
     ds4_image_free(&image);
     return ok;
 }
@@ -75764,10 +75992,75 @@ int ds4_engine_vision_encode_memory(
         char *error,
         size_t error_cap) {
     ds4_image image = {0};
+    ds4_deepseek4_image_patches prepared = {0};
+    if (e && e->vision_kind == DS4_VISION_DEEPSEEK4 && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        vision_prep_take(e, encoded, encoded_len, &image, &prepared))
+        return ds4_engine_vision_encode_image(e, &image, &prepared, out, error, error_cap);
     if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
-    int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
+    int ok = ds4_engine_vision_encode_image(e, &image, NULL, out, error, error_cap);
     ds4_image_free(&image);
     return ok;
+}
+
+int ds4_engine_vision_describe_memory(
+        ds4_engine *e,
+        const uint8_t *encoded,
+        size_t encoded_len,
+        ds4_vision_embedding *out,
+        char *error,
+        size_t error_cap) {
+    if (!e || !out || !e->vision_ready || e->vision_kind != DS4_VISION_DEEPSEEK4 ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return 0;
+    memset(out, 0, sizeof(*out));
+    ds4_image image = {0};
+    if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
+    ds4_deepseek4_image_patches patches = {0};
+    const int ok = ds4_image_preprocess_deepseek41(&patches, &image, error, error_cap);
+    if (ok) {
+        out->token_count = patches.llm_grid_height * patches.llm_grid_width;
+        out->layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL;
+        out->grid_width = patches.llm_grid_width;
+        out->grid_height = patches.llm_grid_height;
+        out->width = image.width;
+        out->height = image.height;
+        out->content_width = patches.content_width;
+        out->content_height = patches.content_height;
+        memcpy(out->fingerprint, image.fingerprint, sizeof(out->fingerprint));
+        vision_prep_put(e, encoded, encoded_len, &image, &patches);
+    }
+    ds4_deepseek4_image_patches_free(&patches);
+    ds4_image_free(&image);
+    return ok;
+}
+
+int ds4_vision_span_fill(
+        ds4_engine *e,
+        ds4_vision_span *span,
+        ds4_vision_embedding *encoded,
+        char *error,
+        size_t error_cap) {
+    if (!e || !span || span->embedding.data || !encoded || !encoded->data ||
+        memcmp(span->embedding.fingerprint, encoded->fingerprint,
+               sizeof(encoded->fingerprint))) {
+        if (error && error_cap)
+            snprintf(error, error_cap, "encoded image does not match its prompt span");
+        return 0;
+    }
+    /* The rows are the ones ds4_prompt_append_vision builds; V4.1 rows do not
+     * depend on the span's position, so a scratch token list stands in. */
+    ds4_tokens scratch = {0};
+    ds4_vision_span filled = {0};
+    const int ok = ds4_prompt_append_vision(e, &scratch, &filled, encoded, error, error_cap);
+    ds4_tokens_free(&scratch);
+    if (!ok) return 0;
+    if (filled.embedding.token_count != span->embedding.token_count) {
+        ds4_vision_embedding_free(&filled.embedding);
+        if (error && error_cap)
+            snprintf(error, error_cap, "encoded image does not match its prompt span");
+        return 0;
+    }
+    span->embedding.data = filled.embedding.data;
+    return 1;
 }
 
 int ds4_engine_tp_vocab_split(ds4_engine *e) {
@@ -76032,6 +76325,7 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    vision_prep_free_all(e);
     ds4_engine_tp_unbind(e);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     /* Built at open but never bound. */
@@ -78417,6 +78711,78 @@ bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
 
+/* A V4.1 graph payload is the whole image-conditioned state: the embeddings
+ * enter only as prefill input rows, and what they leave behind is in the saved
+ * KV, compressor, indexer and drafter rows. The one derived exception is the
+ * Engram history, which ds41_load_payload rebuilds from tokens; see below.
+ * Other backends keep more (for example rope positions shifted by an image),
+ * and a TP load re-prefills the saved tokens as text, so neither persists. */
+static bool ds4_session_vision_restorable(const ds4_session *s) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    return ds4_session_is_ds41(s) && s->ds41_graph_ready && !s->distributed &&
+           !s->engine->tp.active;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+int ds4_session_vision_identities(const ds4_session *s, ds4_vision_span *out, int cap) {
+    if (!s || !s->checkpoint_valid || s->sync_image_count != 0 || cap < 0 ||
+        s->checkpoint_image_count > (size_t)cap ||
+        (s->checkpoint_image_count && (!out || !ds4_session_vision_restorable(s))))
+        return -1;
+    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
+        memset(&out[i], 0, sizeof(out[i]));
+        out[i].token_start = s->checkpoint_images[i].token_start;
+        out[i].embedding.token_count = s->checkpoint_images[i].token_count;
+        memcpy(out[i].embedding.fingerprint, s->checkpoint_images[i].fingerprint,
+               sizeof(out[i].embedding.fingerprint));
+    }
+    return (int)s->checkpoint_image_count;
+}
+
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_span *images, size_t n) {
+    if (!s || !s->checkpoint_valid || (n && (!images || !ds4_session_vision_restorable(s))))
+        return false;
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t start = images[i].token_start;
+        const uint64_t end = start + images[i].embedding.token_count;
+        if (images[i].embedding.token_count == 0 || start < previous_end ||
+            end > (uint64_t)s->checkpoint.len) return false;
+        for (uint64_t p = start; p < end; p++)
+            if (s->checkpoint.v[p] != s->engine->vision_image_token) return false;
+        previous_end = end;
+    }
+    ds4_vision_identity *copy = n ? xcalloc(n, sizeof(copy[0])) : NULL;
+    for (size_t i = 0; i < n; i++) {
+        copy[i].token_start = images[i].token_start;
+        copy[i].token_count = images[i].embedding.token_count;
+        memcpy(copy[i].fingerprint, images[i].embedding.fingerprint, sizeof(copy[i].fingerprint));
+    }
+    free(s->checkpoint_images);
+    s->checkpoint_images = copy;
+    s->checkpoint_image_count = n;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* Live prefill hashes image rows as dead Engram ids (ds41_text_mask), but
+     * the payload load rebuilt the history tail from the placeholder tokens.
+     * Match the live tail when the frontier is within an n-gram of an image. */
+    if (n && ds4_session_is_ds41(s)) {
+        const uint32_t pos = s->ds41_graph.pos;
+        for (uint32_t i = 0; i < DS4_ENGRAM_NGRAM - 1 && i < pos; i++) {
+            const uint32_t p = pos - 1u - i;
+            for (size_t k = 0; k < n; k++)
+                if (p >= images[k].token_start &&
+                    p - images[k].token_start < images[k].embedding.token_count)
+                    s->ds41_graph.history.tail[i] = DS4_ENGRAM_DEAD;
+        }
+    }
+#endif
+    return true;
+}
+
 static bool ds4_session_vision_range_overlaps(
         const ds4_session *s,
         uint32_t           token_start,
@@ -78617,6 +78983,26 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     return rc;
 }
 
+int ds4_session_prefill_start(const ds4_session *s, const ds4_tokens *prompt,
+                              const ds4_vision_span *images, size_t image_count) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* Mirrors ds4_session_sync: it drops a checkpoint whose images differ, and
+     * the V4.1 branch keeps the checkpoint only when the prompt extends it. */
+    if (s && prompt && ds4_session_is_ds41(s) && s->ds41_graph_ready && !s->distributed &&
+        !s->engine->tp.active && s->checkpoint_valid && s->ds41_graph.valid &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+        ds4_session_vision_prefix_matches(s, images, image_count))
+        return s->checkpoint.len;
+#else
+    (void)s;
+    (void)prompt;
+    (void)images;
+    (void)image_count;
+#endif
+    return 0;
+}
+
 int ds4_session_sync_multimodal(
         ds4_session *s,
         const ds4_tokens *prompt,
@@ -78632,12 +79018,16 @@ int ds4_session_sync_multimodal(
         snprintf(err, errlen, "vision encoder is not loaded");
         return 1;
     }
+    /* An image without rows (described, not encoded) is valid only when the
+     * kept prefix already holds all of it, so prefill never reads its rows. */
+    const uint64_t kept = image_count ?
+        (uint64_t)ds4_session_prefill_start(s, prompt, images, image_count) : 0;
     uint64_t previous_end = 0;
     for (size_t i = 0; i < image_count; i++) {
         const ds4_vision_span *span = &images[i];
         const uint64_t end = (uint64_t)span->token_start +
                              span->embedding.token_count;
-        if (!span->embedding.data || span->embedding.token_count == 0 ||
+        if ((!span->embedding.data && end > kept) || span->embedding.token_count == 0 ||
             span->token_start < previous_end || end > (uint64_t)prompt->len) {
             snprintf(err, errlen, "invalid or overlapping image token span");
             return 1;

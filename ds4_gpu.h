@@ -89,6 +89,21 @@ typedef struct {
 #define DS4_GPU_V41_VERIFY_INDEXED (1ull << 41)   /* a DSpark verify block attends like a short prefill: index top-k and indexed attention as batches */
 #define DS4_GPU_V41_ENGRAM_READERS (1ull << 42)   /* a prefill sweep reads its Engram rows from disk with 32 concurrent readers instead of 16 */
 #define DS4_GPU_V41_SHORT_MMA (1ull << 43)   /* Q8_0 matmuls of eight rows outside a DSpark block on simdgroup matrices, at the row kernels' bits */
+#define DS4_GPU_V41_SUFFIX_TRIM (1ull << 44)   /* prefill sweeps of 1,024-8,191 rows trim the decoder suffix inside their chunks, each kept row on its own kernels */
+#define DS4_GPU_V41_PREFILL_MMA (1ull << 45)   /* prefill attention on simdgroup matrices, 32 heads of a token per threadgroup (not bit-exact: sums reassociated) */
+#define DS4_GPU_V41_CED (1ull << 46)   /* the decoder layers replay only a prefill sweep's last 256 rows, the V4.1 report's CED bounded replay (not bit-exact) */
+#define DS4_GPU_V41_IMAGE_CED (1ull << 47)   /* CED for prompts that hold images too (not bit-exact) */
+#define DS4_GPU_V41_IMAGE_TRIM (1ull << 48)   /* SUFFIX_TRIM for prompts that hold images too, at the same bits */
+#define DS4_GPU_V41_MOE_SHORT_TILES (1ull << 49)   /* routed experts of short prefills on the large-prefill MXFP4 tile variants, at the same bits */
+#define DS4_GPU_V41_PREFILL_PIPELINE (1ull << 50)   /* a prefill sweep commits most layers' command buffers without waiting, so the host encodes the next layer while the GPU runs this one */
+#define DS4_GPU_V41_HC_NARROW (1ull << 51)   /* the HC mix projection of a prefill chunk on one simdgroup per 8 rows instead of a few 64x32 tiles, at the same bits */
+#define DS4_GPU_V41_CTX_RESIDENCY (1ull << 52)   /* the engine's own allocations in a residency set on the queue, so a prefill does not wait while the driver makes them resident */
+#define DS4_GPU_V41_MOE_HALF_X (1ull << 53)   /* the routed experts' compact pair tiles read the rows narrowed to half once per layer, at the same bits */
+#define DS4_GPU_V41_CARRY_KEEP (1ull << 54)   /* a one-chunk prefill layer keeps the previous layer's rows in the batch buffers instead of loading them back from the carry */
+/* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
+ * and keeps DSpark to target-only decode as --dspark-strict does. It is off by default. */
+#define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \
+    DS4_GPU_V41_VERIFY_INDEXED | DS4_GPU_V41_PREFILL_MMA | DS4_GPU_V41_CED | DS4_GPU_V41_IMAGE_CED)
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -130,6 +145,14 @@ int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 uint64_t ds4_gpu_v41_off(void);
+/* V4.1 vision: true when the encoder attends with VISION_ATTN_FLASH (accurate, not bit-exact), that is unless
+ * DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH or DS4_V41_EXACT is set; read on every call, as the encoder does. */
+bool ds4_gpu_deepseek41_vision_attn_flash(void);
+/* VISION_ATTN_LAZY (flash only): the online softmax rescales its output only when a row maximum grows by more than
+ * ln 256; off (DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY) every key tile rescales, flash v2's bits. */
+bool ds4_gpu_deepseek41_vision_attn_lazy(void);
+/* VISION_ATTN_KT16 (lazy flash only): 16-key tiles; off (DS4_METAL_DISABLE_V41_VISION_ATTN_KT16) 64-key tiles. */
+bool ds4_gpu_deepseek41_vision_attn_kt16(void);
 /* V4.1 DSpark: on while the drafter's rows or a verify block are encoded. ROWS_MMA and VERIFY_KERNELS apply only then,
  * so prefills and other batches of 3-8 rows keep main's kernels. */
 void ds4_gpu_dsv41_dspark_rows(int on);
@@ -241,6 +264,9 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Commits the open command batch without waiting; the next ds4_gpu_end_commands (or any wait) waits for it and reports
+ * its errors. */
+int ds4_gpu_end_commands_async(void);
 /* Metal: the next decode token's first command buffer, pre-encoded during this token's terminal wait.
  * end_commands_commit / _wait split ds4_gpu_end_commands around the slot's encoding (bridge: a short GPU kernel
  * behind the committed buffer keeps the GPU busy across the handoff); pe_begin opens the slot as the batch (only
@@ -1246,6 +1272,18 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+/* The same over n_tok rows, with the kernel chosen as for plan_tok rows (plan_tok >= n_tok), so each row gets the
+ * bits of the larger dispatch. */
+int ds4_gpu_matmul_f32_plan_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok);
 
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,

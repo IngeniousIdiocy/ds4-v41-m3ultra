@@ -24,6 +24,25 @@
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
 
+/* Image identity of a checkpoint. The key text holds each image as text_len
+ * bytes of \036 at text_offset (the server's normalized marker); token_start
+ * and token_count are its rows in the payload's token history; fingerprint is
+ * the live path's (SHA-256 of width, height and decoded RGB). An entry with
+ * images carries this list at the front of its verified payload, under payload
+ * ABI 3, which older readers refuse; text-only entries keep ABI 2. */
+#define DS4_KVSTORE_IMAGES_MAX 16
+typedef struct {
+    uint32_t text_offset, text_len;
+    uint32_t token_start, token_count;
+    uint8_t fingerprint[32];
+} ds4_kvstore_image;
+
+typedef struct {
+    uint32_t len;
+    uint64_t encoder;   /* image encoder identity (ds4_engine_vision_encoder_identity) */
+    ds4_kvstore_image v[DS4_KVSTORE_IMAGES_MAX];
+} ds4_kvstore_images;
+
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
     DS4_KVSTORE_REASON_COLD      = 1,
@@ -63,6 +82,7 @@ typedef struct {
     uint64_t file_size;
     uint8_t version;
     uint64_t identity, canary, payload_hash;
+    bool images;   /* payload ABI 3: the payload starts with an image list */
     /* NULL when this engine may load the entry; otherwise why it is refused
      * (old version, payload ABI, identity or canary). Refused entries are
      * indexed only so eviction can reclaim their space. */
@@ -99,6 +119,7 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    const ds4_kvstore_images *images;   /* the incoming entry's, NULL: none */
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -171,6 +192,22 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+/* The longest entry whose key is a byte prefix of prompt_text and whose stored
+ * images are exactly the request's images inside that prefix (NULL: none).
+ * prompt_text has image markers normalized as in the stored keys. */
+int ds4_kvstore_find_image_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                  const ds4_kvstore_images *images,
+                                  int model_id, int quant_bits, int ctx_size);
+/* NULL when stored serves a prompt carrying request's images, else why not:
+ * the images inside the first text_bytes, in order, must sit at the same
+ * offsets with the same fingerprints and row counts, from the same encoder. */
+const char *ds4_kvstore_images_mismatch(const ds4_kvstore_images *stored,
+                                        const ds4_kvstore_images *request,
+                                        uint64_t text_bytes);
+/* The image list at the front of an ABI 3 payload (fp at the payload start;
+ * left after the list). Returns its size in bytes, 0 when malformed. */
+uint64_t ds4_kvstore_read_images(FILE *fp, uint64_t payload_bytes,
+                                 ds4_kvstore_images *out);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -181,6 +218,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const ds4_kvstore_images *images,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len);
@@ -206,7 +244,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol);
+                              bool responses_protocol,
+                              const ds4_kvstore_images *images);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
@@ -258,6 +297,17 @@ bool ds4_kvstore_write_entry(FILE *fp, const uint8_t h[DS4_KVSTORE_FIXED_HEADER]
                              const ds4_kvstore_trailer_hooks *hooks,
                              uint64_t *trailer_bytes, uint64_t *payload_hash,
                              char *err, size_t err_len);
+/* Bytes an image list adds to the payload (0 for none), and the entry body
+ * with one: header ABI 3 and payload_bytes grown by that size, the list
+ * digested ahead of the staged payload. NULL or no images writes ABI 2. */
+uint64_t ds4_kvstore_images_bytes(const ds4_kvstore_images *images);
+bool ds4_kvstore_write_entry_images(FILE *fp, const uint8_t h[DS4_KVSTORE_FIXED_HEADER],
+                                    const char *text, size_t text_len,
+                                    const ds4_kvstore_images *images,
+                                    const ds4_session_payload_file *staged,
+                                    const ds4_kvstore_trailer_hooks *hooks,
+                                    uint64_t *trailer_bytes, uint64_t *payload_hash,
+                                    char *err, size_t err_len);
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
                              uint8_t reason, uint8_t ext_flags,
@@ -267,6 +317,11 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
+/* An entry's file name: the SHA-1 of its key text, extended for an image entry
+ * by the encoder and each image inside the key (offset, marker length, rows,
+ * fingerprint). Text-only names are the plain text SHA-1, as before. */
+void ds4_kvstore_entry_sha(const char *text, size_t len,
+                           const ds4_kvstore_images *images, char out[41]);
 char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);

@@ -490,11 +490,24 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_VERIFY_INDEXED",
             "DS4_METAL_DISABLE_V41_ENGRAM_READERS",
             "DS4_METAL_DISABLE_V41_SHORT_MMA",
+            "DS4_METAL_DISABLE_V41_SUFFIX_TRIM",
+            "DS4_METAL_DISABLE_V41_PREFILL_MMA",
+            "DS4_METAL_DISABLE_V41_CED",
+            "DS4_METAL_DISABLE_V41_IMAGE_CED",
+            "DS4_METAL_DISABLE_V41_IMAGE_TRIM",
+            "DS4_METAL_DISABLE_V41_MOE_SHORT_TILES",
+            "DS4_METAL_DISABLE_V41_PREFILL_PIPELINE",
+            "DS4_METAL_DISABLE_V41_HC_NARROW",
+            "DS4_METAL_DISABLE_V41_CTX_RESIDENCY",
+            "DS4_METAL_DISABLE_V41_MOE_HALF_X",
+            "DS4_METAL_DISABLE_V41_CARRY_KEEP",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
             if (v && v[0] && strcmp(v, "0") != 0) g_v41_off |= 1ull << i;
         }
+        const char *exact = getenv("DS4_V41_EXACT");
+        if (exact && exact[0] && strcmp(exact, "0") != 0) g_v41_off |= DS4_GPU_V41_NOT_EXACT;
         g_v41_off_read = 1;
     }
     return g_v41_off;
@@ -780,6 +793,8 @@ static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_indexed_topk_buffer;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_q8_prefill_scratch_buffer;
+static id<MTLBuffer> g_moe_half_x_buffer;
+static NSUInteger g_moe_half_x_bytes;
 static id<MTLBuffer> g_qwen4_conv_halo_buffer;
 static NSUInteger g_qwen4_conv_halo_bytes;
 static id<MTLBuffer> g_raw_store_round_buffer;
@@ -9389,6 +9404,43 @@ void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
 }
 
+/* CTX_RESIDENCY: every tensor the engine allocates (context, KV and prefill scratch) joins one residency set on the
+ * queue, committed before the next command batch. Without it the driver re-establishes these allocations' residency
+ * when a request's first command buffers use them: 60-80 ms of driver time with the GPU idle at the head of every
+ * prefill. Same bits. */
+static id g_ctx_residency_set;
+static int g_ctx_residency_dirty;
+static void ds4_gpu_ctx_residency_note(id<MTLBuffer> buf, int add) {
+#if TARGET_OS_OSX
+    if (!buf || (add && !ds4_gpu_v41_on(DS4_GPU_V41_CTX_RESIDENCY)) || (!add && !g_ctx_residency_set)) return;
+    if (@available(macOS 15.0, *)) {
+        if (!g_ctx_residency_set) {
+            MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+            desc.label = @"ds4_context";
+            desc.initialCapacity = 4096;
+            NSError *error = nil;
+            g_ctx_residency_set = [g_device newResidencySetWithDescriptor:desc error:&error];
+            if (!g_ctx_residency_set) return;
+            if (g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)])
+                [g_queue addResidencySet:g_ctx_residency_set];
+        }
+        if (add) [g_ctx_residency_set addAllocation:buf];
+        else [g_ctx_residency_set removeAllocation:buf];
+        g_ctx_residency_dirty = 1;
+    }
+#endif
+}
+static void ds4_gpu_ctx_residency_flush(void) {
+#if TARGET_OS_OSX
+    if (!g_ctx_residency_dirty) return;
+    if (@available(macOS 15.0, *)) {
+        g_ctx_residency_dirty = 0;
+        [g_ctx_residency_set commit];
+        [g_ctx_residency_set requestResidency];
+    }
+#endif
+}
+
 static ds4_gpu_tensor *ds4_gpu_tensor_alloc_options(uint64_t bytes, MTLResourceOptions options) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
@@ -9403,6 +9455,7 @@ static ds4_gpu_tensor *ds4_gpu_tensor_alloc_options(uint64_t bytes, MTLResourceO
         tensor.offset = 0;
         tensor.bytes = bytes;
         tensor.owner = 1;
+        ds4_gpu_ctx_residency_note(tensor.buffer, 1);
         uint64_t live_snap = 0;
         uint64_t peak_snap = 0;
         pthread_mutex_lock(&g_tensor_mu);
@@ -9548,6 +9601,7 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
                         (double)peak_snap / (1024.0 * 1024.0));
             }
         }
+        if (owner) ds4_gpu_ctx_residency_note(obj.buffer, 0);
         obj.buffer = nil;
         obj.offset = 0;
         obj.bytes = 0;
@@ -9771,6 +9825,7 @@ int ds4_gpu_begin_commands(void) {
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_PRE_M5_HEAD_RMS_ROPE_PIPELINE_STATIC") == NULL;
     g_batch_cb_created_ms = ds4_gpu_now_ms();
+    ds4_gpu_ctx_residency_flush();
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
@@ -11799,6 +11854,16 @@ int ds4_gpu_end_commands(void) {
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+}
+
+int ds4_gpu_end_commands_async(void) {
+    if (g_pe_preparing) { g_pe_failed = 1; return 0; }
+    id<MTLCommandBuffer> cb = ds4_gpu_close_batch();
+    if (!cb) return 0;
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    ds4_gpu_stream_expert_cache_note_batch_committed();
+    return 1;
 }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(
@@ -22978,6 +23043,17 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
     return 1;
 }
 
+static int ds4_gpu_matmul_f32_impl(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok);
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -22987,6 +23063,35 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
+    return ds4_gpu_matmul_f32_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok, n_tok);
+}
+
+/* SUFFIX_TRIM: a trimmed sweep's rows take the kernel the whole chunk would use; each row's sums do not depend on how
+ * many rows share the dispatch. */
+int ds4_gpu_matmul_f32_plan_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok) {
+    return ds4_gpu_matmul_f32_impl(out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok,
+                                   plan_tok > n_tok ? plan_tok : n_tok);
+}
+
+static int ds4_gpu_matmul_f32_impl(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok == 0 || n_tok > UINT32_MAX) return 0;
     if (in_dim > UINT64_MAX / n_tok / sizeof(float) ||
@@ -23026,7 +23131,7 @@ int ds4_gpu_matmul_f32_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_tok == 1) {
+        if (plan_tok == 1) {
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
             if (ds4_gpu_plain_mv_single_row(out_dim)) {
@@ -23058,9 +23163,9 @@ int ds4_gpu_matmul_f32_tensor(
         }
 
         const bool router_batch = in_dim == 5120u && out_dim == 384u &&
-            n_tok >= 32u && !g_quality_mode &&
+            plan_tok >= 32u && !g_quality_mode &&
             !getenv("DS4_METAL_DISABLE_V41_ROUTER_BATCH");
-        if (router_batch && n_tok >= 256u && !getenv("DS4_METAL_DISABLE_V41_ROUTER_MM")) {
+        if (router_batch && plan_tok >= 256u && !getenv("DS4_METAL_DISABLE_V41_ROUTER_MM")) {
             const bool bc_out = (n_tok % 32u) != 0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f32_f32_full", false, bc_out);
@@ -23081,7 +23186,7 @@ int ds4_gpu_matmul_f32_tensor(
             return ds4_gpu_finish_command_buffer(cb, owned, "F32 router prefill matmul");
         }
 
-        if ((n_tok <= 8 || router_batch) && (in_dim % 128u) == 0) {
+        if ((plan_tok <= 8 || router_batch) && (in_dim % 128u) == 0) {
             const int16_t nsg = router_batch ? 2 : ds4_gpu_mv_ext_nsg();
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
             const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
@@ -23294,6 +23399,31 @@ static int ds4_gpu_hc_rms_scale_project_mode(
     return 1;
 }
 
+/* HC_NARROW: V4.1's 24-output HC mix projection of a prefill chunk on kernel_hc_proj24_f16_f32_narrow, at the bits
+ * of the tiled kernel it replaces (kernel_mul_mm_f16_f32 on the normalized rows, or the _scaled variant with scales). */
+static bool ds4_gpu_hc_narrow_fits(uint32_t in_dim, uint32_t out_dim, uint32_t n_rows) {
+    return in_dim == 20480u && out_dim == 24u && n_rows > 8u && ds4_gpu_v41_on(DS4_GPU_V41_HC_NARROW);
+}
+static int ds4_gpu_hc_narrow_encode(id<MTLCommandBuffer> cb, id<MTLBuffer> weightbuf, uint64_t weight_inner,
+                                    const ds4_gpu_tensor *x, ds4_gpu_tensor *out, ds4_gpu_tensor *scales,
+                                    uint32_t in_dim, uint32_t n_rows) {
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_hc_proj24_f16_f32_narrow");
+    if (!pipeline) return 0;
+    const uint32_t dims[4] = {in_dim, n_rows, scales ? 1u : 0u, 0u};
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:dims length:sizeof(dims) atIndex:0];
+    [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(scales ? scales : out)
+            offset:ds4_gpu_tensor_offset(scales ? scales : out) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 int ds4_gpu_hc_rms_scale_project_f16_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *scale_scratch,
@@ -23315,6 +23445,25 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
     const int mode =
         ds4_gpu_hc_rms_scale_project_mode(in_dim, out_dim, n_rows);
     if (mode < 0) return 0;
+    if (mode == 0 && ds4_gpu_hc_narrow_fits(in_dim, out_dim, n_rows)) {
+        if (!ds4_gpu_rms_norm_plain_rows_tensor(scale_scratch, x, in_dim, n_rows, eps)) return 0;
+        @autoreleasepool {
+            const uint64_t weight_bytes = (uint64_t)out_dim * in_dim * sizeof(uint16_t);
+            if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+                ds4_gpu_tensor_bytes(scale_scratch) < (uint64_t)n_rows * in_dim * sizeof(float) ||
+                ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) return 0;
+            uint64_t weight_inner = 0;
+            id<MTLBuffer> weightbuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, weight_offset, weight_bytes, &weight_inner);
+            if (!weightbuf) return 0;
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            if (!ds4_gpu_hc_narrow_encode(cb, weightbuf, weight_inner, scale_scratch, out, NULL, in_dim, n_rows))
+                return 0;
+            return ds4_gpu_finish_command_buffer(cb, owned, "HC narrow projection");
+        }
+    }
     if (mode == 0) {
         return ds4_gpu_rms_norm_plain_rows_tensor(
                    scale_scratch, x, in_dim, n_rows, eps) != 0 &&
@@ -23396,6 +23545,11 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
                  ds4_gpu_rms_norm_threads(in_dim), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        if (ds4_gpu_hc_narrow_fits(in_dim, out_dim, n_rows)) {
+            if (!ds4_gpu_hc_narrow_encode(cb, weightbuf, weight_inner, x, out, scale_scratch, in_dim, n_rows))
+                return 0;
+            return ds4_gpu_finish_command_buffer(cb, owned, "HC narrow projection");
+        }
         ds4_gpu_mul_mm_args mm_args = ds4_gpu_make_mm_args(
             in_dim, out_dim, n_rows, weight_row_bytes);
         enc = ds4_gpu_compute_encoder(cb);
@@ -32027,8 +32181,13 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         /* PREFILL_ATTENTION: V4.1's prefill rows (ratio 1 and 2) stage sixteen rows per barrier, as decode does */
         const bool prefill_rb16 = n_tokens > 8u && ratio <= 2u && !prefill_dual_heads && !g_quality_mode &&
             !g_ssd_streaming_mode && !ds4_gpu_tp_world_is_two() && ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_ATTENTION);
-        if (prefill_rb16) DS4_TEST_NOTE("kernel_dsv41_prefill_attention_rb16");
+        /* PREFILL_MMA: those rows on simdgroup matrices instead, 32 heads of a token per threadgroup (M1-M4) */
+        const bool prefill_mma = prefill_rb16 && n_head % 32u == 0u && ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_MMA) &&
+            ds4_gpu_device_is_pre_m5_apple_silicon();
+        if (prefill_mma) DS4_TEST_NOTE("kernel_dsv41_prefill_attention_mma");
+        else if (prefill_rb16) DS4_TEST_NOTE("kernel_dsv41_prefill_attention_rb16");
         id<MTLComputePipelineState> attn_pipeline =
+            prefill_mma ? ds4_gpu_get_pipeline("kernel_dsv41_prefill_attention_mma") :
             split_decode ?
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_pipeline,
@@ -32174,15 +32333,24 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token || prefill_rb16 ? 16u : 1u) *
-                                            128u * 4u * sizeof(uint16_t)
-                                    atIndex:0];
-            [enc dispatchThreadgroups:
-                    MTLSizeMake((NSUInteger)n_tokens,
-                                ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) /
-                                    (prefill_dual_heads ? 16u : 8u),
-                                1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            if (prefill_mma) {
+                /* 16 staged half rows of 520, per simdgroup 8 x 16 float scores (then weights), 16 row flags */
+                [enc setThreadgroupMemoryLength:16u * 520u * sizeof(uint16_t) +
+                                                16u * 128u * sizeof(float) + 16u * sizeof(uint32_t)
+                                        atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head / 32u, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
+            } else {
+                [enc setThreadgroupMemoryLength:(decode_one_token || prefill_rb16 ? 16u : 1u) *
+                                                128u * 4u * sizeof(uint16_t)
+                                        atIndex:0];
+                [enc dispatchThreadgroups:
+                        MTLSizeMake((NSUInteger)n_tokens,
+                                    ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) /
+                                        (prefill_dual_heads ? 16u : 8u),
+                                    1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
         }
 
@@ -44785,6 +44953,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         id<MTLComputePipelineState> up_mm_pipeline = nil;
         id<MTLComputePipelineState> down_mm_pipeline = nil;
         id<MTLComputePipelineState> pair_swiglu_mm_pipeline = nil;
+        bool pair_half_x = false;
         if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
             fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u\n",
                     gate_type, down_type);
@@ -44998,6 +45167,12 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+        /* MOE_SHORT_TILES: V4.1's routed experts take the five exact large-prefill MXFP4 variants below (compact
+         * tile, map scatter, pair and down tail culls, down half table) from 9 rows instead of 2,048: a short prefill
+         * gives each expert a few rows, so most of its 32-row tiles are short. */
+        const bool v41_moe_shape = n_total_expert == 384u && n_expert == 6u && expert_in_dim == 5120u &&
+            expert_mid_dim == 2304u && out_dim == 5120u;
+        const uint32_t mxfp4_large_min = v41_moe_shape && ds4_gpu_v41_on(DS4_GPU_V41_MOE_SHORT_TILES) ? 9u : 2048u;
         /*
          * The MXFP4 32x32 specialization uses two SIMDgroups and 8 KiB of
          * threadgroup memory, and exactly culls SIMDgroup 1 on at-most-16-row
@@ -45007,7 +45182,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_pre_m5_mxfp4_mm_id_pair_swiglu_compact_tile_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_PAIR_SWIGLU_COMPACT_TILE") == NULL;
         const bool use_mxfp4_mm_id_pair_swiglu_compact_tile =
             use_mm_id_pair_swiglu &&
@@ -45023,7 +45198,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          */
         const bool use_pre_m5_mxfp4_mm_id_map_scatter_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_MAP_SCATTER") == NULL;
         const bool use_mxfp4_mm_id_map_scatter =
             use_mxfp4_mm_id_pair_swiglu_compact_tile &&
@@ -45044,7 +45219,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_pre_m5_mxfp4_mm_id_pair_tail_simdgroup_cull_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL") == NULL;
         const bool use_mxfp4_mm_id_pair_tail_simdgroup_cull =
             use_mm_id_pair_swiglu &&
@@ -45056,7 +45231,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_pre_m5_mxfp4_mm_id_down_tail_simdgroup_cull_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_DOWN_TAIL_SIMDGROUP_CULL") == NULL;
         const bool use_mxfp4_mm_id_down_tail_simdgroup_cull =
             use_mm_id &&
@@ -45073,7 +45248,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          */
         const bool use_pre_m5_mxfp4_mm_id_down_half_lut_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_DOWN_HALF_LUT") == NULL;
         const bool use_mxfp4_mm_id_down_half_lut =
             use_mm_id &&
@@ -45230,6 +45405,15 @@ int ds4_gpu_routed_moe_batch_tensor(
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale" :
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16")) :
                             "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                /* MOE_HALF_X: V4.1's compact pair tiles read the routed rows narrowed to half once per layer, the
+                 * value their staging makes of each float, so they read half the activation bytes at the same bits */
+                if (use_mxfp4_mm_id_pair_swiglu_compact_tile && v41_moe_shape &&
+                    ds4_gpu_v41_on(DS4_GPU_V41_MOE_HALF_X)) {
+                    pair_swiglu_mm_pipeline = ds4_gpu_get_pipeline(use_mxfp4_mm_id_pair_half_scale ?
+                        "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull_half_scale_hx" :
+                        "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull_hx");
+                    pair_half_x = true;
+                }
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
                 (use_mm_id_pair_swiglu && !pair_swiglu_mm_pipeline)) {
@@ -45612,17 +45796,42 @@ int ds4_gpu_routed_moe_batch_tensor(
                     .write_clamped = 0,
                     .clamp_value = clamp,
                 };
-                ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
+                ds4_gpu_mul_mm_id_args pair_args = gate_mm_args;
+                id<MTLBuffer> pair_x = xbuf;
+                NSUInteger pair_x_off = ds4_gpu_tensor_offset(x);
+                if (pair_half_x) {
+                    const uint32_t n_x = (uint32_t)n_tokens * expert_in_dim;
+                    ok = ds4_gpu_ensure_scratch_buffer(&g_moe_half_x_buffer, &g_moe_half_x_bytes,
+                                                       (NSUInteger)n_x * sizeof(uint16_t), "moe half rows");
+                    if (ok) {
+                        id<MTLComputeCommandEncoder> cenc = ds4_gpu_compute_encoder(cb);
+                        [cenc setComputePipelineState:g_cpy_contig_f32_f16_pipeline];
+                        [cenc setBytes:&n_x length:sizeof(n_x) atIndex:0];
+                        [cenc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
+                        [cenc setBuffer:g_moe_half_x_buffer offset:0 atIndex:2];
+                        [cenc dispatchThreads:MTLSizeMake(((NSUInteger)n_x + 3u) / 4u, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        ds4_gpu_end_compute_encoder(cb, cenc);
+                        pair_args = ds4_gpu_make_mul_mm_id_args_src1_size(expert_in_dim, expert_mid_dim,
+                            n_total_expert, gate_row_bytes, gate_expert_bytes, 1, n_expert, n_tokens, sizeof(uint16_t));
+                        pair_args.tp_rank = gate_mm_args.tp_rank;
+                        pair_args.tp_world = gate_mm_args.tp_world;
+                        pair_args.tp_expert_base = gate_mm_args.tp_expert_base;
+                        pair_x = g_moe_half_x_buffer;
+                        pair_x_off = 0;
+                    }
+                }
+                if (ok) ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
                                                                    pair_swiglu_mm_pipeline,
                                                                    use_mxfp4_mm_id_pair_swiglu_compact_tile,
-                                                                   &gate_mm_args,
+                                                                   &pair_args,
                                                                    &act_args,
                                                                    gate_buf,
                                                                    (NSUInteger)gate_inner,
                                                                    up_buf,
                                                                    (NSUInteger)up_inner,
-                                                                   xbuf,
-                                                                   ds4_gpu_tensor_offset(x),
+                                                                   pair_x,
+                                                                   pair_x_off,
                                                                    midbuf,
                                                                    ds4_gpu_tensor_offset(mid),
                                                                    weightsbuf,
@@ -48695,13 +48904,14 @@ static int deepseek4_vision_dispatch_qkv(
         uint64_t              model_size,
         uint64_t              bias_offset,
         uint32_t              rows,
-        uint32_t              grid_width) {
+        uint32_t              grid_width,
+        bool                  half_kv) {        /* VISION_ATTN_FLASH: K, V as half, padded to 64-row tiles */
     uint64_t bias_inner = 0;
     id<MTLBuffer> bias = glm53_gpu_weight_buffer(
             model_map, model_size, bias_offset, 3072u * sizeof(uint16_t),
             &bias_inner, "DeepSeek vision QKV bias");
     id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_deepseek4_vision_qkv_rope");
+            ds4_gpu_get_pipeline(half_kv ? "kernel_deepseek41_vision_qkv_rope_half_kv" : "kernel_deepseek4_vision_qkv_rope");
     if (!bias || !pipeline) return 0;
     deepseek4_vision_qkv_args args = { rows, grid_width };
     int owned = 0;
@@ -48719,7 +48929,7 @@ static int deepseek4_vision_dispatch_qkv(
             offset:ds4_gpu_tensor_offset(k) atIndex:4];
     [enc setBuffer:ds4_gpu_tensor_buffer(v)
             offset:ds4_gpu_tensor_offset(v) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake(rows, 16u, 1)
+    [enc dispatchThreadgroups:MTLSizeMake(half_kv ? (rows + 63u) / 64u * 64u : rows, 16u, 1)
          threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned,
@@ -48863,6 +49073,78 @@ static int deepseek4_vision_debug_dump(
     return ok;
 }
 
+/* V4.1 vision attention (switches read on every encode, default on):
+ *   DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD=1  round the output in its own pass
+ *   DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH=1  (or DS4_V41_EXACT=1) the exact kernels below
+ *   DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY=1   flash rescales its output on every key tile (flash v2's bits)
+ *   DS4_METAL_DISABLE_V41_VISION_ATTN_KT16=1   lazy flash walks 64-key tiles, not 16 (0a218c8e's bits)
+ *   DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT=1  GLM's one-key-at-a-time kernel
+ * mode 2, flash: tiles on simdgroup matrices, accurate but not bit-exact.
+ * mode 1, exact: 32 keys per step at the scalar kernel's bits. mode 0: the scalar kernel. */
+static int deepseek41_vision_dispatch_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows,
+        int                   mode,
+        bool                  round) {
+    const bool lazy = ds4_gpu_deepseek41_vision_attn_lazy();
+    const bool kt16 = lazy && ds4_gpu_deepseek41_vision_attn_kt16();
+    const char *name = mode == 2 ? (kt16 ? (round ? "kernel_deepseek41_vision_attention_flash_lazy16_round"
+                                                  : "kernel_deepseek41_vision_attention_flash_lazy16")
+                                  : lazy ? (round ? "kernel_deepseek41_vision_attention_flash_lazy_round"
+                                                  : "kernel_deepseek41_vision_attention_flash_lazy")
+                                         : (round ? "kernel_deepseek41_vision_attention_flash_round"
+                                                  : "kernel_deepseek41_vision_attention_flash"))
+                     : mode == 1 ? (round ? "kernel_deepseek41_vision_attention_exact_round"
+                                          : "kernel_deepseek41_vision_attention_exact")
+                     : (round ? "kernel_deepseek41_vision_attention_round"
+                              : "kernel_glm53_vision_attention");
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(name);
+    if (!pipeline) return 0;
+    glm53_vision_attention_args args = { rows, 0.125f };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(k) offset:ds4_gpu_tensor_offset(k) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(v) offset:ds4_gpu_tensor_offset(v) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
+    if (mode == 2) {
+        /* K and V in half from kernel_deepseek41_vision_qkv_rope_half_kv; 64 query rows per threadgroup, 8 per SIMD group */
+        [enc dispatchThreadgroups:MTLSizeMake((rows + 63u) / 64u, 16u, 1)
+             threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+    } else if (mode == 1) {
+        /* K tile [32][65], V tile [32][64], one 64-float query row per SIMD group */
+        [enc setThreadgroupMemoryLength:(32u * 65u + 2048u + 8u * 64u) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((rows + 7u) / 8u, 16u, 1)
+             threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 16u, 1)
+             threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+    }
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 vision attention");
+}
+
+bool ds4_gpu_deepseek41_vision_attn_flash(void) {
+    const char *exact_env = getenv("DS4_V41_EXACT");
+    return getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH") == NULL &&
+           !(exact_env && exact_env[0] && strcmp(exact_env, "0") != 0);
+}
+
+bool ds4_gpu_deepseek41_vision_attn_lazy(void) {
+    return getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY") == NULL;
+}
+
+bool ds4_gpu_deepseek41_vision_attn_kt16(void) {
+    return getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_KT16") == NULL;
+}
+
 int ds4_gpu_deepseek4_vision_encode(
         float                              *out,
         const float                        *patches,
@@ -48881,6 +49163,13 @@ int ds4_gpu_deepseek4_vision_encode(
     const uint32_t projection = weights->projection_dim ? weights->projection_dim : 4096u;
     if (projection != 4096u && projection != 5120u) return 0;
     const uint32_t rows = grid_h * grid_w;
+    const bool v41 = projection == 5120u;
+    /* VISION_ROUND_FOLD: each bf16 rounding pass moves into its producer's store
+     * or its consumer's load (the same rounded values, fewer passes). */
+    const bool fold = v41 && getenv("DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD") == NULL;
+    const bool flash_attn = v41 && ds4_gpu_deepseek41_vision_attn_flash();
+    const bool exact_attn = v41 && getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT") == NULL;
+    const int attn_mode = flash_attn ? 2 : exact_attn ? 1 : 0;
     const uint32_t aligned_rows =
         ((grid_h + 2u) / 3u) * ((grid_w + 2u) / 3u);
     const uint64_t row1024 = (uint64_t)rows * 1024u;
@@ -48906,8 +49195,10 @@ int ds4_gpu_deepseek4_vision_encode(
     DEEPSEEK4_VISION_ALLOC(b, row1024);
     DEEPSEEK4_VISION_ALLOC(qkv, row3072);
     DEEPSEEK4_VISION_ALLOC(q, row1024);
-    DEEPSEEK4_VISION_ALLOC(k, row1024);
-    DEEPSEEK4_VISION_ALLOC(v, row1024);
+    /* flash's half K and V take (rows + 63) / 64 * 64 rows of 1024 halves: no more than row1024 floats unless rows < 64 */
+    const uint64_t kv_floats = MAX(row1024, (uint64_t)((rows + 63u) / 64u * 64u) * 512u);
+    DEEPSEEK4_VISION_ALLOC(k, kv_floats);
+    DEEPSEEK4_VISION_ALLOC(v, kv_floats);
     DEEPSEEK4_VISION_ALLOC(attn, row1024);
     DEEPSEEK4_VISION_ALLOC(mlp_w1, row5632);
     DEEPSEEK4_VISION_ALLOC(mlp_mid, row2816);
@@ -48923,10 +49214,10 @@ int ds4_gpu_deepseek4_vision_encode(
             a, model_map, model_size, weights->patch_weight,
             588u, 1024u, patch, rows);
     if (ok) ok = glm53_vision_dispatch_bias(
-            "kernel_glm53_vision_add_bias", a, NULL,
+            fold ? "kernel_deepseek41_vision_add_bias_round" : "kernel_glm53_vision_add_bias", a, NULL,
             model_map, model_size, weights->patch_bias,
             1024u, rows, "DeepSeek vision patch bias");
-    if (ok) ok = deepseek4_vision_dispatch_round(a, 1024u, rows);
+    if (ok && !fold) ok = deepseek4_vision_dispatch_round(a, 1024u, rows);
     if (ok) ok = deepseek4_vision_debug_dump(
             "patch_embed", a, row1024);
 
@@ -48935,10 +49226,10 @@ int ds4_gpu_deepseek4_vision_encode(
     for (uint32_t il = 0; ok && il < DS4_DEEPSEEK4_VISION_LAYERS; il++) {
         const ds4_deepseek4_vision_layer_weights *w = &weights->layer[il];
         ok = glm53_vision_dispatch_rows(
-                "kernel_glm53_vision_rms_bf16", tmp, cur,
+                fold ? "kernel_deepseek41_vision_rms_round" : "kernel_glm53_vision_rms_bf16", tmp, cur,
                 model_map, model_size, w->norm1,
                 1024u, rows, 1.0e-6f, "DeepSeek vision norm1");
-        if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_norm1", tmp, row1024);
         if (ok) ok = ds4_gpu_glm53_matmul_bf16(
@@ -48948,15 +49239,17 @@ int ds4_gpu_deepseek4_vision_encode(
                 "block0_qkv", qkv, row3072);
         if (ok) ok = deepseek4_vision_dispatch_qkv(
                 q, k, v, qkv, model_map, model_size,
-                w->qkv_bias, rows, grid_w);
+                w->qkv_bias, rows, grid_w, attn_mode == 2);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_q", q, row1024);
-        if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
+        /* under flash, k and v hold half values (not dumped) */
+        if (ok && il == 0u && attn_mode != 2) ok = deepseek4_vision_debug_dump(
                 "block0_k", k, row1024);
-        if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
+        if (ok && il == 0u && attn_mode != 2) ok = deepseek4_vision_debug_dump(
                 "block0_v", v, row1024);
-        if (ok) ok = glm53_vision_dispatch_attention(attn, q, k, v, rows);
-        if (ok) ok = deepseek4_vision_dispatch_round(attn, 1024u, rows);
+        if (ok) ok = v41 ? deepseek41_vision_dispatch_attention(attn, q, k, v, rows, attn_mode, fold)
+                         : glm53_vision_dispatch_attention(attn, q, k, v, rows);
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(attn, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_attention", attn, row1024);
         if (ok) ok = ds4_gpu_glm53_matmul_bf16(
@@ -48967,25 +49260,27 @@ int ds4_gpu_deepseek4_vision_encode(
                                       "kernel_glm53_vision_bias_residual", tmp, cur,
                 model_map, model_size, w->attn_proj_bias,
                 1024u, rows, "DeepSeek vision attention bias");
-        if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+        /* kernel_deepseek41_vision_bias_residual stores rounded values; rounding again is the identity */
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_attn_residual", tmp, row1024);
         ds4_gpu_tensor *swap = cur; cur = tmp; tmp = swap;
 
         if (ok) ok = glm53_vision_dispatch_rows(
-                "kernel_glm53_vision_rms_bf16", tmp, cur,
+                fold ? "kernel_deepseek41_vision_rms_round" : "kernel_glm53_vision_rms_bf16", tmp, cur,
                 model_map, model_size, w->norm2,
                 1024u, rows, 1.0e-6f, "DeepSeek vision norm2");
-        if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_norm2", tmp, row1024);
         if (ok) ok = ds4_gpu_glm53_matmul_bf16(
                 mlp_w1, model_map, model_size, w->mlp_w1,
                 1024u, 5632u, tmp, rows);
-        if (ok) ok = deepseek4_vision_dispatch_round(mlp_w1, 5632u, rows);
-        if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(mlp_w1, 5632u, rows);
+        if (ok && il == 0u && !fold) ok = deepseek4_vision_debug_dump(
                 "block0_mlp_w1", mlp_w1, row5632);
         if (ok) ok = deepseek4_vision_dispatch_two_rows(
+                fold ? "kernel_deepseek41_vision_swiglu_split_rl" :
                 projection == 5120u ? "kernel_deepseek41_vision_swiglu_split" :
                                       "kernel_deepseek4_vision_swiglu_split",
                 mlp_w1, mlp_mid, 2816u, rows,
@@ -48995,9 +49290,9 @@ int ds4_gpu_deepseek4_vision_encode(
         if (ok) ok = ds4_gpu_glm53_matmul_bf16(
                 tmp, model_map, model_size, w->mlp_w2,
                 2816u, 1024u, mlp_mid, rows);
-        if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
         if (ok) ok = deepseek4_vision_dispatch_two_rows(
-                "kernel_deepseek4_vision_add_residual",
+                fold ? "kernel_deepseek41_vision_add_residual_rl" : "kernel_deepseek4_vision_add_residual",
                 tmp, cur, 1024u, rows,
                 "DeepSeek vision MLP residual");
         swap = cur; cur = tmp; tmp = swap;
@@ -49008,10 +49303,10 @@ int ds4_gpu_deepseek4_vision_encode(
         }
     }
     if (ok) ok = glm53_vision_dispatch_rows(
-            "kernel_glm53_vision_rms_bf16", tmp, cur,
+            fold ? "kernel_deepseek41_vision_rms_round" : "kernel_glm53_vision_rms_bf16", tmp, cur,
             model_map, model_size, weights->post_norm,
             1024u, rows, 1.0e-6f, "DeepSeek vision final norm");
-    if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+    if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
     if (ok) ok = deepseek4_vision_debug_dump(
             "vision_norm", tmp, row1024);
     if (ok) ok = deepseek4_vision_dispatch_aligner_reorder(
@@ -49026,10 +49321,10 @@ int ds4_gpu_deepseek4_vision_encode(
             align_a, model_map, model_size, weights->aligner_w2,
             projection, projection, align_b, aligned_rows);
     if (ok) ok = glm53_vision_dispatch_bias(
-            "kernel_glm53_vision_add_bias", align_a, NULL,
+            fold ? "kernel_deepseek41_vision_add_bias_round" : "kernel_glm53_vision_add_bias", align_a, NULL,
             model_map, model_size, weights->aligner_w2_bias,
             projection, aligned_rows, "DeepSeek vision aligner output bias");
-    if (ok) ok = deepseek4_vision_dispatch_round(
+    if (ok && !fold) ok = deepseek4_vision_dispatch_round(
             align_a, projection, aligned_rows);
     if (ok) ok = deepseek4_vision_debug_dump(
             "aligned", align_a, aligned_projection);

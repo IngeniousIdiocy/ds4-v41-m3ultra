@@ -197,6 +197,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         }
         opt(fp, c, "--v41-sidecar FILE", "DeepSeek V4.1 on Metal: an optional router BF16, Engram FP8 or indexer FP8 sidecar GGUF (one per family, repeat for each). Default: none; the narrow decode copies are built at load.");
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER) {
+            opt(fp, c, "--exact", "DeepSeek V4.1 on Metal: output bit-identical to main's serial decode; turns off the speed groups that are not, and DSpark drafting (same as DS4_V41_EXACT=1). Default: off");
+        }
         opt(fp, c, "--warm-weights", "Touch resident weights at startup to reduce first-use stalls.");
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");

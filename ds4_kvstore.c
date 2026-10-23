@@ -35,6 +35,13 @@
  * file version because the KVC envelope can remain stable while the serialized
  * ds4_session internals become unsafe to restore across runtime changes. */
 #define KV_CACHE_PAYLOAD_ABI 2u
+/* ABI 3: the same graph payload behind an image list (ds4_kvstore_images), so
+ * readers that predate image identity refuse the entry instead of restoring
+ * image-conditioned rows by text alone. The list is "KVIM", version, count,
+ * zero, encoder fingerprint, then one 48-byte record per image. */
+#define KV_CACHE_PAYLOAD_ABI_IMAGES 3u
+#define KV_IMAGES_HEADER 24u
+#define KV_IMAGE_RECORD 48u
 #define KV_CACHE_DEFAULT_MIN_TOKENS 512
 #define KV_CACHE_DEFAULT_COLD_MAX_TOKENS 30000
 /* Tokenizers may merge text across the prompt boundary. Trimming a small tail
@@ -332,6 +339,35 @@ void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     hex20(digest, out);
 }
 
+void ds4_kvstore_entry_sha(const char *text, size_t len,
+                           const ds4_kvstore_images *images, char out[41]) {
+    uint32_t inside = 0;
+    while (images && inside < images->len && images->v[inside].text_offset < len) inside++;
+    if (!inside) {
+        ds4_kvstore_sha1_bytes_hex(text, len, out);
+        return;
+    }
+    sha1_ctx c;
+    sha1_init(&c);
+    sha1_update(&c, text, len);
+    uint8_t b[16];
+    memcpy(b, "\0KVIM", 5);
+    sha1_update(&c, b, 5);
+    kv_le_put64(b, images->encoder);
+    sha1_update(&c, b, 8);
+    for (uint32_t i = 0; i < inside; i++) {
+        const ds4_kvstore_image *im = &images->v[i];
+        ds4_kvstore_le_put32(b, im->text_offset);
+        ds4_kvstore_le_put32(b + 4, im->text_len);
+        ds4_kvstore_le_put32(b + 8, im->token_count);
+        sha1_update(&c, b, 12);
+        sha1_update(&c, im->fingerprint, sizeof(im->fingerprint));
+    }
+    uint8_t digest[20];
+    sha1_final(&c, digest);
+    hex20(digest, out);
+}
+
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
     if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
     for (int i = 0; i < 40; i++) {
@@ -552,17 +588,16 @@ int ds4_kvstore_verify_payload(FILE *fp, const ds4_kvstore_entry *e,
     return 0;
 }
 
-/* Copies the staged payload into fp, digesting it on the way. */
+/* Copies the staged payload into fp, continuing the digest s on the way. */
 static int kv_copy_staged_hashed(const ds4_session_payload_file *staged, FILE *fp,
-                                 uint64_t *hash, char *err, size_t err_len) {
+                                 ds4_kvstore_hash s, uint64_t *hash,
+                                 char *err, size_t err_len) {
     FILE *src = staged && staged->path ? fopen(staged->path, "rb") : NULL;
     if (!src) {
         snprintf(err, err_len, "failed to open staged session payload");
         return 1;
     }
     uint8_t *buf = malloc(KV_HASH_CHUNK);
-    ds4_kvstore_hash s;
-    ds4_kvstore_hash_init(&s);
     uint64_t left = staged->bytes;
     int rc = buf ? 0 : 1;
     while (rc == 0 && left > 0) {
@@ -588,6 +623,97 @@ static bool kv_put_payload_hash(FILE *fp, uint64_t hash) {
     kv_le_put64(b, hash);
     return fflush(fp) == 0 && fseeko(fp, 64, SEEK_SET) == 0 &&
            fwrite(b, 1, sizeof(b), fp) == sizeof(b);
+}
+
+/* ---- image identity list (ABI 3 payload prefix) ---- */
+
+uint64_t ds4_kvstore_images_bytes(const ds4_kvstore_images *images) {
+    return images && images->len ?
+           KV_IMAGES_HEADER + (uint64_t)images->len * KV_IMAGE_RECORD : 0;
+}
+
+static void kv_images_encode(const ds4_kvstore_images *images, uint8_t *out) {
+    memcpy(out, "KVIM", 4);
+    ds4_kvstore_le_put32(out + 4, 1);
+    ds4_kvstore_le_put32(out + 8, images->len);
+    ds4_kvstore_le_put32(out + 12, 0);
+    kv_le_put64(out + 16, images->encoder);
+    for (uint32_t i = 0; i < images->len; i++) {
+        uint8_t *r = out + KV_IMAGES_HEADER + (size_t)i * KV_IMAGE_RECORD;
+        const ds4_kvstore_image *im = &images->v[i];
+        ds4_kvstore_le_put32(r, im->text_offset);
+        ds4_kvstore_le_put32(r + 4, im->text_len);
+        ds4_kvstore_le_put32(r + 8, im->token_start);
+        ds4_kvstore_le_put32(r + 12, im->token_count);
+        memcpy(r + 16, im->fingerprint, sizeof(im->fingerprint));
+    }
+}
+
+/* Images are ordered, non-empty and disjoint both in the key text and in the
+ * token history. */
+static bool kv_images_well_formed(const ds4_kvstore_images *images) {
+    if (images->len > DS4_KVSTORE_IMAGES_MAX) return false;
+    uint64_t text_end = 0, token_end = 0;
+    for (uint32_t i = 0; i < images->len; i++) {
+        const ds4_kvstore_image *im = &images->v[i];
+        if (!im->text_len || !im->token_count ||
+            im->text_offset < text_end || im->token_start < token_end) return false;
+        text_end = (uint64_t)im->text_offset + im->text_len;
+        token_end = (uint64_t)im->token_start + im->token_count;
+    }
+    return true;
+}
+
+uint64_t ds4_kvstore_read_images(FILE *fp, uint64_t payload_bytes,
+                                 ds4_kvstore_images *out) {
+    memset(out, 0, sizeof(*out));
+    uint8_t h[KV_IMAGES_HEADER];
+    if (payload_bytes < KV_IMAGES_HEADER || fread(h, 1, sizeof(h), fp) != sizeof(h) ||
+        memcmp(h, "KVIM", 4) || ds4_kvstore_le_get32(h + 4) != 1u ||
+        ds4_kvstore_le_get32(h + 12) != 0) return 0;
+    const uint32_t count = ds4_kvstore_le_get32(h + 8);
+    if (count == 0 || count > DS4_KVSTORE_IMAGES_MAX) return 0;
+    const uint64_t bytes = KV_IMAGES_HEADER + (uint64_t)count * KV_IMAGE_RECORD;
+    if (bytes > payload_bytes) return 0;
+    out->len = count;
+    out->encoder = kv_le_get64(h + 16);
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t r[KV_IMAGE_RECORD];
+        if (fread(r, 1, sizeof(r), fp) != sizeof(r)) return 0;
+        ds4_kvstore_image *im = &out->v[i];
+        im->text_offset = ds4_kvstore_le_get32(r);
+        im->text_len = ds4_kvstore_le_get32(r + 4);
+        im->token_start = ds4_kvstore_le_get32(r + 8);
+        im->token_count = ds4_kvstore_le_get32(r + 12);
+        memcpy(im->fingerprint, r + 16, sizeof(im->fingerprint));
+    }
+    return out->encoder && kv_images_well_formed(out) ? bytes : 0;
+}
+
+const char *ds4_kvstore_images_mismatch(const ds4_kvstore_images *stored,
+                                        const ds4_kvstore_images *request,
+                                        uint64_t text_bytes) {
+    static const ds4_kvstore_images none;
+    if (!stored) stored = &none;
+    if (!request) request = &none;
+    uint32_t inside = 0;
+    while (inside < request->len && request->v[inside].text_offset < text_bytes) inside++;
+    if (inside != stored->len)
+        return !stored->len ? "entry has no image identity for the request's images" :
+               !inside ? "entry holds images the request does not" :
+                         "entry holds a different number of images";
+    if (inside && (!stored->encoder || stored->encoder != request->encoder))
+        return "entry was conditioned by another vision encoder";
+    for (uint32_t i = 0; i < inside; i++) {
+        const ds4_kvstore_image *a = &stored->v[i], *b = &request->v[i];
+        if (a->text_offset != b->text_offset || a->text_len != b->text_len ||
+            (uint64_t)a->text_offset + a->text_len > text_bytes)
+            return "an image sits at a different position";
+        if (a->token_count != b->token_count ||
+            memcmp(a->fingerprint, b->fingerprint, sizeof(a->fingerprint)))
+            return "an image differs (fingerprint)";
+    }
+    return NULL;
 }
 
 int ds4_kvstore_engine_canary(ds4_engine *engine, int tokens, uint64_t *out,
@@ -700,6 +826,7 @@ static bool kv_parse_header(FILE *fp, ds4_kvstore_entry *e,
     e->last_used = kv_le_get64(h + 32);
     e->payload_bytes = kv_le_get64(h + 40);
     e->identity = e->canary = e->payload_hash = 0;
+    e->images = e->version != 1u && h[20] == KV_CACHE_PAYLOAD_ABI_IMAGES;
     if (hb == DS4_KVSTORE_FIXED_HEADER) {
         e->identity = kv_le_get64(h + 48);
         e->canary = kv_le_get64(h + 56);
@@ -712,7 +839,7 @@ static bool kv_parse_header(FILE *fp, ds4_kvstore_entry *e,
     e->refusal = NULL;
     if (e->version == 1u)
         e->refusal = "v1 entry (no engine identity, canary or payload hash)";
-    else if (h[20] != KV_CACHE_PAYLOAD_ABI)
+    else if (h[20] != KV_CACHE_PAYLOAD_ABI && !e->images)
         e->refusal = "graph payload ABI differs";
     else if (g_kv_identity && e->identity != g_kv_identity)
         e->refusal = "engine identity differs (other weights or prefill representation)";
@@ -835,8 +962,8 @@ static bool kv_cache_incoming_supersedes_continued(
     if (incoming->ctx_size > e->ctx_size) return false;
 
     char prefix_sha[41];
-    ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
-                               prefix_sha);
+    ds4_kvstore_entry_sha(incoming->text, (size_t)e->text_bytes,
+                          incoming->images, prefix_sha);
     return !strcmp(prefix_sha, e->sha);
 }
 
@@ -979,6 +1106,54 @@ char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
     }
     if (out_len) *out_len = b.len;
     return kv_buf_take(&b);
+}
+
+/* Token text with each image's rows written as its normalized marker (text_len
+ * bytes of \036, the form requests are matched in), recording where each one
+ * lands. NULL when the spans are not inside the tokens in order. */
+static char *kv_render_tokens_text_images(ds4_engine *engine,
+                                          const ds4_tokens *tokens,
+                                          ds4_kvstore_images *images,
+                                          size_t *out_len) {
+    kv_buf b = {0};
+    uint32_t next = 0;
+    for (int i = 0; i < tokens->len; i++) {
+        if (next < images->len && (uint32_t)i == images->v[next].token_start) {
+            ds4_kvstore_image *im = &images->v[next++];
+            if (!im->token_count || b.len > UINT32_MAX ||
+                (uint64_t)im->token_start + im->token_count > (uint64_t)tokens->len) break;
+            im->text_offset = (uint32_t)b.len;
+            for (uint32_t k = 0; k < im->text_len; k++) kv_buf_putc(&b, '\036');
+            i += (int)im->token_count - 1;
+            continue;
+        }
+        size_t len = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &len);
+        kv_buf_append(&b, piece, len);
+        free(piece);
+    }
+    if (next != images->len || !kv_images_well_formed(images)) {
+        free(b.ptr);
+        return NULL;
+    }
+    if (out_len) *out_len = b.len;
+    return kv_buf_take(&b);
+}
+
+/* A visible-transcript key brings its own marker offsets: they must hold the
+ * normalized markers, in order, inside the key. */
+static bool kv_override_images_ok(const char *text, size_t text_len,
+                                  const ds4_kvstore_images *images,
+                                  int token_len) {
+    if (!kv_images_well_formed(images)) return false;
+    for (uint32_t i = 0; i < images->len; i++) {
+        const ds4_kvstore_image *im = &images->v[i];
+        if ((uint64_t)im->text_offset + im->text_len > text_len ||
+            (uint64_t)im->token_start + im->token_count > (uint64_t)token_len) return false;
+        for (uint32_t k = 0; k < im->text_len; k++)
+            if (text[im->text_offset + k] != '\036') return false;
+    }
+    return true;
 }
 
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
@@ -1128,8 +1303,11 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
     return required <= kc->budget_bytes;
 }
 
+static bool kv_entry_images(const ds4_kvstore_entry *e, ds4_kvstore_images *out);
+
 static bool kv_cache_file_text_matches(const char *path, const char sha[41],
-                                       const char *text, size_t text_len) {
+                                       const char *text, size_t text_len,
+                                       const ds4_kvstore_images *images) {
     if (text_len > UINT32_MAX) return false;
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
@@ -1150,7 +1328,7 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     }
 
     char stored_sha[41];
-    ds4_kvstore_sha1_bytes_hex(stored, text_bytes, stored_sha);
+    ds4_kvstore_entry_sha(stored, text_bytes, images, stored_sha);
     ok = !strcmp(stored_sha, sha) &&
          (text_len == 0 || memcmp(stored, text, text_len) == 0);
     free(stored);
@@ -1160,15 +1338,21 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
 static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
+                                         const ds4_kvstore_images *images,
                                          int model_id, int quant_bits, int ctx_size) {
     if (access(path, F_OK) != 0) return false;
     ds4_kvstore_entry e = {0};
     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
-    bool compatible = e.model_id == (uint8_t)model_id &&
+    /* The same key text with other pixels is another state: replace it. */
+    ds4_kvstore_images stored;
+    const uint32_t want = images ? images->len : 0;
+    bool compatible = kv_entry_images(&e, &stored) && stored.len == want &&
+                      !ds4_kvstore_images_mismatch(&stored, images, text_len) &&
+                      e.model_id == (uint8_t)model_id &&
                       (!kc->reject_different_quant ||
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
-                      kv_cache_file_text_matches(path, sha, text, text_len);
+                      kv_cache_file_text_matches(path, sha, text, text_len, images);
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {
@@ -1235,21 +1419,48 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
     (void)ok;
 }
 
+bool ds4_kvstore_write_entry_images(FILE *fp, const uint8_t h[DS4_KVSTORE_FIXED_HEADER],
+                                    const char *text, size_t text_len,
+                                    const ds4_kvstore_images *images,
+                                    const ds4_session_payload_file *staged,
+                                    const ds4_kvstore_trailer_hooks *hooks,
+                                    uint64_t *trailer_bytes, uint64_t *payload_hash,
+                                    char *err, size_t err_len) {
+    const uint64_t list_bytes = ds4_kvstore_images_bytes(images);
+    uint8_t hh[DS4_KVSTORE_FIXED_HEADER], tb[4];
+    uint8_t list[KV_IMAGES_HEADER + DS4_KVSTORE_IMAGES_MAX * KV_IMAGE_RECORD];
+    memcpy(hh, h, sizeof(hh));
+    ds4_kvstore_hash digest;
+    ds4_kvstore_hash_init(&digest);
+    if (list_bytes) {
+        if (!kv_images_well_formed(images) || !images->encoder) {
+            snprintf(err, err_len, "malformed image identity list");
+            return false;
+        }
+        kv_images_encode(images, list);
+        ds4_kvstore_hash_update(&digest, list, (size_t)list_bytes);
+        hh[20] = KV_CACHE_PAYLOAD_ABI_IMAGES;
+        kv_le_put64(hh + 40, kv_le_get64(h + 40) + list_bytes);
+    }
+    ds4_kvstore_le_put32(tb, (uint32_t)text_len);
+    return fwrite(hh, 1, sizeof(hh), fp) == sizeof(hh) &&
+           fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
+           fwrite(text, 1, text_len, fp) == text_len &&
+           fwrite(list, 1, (size_t)list_bytes, fp) == list_bytes &&
+           (staged ? kv_copy_staged_hashed(staged, fp, digest, payload_hash, err, err_len) == 0 :
+                     (*payload_hash = ds4_kvstore_hash_final(&digest), true)) &&
+           kv_trailer_write(hooks, fp, text, trailer_bytes) &&
+           kv_put_payload_hash(fp, *payload_hash);
+}
+
 bool ds4_kvstore_write_entry(FILE *fp, const uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              const char *text, size_t text_len,
                              const ds4_session_payload_file *staged,
                              const ds4_kvstore_trailer_hooks *hooks,
                              uint64_t *trailer_bytes, uint64_t *payload_hash,
                              char *err, size_t err_len) {
-    uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, (uint32_t)text_len);
-    return fwrite(h, 1, DS4_KVSTORE_FIXED_HEADER, fp) == DS4_KVSTORE_FIXED_HEADER &&
-           fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-           fwrite(text, 1, text_len, fp) == text_len &&
-           (staged ? kv_copy_staged_hashed(staged, fp, payload_hash, err, err_len) == 0 :
-                     (*payload_hash = ds4_kvstore_payload_hash(NULL, 0), true)) &&
-           kv_trailer_write(hooks, fp, text, trailer_bytes) &&
-           kv_put_payload_hash(fp, *payload_hash);
+    return ds4_kvstore_write_entry_images(fp, h, text, text_len, NULL, staged, hooks,
+                                          trailer_bytes, payload_hash, err, err_len);
 }
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
@@ -1261,6 +1472,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const ds4_kvstore_images *images,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len) {
@@ -1299,11 +1511,26 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     size_t text_len = 0;
     char *text = NULL;
     const bool text_override = cache_text_override && cache_text_override[0];
+    ds4_kvstore_images im = {0};
+    if (images) im = *images;
     if (text_override) {
         text = kv_xstrdup(cache_text_override);
         text_len = strlen(text);
+        if (im.len && !kv_override_images_ok(text, text_len, &im, store_tokens.len)) {
+            free(text);
+            text = NULL;
+        }
+    } else if (im.len) {
+        text = kv_render_tokens_text_images(engine, &store_tokens, &im, &text_len);
     } else {
         text = ds4_kvstore_render_tokens_text(engine, &store_tokens, &text_len);
+    }
+    if (!text) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because its %u image spans do not fit the key",
+                kv_log_name(kc), store_tokens.len, reason, im.len);
+        ds4_tokens_free(&store_tokens);
+        return false;
     }
     if (text_len > UINT32_MAX) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1323,12 +1550,14 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_tokens_free(&store_tokens);
         return false;
     }
+    /* Image entries are named by their images too, so chats that share text
+     * but not pixels keep separate checkpoints. */
     char sha[41];
-    ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
+    ds4_kvstore_entry_sha(text, text_len, &im, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
-    if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
+    if (kv_cache_existing_compatible(kc, path, sha, text, text_len, &im,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
@@ -1354,7 +1583,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_tokens_free(&store_tokens);
         return false;
     }
-    uint64_t payload_bytes = staged.bytes;
+    uint64_t payload_bytes = staged.bytes + ds4_kvstore_images_bytes(&im);
 
     uint64_t est_file_bytes = 0, est_required_bytes = 0;
     if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
@@ -1382,6 +1611,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .images = &im,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
@@ -1411,12 +1641,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
                             (uint32_t)ds4_session_ctx(session),
-                            now, now, payload_bytes);
+                            now, now, staged.bytes);
     uint64_t trailer_bytes = 0, payload_hash = 0;
     errno = 0;
-    bool ok = ds4_kvstore_write_entry(fp, h, text, text_len, &staged, hooks,
-                                      &trailer_bytes, &payload_hash,
-                                      save_err, sizeof(save_err)) &&
+    bool ok = ds4_kvstore_write_entry_images(fp, h, text, text_len, &im, &staged, hooks,
+                                             &trailer_bytes, &payload_hash,
+                                             save_err, sizeof(save_err)) &&
               fflush(fp) == 0 && fsync(fileno(fp)) == 0;
     int saved_errno = errno;
     if (fclose(fp) != 0) {
@@ -1465,13 +1695,16 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         }
         unlink(tmp);
     } else {
+        char image_note[24] = "";
+        if (im.len) snprintf(image_note, sizeof(image_note), " images=%u", im.len);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms payload_hash=%016llx",
+                "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s%s size=%.2f MiB save=%.1f ms payload_hash=%016llx",
                 kv_log_name(kc),
                 store_tokens.len,
                 original_len - store_tokens.len,
                 reason,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
+                image_note,
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms, (unsigned long long)payload_hash);
     }
@@ -1494,7 +1727,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
-                                              hooks, err, err_len);
+                                              NULL, hooks, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
@@ -1516,8 +1749,30 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     return false;
 }
 
+/* The image list of an indexed entry (empty for ABI 2). false: unreadable. */
+static bool kv_entry_images(const ds4_kvstore_entry *e, ds4_kvstore_images *out) {
+    memset(out, 0, sizeof(*out));
+    if (!e->images) return true;
+    FILE *fp = fopen(e->path, "rb");
+    if (!fp) return false;
+    ds4_kvstore_entry hdr = {0};
+    uint32_t text_bytes = 0;
+    bool ok = kv_parse_header(fp, &hdr, &text_bytes) && hdr.images &&
+              fseeko(fp, (off_t)text_bytes, SEEK_CUR) == 0 &&
+              ds4_kvstore_read_images(fp, hdr.payload_bytes, out) != 0;
+    fclose(fp);
+    return ok;
+}
+
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size) {
+    return ds4_kvstore_find_image_prefix(kc, prompt_text, NULL, model_id,
+                                         quant_bits, ctx_size);
+}
+
+int ds4_kvstore_find_image_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                  const ds4_kvstore_images *images,
+                                  int model_id, int quant_bits, int ctx_size) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
@@ -1535,9 +1790,23 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
             if (e->text_bytes < b->text_bytes) continue;
             if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
         }
+        /* The name binds the request's images inside the prefix, so another
+         * image behind the same text never names this entry. The stored list
+         * is still checked: it is what a restore attaches. */
         char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
-        if (!strcmp(sha, e->sha)) best = i;
+        ds4_kvstore_entry_sha(prompt_text, (size_t)e->text_bytes, images, sha);
+        if (strcmp(sha, e->sha)) continue;
+        ds4_kvstore_images stored;
+        const char *why = kv_entry_images(e, &stored) ?
+            ds4_kvstore_images_mismatch(&stored, images, e->text_bytes) :
+            "unreadable image identity list";
+        if (!why) {
+            best = i;
+        } else {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache refused %s tokens=%u images=%u: %s; nothing restored from it",
+                    kv_log_name(kc), e->path, e->tokens, stored.len, why);
+        }
     }
     /* Name each refused entry that would have served a longer prefix. */
     for (int i = 0; i < kc->len; i++) {
@@ -1546,7 +1815,7 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if (best >= 0 && e->text_bytes <= kc->entry[best].text_bytes) continue;
         char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        ds4_kvstore_entry_sha(prompt_text, (size_t)e->text_bytes, images, sha);
         if (strcmp(sha, e->sha)) continue;
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache refused %s tokens=%u: %s (entry identity %016llx canary %016llx, "
@@ -1565,7 +1834,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              bool responses_protocol) {
+                              bool responses_protocol,
+                              const ds4_kvstore_images *images) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
@@ -1575,8 +1845,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
+    int idx = ds4_kvstore_find_image_prefix(kc, prompt_text, images, model_id,
+                                            quant_bits, ds4_session_ctx(session));
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
@@ -1611,7 +1881,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             } else {
                 cached_text[text_bytes] = '\0';
                 char text_sha[41];
-                ds4_kvstore_sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                ds4_kvstore_entry_sha(cached_text, text_bytes, images, text_sha);
                 if (strcmp(text_sha, e.sha)) {
                     header_ok = false;
                     fail_reason = "cached text hash mismatch";
@@ -1633,12 +1903,45 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         corrupt = true;
         fail_reason = why;
     }
+    /* The image list is inside the verified payload; it was matched at lookup
+     * and is checked again here against what is actually read. */
+    ds4_kvstore_images stored = {0};
+    uint64_t list_bytes = 0;
+    if (header_ok && hdr.images) {
+        list_bytes = ds4_kvstore_read_images(fp, hdr.payload_bytes, &stored);
+        if (!list_bytes) {
+            header_ok = false;
+            fail_reason = "malformed image identity list";
+        }
+    }
+    if (header_ok) {
+        const char *mismatch = ds4_kvstore_images_mismatch(&stored, images, text_bytes);
+        if (mismatch) {
+            header_ok = false;
+            fail_reason = mismatch;
+        }
+    }
+    ds4_vision_span spans[DS4_KVSTORE_IMAGES_MAX];
+    memset(spans, 0, sizeof(spans));
+    for (uint32_t i = 0; i < stored.len; i++) {
+        spans[i].token_start = stored.v[i].token_start;
+        spans[i].embedding.token_count = stored.v[i].token_count;
+        memcpy(spans[i].embedding.fingerprint, stored.v[i].fingerprint,
+               sizeof(spans[i].embedding.fingerprint));
+    }
     int loaded = 0;
     if (header_ok &&
-        ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
+        ds4_session_load_payload(session, fp, hdr.payload_bytes - list_bytes,
+                                 err, sizeof(err)) == 0)
     {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
-        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
+        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens &&
+            !ds4_session_restore_vision_identities(session, spans, stored.len)) {
+            ds4_session_invalidate(session);
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache load failed %s: its image identities do not fit the restored tokens; nothing restored",
+                    kv_log_name(kc), path);
+        } else if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
             if (effective_prompt) {
                 /* The cache lookup was by bytes, but the graph state is still
@@ -1683,12 +1986,15 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         kc->continued_last_store_tokens = loaded;
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
         ds4_kvstore_touch_file(path, hdr.hits + 1);
+        char image_note[48] = "";
+        if (stored.len) snprintf(image_note, sizeof(image_note),
+                                 " images=%u identity=fingerprint-match", stored.len);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s%s load=%.1f ms file=%s",
                 kv_log_name(kc),
                 responses_protocol ? " " : "",
                 responses_protocol ? "RESPPROTO" : "",
-                loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
+                loaded, text_bytes, hdr.quant_bits, key_kind, image_note, load_ms, path);
         if (result) {
             result->tokens = loaded;
             result->text_bytes = text_bytes;

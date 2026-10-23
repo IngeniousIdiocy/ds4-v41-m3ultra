@@ -4377,6 +4377,70 @@ kernel void kernel_mul_mm_f16_f32_scaled(
     }
 }
 
+// HC_NARROW: the HC mix projection (24 outputs from the 4 x n_embd stream) of a
+// prefill chunk at the bits of kernel_mul_mm_f16_f32 (scales == 0) or
+// kernel_mul_mm_f16_f32_scaled. Those run one 64x32 tile per threadgroup, so a
+// chunk of a few hundred rows is a handful of threadgroups that walk the whole
+// K in 32-wide barrier steps. Here one simdgroup owns 8 rows and all 24 outputs
+// and keeps 128 K of loads in flight per step. Each output still accumulates
+// half(x) * half(w) 8x8 products in ascending K from zero on simdgroup
+// matrices, as the tiled kernels do, so the result is the same to the bit.
+kernel void kernel_hc_proj24_f16_f32_narrow(
+        constant uint4 & dims,            // x: K (in_dim), y: n_rows, z: use scales
+        device const half  * w,           // [24][K]
+        device const float * x,           // [n_rows][K]
+        device       float * dst,         // [n_rows][24]
+        device const float * scales,      // [n_rows] when dims.z
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]]) {
+    const uint K = dims.x;
+    const uint n_rows = dims.y;
+    const uint r0 = (tgpig * 4u + sgitg) * 8u;
+    if (r0 >= n_rows) return;
+
+    // the 8x8 element layout of a simdgroup matrix: this lane holds (sm, sn) and (sm, sn + 1)
+    const short qid = lane / 4;
+    const short sm = (qid & 4) + (lane / 2) % 4;
+    const short sn = (qid & 2) * 2 + (lane % 2) * 2;
+    const uint row = min(r0 + (uint)sm, n_rows - 1u);
+    const float scale = dims.z ? scales[row] : 1.0f;
+    device const float * xr = x + (uint64_t)row * K + sn;
+
+    simdgroup_float8x8 mc[3];
+    for (short c = 0; c < 3; c++) mc[c] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    constexpr short U = 16;   // 128 K per step
+    for (uint k0 = 0; k0 < K; k0 += 8u * U) {
+        float2 xv[U];
+        simdgroup_half8x8 ma[U][3];
+        FOR_UNROLL (short u = 0; u < U; u++) xv[u] = *(device const float2 *)(xr + k0 + 8u * u);
+        FOR_UNROLL (short u = 0; u < U; u++) {
+            FOR_UNROLL (short c = 0; c < 3; c++) {
+                simdgroup_load(ma[u][c], w + (uint64_t)(8 * c) * K + k0 + 8u * u, K, ulong2(0, 0), true);
+            }
+        }
+        FOR_UNROLL (short u = 0; u < U; u++) {
+            simdgroup_half8x8 mb;
+            const float2 v = dims.z ? xv[u] * scale : xv[u];
+            mb.thread_elements()[0] = (half)v[0];
+            mb.thread_elements()[1] = (half)v[1];
+            FOR_UNROLL (short c = 0; c < 3; c++) {
+                simdgroup_multiply_accumulate(mc[c], mb, ma[u][c], mc[c]);
+            }
+        }
+    }
+
+    if (r0 + (uint)sm < n_rows) {
+        device float * d = dst + (uint64_t)(r0 + sm) * 24u + sn;
+        FOR_UNROLL (short c = 0; c < 3; c++) {
+            const auto e = mc[c].thread_elements();
+            d[8 * c]     = e[0];
+            d[8 * c + 1] = e[1];
+        }
+    }
+}
+
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
 // Dense prefill variants, including a full-F32 router without half conversion.

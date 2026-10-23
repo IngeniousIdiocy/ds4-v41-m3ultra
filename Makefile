@@ -25,6 +25,8 @@ DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
+# ds4_image.c decodes WebP through ImageIO, in the CPU build as well.
+LDLIBS += -framework ImageIO -framework CoreGraphics -framework CoreFoundation -lcompression
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
@@ -902,13 +904,13 @@ tests/test_deepseek4_vision_image.o: tests/test_deepseek4_vision_image.c ds4_ima
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/test_deepseek4_vision_image: tests/test_deepseek4_vision_image.o ds4_image.o
-	$(CC) $(CFLAGS) -o $@ $^ -lm
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_image_decode.o: tests/test_image_decode.c ds4_image.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/test_image_decode: tests/test_image_decode.o ds4_image.o
-	$(CC) $(CFLAGS) -o $@ $^ -lm
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ifeq ($(UNAME_S),Darwin)
 $(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_metal.o ds4_image.o
