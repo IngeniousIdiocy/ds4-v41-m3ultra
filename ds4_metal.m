@@ -498,6 +498,8 @@ uint64_t ds4_gpu_v41_off(void) {
             const char *v = getenv(names[i]);
             if (v && v[0] && strcmp(v, "0") != 0) g_v41_off |= 1ull << i;
         }
+        const char *exact = getenv("DS4_V41_EXACT");
+        if (exact && exact[0] && strcmp(exact, "0") != 0) g_v41_off |= DS4_GPU_V41_NOT_EXACT;
         g_v41_off_read = 1;
     }
     return g_v41_off;

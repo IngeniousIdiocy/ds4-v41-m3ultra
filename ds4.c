@@ -73773,7 +73773,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->glm_mtp = opt->glm_mtp;
     e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;
-    e->dspark_strict = opt->dspark_strict;
+    const char *exact = getenv("DS4_V41_EXACT");   /* the exact shortcut: DSpark keeps target-only decode */
+    e->dspark_strict = opt->dspark_strict || (exact && exact[0] && strcmp(exact, "0") != 0);
+    if (exact && exact[0] && strcmp(exact, "0") != 0)
+        fprintf(stderr, "ds4: exact: V4.1 groups that are not bit-identical to main's serial decode are off; "
+                "DSpark keeps target-only decode\n");
     e->dspark_exact_sampling = opt->dspark_exact_sampling;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
