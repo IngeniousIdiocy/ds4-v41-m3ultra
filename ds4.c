@@ -41020,6 +41020,8 @@ typedef struct {
     /* SUFFIX_TRIM: the rows the untrimmed chunk would run here; the F32 router picks its kernel for these. 0: the
      * batch's own. */
     uint32_t plan_rows;
+    /* CED: a prefill sweep's decoder rows see no window keys before this position (0: all of them) */
+    uint32_t window_floor;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
@@ -42933,7 +42935,9 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, ds41_gpu_graph *const *graph
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (start + count) / ratio : 0;
-    const uint32_t previous = start < 127u ? start : 127u;
+    /* CED: window keys before window_floor are not visible */
+    const uint32_t visible = start > g->window_floor ? start - g->window_floor : 0u;
+    const uint32_t previous = visible < 127u ? visible : 127u;
     const uint32_t raw_start = (start - previous) % 128u;
     const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
     const uint32_t n_raw = previous + count;
@@ -43992,16 +43996,23 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               bool encoder_only, bool resume_encoder,
                               const int *next_tokens, uint32_t next_count) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
+    /* CED (the V4.1 report's causal encoder-decoder with SWA bounded replay): decoder layers 20-39 read the global
+     * keys the encoder layers publish and only a 128-row window of their own, so a sweep replays just its last 256
+     * rows through them (the last 128 see full windows), their windows truncated to the replayed segment. DeepSeek
+     * post-trained the model for this mode; it is not bit-identical to the full forward. */
+    const uint32_t ced_tail = 256u;
+    const bool ced = ds41_on(DS4_GPU_V41_CED) && !g->quality && !g->streaming && !g->image_count &&
+        total_count >= ced_tail + 256u && total_count <= g->carry_cap;
     /* SUFFIX_TRIM: sweeps of 1,024-8,191 rows trim the decoder suffix inside the plain schedule's chunks, with each
      * kept row on the kernels the untrimmed chunk would use, so the output is unchanged. Below 1,024 rows it does not
      * pay. */
-    const bool trim = ds41_on(DS4_GPU_V41_SUFFIX_TRIM) && !g->quality && g->tp_world == 1 && !g->streaming &&
+    const bool trim = !ced && ds41_on(DS4_GPU_V41_SUFFIX_TRIM) && !g->quality && g->tp_world == 1 && !g->streaming &&
         !g->image_count && total_count >= 1024u && total_count < 8192u && total_count <= g->carry_cap;
     /* DS4_V41_SUFFIX_ALL: the exact dependency suffix for short sweeps too, without
      * tile rounding; same math, other kernels for the smaller row counts. */
-    const bool suffix_all = !trim && getenv("DS4_V41_SUFFIX_ALL") && g->tp_world == 1 && !g->streaming &&
+    const bool suffix_all = !ced && !trim && getenv("DS4_V41_SUFFIX_ALL") && g->tp_world == 1 && !g->streaming &&
         !g->image_count && total_count >= 384u && total_count <= g->carry_cap;
-    const bool wide = total_count > encoder_chunk || suffix_all || trim;
+    const bool wide = total_count > encoder_chunk || suffix_all || trim || ced;
     if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
@@ -44016,7 +44027,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * window of every layer's stream. SHORT_SWEEP rebuilds that suffix from as many rows, not from 8192. */
     const uint32_t kept = g->dspark ? 128u : 1u;
     const uint32_t suffix_rows = kept + (DS4_N_LAYER - 20u) * 127u;
-    const bool decoder_suffix = trim || suffix_all || (wide && total_count >= (ds41_on(DS4_GPU_V41_SHORT_SWEEP) ? suffix_rows : 8192u) &&
+    const bool decoder_suffix = ced || trim || suffix_all || (wide && total_count >= (ds41_on(DS4_GPU_V41_SHORT_SWEEP) ? suffix_rows : 8192u) &&
                                                !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX"));
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
@@ -44141,6 +44152,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
+            if (ced) {
+                first = total_count - ced_tail;
+                g->window_floor = initial_start + first;
+            }
+        }
+        if (ok && decoder_suffix && il >= 20u && !ced) {
             const uint32_t needed = kept + (DS4_N_LAYER - 1u - il) * 127u;
             first = needed < total_count ? total_count - needed : 0u;
             if (trim) {
@@ -44386,6 +44403,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         g->plan_rows = 0;
     }
     g->plan_rows = 0;
+    g->window_floor = 0;
     if (!ds41_engram_prefetch_join(engram_pf, !ok)) ok = false;
     if (!ok) ds41_engram_carry_drop(g);
 #ifdef DS4_ROCM_BUILD
