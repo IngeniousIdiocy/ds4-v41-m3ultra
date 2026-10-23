@@ -65369,6 +65369,15 @@ uint64_t ds4_engine_vision_encoder_identity(ds4_engine *e) {
         h *= UINT64_C(1099511628211);
         if (!h) h = 1;
     }
+    /* IMAGE_CED replays only a sweep's tail through the decoder layers on prompts with images, so image state
+     * built with it must never restore where image prompts run the full replay (DS4_V41_EXACT=1, or either
+     * switch off), nor the other way round. The text canary cannot tell these apart: it holds no image. */
+    if (h && e->vision_kind == DS4_VISION_DEEPSEEK4 && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        ds41_on(DS4_GPU_V41_CED) && ds41_on(DS4_GPU_V41_IMAGE_CED)) {
+        h ^= UINT64_C(0x696d67636564);   /* "imgced" */
+        h *= UINT64_C(1099511628211);
+        if (!h) h = 1;
+    }
 #endif
     return h;
 }
