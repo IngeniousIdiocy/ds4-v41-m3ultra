@@ -8938,7 +8938,10 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 // above. On a short final work item, SIMDgroup 1 remains in staging and at
 // every threadgroup barrier but skips its MMA/store when rows 16..31 are
 // empty.
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+// T1 = half (MOE_HALF_X): the routed rows arrive already narrowed to half, the value this kernel's staging makes of
+// each float, so the tiles read half the activation bytes and give the same bits.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &),
+         typename T1 = float, typename T1_2x4 = float2x4>
 kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -9016,12 +9019,12 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
 
     const short iy = 8*(tiitg % NL1);
 
-    device const float * y_b0 = (device const float *)(src1
+    device const T1 * y_b0 = (device const T1 *)(src1
         + args.nb13*i13
         + args.nb12*i12_b0
         + args.nb11*i11_b0
         + args.nb10*iy);
-    device const float * y_b1 = (device const float *)(src1
+    device const T1 * y_b1 = (device const T1 *)(src1
         + args.nb13*i13
         + args.nb12*i12_b1
         + args.nb11*i11_b1
@@ -9057,9 +9060,9 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
             const short ib_b0 = 4*sx_b + sy_b0;
             const short ib_b1 = 4*sx_b + sy_b1;
             *(threadgroup half2x4 *)(sb + 64*ib_b0 + 8*ly_b) =
-                (half2x4)(*((device float2x4 *) y_b0));
+                (half2x4)(*((device const T1_2x4 *) y_b0));
             *(threadgroup half2x4 *)(sb + 64*ib_b1 + 8*ly_b) =
-                (half2x4)(*((device float2x4 *) y_b1));
+                (half2x4)(*((device const T1_2x4 *) y_b1));
         }
 
         FOR_UNROLL (short i = 0; i < 16; i++) {
@@ -9170,6 +9173,9 @@ template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_tail_cull_half_scal
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull_half_scale")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4_compact_tail kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_tail_cull")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4_tail_cull kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4, true>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4_compact_tail kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl<block_mxfp4, 2, dequantize_mxfp4>;
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale, half, half2x4>) mul_mm_id_pair_swiglu_f16_mxfp4_compact_tail_hx;
+template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull_half_scale_hx")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4_compact_tail_hx kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_compact_tail_cull_hx")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4_compact_tail_hx kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl<block_mxfp4, 2, dequantize_mxfp4, half, half2x4>;
 
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_f16_rhs;
