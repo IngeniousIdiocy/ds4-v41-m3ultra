@@ -48904,13 +48904,14 @@ static int deepseek4_vision_dispatch_qkv(
         uint64_t              model_size,
         uint64_t              bias_offset,
         uint32_t              rows,
-        uint32_t              grid_width) {
+        uint32_t              grid_width,
+        bool                  half_kv) {        /* VISION_ATTN_FLASH: K, V as half, padded to 64-row tiles */
     uint64_t bias_inner = 0;
     id<MTLBuffer> bias = glm53_gpu_weight_buffer(
             model_map, model_size, bias_offset, 3072u * sizeof(uint16_t),
             &bias_inner, "DeepSeek vision QKV bias");
     id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_deepseek4_vision_qkv_rope");
+            ds4_gpu_get_pipeline(half_kv ? "kernel_deepseek41_vision_qkv_rope_half_kv" : "kernel_deepseek4_vision_qkv_rope");
     if (!bias || !pipeline) return 0;
     deepseek4_vision_qkv_args args = { rows, grid_width };
     int owned = 0;
@@ -48928,7 +48929,7 @@ static int deepseek4_vision_dispatch_qkv(
             offset:ds4_gpu_tensor_offset(k) atIndex:4];
     [enc setBuffer:ds4_gpu_tensor_buffer(v)
             offset:ds4_gpu_tensor_offset(v) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake(rows, 16u, 1)
+    [enc dispatchThreadgroups:MTLSizeMake(half_kv ? (rows + 63u) / 64u * 64u : rows, 16u, 1)
          threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned,
@@ -49110,8 +49111,7 @@ static int deepseek41_vision_dispatch_attention(
     [enc setBuffer:ds4_gpu_tensor_buffer(v) offset:ds4_gpu_tensor_offset(v) atIndex:3];
     [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
     if (mode == 2) {
-        /* K and V tiles [64][72] in half; 64 query rows per threadgroup, 8 per SIMD group */
-        [enc setThreadgroupMemoryLength:2u * 64u * 72u * sizeof(uint16_t) atIndex:0];
+        /* K and V in half from kernel_deepseek41_vision_qkv_rope_half_kv; 64 query rows per threadgroup, 8 per SIMD group */
         [enc dispatchThreadgroups:MTLSizeMake((rows + 63u) / 64u, 16u, 1)
              threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
     } else if (mode == 1) {
@@ -49187,8 +49187,10 @@ int ds4_gpu_deepseek4_vision_encode(
     DEEPSEEK4_VISION_ALLOC(b, row1024);
     DEEPSEEK4_VISION_ALLOC(qkv, row3072);
     DEEPSEEK4_VISION_ALLOC(q, row1024);
-    DEEPSEEK4_VISION_ALLOC(k, row1024);
-    DEEPSEEK4_VISION_ALLOC(v, row1024);
+    /* flash's half K and V take (rows + 63) / 64 * 64 rows of 1024 halves: no more than row1024 floats unless rows < 64 */
+    const uint64_t kv_floats = MAX(row1024, (uint64_t)((rows + 63u) / 64u * 64u) * 512u);
+    DEEPSEEK4_VISION_ALLOC(k, kv_floats);
+    DEEPSEEK4_VISION_ALLOC(v, kv_floats);
     DEEPSEEK4_VISION_ALLOC(attn, row1024);
     DEEPSEEK4_VISION_ALLOC(mlp_w1, row5632);
     DEEPSEEK4_VISION_ALLOC(mlp_mid, row2816);
@@ -49229,12 +49231,13 @@ int ds4_gpu_deepseek4_vision_encode(
                 "block0_qkv", qkv, row3072);
         if (ok) ok = deepseek4_vision_dispatch_qkv(
                 q, k, v, qkv, model_map, model_size,
-                w->qkv_bias, rows, grid_w);
+                w->qkv_bias, rows, grid_w, attn_mode == 2);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_q", q, row1024);
-        if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
+        /* under flash, k and v hold half values (not dumped) */
+        if (ok && il == 0u && attn_mode != 2) ok = deepseek4_vision_debug_dump(
                 "block0_k", k, row1024);
-        if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
+        if (ok && il == 0u && attn_mode != 2) ok = deepseek4_vision_debug_dump(
                 "block0_v", v, row1024);
         if (ok) ok = v41 ? deepseek41_vision_dispatch_attention(attn, q, k, v, rows, attn_mode, fold)
                          : glm53_vision_dispatch_attention(attn, q, k, v, rows);

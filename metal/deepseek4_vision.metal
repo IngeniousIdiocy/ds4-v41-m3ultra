@@ -82,6 +82,65 @@ kernel void kernel_deepseek4_vision_qkv_rope(
             bias[2048u + (ulong)head * 64u + lane + 32u]));
 }
 
+/* VISION_ATTN_FLASH's QKV: as kernel_deepseek4_vision_qkv_rope, with K and V stored as half (they are bf16-rounded,
+ * which half holds exactly in its normal range: the values flash staged before) and rows up to a whole 64-key tile
+ * zeroed, so flash loads whole tiles from device memory. Dispatch (rows + 63) / 64 * 64 rows. */
+kernel void kernel_deepseek41_vision_qkv_rope_half_kv(
+        constant deepseek4_vision_qkv_args &args,
+        device const float                 *qkv,
+        device const ushort                *bias,
+        device float                       *q,
+        device half                        *k,
+        device half                        *v,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint row = group.x;
+    const uint head = group.y;
+    if (head >= 16u) return;
+    const ulong qkv_base = (ulong)row * 3072u + (ulong)head * 64u;
+    const ulong out_base = (ulong)row * 1024u + (ulong)head * 64u;
+    if (row >= args.rows) {
+        k[out_base + lane] = 0.0h;
+        k[out_base + lane + 32u] = 0.0h;
+        v[out_base + lane] = 0.0h;
+        v[out_base + lane + 32u] = 0.0h;
+        return;
+    }
+    const float q0 = deepseek4_vision_round_bf16(
+        qkv[qkv_base + lane] +
+        glm53_bf16_to_f32(bias[(ulong)head * 64u + lane]));
+    const float q1 = deepseek4_vision_round_bf16(
+        qkv[qkv_base + lane + 32u] +
+        glm53_bf16_to_f32(bias[(ulong)head * 64u + lane + 32u]));
+    const float k0 = deepseek4_vision_round_bf16(
+        qkv[qkv_base + 1024u + lane] +
+        glm53_bf16_to_f32(bias[1024u + (ulong)head * 64u + lane]));
+    const float k1 = deepseek4_vision_round_bf16(
+        qkv[qkv_base + 1024u + lane + 32u] +
+        glm53_bf16_to_f32(bias[1024u + (ulong)head * 64u + lane + 32u]));
+    const uint y = row / args.grid_width;
+    const uint x = row - y * args.grid_width;
+    const uint pos = lane < 16u ? y : x;
+    const uint freq_index = lane & 15u;
+    const float inv_freq = powr(10000.0f, -(float)freq_index / 16.0f);
+    const float angle = (float)pos * inv_freq;
+    const float cs = cos(angle);
+    const float sn = sin(angle);
+    q[out_base + lane] = deepseek4_vision_round_bf16(q0 * cs - q1 * sn);
+    q[out_base + lane + 32u] =
+        deepseek4_vision_round_bf16(q1 * cs + q0 * sn);
+    k[out_base + lane] = (half)deepseek4_vision_round_bf16(k0 * cs - k1 * sn);
+    k[out_base + lane + 32u] =
+        (half)deepseek4_vision_round_bf16(k1 * cs + k0 * sn);
+    v[out_base + lane] = (half)deepseek4_vision_round_bf16(
+        qkv[qkv_base + 2048u + lane] +
+        glm53_bf16_to_f32(bias[2048u + (ulong)head * 64u + lane]));
+    v[out_base + lane + 32u] = (half)deepseek4_vision_round_bf16(
+        qkv[qkv_base + 2048u + lane + 32u] +
+        glm53_bf16_to_f32(
+            bias[2048u + (ulong)head * 64u + lane + 32u]));
+}
+
 kernel void kernel_deepseek4_vision_round_bf16(
         constant deepseek4_vision_rows_args &args,
         device float                       *x,
@@ -396,8 +455,9 @@ template [[host_name("kernel_deepseek41_vision_attention_exact_round")]] kernel 
 
 /* VISION_ATTN_FLASH (default on; accurate, not bit-exact): tiled attention on simdgroup matrices.
  * A threadgroup of eight SIMD groups takes 64 query rows of one head, 8 per SIMD group, and walks the keys in tiles
- * of 64 staged in threadgroup memory as half (q and k are bf16-rounded, which half holds exactly in its normal
- * range; every product and sum stays in float). The softmax never leaves the SIMD group: in an 8x8 simdgroup
+ * of 64. K and V come as half from kernel_deepseek41_vision_qkv_rope_half_kv (bf16-rounded values, which half holds
+ * exactly in its normal range; zero rows pad the last tile), and each SIMD group loads its fragments straight from
+ * device memory: no threadgroup staging, no barriers. Every product and sum stays in float. The softmax never leaves the SIMD group: in an 8x8 simdgroup
  * matrix lane l holds row (l/4 & 4) + (l/2 % 4) at columns fn, fn+1 with fn = (l/4 & 2)*2 + (l%2)*2, so a row's
  * scores sit in the lanes that differ in bits 0 and 3 and reduce with two shuffles, and the running maximum,
  * the output rescale and the probabilities stay in registers. Q is pre-scaled by 1/8 (exact). Only the final,
@@ -412,10 +472,10 @@ static inline void deepseek41_vision_attention_flash_tile(
         thread simdgroup_float8x8       *O,
         thread float                    &m,
         thread float                    &l,
-        threadgroup const half          *Ks,
-        threadgroup const half          *Vs,
+        device const half               *Ks,        /* this tile's first key, this head */
+        device const half               *Vs,
         uint key0, uint rows, ushort fn) {
-    constexpr uint KT = 64, KP = 72;
+    constexpr uint KT = 64, KP = 1024;          /* keys per tile, key row stride (halves) */
     simdgroup_float8x8 S[KT / 8];
 #pragma unroll
     for (uint n = 0; n < KT / 8u; n++) {
@@ -485,21 +545,16 @@ template <bool ROUND, bool LAZY>
 kernel void kernel_deepseek41_vision_attention_flash(
         constant glm53_vision_attention_args &args,
         device const float                   *q,
-        device const float                   *k,
-        device const float                   *v,
+        device const half                    *k,
+        device const half                    *v,
         device float                         *out,
-        threadgroup half                     *tg [[threadgroup(0)]],
         uint2 group [[threadgroup_position_in_grid]],
-        ushort tid [[thread_index_in_threadgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]]) {
-    constexpr uint KT = 64;                     /* keys per staged tile */
-    constexpr uint KP = 72;                     /* padded tile row (halves) */
+    constexpr uint KT = 64;                     /* keys per tile */
     const uint head = group.y;
     const uint rows = args.rows;
     const uint row0 = group.x * 64u + sg * 8u;
-    threadgroup half *Ks = tg;                  /* [KT][KP] */
-    threadgroup half *Vs = tg + KT * KP;        /* [KT][KP] */
     const ushort qid = lane / 4u;
     const ushort fm = (qid & 4u) + ((lane / 2u) % 4u);
     const ushort fn = (qid & 2u) * 2u + (lane % 2u) * 2u;
@@ -518,16 +573,8 @@ kernel void kernel_deepseek41_vision_attention_flash(
     for (uint c = 0; c < 8u; c++) O[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     float m = -INFINITY, l = 0.0f;
     for (uint key0 = 0; key0 < rows; key0 += KT) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < KT * 16u; i += 256u) {
-            const uint r = i >> 4, c4 = (i & 15u) * 4u, key = key0 + r;
-            const ulong off = (ulong)key * 1024u + (ulong)head * 64u + c4;
-            const float4 kv = key < rows ? *(device const float4 *)(k + off) : float4(0.0f);
-            const float4 vv = key < rows ? *(device const float4 *)(v + off) : float4(0.0f);
-            *(threadgroup half4 *)(Ks + r * KP + c4) = half4(kv);
-            *(threadgroup half4 *)(Vs + r * KP + c4) = half4(vv);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const half *Ks = k + (ulong)key0 * 1024u + (ulong)head * 64u;
+        device const half *Vs = v + (ulong)key0 * 1024u + (ulong)head * 64u;
         if (key0 + KT > rows) deepseek41_vision_attention_flash_tile<true, LAZY>(Qm, O, m, l, Ks, Vs, key0, rows, fn);
         else                  deepseek41_vision_attention_flash_tile<false, LAZY>(Qm, O, m, l, Ks, Vs, key0, rows, fn);
     }
