@@ -25,7 +25,9 @@ DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework ImageIO -framework CoreGraphics -framework CoreFoundation
+# ds4_image.c decodes WebP through ImageIO, in the CPU build as well.
+LDLIBS += -framework ImageIO -framework CoreGraphics -framework CoreFoundation
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else

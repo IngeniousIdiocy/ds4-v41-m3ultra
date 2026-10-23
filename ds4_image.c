@@ -253,6 +253,7 @@ static int ds4_decode_webp_imageio(
     CGImageSourceRef source = NULL;
     CGImageRef image = NULL;
     CGContextRef context = NULL;
+    CGColorSpaceRef space = NULL;
     data = CFDataCreate(NULL, encoded, (CFIndex)encoded_len);
     if (data) source = CGImageSourceCreateWithData(data, NULL);
     if (source) image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
@@ -268,10 +269,11 @@ static int ds4_decode_webp_imageio(
         ds4_image_error(error, error_cap, "WebP image exceeds the decoded image limits");
         goto webp_done;
     }
-    context = CGBitmapContextCreate(NULL, width, height, 8, 0,
-                                    CGColorSpaceCreateDeviceRGB(),
-                                    (CGBitmapInfo)(kCGImageAlphaPremultipliedLast |
-                                                   kCGBitmapByteOrder32Big));
+    space = CGColorSpaceCreateDeviceRGB();
+    if (space)
+        context = CGBitmapContextCreate(NULL, width, height, 8, 0, space,
+                                        (CGBitmapInfo)(kCGImageAlphaPremultipliedLast |
+                                                       kCGBitmapByteOrder32Big));
     if (!context) {
         ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
         goto webp_done;
@@ -291,6 +293,7 @@ static int ds4_decode_webp_imageio(
     if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
 webp_done:
     if (context) CFRelease(context);
+    if (space) CFRelease(space);
     if (image) CFRelease(image);
     if (source) CFRelease(source);
     if (data) CFRelease(data);
