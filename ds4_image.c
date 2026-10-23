@@ -7,6 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+#include <dispatch/dispatch.h>
+#endif
+
 #define JPEG_IMPLEMENTATION
 #define PNG_IMPLEMENTATION
 #include "third_party/iris/jpeg.h"
@@ -137,6 +142,54 @@ static void ds4_image_error(char *error, size_t cap, const char *message) {
     snprintf(error, cap, "%s", message);
 }
 
+/* VISION_HOST_PREP (default on; DS4_METAL_DISABLE_V41_VISION_HOST_PREP=1 restores
+ * the serial path): image rows are independent, so decode copies, the bicubic
+ * resize, normalization and patching split across cores with the same per-pixel
+ * arithmetic, and the pixel fingerprint uses the system SHA-256 (same digest). */
+static int ds4_image_host_prep_on(void) {
+    return getenv("DS4_METAL_DISABLE_V41_VISION_HOST_PREP") == NULL;
+}
+
+typedef void (*ds4_image_rows_fn)(void *ctx, size_t first, size_t end);
+
+typedef struct {
+    ds4_image_rows_fn fn;
+    void *ctx;
+    size_t count;
+    size_t chunk;
+} ds4_image_rows_job;
+
+#ifdef __APPLE__
+static void ds4_image_rows_chunk(void *ctx, size_t index) {
+    const ds4_image_rows_job *job = ctx;
+    const size_t first = index * job->chunk;
+    size_t end = first + job->chunk;
+    if (end > job->count) end = job->count;
+    if (first < end) job->fn(job->ctx, first, end);
+}
+#endif
+
+static void ds4_image_rows(size_t count, size_t min_chunk, ds4_image_rows_fn fn, void *ctx) {
+    if (count == 0) return;
+#ifdef __APPLE__
+    if (ds4_image_host_prep_on() && count > min_chunk) {
+        size_t chunks = (count + min_chunk - 1) / min_chunk;
+        if (chunks > 64) chunks = 64;
+        ds4_image_rows_job job = {fn, ctx, count, (count + chunks - 1) / chunks};
+        dispatch_apply_f((count + job.chunk - 1) / job.chunk,
+                         dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                         &job, ds4_image_rows_chunk);
+        return;
+    }
+#else
+    (void)min_chunk;
+#endif
+    fn(ctx, 0, count);
+}
+
+static void ds4_image_fingerprint(uint8_t out[32], uint32_t width, uint32_t height,
+                                  const uint8_t *rgb, size_t bytes);
+
 static uint16_t ds4_exif_u16(const uint8_t *p, int little) {
     return little ? (uint16_t)(p[0] | (p[1] << 8))
                   : (uint16_t)((p[0] << 8) | p[1]);
@@ -189,6 +242,15 @@ static int ds4_jpeg_orientation(const uint8_t *data, size_t len) {
     return 1;
 }
 
+typedef struct {
+    const uint8_t *pixels;
+    uint8_t *rgb;
+    uint32_t width, height, channels, out_width;
+    int orientation;
+} ds4_oriented_rows;
+
+static void ds4_oriented_rgb_rows(void *opaque, size_t first, size_t end);
+
 static int ds4_oriented_rgb(
         ds4_image *out,
         const uint8_t *pixels,
@@ -202,7 +264,24 @@ static int ds4_oriented_rgb(
     uint8_t *rgb = malloc(bytes);
     if (!rgb) return 0;
 
-    for (uint32_t y = 0; y < height; y++) {
+    ds4_oriented_rows ctx = {pixels, rgb, width, height, channels, out_width, orientation};
+    ds4_image_rows(height, 32, ds4_oriented_rgb_rows, &ctx);
+
+    out->width = out_width;
+    out->height = out_height;
+    out->rgb = rgb;
+    ds4_image_fingerprint(out->fingerprint, out_width, out_height, rgb, bytes);
+    return 1;
+}
+
+static void ds4_oriented_rgb_rows(void *opaque, size_t first, size_t end) {
+    const ds4_oriented_rows *c = opaque;
+    const uint8_t *pixels = c->pixels;
+    uint8_t *rgb = c->rgb;
+    const uint32_t width = c->width, height = c->height, channels = c->channels;
+    const uint32_t out_width = c->out_width;
+    const int orientation = c->orientation;
+    for (uint32_t y = (uint32_t)first; y < (uint32_t)end; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t ox = x, oy = y;
             switch (orientation) {
@@ -224,17 +303,31 @@ static int ds4_oriented_rgb(
             }
         }
     }
+}
 
-    out->width = out_width;
-    out->height = out_height;
-    out->rgb = rgb;
+static void ds4_image_fingerprint(uint8_t out[32], uint32_t width, uint32_t height,
+                                  const uint8_t *rgb, size_t bytes) {
+#ifdef __APPLE__
+    if (ds4_image_host_prep_on()) {
+        CC_SHA256_CTX ctx;
+        CC_SHA256_Init(&ctx);
+        CC_SHA256_Update(&ctx, &width, sizeof(width));
+        CC_SHA256_Update(&ctx, &height, sizeof(height));
+        for (size_t done = 0; done < bytes;) {
+            size_t take = bytes - done < (1u << 30) ? bytes - done : (1u << 30);
+            CC_SHA256_Update(&ctx, rgb + done, (CC_LONG)take);
+            done += take;
+        }
+        CC_SHA256_Final(out, &ctx);
+        return;
+    }
+#endif
     ds4_sha256 sha;
     ds4_sha256_init(&sha);
-    ds4_sha256_update(&sha, &out_width, sizeof(out_width));
-    ds4_sha256_update(&sha, &out_height, sizeof(out_height));
+    ds4_sha256_update(&sha, &width, sizeof(width));
+    ds4_sha256_update(&sha, &height, sizeof(height));
     ds4_sha256_update(&sha, rgb, bytes);
-    ds4_sha256_final(&sha, out->fingerprint);
-    return 1;
+    ds4_sha256_final(&sha, out);
 }
 
 /* Pasted screenshots and clipboard images frequently arrive as WebP. macOS
@@ -471,6 +564,16 @@ static double ds4_cubic(double x, double a) {
     return 0.0;
 }
 
+typedef struct {
+    const uint8_t *src;
+    uint32_t src_width, src_height;
+    float *dst;
+    uint32_t dst_width, dst_stride;
+    double scale_x, scale_y, filter_x, filter_y, support_x, support_y;
+} ds4_resize_rows;
+
+static void ds4_resize_rgb_bicubic_rows(void *opaque, size_t first, size_t end);
+
 static void ds4_resize_rgb_bicubic(
         const uint8_t *src,
         uint32_t src_width,
@@ -485,8 +588,21 @@ static void ds4_resize_rgb_bicubic(
     double filter_y = scale_y >= 1.0 ? 1.0 / scale_y : 1.0;
     double support_x = scale_x >= 1.0 ? 2.0 * scale_x : 2.0;
     double support_y = scale_y >= 1.0 ? 2.0 * scale_y : 2.0;
+    ds4_resize_rows ctx = {src, src_width, src_height, dst, dst_width, dst_stride,
+                           scale_x, scale_y, filter_x, filter_y, support_x, support_y};
+    ds4_image_rows(dst_height, 4, ds4_resize_rgb_bicubic_rows, &ctx);
+}
 
-    for (uint32_t dy = 0; dy < dst_height; dy++) {
+static void ds4_resize_rgb_bicubic_rows(void *opaque, size_t first, size_t end) {
+    const ds4_resize_rows *c = opaque;
+    const uint8_t *src = c->src;
+    const uint32_t src_width = c->src_width, src_height = c->src_height;
+    float *dst = c->dst;
+    const uint32_t dst_width = c->dst_width, dst_stride = c->dst_stride;
+    const double scale_x = c->scale_x, scale_y = c->scale_y;
+    const double filter_x = c->filter_x, filter_y = c->filter_y;
+    const double support_x = c->support_x, support_y = c->support_y;
+    for (uint32_t dy = (uint32_t)first; dy < (uint32_t)end; dy++) {
         double center_y = scale_y * ((double)dy + 0.5);
         int y0 = (int)(center_y - support_y + 0.5);
         int y1 = (int)(center_y + support_y + 0.5);
@@ -827,6 +943,36 @@ static int ds4_deepseek4_safe_resize(
     return 1;
 }
 
+static void ds4_deepseek_normalize_rows(void *opaque, size_t first, size_t end) {
+    float *canvas = opaque;
+    for (size_t i = first; i < end; i++) canvas[i] = canvas[i] / 127.5f - 1.0f;
+}
+
+typedef struct {
+    const float *canvas;
+    float *patches;
+    uint32_t best_width, grid_width;
+} ds4_deepseek_patch_ctx;
+
+static void ds4_deepseek_patch_rows(void *opaque, size_t first, size_t end) {
+    const ds4_deepseek_patch_ctx *c = opaque;
+    for (uint32_t patch_y = (uint32_t)first; patch_y < (uint32_t)end; patch_y++) {
+        size_t index = (size_t)patch_y * c->grid_width * 3u * 14u * 14u;
+        for (uint32_t patch_x = 0; patch_x < c->grid_width; patch_x++) {
+            for (uint32_t channel = 0; channel < 3u; channel++) {
+                for (uint32_t y = 0; y < 14u; y++) {
+                    for (uint32_t x = 0; x < 14u; x++) {
+                        const float *pixel = c->canvas +
+                            ((size_t)(patch_y * 14u + y) * c->best_width +
+                             patch_x * 14u + x) * 3u;
+                        c->patches[index++] = pixel[channel];
+                    }
+                }
+            }
+        }
+    }
+}
+
 static int ds4_image_preprocess_deepseek(
         ds4_deepseek4_image_patches *out,
         const ds4_image *image,
@@ -904,9 +1050,7 @@ static int ds4_image_preprocess_deepseek(
     float *resized = canvas + ((size_t)offset_y * best_width + offset_x) * 3u;
     ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
                            resized, content_width, content_height, best_width);
-    for (size_t i = 0; i < canvas_values; i++) {
-        canvas[i] = canvas[i] / 127.5f - 1.0f;
-    }
+    ds4_image_rows(canvas_values, 1u << 18, ds4_deepseek_normalize_rows, canvas);
 
     const uint32_t grid_height = best_height / 14u;
     const uint32_t grid_width = best_width / 14u;
@@ -918,21 +1062,9 @@ static int ds4_image_preprocess_deepseek(
         ds4_image_error(error, error_cap, "unable to allocate vision patches");
         return 0;
     }
-    size_t index = 0;
-    for (uint32_t patch_y = 0; patch_y < grid_height; patch_y++) {
-        for (uint32_t patch_x = 0; patch_x < grid_width; patch_x++) {
-            for (uint32_t channel = 0; channel < 3u; channel++) {
-                for (uint32_t y = 0; y < 14u; y++) {
-                    for (uint32_t x = 0; x < 14u; x++) {
-                        const float *pixel = canvas +
-                            ((size_t)(patch_y * 14u + y) * best_width +
-                             patch_x * 14u + x) * 3u;
-                        patches[index++] = pixel[channel];
-                    }
-                }
-            }
-        }
-    }
+    ds4_deepseek_patch_ctx pctx = {canvas, patches, best_width, grid_width};
+    ds4_image_rows(grid_height, 1, ds4_deepseek_patch_rows, &pctx);
+    const size_t index = (size_t)grid_height * grid_width * 3u * 14u * 14u;
     free(canvas);
     if (index != patch_values) {
         free(patches);
