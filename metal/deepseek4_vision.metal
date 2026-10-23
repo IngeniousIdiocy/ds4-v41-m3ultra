@@ -393,3 +393,111 @@ kernel void kernel_deepseek41_vision_attention_exact(
 typedef decltype(kernel_deepseek41_vision_attention_exact<false>) deepseek41_vision_attention_exact_t;
 template [[host_name("kernel_deepseek41_vision_attention_exact")]] kernel deepseek41_vision_attention_exact_t kernel_deepseek41_vision_attention_exact<false>;
 template [[host_name("kernel_deepseek41_vision_attention_exact_round")]] kernel deepseek41_vision_attention_exact_t kernel_deepseek41_vision_attention_exact<true>;
+
+/* VISION_ATTN_FLASH (default on; accurate, not bit-exact): tiled attention on
+ * simdgroup matrices. A threadgroup of four SIMD groups takes 32 query rows of one head;
+ * K and V tiles of 32 keys are staged in threadgroup memory; each SIMD group
+ * keeps its 8 rows' output in eight 8x8 accumulators with an online softmax
+ * per tile. Q is pre-scaled by 1/8 (exact). Float operands. */
+template <bool ROUND>
+kernel void kernel_deepseek41_vision_attention_flash(
+        constant glm53_vision_attention_args &args,
+        device const float                   *q,
+        device const float                   *k,
+        device const float                   *v,
+        device float                         *out,
+        threadgroup float                    *tg [[threadgroup(0)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint head = group.y;
+    const uint row0 = group.x * 32u;
+    const uint rows = args.rows;
+    threadgroup float *Ks = tg;                 /* [32][64] */
+    threadgroup float *Vs = tg + 2048;          /* [32][64] */
+    threadgroup float *Qs = tg + 4096;          /* [32][64], later the output */
+    threadgroup float *S  = tg + 6144 + sg * 320u;  /* [8][32] scores, then [8][8] diag */
+    threadgroup float *D  = S + 256;
+    for (uint i = tid; i < 2048u; i += 128u) {
+        const uint r = i >> 6, d = i & 63u, row = row0 + r;
+        Qs[i] = row < rows ? q[(ulong)row * 1024u + head * 64u + d] * args.scale : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 Qm[8];
+    for (uint kk = 0; kk < 8u; kk++) simdgroup_load(Qm[kk], Qs + sg * 512u + kk * 8u, 64);
+    simdgroup_float8x8 O[8];
+    for (uint c = 0; c < 8u; c++) O[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint r = lane >> 2, c0 = (lane & 3u) * 8u;
+    float m = -INFINITY, l = 0.0f;
+    for (uint key0 = 0; key0 < rows; key0 += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 2048u; i += 128u) {
+            const uint kr = i >> 6, d = i & 63u, key = key0 + kr;
+            const ulong off = (ulong)key * 1024u + head * 64u + d;
+            Ks[i] = key < rows ? k[off] : 0.0f;
+            Vs[i] = key < rows ? v[off] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint n = 0; n < 4u; n++) {
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint kk = 0; kk < 8u; kk++) {
+                simdgroup_float8x8 Kt;
+                simdgroup_load(Kt, Ks + n * 8u * 64u + kk * 8u, 64, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc, Qm[kk], Kt, acc);
+            }
+            simdgroup_store(acc, S + n * 8u, 32);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float sv[8], mx = -INFINITY;
+        for (uint c = 0; c < 8u; c++) {
+            sv[c] = key0 + c0 + c < rows ? S[r * 32u + c0 + c] : -INFINITY;
+            mx = max(mx, sv[c]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float m_new = max(m, mx);
+        const float alpha = exp(m - m_new);
+        float sum = 0.0f;
+        for (uint c = 0; c < 8u; c++) {
+            const float p = exp(sv[c] - m_new);
+            S[r * 32u + c0 + c] = p;
+            sum += p;
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        l = l * alpha + sum;
+        m = m_new;
+        if ((lane & 3u) == 0u) {
+            for (uint c = 0; c < 8u; c++) D[r * 8u + c] = c == r ? alpha : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 Dm;
+        simdgroup_load(Dm, D, 8);
+        for (uint c = 0; c < 8u; c++) simdgroup_multiply(O[c], Dm, O[c]);
+        for (uint kk = 0; kk < 4u; kk++) {
+            simdgroup_float8x8 Pm;
+            simdgroup_load(Pm, S + kk * 8u, 32);
+            for (uint c = 0; c < 8u; c++) {
+                simdgroup_float8x8 Vm;
+                simdgroup_load(Vm, Vs + kk * 8u * 64u + c * 8u, 64);
+                simdgroup_multiply_accumulate(O[c], Pm, Vm, O[c]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float *Os = Qs + sg * 512u;
+    for (uint c = 0; c < 8u; c++) simdgroup_store(O[c], Os + c * 8u, 64);
+    if ((lane & 3u) == 0u) D[r] = l;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = lane; i < 512u; i += 32u) {
+        const uint rr = i >> 6, d = i & 63u, row = row0 + sg * 8u + rr;
+        if (row >= rows) continue;
+        const float value = Os[i] / D[rr];
+        out[(ulong)row * 1024u + head * 64u + d] = ROUND ? deepseek4_vision_round_bf16(value) : value;
+    }
+}
+
+typedef decltype(kernel_deepseek41_vision_attention_flash<false>) deepseek41_vision_attention_flash_t;
+template [[host_name("kernel_deepseek41_vision_attention_flash")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true>;
