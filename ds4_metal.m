@@ -491,6 +491,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_ENGRAM_READERS",
             "DS4_METAL_DISABLE_V41_SHORT_MMA",
             "DS4_METAL_DISABLE_V41_SUFFIX_TRIM",
+            "DS4_METAL_DISABLE_V41_PREFILL_MMA",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -32068,8 +32069,13 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         /* PREFILL_ATTENTION: V4.1's prefill rows (ratio 1 and 2) stage sixteen rows per barrier, as decode does */
         const bool prefill_rb16 = n_tokens > 8u && ratio <= 2u && !prefill_dual_heads && !g_quality_mode &&
             !g_ssd_streaming_mode && !ds4_gpu_tp_world_is_two() && ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_ATTENTION);
-        if (prefill_rb16) DS4_TEST_NOTE("kernel_dsv41_prefill_attention_rb16");
+        /* PREFILL_MMA: those rows on simdgroup matrices instead, 32 heads of a token per threadgroup (M1-M4) */
+        const bool prefill_mma = prefill_rb16 && n_head % 32u == 0u && ds4_gpu_v41_on(DS4_GPU_V41_PREFILL_MMA) &&
+            ds4_gpu_device_is_pre_m5_apple_silicon();
+        if (prefill_mma) DS4_TEST_NOTE("kernel_dsv41_prefill_attention_mma");
+        else if (prefill_rb16) DS4_TEST_NOTE("kernel_dsv41_prefill_attention_rb16");
         id<MTLComputePipelineState> attn_pipeline =
+            prefill_mma ? ds4_gpu_get_pipeline("kernel_dsv41_prefill_attention_mma") :
             split_decode ?
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_pipeline,
@@ -32215,15 +32221,24 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token || prefill_rb16 ? 16u : 1u) *
-                                            128u * 4u * sizeof(uint16_t)
-                                    atIndex:0];
-            [enc dispatchThreadgroups:
-                    MTLSizeMake((NSUInteger)n_tokens,
-                                ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) /
-                                    (prefill_dual_heads ? 16u : 8u),
-                                1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            if (prefill_mma) {
+                /* 16 staged half rows of 520, per simdgroup 8 x 16 float scores (then weights), 16 row flags */
+                [enc setThreadgroupMemoryLength:16u * 520u * sizeof(uint16_t) +
+                                                16u * 128u * sizeof(float) + 16u * sizeof(uint32_t)
+                                        atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head / 32u, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
+            } else {
+                [enc setThreadgroupMemoryLength:(decode_one_token || prefill_rb16 ? 16u : 1u) *
+                                                128u * 4u * sizeof(uint16_t)
+                                        atIndex:0];
+                [enc dispatchThreadgroups:
+                        MTLSizeMake((NSUInteger)n_tokens,
+                                    ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) /
+                                        (prefill_dual_heads ? 16u : 8u),
+                                    1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
         }
 

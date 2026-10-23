@@ -2585,6 +2585,7 @@ static int check_prefill_attention(void) {
     CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
     ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
     const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_dsv41_prefill_attention_rb16");
+    const uint64_t mma_runs = ds4_gpu_test_kernel_runs("kernel_dsv41_prefill_attention_mma");
     const uint32_t counts[] = {9, 33, 129};
     for (uint32_t c = 0; c < 3; c++)
         for (uint32_t ratio = 1; ratio <= 2; ratio++)
@@ -2605,21 +2606,38 @@ static int check_prefill_attention(void) {
                     for (uint32_t j = 0; j < K; j++)
                         ids[t * K + j] = sparse && (j % 7 == 3 || j % 29 == 0) ? -1 :
                             (int32_t)((j * 127u + t * 17u) % C);
-                ds4_gpu_test_set_v41_off(DS4_GPU_V41_PREFILL_ATTENTION);
+                ds4_gpu_test_set_v41_off(DS4_GPU_V41_PREFILL_ATTENTION | DS4_GPU_V41_PREFILL_MMA);
                 CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(ref, sinks, getpagesize(),
                     0, qt, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H, D));
-                ds4_gpu_test_set_v41_off(0);
+                ds4_gpu_test_set_v41_off(DS4_GPU_V41_PREFILL_MMA);
                 CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(got, sinks, getpagesize(),
                     0, qt, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H, D));
                 CHECK(ds4_gpu_synchronize());
                 CHECK(same_bits(ref, got, nq));
+                /* PREFILL_MMA: the same rows on simdgroup matrices, equal up to the reassociated sums */
+                ds4_gpu_test_set_v41_off(0);
+                CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(got, sinks, getpagesize(),
+                    0, qt, rt, ct, 0, it, n, start, nr, nr, 0, C, K, 128, ratio, H, D));
+                CHECK(ds4_gpu_synchronize());
+                const float *rv = ds4_gpu_tensor_contents(ref), *gv = ds4_gpu_tensor_contents(got);
+                double worst = 0;
+                for (size_t i = 0; i < nq; i++) {
+                    const double e = fabs((double)gv[i] - rv[i]) / (1e-3 + fabs(rv[i]));
+                    if (!(e <= worst)) worst = e;
+                }
+                if (!(worst <= 2e-2)) fprintf(stderr, "prefill MMA: worst relative error %g (n %u ratio %u)\n",
+                                              worst, n, ratio);
+                CHECK(worst <= 2e-2);
                 ds4_gpu_tensor *tensors[] = {qt, rt, ct, it, ref, got};
                 for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
             }
     CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_prefill_attention_rb16") == runs + 12);
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_prefill_attention_mma") == mma_runs + 12);
+    ds4_gpu_test_set_v41_off(0);
     ds4_gpu_test_set_flags(0);
     free(sinks);
-    fprintf(stderr, "V4.1 prefill attention: 16 rows per barrier == the eight-head kernel\n");
+    fprintf(stderr, "V4.1 prefill attention: 16 rows per barrier == the eight-head kernel; simdgroup matrices within "
+            "reassociation\n");
     return 1;
 }
 

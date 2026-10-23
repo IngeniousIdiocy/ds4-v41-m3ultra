@@ -90,6 +90,7 @@ typedef struct {
 #define DS4_GPU_V41_ENGRAM_READERS (1ull << 42)   /* a prefill sweep reads its Engram rows from disk with 32 concurrent readers instead of 16 */
 #define DS4_GPU_V41_SHORT_MMA (1ull << 43)   /* Q8_0 matmuls of eight rows outside a DSpark block on simdgroup matrices, at the row kernels' bits */
 #define DS4_GPU_V41_SUFFIX_TRIM (1ull << 44)   /* prefill sweeps of 1,024-8,191 rows trim the decoder suffix inside their chunks, each kept row on its own kernels */
+#define DS4_GPU_V41_PREFILL_MMA (1ull << 45)   /* prefill attention on simdgroup matrices, 32 heads of a token per threadgroup (not bit-exact: sums reassociated) */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
