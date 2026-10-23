@@ -65365,7 +65365,7 @@ uint64_t ds4_engine_vision_encoder_identity(ds4_engine *e) {
      * from them must never restore under the exact encoder, nor the other way round. */
     if (h && e->vision_kind == DS4_VISION_DEEPSEEK4 &&
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds4_gpu_deepseek41_vision_attn_flash()) {
-        h ^= UINT64_C(0x666c61736831);   /* "flash1" */
+        h ^= UINT64_C(0x666c61736832);   /* "flash1" */
         h *= UINT64_C(1099511628211);
         if (!h) h = 1;
     }

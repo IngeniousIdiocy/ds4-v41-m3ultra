@@ -48976,10 +48976,10 @@ static int deepseek41_vision_dispatch_attention(
     [enc setBuffer:ds4_gpu_tensor_buffer(v) offset:ds4_gpu_tensor_offset(v) atIndex:3];
     [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
     if (mode == 2) {
-        /* K, V and Q tiles [32][64], per SIMD group 8x32 scores and an 8x8 diagonal */
-        [enc setThreadgroupMemoryLength:(6144u + 4u * 320u) * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((rows + 31u) / 32u, 16u, 1)
-             threadsPerThreadgroup:MTLSizeMake(128u, 1, 1)];
+        /* K and V tiles [64][72] in half; 64 query rows per threadgroup, 8 per SIMD group */
+        [enc setThreadgroupMemoryLength:2u * 64u * 72u * sizeof(uint16_t) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((rows + 63u) / 64u, 16u, 1)
+             threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
     } else if (mode == 1) {
         /* K tile [32][65], V tile [32][64], one 64-float query row per SIMD group */
         [enc setThreadgroupMemoryLength:(32u * 65u + 2048u + 8u * 64u) * sizeof(float) atIndex:0];
