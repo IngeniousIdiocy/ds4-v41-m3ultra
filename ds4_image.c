@@ -270,8 +270,10 @@ static int ds4_decode_webp_imageio(
         goto webp_done;
     }
     space = CGColorSpaceCreateDeviceRGB();
+    /* Packed rows: ds4_oriented_rgb reads width * 4 bytes per row, while a
+     * bytesPerRow of 0 lets Core Graphics pad each row (2541 px wide skewed). */
     if (space)
-        context = CGBitmapContextCreate(NULL, width, height, 8, 0, space,
+        context = CGBitmapContextCreate(NULL, width, height, 8, width * 4, space,
                                         (CGBitmapInfo)(kCGImageAlphaPremultipliedLast |
                                                        kCGBitmapByteOrder32Big));
     if (!context) {

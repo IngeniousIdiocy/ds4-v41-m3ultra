@@ -24130,6 +24130,30 @@ static void test_responses_inline_image_content(void) {
 static const char test_inline_webp_base64[] =
     "UklGRjIAAABXRUJQVlA4TCUAAAAvH8AHAM1VIKL/sYuI/geEBITo/2tZOf6/kCAh+n+tMZJ0RXsDAA==";
 
+/* A 5x3 lossless WebP: its 20-byte rows are ones Core Graphics pads unless the
+ * decoder asks for packed rows. Pixel (x, y) is (40x + 10, 80y + 5, 200 - 30x). */
+static void test_webp_odd_width_decodes_exactly(void) {
+#ifdef __APPLE__
+    static const char b64[] =
+        "UklGRkYAAABXRUJQVlA4TDoAAAAvBIAAAHdAmG30ml8Rzh/kGMSCKd4dSQKBJH+yOSaZ/x5UAfZeAIMAkAhULCmkEFwKK4wa0f/wkGNf";
+    uint8_t *encoded = NULL;
+    size_t encoded_len = 0;
+    TEST_ASSERT(server_decode_base64(b64, &encoded, &encoded_len));
+    ds4_image img = {0};
+    char err[128] = {0};
+    TEST_ASSERT(ds4_image_decode_memory(&img, encoded, encoded_len, err, sizeof(err)));
+    TEST_ASSERT(img.width == 5 && img.height == 3);
+    for (uint32_t y = 0; img.rgb && y < 3; y++) {
+        for (uint32_t x = 0; x < 5; x++) {
+            const uint8_t *px = img.rgb + ((size_t)y * 5 + x) * 3;
+            TEST_ASSERT(px[0] == 40 * x + 10 && px[1] == 80 * y + 5 && px[2] == 200 - 30 * x);
+        }
+    }
+    ds4_image_free(&img);
+    free(encoded);
+#endif
+}
+
 static void test_openai_inline_webp_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -24620,6 +24644,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
     test_openai_inline_webp_image_content();
+    test_webp_odd_width_decodes_exactly();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();
