@@ -500,6 +500,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_HC_NARROW",
             "DS4_METAL_DISABLE_V41_CTX_RESIDENCY",
             "DS4_METAL_DISABLE_V41_MOE_HALF_X",
+            "DS4_METAL_DISABLE_V41_CARRY_KEEP",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);

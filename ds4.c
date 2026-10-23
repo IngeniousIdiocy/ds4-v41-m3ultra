@@ -44084,6 +44084,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     }
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
     metal_graph_stream_prepare_slot prepare = {0};
+    /* CARRY_KEEP: rows a one-chunk layer stored to the carry are still in the batch buffers when the next layer
+     * starts on the same rows, so it does not load them back. */
+    const bool carry_keep = pipeline_layers && ds41_on(DS4_GPU_V41_CARRY_KEEP);
+    uint32_t kept_off = UINT32_MAX, kept_count = 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
         if (encoder_only && il == 20u) {
@@ -44256,7 +44260,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     }
                 }
             } else if (wide) {
-                if (ok) ok = ds41_carry_copy(g, off, count, false);
+                /* the decoder's prepare loads its warm rows into the batch buffers */
+                const bool kept = carry_keep && off == kept_off && count == kept_count &&
+                    !(decoder_suffix && il >= 20u && (il == 20u || !ced));
+                if (ok && !kept)
+                    ok = ds41_carry_copy(g, off, count, false);
             }
             /* PREFILL_PIPELINE: the layer's rows run as one chunk. The layer's start (embedding or carry copy)
              * never waits; the layer's end waits before the host-side work named above. */
@@ -44378,6 +44386,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ok && wide && il + 1u < DS4_N_LAYER) {
                 ok = ds41_carry_copy(g, off, count, true);
             }
+            kept_off = off == first && off + count == total_count ? off : UINT32_MAX;
+            kept_count = count;
             const double t_encoded = profile ? now_sec() : 0;
             if (ds4_gpu_commands_active() &&
                 !(layer_async ? ds4_gpu_end_commands_async() : ds4_gpu_end_commands())) ok = false;

@@ -99,6 +99,7 @@ typedef struct {
 #define DS4_GPU_V41_HC_NARROW (1ull << 51)   /* the HC mix projection of a prefill chunk on one simdgroup per 8 rows instead of a few 64x32 tiles, at the same bits */
 #define DS4_GPU_V41_CTX_RESIDENCY (1ull << 52)   /* the engine's own allocations in a residency set on the queue, so a prefill does not wait while the driver makes them resident */
 #define DS4_GPU_V41_MOE_HALF_X (1ull << 53)   /* the routed experts' compact pair tiles read the rows narrowed to half once per layer, at the same bits */
+#define DS4_GPU_V41_CARRY_KEEP (1ull << 54)   /* a one-chunk prefill layer keeps the previous layer's rows in the batch buffers instead of loading them back from the carry */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
  * and keeps DSpark to target-only decode as --dspark-strict does. It is off by default. */
 #define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \
