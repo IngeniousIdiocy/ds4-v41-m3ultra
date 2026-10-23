@@ -49036,6 +49036,7 @@ static int deepseek4_vision_debug_dump(
 /* V4.1 vision attention (switches read on every encode, default on):
  *   DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD=1  round the output in its own pass
  *   DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH=1  (or DS4_V41_EXACT=1) the exact kernels below
+ *   DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY=1   flash rescales its output on every key tile (flash v2's bits)
  *   DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT=1  GLM's one-key-at-a-time kernel
  * mode 2, flash: tiles on simdgroup matrices, accurate but not bit-exact.
  * mode 1, exact: 32 keys per step at the scalar kernel's bits. mode 0: the scalar kernel. */
@@ -49047,8 +49048,11 @@ static int deepseek41_vision_dispatch_attention(
         uint32_t              rows,
         int                   mode,
         bool                  round) {
-    const char *name = mode == 2 ? (round ? "kernel_deepseek41_vision_attention_flash_round"
-                                          : "kernel_deepseek41_vision_attention_flash")
+    const bool lazy = ds4_gpu_deepseek41_vision_attn_lazy();
+    const char *name = mode == 2 ? (lazy ? (round ? "kernel_deepseek41_vision_attention_flash_lazy_round"
+                                                  : "kernel_deepseek41_vision_attention_flash_lazy")
+                                         : (round ? "kernel_deepseek41_vision_attention_flash_round"
+                                                  : "kernel_deepseek41_vision_attention_flash"))
                      : mode == 1 ? (round ? "kernel_deepseek41_vision_attention_exact_round"
                                           : "kernel_deepseek41_vision_attention_exact")
                      : (round ? "kernel_deepseek41_vision_attention_round"
@@ -49088,6 +49092,10 @@ bool ds4_gpu_deepseek41_vision_attn_flash(void) {
     const char *exact_env = getenv("DS4_V41_EXACT");
     return getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH") == NULL &&
            !(exact_env && exact_env[0] && strcmp(exact_env, "0") != 0);
+}
+
+bool ds4_gpu_deepseek41_vision_attn_lazy(void) {
+    return getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY") == NULL;
 }
 
 int ds4_gpu_deepseek4_vision_encode(

@@ -400,8 +400,88 @@ template [[host_name("kernel_deepseek41_vision_attention_exact_round")]] kernel 
  * range; every product and sum stays in float). The softmax never leaves the SIMD group: in an 8x8 simdgroup
  * matrix lane l holds row (l/4 & 4) + (l/2 % 4) at columns fn, fn+1 with fn = (l/4 & 2)*2 + (l%2)*2, so a row's
  * scores sit in the lanes that differ in bits 0 and 3 and reduce with two shuffles, and the running maximum,
- * the output rescale and the probabilities stay in registers. Q is pre-scaled by 1/8 (exact). */
-template <bool ROUND>
+ * the output rescale and the probabilities stay in registers. Q is pre-scaled by 1/8 (exact). Only the final,
+ * partial key tile is masked (full tiles skip the compares; the same bits).
+ * VISION_ATTN_LAZY (default on): the online softmax keeps its running maximum m until some row of the SIMD group
+ * would grow it by more than ln 256, so exp(s - m) <= 256 and the output and its sum are rescaled only then
+ * (rarely after the first tile) instead of on every tile. The same softmax after the final 1/l, rounded
+ * differently; off, every tile rescales as flash v2 did. */
+template <bool MASK, bool LAZY>
+static inline void deepseek41_vision_attention_flash_tile(
+        thread const simdgroup_float8x8 *Qm,
+        thread simdgroup_float8x8       *O,
+        thread float                    &m,
+        thread float                    &l,
+        threadgroup const half          *Ks,
+        threadgroup const half          *Vs,
+        uint key0, uint rows, ushort fn) {
+    constexpr uint KT = 64, KP = 72;
+    simdgroup_float8x8 S[KT / 8];
+#pragma unroll
+    for (uint n = 0; n < KT / 8u; n++) {
+        S[n] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#pragma unroll
+        for (uint kk = 0; kk < 8u; kk++) {
+            simdgroup_half8x8 Kt;
+            simdgroup_load(Kt, Ks + n * 8u * KP + kk * 8u, KP, ulong2(0, 0), true);
+            simdgroup_float8x8 Kf;
+            Kf.thread_elements()[0] = (float)Kt.thread_elements()[0];
+            Kf.thread_elements()[1] = (float)Kt.thread_elements()[1];
+            simdgroup_multiply_accumulate(S[n], Qm[kk], Kf, S[n]);
+        }
+    }
+    float mx = -INFINITY;
+#pragma unroll
+    for (uint n = 0; n < KT / 8u; n++) {
+        thread auto &e = S[n].thread_elements();
+        if (MASK) {
+            const uint key = key0 + n * 8u + fn;
+            if (key >= rows) e[0] = -INFINITY;
+            if (key + 1u >= rows) e[1] = -INFINITY;
+        }
+        mx = max(mx, max(e[0], e[1]));
+    }
+    mx = max(mx, simd_shuffle_xor(mx, 1));
+    mx = max(mx, simd_shuffle_xor(mx, 8));
+    const float m_grow = max(m, mx);
+    float m_new = m, alpha = 1.0f;
+    if (!LAZY || key0 == 0u || simd_any(m_grow > m + 5.54517744f)) {   /* ln 256 */
+        m_new = m_grow;
+        alpha = exp(m - m_new);
+#pragma unroll
+        for (uint c = 0; c < 8u; c++) {
+            thread auto &e = O[c].thread_elements();
+            e[0] *= alpha;
+            e[1] *= alpha;
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (uint n = 0; n < KT / 8u; n++) {
+        thread auto &e = S[n].thread_elements();
+        e[0] = exp(e[0] - m_new);
+        e[1] = exp(e[1] - m_new);
+        sum += e[0] + e[1];
+    }
+    sum += simd_shuffle_xor(sum, 1);
+    sum += simd_shuffle_xor(sum, 8);
+    l = l * alpha + sum;
+    m = m_new;
+#pragma unroll
+    for (uint n = 0; n < KT / 8u; n++) {
+#pragma unroll
+        for (uint c = 0; c < 8u; c++) {
+            simdgroup_half8x8 Vm;
+            simdgroup_load(Vm, Vs + n * 8u * KP + c * 8u, KP);
+            simdgroup_float8x8 Vf;
+            Vf.thread_elements()[0] = (float)Vm.thread_elements()[0];
+            Vf.thread_elements()[1] = (float)Vm.thread_elements()[1];
+            simdgroup_multiply_accumulate(O[c], S[n], Vf, O[c]);
+        }
+    }
+}
+
+template <bool ROUND, bool LAZY>
 kernel void kernel_deepseek41_vision_attention_flash(
         constant glm53_vision_attention_args &args,
         device const float                   *q,
@@ -448,63 +528,8 @@ kernel void kernel_deepseek41_vision_attention_flash(
             *(threadgroup half4 *)(Vs + r * KP + c4) = half4(vv);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_float8x8 S[KT / 8];
-#pragma unroll
-        for (uint n = 0; n < KT / 8u; n++) {
-            S[n] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-#pragma unroll
-            for (uint kk = 0; kk < 8u; kk++) {
-                simdgroup_half8x8 Kt;
-                simdgroup_load(Kt, Ks + n * 8u * KP + kk * 8u, KP, ulong2(0, 0), true);
-                simdgroup_float8x8 Kf;
-                Kf.thread_elements()[0] = (float)Kt.thread_elements()[0];
-                Kf.thread_elements()[1] = (float)Kt.thread_elements()[1];
-                simdgroup_multiply_accumulate(S[n], Qm[kk], Kf, S[n]);
-            }
-        }
-        float mx = -INFINITY;
-#pragma unroll
-        for (uint n = 0; n < KT / 8u; n++) {
-            thread auto &e = S[n].thread_elements();
-            const uint key = key0 + n * 8u + fn;
-            if (key >= rows) e[0] = -INFINITY;
-            if (key + 1u >= rows) e[1] = -INFINITY;
-            mx = max(mx, max(e[0], e[1]));
-        }
-        mx = max(mx, simd_shuffle_xor(mx, 1));
-        mx = max(mx, simd_shuffle_xor(mx, 8));
-        const float m_new = max(m, mx);
-        const float alpha = exp(m - m_new);
-        float sum = 0.0f;
-#pragma unroll
-        for (uint n = 0; n < KT / 8u; n++) {
-            thread auto &e = S[n].thread_elements();
-            e[0] = exp(e[0] - m_new);
-            e[1] = exp(e[1] - m_new);
-            sum += e[0] + e[1];
-        }
-        sum += simd_shuffle_xor(sum, 1);
-        sum += simd_shuffle_xor(sum, 8);
-        l = l * alpha + sum;
-        m = m_new;
-#pragma unroll
-        for (uint c = 0; c < 8u; c++) {
-            thread auto &e = O[c].thread_elements();
-            e[0] *= alpha;
-            e[1] *= alpha;
-        }
-#pragma unroll
-        for (uint n = 0; n < KT / 8u; n++) {
-#pragma unroll
-            for (uint c = 0; c < 8u; c++) {
-                simdgroup_half8x8 Vm;
-                simdgroup_load(Vm, Vs + n * 8u * KP + c * 8u, KP);
-                simdgroup_float8x8 Vf;
-                Vf.thread_elements()[0] = (float)Vm.thread_elements()[0];
-                Vf.thread_elements()[1] = (float)Vm.thread_elements()[1];
-                simdgroup_multiply_accumulate(O[c], S[n], Vf, O[c]);
-            }
-        }
+        if (key0 + KT > rows) deepseek41_vision_attention_flash_tile<true, LAZY>(Qm, O, m, l, Ks, Vs, key0, rows, fn);
+        else                  deepseek41_vision_attention_flash_tile<false, LAZY>(Qm, O, m, l, Ks, Vs, key0, rows, fn);
     }
     if (!qvalid) return;
     device float *op = out + (ulong)qrow * 1024u + (ulong)head * 64u;
@@ -518,6 +543,8 @@ kernel void kernel_deepseek41_vision_attention_flash(
     }
 }
 
-typedef decltype(kernel_deepseek41_vision_attention_flash<false>) deepseek41_vision_attention_flash_t;
-template [[host_name("kernel_deepseek41_vision_attention_flash")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false>;
-template [[host_name("kernel_deepseek41_vision_attention_flash_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true>;
+typedef decltype(kernel_deepseek41_vision_attention_flash<false, false>) deepseek41_vision_attention_flash_t;
+template [[host_name("kernel_deepseek41_vision_attention_flash")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false, false>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true, false>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_lazy")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false, true>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_lazy_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true, true>;
