@@ -95,6 +95,7 @@ typedef struct {
 #define DS4_GPU_V41_IMAGE_CED (1ull << 47)   /* CED for prompts that hold images too (not bit-exact) */
 #define DS4_GPU_V41_IMAGE_TRIM (1ull << 48)   /* SUFFIX_TRIM for prompts that hold images too, at the same bits */
 #define DS4_GPU_V41_MOE_SHORT_TILES (1ull << 49)   /* routed experts of short prefills on the large-prefill MXFP4 tile variants, at the same bits */
+#define DS4_GPU_V41_PREFILL_PIPELINE (1ull << 50)   /* a prefill sweep commits most layers' command buffers without waiting, so the host encodes the next layer while the GPU runs this one */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
  * and keeps DSpark to target-only decode as --dspark-strict does. It is off by default. */
 #define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \
@@ -254,6 +255,9 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Commits the open command batch without waiting; the next ds4_gpu_end_commands (or any wait) waits for it and reports
+ * its errors. */
+int ds4_gpu_end_commands_async(void);
 /* Metal: the next decode token's first command buffer, pre-encoded during this token's terminal wait.
  * end_commands_commit / _wait split ds4_gpu_end_commands around the slot's encoding (bridge: a short GPU kernel
  * behind the committed buffer keeps the GPU busy across the handoff); pe_begin opens the slot as the batch (only

@@ -44020,6 +44020,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         return false;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
     const bool stage_profile = getenv("DS4_METAL_V41_STAGE_PROFILE") != NULL;
+    /* PREFILL_PIPELINE: a layer whose rows run as one chunk commits without waiting, and the host encodes the next
+     * layer while the GPU runs it. The host writes the next layer's token ids and image mask unchanged, so it waits
+     * only where it writes or reads GPU memory the earlier layers use: before the Engram layers 1 and 14 and the
+     * read-ahead that starts at layer 2 and after 14, and where the decoder starts (layer 20). The streaming
+     * expert cache seed reads each layer's routing on the host, so streaming keeps every wait. */
+    const bool pipeline_layers = ds41_on(DS4_GPU_V41_PREFILL_PIPELINE) && g->tp_world == 1 && !g->streaming &&
+        !profile && !stage_profile;
     const bool batch_moe = !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE");
     const bool batch_attention = !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN");
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
@@ -44251,7 +44258,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             } else if (wide) {
                 if (ok) ok = ds41_carry_copy(g, off, count, false);
             }
-            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+            /* PREFILL_PIPELINE: the layer's rows run as one chunk. The layer's start (embedding or carry copy)
+             * never waits; the layer's end waits before the host-side work named above. */
+            const bool one_chunk = pipeline_layers && off == first && off + count == total_count;
+            const bool layer_async = one_chunk && il + 1u < DS4_N_LAYER &&
+                il != 0u && il != 1u && il != 13u && il != 14u && il != 19u;
+            if (ds4_gpu_commands_active() &&
+                !(one_chunk ? ds4_gpu_end_commands_async() : ds4_gpu_end_commands())) ok = false;
             const double t_ready = profile ? now_sec() : 0;
             if (ok && ds41_engram_layer(il)) {
                 const uint32_t engram = il == 1 ? 0 : 1;
@@ -44366,7 +44379,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_carry_copy(g, off, count, true);
             }
             const double t_encoded = profile ? now_sec() : 0;
-            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+            if (ds4_gpu_commands_active() &&
+                !(layer_async ? ds4_gpu_end_commands_async() : ds4_gpu_end_commands())) ok = false;
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
             if (ok && !encoder_only && off + count == total_count)

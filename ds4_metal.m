@@ -496,6 +496,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_IMAGE_CED",
             "DS4_METAL_DISABLE_V41_IMAGE_TRIM",
             "DS4_METAL_DISABLE_V41_MOE_SHORT_TILES",
+            "DS4_METAL_DISABLE_V41_PREFILL_PIPELINE",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -11807,6 +11808,16 @@ int ds4_gpu_end_commands(void) {
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+}
+
+int ds4_gpu_end_commands_async(void) {
+    if (g_pe_preparing) { g_pe_failed = 1; return 0; }
+    id<MTLCommandBuffer> cb = ds4_gpu_close_batch();
+    if (!cb) return 0;
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+    ds4_gpu_stream_expert_cache_note_batch_committed();
+    return 1;
 }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(
