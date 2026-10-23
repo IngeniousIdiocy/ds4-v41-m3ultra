@@ -48865,16 +48865,20 @@ static int deepseek4_vision_debug_dump(
 
 /* V4.1 vision attention (switches read on every encode, default on):
  *   DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD=1  round the output in its own pass
- * Under the fold the scalar kernel's copy rounds in its store. */
+ *   DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT=1  GLM's one-key-at-a-time kernel
+ * The exact kernel takes 32 keys per step and reproduces the scalar kernel's bits. */
 static int deepseek41_vision_dispatch_attention(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k,
         const ds4_gpu_tensor *v,
         uint32_t              rows,
+        bool                  exact,
         bool                  round) {
-    const char *name = round ? "kernel_deepseek41_vision_attention_round"
-                             : "kernel_glm53_vision_attention";
+    const char *name = exact ? (round ? "kernel_deepseek41_vision_attention_exact_round"
+                                      : "kernel_deepseek41_vision_attention_exact")
+                             : (round ? "kernel_deepseek41_vision_attention_round"
+                                      : "kernel_glm53_vision_attention");
     id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(name);
     if (!pipeline) return 0;
     glm53_vision_attention_args args = { rows, 0.125f };
@@ -48888,8 +48892,15 @@ static int deepseek41_vision_dispatch_attention(
     [enc setBuffer:ds4_gpu_tensor_buffer(k) offset:ds4_gpu_tensor_offset(k) atIndex:2];
     [enc setBuffer:ds4_gpu_tensor_buffer(v) offset:ds4_gpu_tensor_offset(v) atIndex:3];
     [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(rows, 16u, 1)
-         threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+    if (exact) {
+        /* K tile [32][65], V tile [32][64], one 64-float query row per SIMD group */
+        [enc setThreadgroupMemoryLength:(32u * 65u + 2048u + 8u * 64u) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((rows + 7u) / 8u, 16u, 1)
+             threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 16u, 1)
+             threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+    }
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 vision attention");
 }
@@ -48916,6 +48927,7 @@ int ds4_gpu_deepseek4_vision_encode(
     /* VISION_ROUND_FOLD: each bf16 rounding pass moves into its producer's store
      * or its consumer's load (the same rounded values, fewer passes). */
     const bool fold = v41 && getenv("DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD") == NULL;
+    const bool exact_attn = v41 && getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT") == NULL;
     const uint32_t aligned_rows =
         ((grid_h + 2u) / 3u) * ((grid_w + 2u) / 3u);
     const uint64_t row1024 = (uint64_t)rows * 1024u;
@@ -48990,7 +49002,7 @@ int ds4_gpu_deepseek4_vision_encode(
                 "block0_k", k, row1024);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_v", v, row1024);
-        if (ok) ok = v41 ? deepseek41_vision_dispatch_attention(attn, q, k, v, rows, fold)
+        if (ok) ok = v41 ? deepseek41_vision_dispatch_attention(attn, q, k, v, rows, exact_attn, fold)
                          : glm53_vision_dispatch_attention(attn, q, k, v, rows);
         if (ok && !fold) ok = deepseek4_vision_dispatch_round(attn, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(

@@ -291,3 +291,105 @@ kernel void kernel_deepseek41_vision_attention_round(
     out[base + lane] = deepseek4_vision_round_bf16(acc0 / denom);
     out[base + lane + 32u] = deepseek4_vision_round_bf16(acc1 / denom);
 }
+
+/* VISION_ATTN_EXACT: the scalar kernel's arithmetic, 32 keys at a time.
+ * Lane j forms key j's 32 lane products itself and adds them with simd_sum's
+ * adjacent-pairs tree (strides 1, 2, 4, 8, 16), so the score has simd_sum's
+ * bits without five shuffles per key. The running maximum is a prefix maximum
+ * (order-free), each key's two exponentials are computed by its own lane from
+ * the same operands, and the rescaling chain then runs in key order exactly as
+ * before, reading the broadcast factors. q and k hold bf16-rounded values,
+ * so each lane product is exact in float and contraction cannot change it. */
+static inline float deepseek41_vision_tree_dot(
+        threadgroup const float *qs,
+        threadgroup const float *kr) {
+#pragma clang fp reassociate(off)
+    float level[5];
+    float x = 0.0f;
+#pragma unroll
+    for (uint l = 0; l < 32u; l++) {
+        x = qs[l] * kr[l] + qs[l + 32u] * kr[l + 32u];
+#pragma unroll
+        for (uint b = 0; b < 5u; b++) {
+            if ((l >> b) & 1u) {
+                x = level[b] + x;
+            } else {
+                level[b] = x;
+                break;
+            }
+        }
+    }
+    return x;
+}
+
+/* Eight SIMD groups (eight query rows of one head) share each 32-key K/V tile in
+ * threadgroup memory; K rows are padded to 65 floats so lane j's row reads do
+ * not collide in a bank. */
+template <bool ROUND>
+kernel void kernel_deepseek41_vision_attention_exact(
+        constant glm53_vision_attention_args &args,
+        device const float                   *q,
+        device const float                   *k,
+        device const float                   *v,
+        device float                         *out,
+        threadgroup float                    *tg [[threadgroup(0)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint head = group.y;
+    const uint rows = args.rows;
+    const uint row = group.x * 8u + sg;
+    const bool valid = row < rows;
+    threadgroup float *Ks = tg;              /* [32][65] */
+    threadgroup float *Vs = tg + 32u * 65u;  /* [32][64] */
+    threadgroup float *qs = Vs + 2048u + sg * 64u;
+    const ulong base = (ulong)(valid ? row : 0u) * 1024u + (ulong)head * 64u;
+    qs[lane] = q[base + lane];
+    qs[lane + 32u] = q[base + lane + 32u];
+    float acc0 = 0.0f, acc1 = 0.0f;
+    float max_score = -INFINITY;
+    float denom = 0.0f;
+    for (uint key0 = 0; key0 < rows; key0 += 32u) {
+        const uint n = min(32u, rows - key0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 2048u; i += 256u) {
+            const uint kr = i >> 6, d = i & 63u, key = min(key0 + kr, rows - 1u);
+            const ulong off = (ulong)key * 1024u + (ulong)head * 64u + d;
+            Ks[kr * 65u + d] = k[off];
+            Vs[i] = v[off];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float score = deepseek41_vision_tree_dot(qs, Ks + lane * 65u);
+        score *= args.scale;
+        if (lane >= n) score = -INFINITY;
+        float prefix = score;
+#pragma unroll
+        for (ushort d = 1; d < 32; d <<= 1) {
+            const float t = simd_shuffle_up(prefix, d);
+            if (lane >= d) prefix = max(prefix, t);
+        }
+        const float next_max = max(max_score, prefix);
+        float prev_max = simd_shuffle_up(next_max, 1);
+        if (lane == 0) prev_max = max_score;
+        const float old_lane = prev_max == -INFINITY ? 0.0f : exp(prev_max - next_max);
+        const float new_lane = exp(score - next_max);
+        for (uint j = 0; j < n; j++) {
+            const float old_scale = simd_broadcast(old_lane, (ushort)j);
+            const float new_scale = simd_broadcast(new_lane, (ushort)j);
+            denom = denom * old_scale + new_scale;
+            acc0 = acc0 * old_scale + new_scale * Vs[j * 64u + lane];
+            acc1 = acc1 * old_scale + new_scale * Vs[j * 64u + lane + 32u];
+        }
+        max_score = simd_broadcast(next_max, (ushort)(n - 1u));
+    }
+    if (!valid) return;
+    const float o0 = acc0 / denom;
+    const float o1 = acc1 / denom;
+    out[base + lane] = ROUND ? deepseek4_vision_round_bf16(o0) : o0;
+    out[base + lane + 32u] = ROUND ? deepseek4_vision_round_bf16(o1) : o1;
+}
+
+typedef decltype(kernel_deepseek41_vision_attention_exact<false>) deepseek41_vision_attention_exact_t;
+template [[host_name("kernel_deepseek41_vision_attention_exact")]] kernel deepseek41_vision_attention_exact_t kernel_deepseek41_vision_attention_exact<false>;
+template [[host_name("kernel_deepseek41_vision_attention_exact_round")]] kernel deepseek41_vision_attention_exact_t kernel_deepseek41_vision_attention_exact<true>;
