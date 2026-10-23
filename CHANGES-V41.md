@@ -67,6 +67,45 @@ is faster, and [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every switch.
 | 56 | Encode batch steps' Engram layers while their rows are still being read. | `ENGRAM_ASYNC` |
 | 57 | Read a prefill sweep's Engram rows with 32 concurrent readers. | `ENGRAM_READERS` |
 | 58 | Multiply eight-row prefill batches on simdgroup matrices at the row kernels' bits. | `SHORT_MMA` |
+| 59 | Save image chats to the disk KV cache with their image identity. | (format) |
+| 60 | Name image checkpoints by their images, and test the identity rules. | (format) |
+| 61 | A model test for image chats restored from the disk KV cache. | (test) |
+| 62 | Replay each reply verbatim in that test. | (test) |
+| 63 | Pair V4.1 vision files with their language checkpoint by revision (DwarfStar PR #1225, by nazeshinjite). | (loader) |
+| 64 | Accept WebP images on macOS through ImageIO (DwarfStar PR #1197, by joohooo). | (input) |
+| 65 | Keep WebP draws upright, and test pixel orientation (PR #1197). | (input) |
+| 66 | Link ImageIO into the macOS CPU build, and release the WebP color space. | (build) |
+| 67 | Skip the vision encoder for images a restored prefix already holds. | (server) |
+| 68 | Decode WebP rows packed, as the shared RGB path reads them. | (input) |
+| 69 | Link the image decoder tests with the image frameworks. | (build) |
+| 70 | Prepare vision images on every core, with the system SHA-256. | `VISION_HOST_PREP` |
+| 71 | Fold the vision encoder's bf16 rounding into its kernels. | `VISION_ROUND_FOLD` |
+| 72 | Attend over the vision patches 32 keys at a time, at the scalar kernel's bits. | `VISION_ATTN_EXACT` |
+| 73 | Attend over the vision patches in simdgroup-matrix tiles. | `VISION_ATTN_FLASH` |
+| 74 | Key stored image state by the vision encoder's numerics. | (format) |
+| 75 | Trim the decoder suffix inside short prefill sweeps, at main's bits. | `SUFFIX_TRIM` |
+| 76 | Run prefill attention on simdgroup matrices. | `PREFILL_MMA` |
+| 77 | Replay only the tail of a prefill sweep through the decoder layers (CED). | `CED` |
+| 78 | One switch for main's serial bits: `DS4_V41_EXACT=1` or `--exact`. | `DS4_V41_EXACT` |
+| 79 | CED for prefill sweeps that hold images. | `IMAGE_CED` |
+| 80 | Trim the decoder suffix of short sweeps that hold images. | `IMAGE_TRIM` |
+| 81 | Run short prefills' routed experts on the large-prefill tile variants. | `MOE_SHORT_TILES` |
+| 82 | Pipeline single-chunk prefill layers. | `PREFILL_PIPELINE` |
+| 83 | Keep the vision attention's softmax in registers. | `VISION_ATTN_FLASH` |
+| 84 | Key stored image state by the image prefill replay too. | (format) |
+| 85 | Run the hyper-connection mix projection on narrow tiles. | `HC_NARROW` |
+| 86 | Keep the engine's own Metal allocations in a residency set. | `CTX_RESIDENCY` |
+| 87 | Decode PNG images about three times faster, at the same pixels. | `DS4_DISABLE_PNG_SYSTEM_INFLATE=1` |
+| 88 | Rescale the vision attention's output only when a maximum grows. | `VISION_ATTN_LAZY` |
+| 89 | Feed the routed expert tiles half rows. | `MOE_HALF_X` |
+| 90 | Keep prefill rows in place between one-chunk layers. | `CARRY_KEEP` |
+| 91 | Load the vision attention's K and V as half, straight from memory. | (flash kernel) |
+| 92 | Decode each request image once, not twice. | `DS4_DISABLE_V41_VISION_PREP_REUSE=1` |
+| 93 | Walk the vision attention's keys in tiles of 16. | `VISION_ATTN_KT16` |
+
+Commits 59 to 93 came after the first release on main and are kept as they
+were committed. Commit 59 was committed as a work in progress; commits 60 to 62
+complete it with its tests.
 
 Switch names without a prefix are `DS4_METAL_DISABLE_V41_<NAME>=1`, except
 `COMPUTE_TENSOR_COPY`, which is `DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY=1`.
@@ -110,7 +149,7 @@ groups. What moved:
 | `DS4_DS41_DSPARK_ADAPTIVE`, `..._MIN_SERIAL_TOKENS`, `..._P_MIN`, `..._MIN_DRAFT`, `..._LOSS_BUDGET`, `..._REASONING_SERIAL` | Tuning variables of that runtime. The ported controller runs with the release's tuned values; `--serial-reasoning` covers the reasoning case. |
 | `DS4_DS41_DSPARK_FAIL` | Fault injection for that runtime. |
 | `DS4_METAL_DISABLE_V41_DSPARK_DEFER` | Nothing to defer on main's runtime (above). |
-| `DS4_METAL_V41_PREFILL_MMA` | An opt-in in the release, off by default and not bit-identical. |
+| `DS4_METAL_V41_PREFILL_MMA` | An opt-in in the release. The kernel is now on by default as the PREFILL_MMA group, with the switch `DS4_METAL_DISABLE_V41_PREFILL_MMA=1`. |
 | `DS4_V41_ENGRAM_DECODE=shift` | An experiment that did not pay. |
 | `DS4_METAL_DISABLE_V41_TP_BATCH_POLL` | Dead code in the release (nothing reached it). |
 | `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` (dense attention up to 1,024 compressed rows) | Main changed this on purpose: it selects the model's top-k as soon as there are more than 512 index rows, because attending to more rows changes the output. The branch keeps main's rule. It matters only between about 2K and 4K tokens. |

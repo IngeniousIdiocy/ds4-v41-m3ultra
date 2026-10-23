@@ -2,7 +2,8 @@
 
 This page says how the numbers in the README were taken, so they can be taken
 again. It covers the quiet machine, decode from saved caches, cold prefill at
-several depths, and comparing groups inside one process.
+several depths, comparing groups inside one process, follow-up turns, image
+first tokens and the accuracy of the defaults that are not bit for bit.
 
 The machine was a Mac Studio with an M3 Ultra (80 GPU cores) and 512 GB of
 memory. The weights were the MXFP4 build of the October 17 checkpoint and its
@@ -147,3 +148,52 @@ builds, or with the group off and on:
 
 The unit checks in `tests/test_deepseek41_metal --v41-groups` compare each fast
 kernel with the one it replaces at V4.1's shapes, without the model.
+
+With `--exact` (or `DS4_V41_EXACT=1`), the same comparisons hold against main
+with the faster defaults on: the logits after cold prefills of 8, 8K, 32K and
+131K tokens, 256 greedy steps from main's 8K cache, and the same 256 steps with
+the drafter loaded and DSpark on.
+
+## 7. Follow-up turns
+
+A follow-up turn is a prompt appended to a saved session, as a chat's next turn
+is. Restore main's 8K prose cache, time the prefill of the next N tokens of the
+same text (for example 1K, 2K and 4K), and restore again for each repetition.
+The README's figure is the 2K follow-up, without the drafter.
+
+## 8. Image first token
+
+Image figures are timed through `ds4-server` with the launch the README shows,
+plus `--vision` with the 1017 vision file. Send each request to a server that
+has already answered a short text request, with an empty disk KV cache
+directory so nothing is restored: one image, the text "Describe this image."
+and `max_tokens` 1. Time from sending the request to the end
+of the response, which is the first token. Use four different images of each
+size, none sent before, and take the median. The sizes are 3840x2160 and
+1400x900 screenshots and a 512x507 image, all PNG; they give 943, 748 and 169
+encoder rows and prompts of 1,002, 806 and 218 tokens.
+
+To split a first token into its parts, the server's log gives the vision
+embedding time and the prompt's prefill time for each request.
+
+## 9. Accuracy of the non-exact defaults
+
+PREFILL_MMA and CED are compared with the exact prefill in two ways.
+
+- **Follow-up chains.** Prefill 3K tokens exactly and save the session. Then,
+  for each configuration, restore it and append 1K tokens at a time up to 32K,
+  keeping the logits after each append (29 points). Report the full-vocabulary
+  KL divergence of each configuration's logits from the exact ones at every
+  point, its mean, and whether the top token is the same. The prose prompt and
+  a code prompt (the first 400 KB of `ds4.c`) were both used.
+- **Long scoring cases.** `gguf-tools/quality-testing/score_official` scores
+  DeepSeek's own continuations of 21 long V4.1 prompts, teacher-forced at a
+  131,072-token context, and reports the mean negative log-likelihood per
+  token. The 21 cases are the long ones of two suites in
+  `gguf-tools/quality-testing`, listed in `deepseek-v4.1-flash-long21.tsv`:
+  `make gguf-tools/quality-testing/score_official`, then
+  `gguf-tools/quality-testing/score_official MODEL gguf-tools/quality-testing/deepseek-v4.1-flash-long21.tsv OUT.tsv 131072`
+  from the repository root, once per configuration with the switches in the
+  environment.
+  The paired difference between two configurations, with its standard error
+  over the 21 cases, is the figure the docs give.

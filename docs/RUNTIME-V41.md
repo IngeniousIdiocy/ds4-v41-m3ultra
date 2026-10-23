@@ -1,14 +1,15 @@
 # DeepSeek V4.1 on Metal: options and switches
 
 This page lists what this branch adds to DwarfStar main's command line and
-environment for DeepSeek V4.1 Flash on Metal: the options, the 44 group
-switches and the few other variables. Everything else is main's and is
+environment for DeepSeek V4.1 Flash on Metal: the options, the 55 group
+switches, the image input switches and the few other variables. Everything else is main's and is
 documented in main's own guides ([serving](SERVER.md),
 [speculative decoding](SPECULATIVE_DECODING.md), [models](MODELS.md),
 [performance](PERFORMANCE.md)).
 
 A normal launch sets no environment variable. Every group is on by default,
-and its switch exists to turn it off for comparison or bisection.
+and its switch exists to turn it off for comparison or bisection. `--exact`
+turns off, in one go, every group that is not bit for bit.
 
 ## A serving launch
 
@@ -36,6 +37,7 @@ keep it on 127.0.0.1 unless the network is private.
 | `--serial-reasoning` | off | V4.1 decodes every reasoning span serially; DSpark drafts only answers and tool calls. No effect on other models or in batched mode. |
 | `--default-reasoning-effort E` | `high` | Effort for a request that names none: `low`, `medium`, `high` or `max`. A request's own values still win. V4.1 renders `low` as effort level 50, as DeepSeek's encoder does. |
 | `--default-top-p F`, `--default-min-p F` | main's defaults | Sampler values for a request that sets none. |
+| `--exact` | off | Output bit for bit DwarfStar main's serial decoding, the same as `DS4_V41_EXACT=1` (below). Also on `ds4`. |
 
 The server also changes two behaviours without an option. An idle single slot
 prefills in the engine's prefill chunk instead of 2,048 tokens. And the disk KV
@@ -117,6 +119,15 @@ one mask with one bit per group (`ds4_gpu_v41_off()` in `ds4_metal.m`, the bit
 names in `ds4_gpu.h`). A switch counts as set when it is present, non-empty and
 not `0`. With a switch set, that group runs DwarfStar main's code.
 
+`DS4_V41_EXACT=1`, which `--exact` sets, is read with the switches. It sets
+those of PREFILL_MMA, CED, IMAGE_CED, INDEX_SCORE_WIDE, TOPK, ROWS_MMA and
+VERIFY_INDEXED (INDEX_CANDIDATES needs INDEX_SCORE_WIDE and TOPK, so it stops
+too), turns off the vision encoder's flash attention, and keeps DSpark to
+target-only decoding, as `--dspark-strict` does. Those are the defaults whose
+output can differ from main's serial decoding. VERIFY_KERNELS and
+PUBLIC_CONTROLLER differ only from main's DSpark, and with drafting off they
+never run. The engine logs one line at load when it is on.
+
 The column "Exact" says whether turning the group on keeps the output bit for
 bit. "Yes" means the same bits as the code it replaces. Where it says otherwise,
 the generated text stayed the same in the checks that were run, and the note says
@@ -182,10 +193,21 @@ These never run in one-token decoding, so serial output never depends on them.
 | 27 | `DS4_METAL_DISABLE_V41_PREFILL_FOLDS` | bf16 rounding and glue folded into the producers of large prefills. | Yes |
 | 31 | `DS4_METAL_DISABLE_V41_PREFILL_MATMUL` | Unpacking Q8 weights to F16 once for products of 32 or more rows on the M3 Ultra. Main's `DS4_QWEN4_Q8_PREFILL_UNPACK=0` also turns it off. | Yes |
 | 32 | `DS4_METAL_DISABLE_V41_PREFILL_INDEX_BATCH` | Batch top-k from 513 visible keys, select-all for short rows, batched candidates, ratio-1 batch publishing. | Yes |
-| 33 | `DS4_METAL_DISABLE_V41_SHORT_SWEEP` | One sweep for 3,072 to 8,191 tokens with the decoder suffix pruned. | No: a short prompt is split into chunks differently, so prefill rounding can differ in the last bits (seen in the previous release; not rechecked on this branch). |
+| 33 | `DS4_METAL_DISABLE_V41_SHORT_SWEEP` | One sweep for 3,072 to 8,191 tokens with the decoder suffix pruned. | Yes: with `--exact`, cold prompts of 3,072, 4,096, 6,144 and 8,000 tokens give main's logits. (The previous release's form of this group changed prefill rounding.) |
 | 34 | `DS4_METAL_DISABLE_V41_ENGRAM_READAHEAD` | Reading the next sweep's Engram rows during the current sweep. | Yes |
 | 42 | `DS4_METAL_DISABLE_V41_ENGRAM_READERS` | 32 concurrent Engram readers for a prefill sweep (16 when off). | Yes |
 | 43 | `DS4_METAL_DISABLE_V41_SHORT_MMA` | An eight-row prefill batch's Q8_0 products on simdgroup matrices in the row kernels' order of sums, outside DSpark blocks. Needs ROW_MATMULS, one Mac and an M1 to M4 GPU. Off runs main's row kernels. | Yes: bit for bit main's row kernels (unit test on every V4.1 Q8_0 shape, and an eight-token prompt's logits). |
+| 44 | `DS4_METAL_DISABLE_V41_SUFFIX_TRIM` | Inside the chunks of a 1,024- to 8,191-row sweep, the decoder layers skip the rows no later row reads, cut at a 128-row boundary with at least 256 rows kept. One Mac, not `--quality`, not SSD streaming; prompts with images only through IMAGE_TRIM. | Yes: main's logits and next 16 greedy steps on follow-ups of 512 to 8,000 tokens and cold prompts of 512 to 8,000. |
+| 45 | `DS4_METAL_DISABLE_V41_PREFILL_MMA` | Prefill attention on simdgroup matrices, 32 heads of a token per threadgroup, for the rows PREFILL_ATTENTION takes. M1 to M4 GPUs. | No: the sums run in another order. Mean KL after 29 follow-ups of 1K tokens (4K to 32K): 0.0102 prose, 0.0007 code, the same next token at every point; NLL over 21 long cases +0.0004 ± 0.0036. |
+| 46 | `DS4_METAL_DISABLE_V41_CED` | The decoder layers (20 to 39) replay only the last 256 rows of a sweep of 512 rows or more, as in the V4.1 report's bounded replay. Not `--quality`, not SSD streaming. | No: earlier rows are not replayed through the decoder layers. Mean KL 0.0064 prose, 0.0004 code, the same next token at every point; NLL −0.0001 ± 0.0009. With PREFILL_MMA: 0.0143 and 0.0009. |
+| 47 | `DS4_METAL_DISABLE_V41_IMAGE_CED` | CED for sweeps that hold images too. | No: as CED. First-token KL against the full replay 1.2e-4 and 1.4e-5 on two screenshots, the same top token. |
+| 48 | `DS4_METAL_DISABLE_V41_IMAGE_TRIM` | SUFFIX_TRIM for sweeps that hold images too, where CED does not run (`--exact`, or CED off). | Yes |
+| 49 | `DS4_METAL_DISABLE_V41_MOE_SHORT_TILES` | The routed experts' five exact large-prefill MXFP4 tile variants from 9 rows instead of 2,048 (V4.1 only). | Yes |
+| 50 | `DS4_METAL_DISABLE_V41_PREFILL_PIPELINE` | One-chunk layers committing their command buffers without waiting; the host still waits at the Engram layers, the decoder start and the last layer. SSD streaming and the prefill profilers keep every wait. | Yes |
+| 51 | `DS4_METAL_DISABLE_V41_HC_NARROW` | The hyper-connection mix projection of a prefill chunk on one SIMD group per 8 rows. | Yes |
+| 52 | `DS4_METAL_DISABLE_V41_CTX_RESIDENCY` | The engine's own allocations (context, KV, scratch) in a residency set on the queue. | Yes |
+| 53 | `DS4_METAL_DISABLE_V41_MOE_HALF_X` | The compact expert pair tiles reading rows narrowed to half once per layer. | Yes |
+| 54 | `DS4_METAL_DISABLE_V41_CARRY_KEEP` | A one-chunk layer keeping the previous layer's rows in the batch buffers instead of loading them from the carry. | Yes |
 
 ### The decode handoff and sampling
 
@@ -206,10 +228,30 @@ decode never reaches them.
 | 39 | `DS4_METAL_DISABLE_V41_TP_GATES` | Partials written straight into the gate slots and added by the HC expansion. | Not measured |
 | 40 | `DS4_METAL_DISABLE_V41_TP_PREFILL_ROWS8` | The attention output's K-slice rows in one dispatch, eight output rows per group on the M3 Ultra. | Yes (unit test) |
 
+### Image input
+
+Read straight from the environment, not through the group mask. They change
+only requests with images; text prompts never run the encoder.
+
+| Switch | Turns off | Exact |
+| --- | --- | --- |
+| `DS4_METAL_DISABLE_V41_VISION_HOST_PREP` | Image preparation split by rows across the CPU cores, and the system SHA-256 for the fingerprint. | Yes: the same patches and fingerprints. |
+| `DS4_DISABLE_V41_VISION_PREP_REUSE` | The encoder reusing the patches the server built when the request arrived. | Yes |
+| `DS4_DISABLE_PNG_SYSTEM_INFLATE` | The system DEFLATE decoder for PNG images (the faster checksums stay). | Yes: the same pixels. |
+| `DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD` | The encoder's bf16 rounding inside its kernels. | Yes |
+| `DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT` | The exact attention kernel's 32 keys per step; off runs the one-key kernel. | Yes |
+| `DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH` | The flash attention kernel on simdgroup matrices; off runs the exact kernels. `--exact` turns it off too. | No: float sums in another order. With every image default on, 176 of 216 scored questions on rendered images against 177 with `--exact`; see [METAL-V41.md](METAL-V41.md#vision_attn_flash-the-encoders-attention-on-simdgroup-matrices). |
+| `DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY` | Flash attention's lazy rescale. | No, as flash: rounded differently from the eager rescale. |
+| `DS4_METAL_DISABLE_V41_VISION_ATTN_KT16` | Flash attention's 16-key tiles (64 when off). | No, as flash: the lazy maximum moves per 16 keys. |
+
+The disk KV cache stores the encoder's flash setting with every image chat, so
+an image checkpoint written with one setting is refused with another.
+
 ## Other variables this branch adds
 
 | Variable | What it does |
 | --- | --- |
+| `DS4_V41_EXACT=1` | The exact shortcut, for every tool; see [the group switches](#the-group-switches). `--exact` sets it. |
 | `DS4_V41_ROUTER_BF16_SIDECAR`, `DS4_V41_ENGRAM_FP8_SIDECAR`, `DS4_V41_INDEXER_FP8_SIDECAR` | Name a sidecar file for a family that no `--v41-sidecar` named. Diagnostics; the option is the normal way. |
 | `DS4_METAL_SAMPLER_SELECTOR_SOURCE` | Loads the GPU top-p selector's Metal source (`metal/sampler_selector.metal`) from another path. If the source is missing, sampling stays on the CPU. |
 | `DS4_V41_SUFFIX_ALL=1` | An opt-in experiment: builds the exact decoder suffix for any prefill sweep of 384 tokens or more, without the tile rounding. Off by default. |
@@ -241,6 +283,7 @@ timing variables that help find idle GPU time are main's too, notably
 | `make test-deepseek41-dspark-payload` | A payload with the drafter window restores and repeats eight DSpark cycles exactly; an old payload still loads. | Yes, and the drafter |
 | `make test-deepseek41-verify-indexed` | Batched verify blocks rewound to their first, second and third rows give the next four decode steps bit for bit. | Yes, and the drafter |
 | `make tests/test_snapstore && ./tests/test_snapstore` | Snapshot format 4: hashes, atomic writes, compatibility verdicts. Also runs in `make test`. | No |
+| `python3 tests/test_server_vision_disk_cache.py --output DIR -- -m MODEL --vision VISION` | An image chat restored from the disk KV cache after a restart, with no full re-read; the same text with another image misses. | Yes, and the vision file |
 | `make tests/test_sampling && ./tests/test_sampling` | The GPU top-p summary's consumer against a reference on 30,000 summaries, some corrupted. | No |
 
 Main's own full Metal unit test (`./tests/test_deepseek41_metal` with no

@@ -23,7 +23,14 @@ switches off back to DwarfStar's own code.
 
 ## Ivan Fioravanti and Tarjei Mandt
 
-This branch is built on antirez's DwarfStar. Thanks to Tarjei Mandt ([kernelpool/ds4](https://github.com/kernelpool/ds4)) and Ivan Fioravanti ([ivanfioravanti/ds4-metal](https://github.com/ivanfioravanti/ds4-metal)): some of the code here started in their forks, including several of Tarjei's decode and verify kernels and Ivan's narrow decode weight copies and prefill index scorer. The speed groups and how they fit together are this project's own.
+This branch is built on antirez's DwarfStar. Thanks to Tarjei Mandt ([kernelpool/ds4](https://github.com/kernelpool/ds4)) and Ivan Fioravanti ([ivanfioravanti/ds4-metal](https://github.com/ivanfioravanti/ds4-metal)): some of the code here started in their forks, including several of Tarjei's decode and verify kernels and Ivan's narrow decode weight copies, prefill index scorer, prefill attention on simdgroup matrices (PREFILL_MMA), bounded decoder replay (CED) and in-chunk suffix trim (SUFFIX_TRIM). The speed groups and how they fit together are this project's own.
+
+## DwarfStar pull requests
+
+Two image features come from open pull requests to DwarfStar, taken with their
+authors' commits: #1225 by nazeshinjite, which pairs a V4.1 vision file with its
+language checkpoint by revision so the 1017 encoder loads, and #1197 by joohooo,
+which reads WebP images on macOS through ImageIO.
 
 ## The DSpark admission policy
 

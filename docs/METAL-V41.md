@@ -9,6 +9,9 @@ use `DS4_METAL_MODEL_TRACKED=1` and `DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY=1`). 
 engine runs main's code again. [RUNTIME-V41.md](RUNTIME-V41.md) lists every
 switch; [REPRODUCE-V41.md](REPRODUCE-V41.md) says how to measure them.
 
+The page ends with the image input groups and one speed-up that was identified
+and sized but not built.
+
 Some of the code here started in forks by Ivan Fioravanti and Tarjei Mandt;
 [THIRD_PARTY-V41.md](../THIRD_PARTY-V41.md) has the details.
 
@@ -671,9 +674,9 @@ final partial tile, and the pruning starts as soon as the prompt is longer than
 the rows it keeps (2,541, or 2,668 with DSpark). Fewer rows go through the
 decoder layers and there is no second pass.
 
-This is a scheduling change. Because it changes how a short prompt is split into
-chunks, the prefill's rounding can differ in the last bits from main's
-schedule.
+This is a scheduling change. Each row's arithmetic is unchanged: cold prompts of
+3,072, 4,096, 6,144 and 8,000 tokens give main's logits bit for bit (checked
+with `--exact`, so that CED and MMA attention do not take part).
 
 Kind: wasted work. Step: measured together with ENGRAM_READAHEAD and the decode
 groups after it: cold 32K prefill 40.4 to 40.4 s. A 32K prompt is longer than
@@ -736,6 +739,193 @@ every group on (which ran these rows through ROWS_MMA and VERIFY_KERNELS, not at
 main's bits): an eight-token prefill 0.3 s as before, now with main's logits;
 cold 32K 37.8 s, under 0.1 s from before; DSpark code 59.2 t/s, within 0.1 t/s
 of before and within noise.
+
+---
+
+## Prefill after the progression
+
+These groups came after the progression table. Each was measured on its own,
+against the build before it, on the M3 Ultra with the MXFP4 1017 weights. Text
+figures are cold prompts or follow-ups (a prompt appended to a saved 8K prose
+cache) without the drafter; image figures are the language model's prefill of
+an image prompt in one reused session, with the drafter loaded.
+
+### SUFFIX_TRIM: skip the rows no later row reads, inside a chunk
+
+`DS4_METAL_DISABLE_V41_SUFFIX_TRIM=1` turns it off.
+
+Layer `l` of a prefill sweep is read later only through the last
+1 + (39 − l) × 127 rows (plus the drafter's window). SHORT_SWEEP already skips
+whole 2,048-row tiles outside that range, but a shorter sweep, and every
+follow-up turn, ran all its rows through all 40 layers. Sweeps of 1,024 to
+8,191 rows now also cut inside the chunks: chunks before the cut are skipped,
+and the cut chunk starts at a 128-row boundary of the sequence (the compressor's
+blocks) and keeps at least 256 rows. Each kept row's arithmetic is unchanged. The
+router's F32 product still picks the kernel the whole chunk would have used,
+because its kernels give each row the same sums for any row count but switch
+kernels by row count.
+
+Kind: wasted work. Measured: follow-ups of 1,024, 2,048, 4,096 and 8,000 tokens
+5.5%, 14.6%, 15.6% and 9.9% faster; cold prompts of 2,048 to 8,000 tokens 9 to
+15% faster. Every case gave main's logits and main's next 16 greedy steps. At
+512 rows the trim was 1 to 3% slower, so it starts at 1,024.
+
+### PREFILL_MMA: prefill attention on simdgroup matrices
+
+`DS4_METAL_DISABLE_V41_PREFILL_MMA=1` turns it off.
+
+Every head of a prefill token reads the same window and top-k rows, one latent
+row serving as both key and value. The new kernel gives a threadgroup 32 heads
+of one token: sixteen SIMD groups, each eight heads by a quarter of the 512
+dimensions, over 16-row blocks staged once as half, with one softmax rescale
+per block instead of one per row. Q, K and V keep the scalar kernel's half
+rounding and the sums stay in float, but they run in another order, so the
+output is not bit for bit the scalar kernel's. It takes the rows
+PREFILL_ATTENTION's kernel would (more than eight rows, ratio 1 and 2, one Mac)
+on M1 to M4 GPUs; decode and DSpark's verify rows (eight or fewer) never take it.
+
+Kind: arithmetic throughput. Measured: cold 8K 10.95 to 10.29 s, 32K 37.86 to
+35.40 s, 131K 151.6 to 142.0 s. Accuracy: after each of 29 follow-ups of 1K
+tokens (4K to 32K), the first decode step's full-vocabulary KL divergence
+against the scalar kernel averaged 0.0102 on prose and 0.0007 on code, with the
+same top token at all 29 points. Over 21 long scoring cases (DeepSeek's own
+V4.1 continuations, teacher-forced), the mean negative log-likelihood per token
+moved by +0.0004 ± 0.0036, within noise.
+
+### CED: replay only a prompt's last rows through the decoder layers
+
+`DS4_METAL_DISABLE_V41_CED=1` turns it off.
+
+DeepSeek V4.1's decoder layers (20 to 39) read the global keys the encoder
+layers publish, and only a 128-row sliding window of their own. Section 3.2.2
+of the V4.1 report describes a causal encoder-decoder with bounded replay: the
+prompt runs through the encoder layers in full, and only its last rows through
+the decoder layers, their windows cut to the replayed rows. DeepSeek trained the
+model for this mode. A sweep of 512 rows or more now replays its last 256 rows
+through layers 20 to 39 (the report's recipe is 128; with 256 the last 128 see
+full windows), instead of the exact dependency suffix of up to 2,414 rows. The
+encoder's work is unchanged. A long prompt already runs only the encoder in its
+earlier sweeps, so the saving comes once per prompt, in its last sweep.
+
+Kind: wasted work. Measured: follow-ups of 1,024 and 2,048 tokens 2.997 to
+2.166 s and 4.845 to 3.149 s; cold 8K 11.5% faster, 32K 3.5%, 131K 1.2%. With
+PREFILL_MMA too, cold 32K takes 34.25 s and 131K 140.3 s. Accuracy, measured
+as for PREFILL_MMA: mean KL 0.0064 on prose and 0.0004 on code, the same top
+token at all 29 points; with PREFILL_MMA too, 0.0143 and 0.0009. NLL over the
+21 long cases moved by −0.0001 ± 0.0009.
+
+### IMAGE_CED: CED for prompts that hold images
+
+`DS4_METAL_DISABLE_V41_IMAGE_CED=1` turns it off.
+
+An image's rows enter the sweep through the embedding at layer 0 and travel
+through the layers like text rows, and the decoder layers read the whole image
+through the encoder layers' global keys. So a prompt with images now replays
+through the decoder like any other: from 512 rows, its last 256 rows.
+
+Kind: wasted work. Measured: a 3840x2160 screenshot (978 prompt tokens) 2.688
+to 2.007 s, a 1400x900 screenshot (782) 2.319 to 1.817 s; a 512x507 photo (194)
+is under 512 rows and unchanged. The first token's full-vocabulary KL
+divergence against the full replay was 1.2e-4 and 1.4e-5, with the same top
+token.
+
+### IMAGE_TRIM: SUFFIX_TRIM for prompts that hold images
+
+`DS4_METAL_DISABLE_V41_IMAGE_TRIM=1` turns it off.
+
+The trim's cut applies to image rows unchanged. It runs only where CED does
+not, that is with `--exact` or with CED switched off, on sweeps of 1,024 to
+8,191 rows; one image is at most 1,024 rows, so it takes an image chat with some
+text.
+
+Kind: wasted work. Measured with `--exact`, image prompts after about 1,250
+text tokens: a 512x507 photo 3.44 to 3.20 s, a 1400x900 screenshot 4.61 to
+4.03 s, a 3840x2160 screenshot 5.39 to 4.74 s, each with the same logits, bit
+for bit.
+
+### MOE_SHORT_TILES: the large-prefill expert tiles for short prefills
+
+`DS4_METAL_DISABLE_V41_MOE_SHORT_TILES=1` turns it off.
+
+Five exact variants of the routed experts' grouped products (a compact 32x32
+pair tile, a token-centric scatter, two tail culls and a half-result table for
+the down projection) were the default only from 2,048 rows. A short prefill
+gives each of the 384 experts only a few rows, so most of its 32-row tiles are
+short, and the culls and the compact tile pay most there: a 978-row image prompt
+gives an expert about 15 rows. V4.1's experts now take them from 9 rows.
+
+Kind: wasted work. Measured: a 194-row image prompt 1.063 to 0.888 s, 978 rows
+2.688 to 2.397 s; text of 218 tokens 1.201 to 1.008 s, 2,048 tokens 2.889 to
+2.779 s; every logit the same.
+
+### PREFILL_PIPELINE: commit one-chunk layers without waiting
+
+`DS4_METAL_DISABLE_V41_PREFILL_PIPELINE=1` turns it off.
+
+A prefill sweep committed every layer's command buffer and waited for it, so
+the GPU sat idle while the host encoded the next layer. When a layer's rows run
+as one chunk, its buffers now commit without waiting. The host still waits
+before its own work on GPU memory: the Engram reads at layers 1 and 14 and
+their read-ahead, the decoder start at layer 20 and the last layer. The same
+kernels run in the same order.
+
+Kind: idle time. Measured: 20 to 40 ms per prompt (a 3840x2160 screenshot
+1.623 to 1.591 s, text of 1,002 tokens 1.915 to 1.884 s), every logit the same.
+
+### HC_NARROW: the hyper-connection mix projection on narrow tiles
+
+`DS4_METAL_DISABLE_V41_HC_NARROW=1` turns it off.
+
+Each layer projects its four 5,120-wide hyper-connection streams onto 24 mix
+weights, twice. A chunk of a few hundred rows made only 8 to 31 threadgroups of
+the 64x32 tiled kernel, each walking the 20,480-wide input in 32-wide steps
+with a barrier per step: about 0.75 ms per dispatch whatever the row count. One
+SIMD group per 8 rows now owns all 24 outputs and keeps 128 inputs in flight
+per step. Each output adds the same 8x8 half products in the same order.
+
+Kind: occupancy and barriers. Measured: a 512x507 photo 0.776 to 0.738 s, text
+of 4,096 tokens 5.032 to 4.981 s; every logit and decode digest the same.
+
+### CTX_RESIDENCY: keep the engine's own buffers resident
+
+`DS4_METAL_DISABLE_V41_CTX_RESIDENCY=1` turns it off.
+
+The model's weights sit in residency sets on the command queue, but the
+context, KV and prefill scratch buffers (12 GB at a 393,216-token context) did
+not, so on every request the driver made them resident again when the first
+command buffers used them: about 75 ms with the GPU idle. Every buffer the
+engine allocates now joins one residency set on the queue. The arithmetic does
+not change.
+
+Kind: idle time. Measured through the server, first token of a one-token reply:
+a 512x507 photo 1.105 to 1.050 s, a 3840x2160 screenshot 3.446 to 3.366 s, text
+of about 800 tokens 1.508 to 1.425 s.
+
+### MOE_HALF_X: the expert tiles read half rows
+
+`DS4_METAL_DISABLE_V41_MOE_HALF_X=1` turns it off.
+
+The compact expert tiles (gate and up with SwiGLU) narrowed each routed row
+from float to half in every one of the 72 column blocks that read it. Each
+layer now narrows the rows once, and the tiles read half rows: half the bytes,
+the same half values.
+
+Kind: bytes moved. Measured: a 3840x2160 screenshot 1.590 to 1.570 s, text of
+4,096 tokens 4.947 to 4.892 s; every logit the same.
+
+### CARRY_KEEP: keep a one-chunk layer's rows in place
+
+`DS4_METAL_DISABLE_V41_CARRY_KEEP=1` turns it off.
+
+A sweep stores each layer's rows (the residual, the hyper-connection weights,
+the index selection and its mask) to the carry and loads them back when the
+next layer starts. When both layers run their rows as one chunk at the same
+offset, the batch buffers still hold those rows, so the next layer no longer
+loads them. The stores stay, because the decoder and the next sweep read the
+carry.
+
+Kind: bytes moved. Measured: a 3840x2160 screenshot 1.590 to 1.573 s, text of
+1,002 tokens 1.880 to 1.855 s; every logit the same.
 
 ---
 
@@ -837,3 +1027,201 @@ threadgroup reuses each input row across more outputs. The results are the
 same bits.
 
 Kind: kernel launches and bytes moved.
+
+---
+
+## Image input
+
+An image request runs in three parts before its first token: the host decodes
+and prepares the image, the vision encoder turns its patches into rows of
+embeddings, and the language model prefills the prompt that holds them. The
+groups below speed up the first two; IMAGE_CED, IMAGE_TRIM and the other
+prefill groups above speed up the third. Encoder times are for the 1017 vision
+encoder on the M3 Ultra, in one process. A 512x507 photo is 169 encoder rows, a
+1400x900 screenshot 748 and a 3840x2160 screenshot 943. Their switches are read
+straight from the environment, not through the group mask.
+
+### VISION_HOST_PREP: prepare the image on every core
+
+`DS4_METAL_DISABLE_V41_VISION_HOST_PREP=1` turns it off.
+
+Before the encoder starts, the host orients, resizes, normalizes and cuts the
+image into patches, on one thread. Output rows are independent, so each of
+those steps now splits by rows across the cores, each row with the same
+per-pixel code as before. The image's fingerprint uses the system's SHA-256,
+which gives the same digest.
+
+Kind: idle time. Measured: decode and preparation of a 3840x2160 screenshot 340
+to 114 ms, a 4032x3024 photo 510 to 174 ms; patches and fingerprints the same,
+bit for bit, on 29 images.
+
+### VISION_PREP_REUSE: decode each image once
+
+`DS4_DISABLE_V41_VISION_PREP_REUSE=1` turns it off.
+
+The server decodes and prepares every new image when the request arrives, to
+learn its token count and fingerprint, and the encoder then decoded and
+prepared the same bytes again. The encoder now takes the patches the first
+pass built, keyed by a full copy of the image's bytes.
+
+Kind: wasted work. Measured: a 4K PNG 1,322 to 1,279 ms, a 4K camera JPEG
+1,511 to 1,349 ms, with the same embeddings.
+
+### PNG decoding
+
+`DS4_DISABLE_PNG_SYSTEM_INFLATE=1` uses the bundled decoder alone.
+
+The bundled PNG reader spent most of its time on checksums. Adler-32 now
+reduces once every 5,552 bytes (zlib's bound) instead of twice per byte, CRC-32
+uses a table, and on Apple the compressed stream goes through the system's
+DEFLATE decoder, whose output is kept only when it has exactly the expected
+length and checksum; anything else falls back to the bundled decoder.
+
+Kind: arithmetic. Measured: a 3840x2160 PNG 97 to 35 ms, 1400x900 14.3 to
+4.8 ms, with the same pixels on 83 PNGs.
+
+### VISION_ROUND_FOLD: round inside the encoder's kernels
+
+`DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD=1` turns it off.
+
+The encoder rounded its activations to bf16 in 195 separate passes per image,
+after each bias, norm, attention output, residual and MLP product. Each rounding
+now happens in the kernel that makes the value or first reads it, with the same
+arithmetic.
+
+Kind: kernel launches and bytes moved. Measured: 7, 21 and 42 ms less for the
+photo, the 1400x900 and the 3840x2160 screenshot, with the same embeddings.
+
+### VISION_ATTN_EXACT: 32 keys per step
+
+`DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT=1` turns it off.
+
+The encoder's attention is global over all patches, and its kernel gave one
+SIMD group to each query row and head and walked the keys one at a time, each
+with a sum across the SIMD group: 89% of the encoder's time on a large image.
+The new kernel takes 32 keys per step, shared by eight query rows through
+threadgroup memory. Each lane forms one key's score and adds its products in
+the same tree as the old sum, and the softmax then runs in key order exactly as
+before, so the output is the same bits.
+
+Kind: occupancy and arithmetic. Measured: the encoder takes 216 to 176 ms on
+the photo, 2,701 to 2,079 ms on the 1400x900 screenshot and 4,375 to 3,466 ms
+on the 3840x2160 one, with the same embeddings and the same 200 greedy tokens
+after each image.
+
+### VISION_ATTN_FLASH: the encoder's attention on simdgroup matrices
+
+`DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH=1`, or `--exact`, turns it off.
+
+The exact kernel still forms every score and output with scalar arithmetic.
+The flash kernel runs them on 8x8 simdgroup matrices. Eight SIMD groups share
+each tile of keys and values; each row's scores sit in four lanes of the
+matrix, so the running maximum, the probabilities and the output rescale stay
+in registers; and K and V are written as half once by the projection kernel
+and read straight from memory, with no staging and no barriers. Every product
+and sum stays in float, but the order differs, so it is not bit for bit.
+
+Kind: arithmetic throughput. Measured on the 3840x2160 screenshot: the first
+flash kernel took the encoder from 3,466 ms (exact) to 2,537 ms; keeping the
+softmax in registers, in a later session, from 2.71 to 1.60 s; and reading K
+and V as half from 1,267 to 1,185 ms.
+
+Accuracy, with every image default on against `--exact`: on 216 exactly scored
+questions about 42 rendered images (charts, tables, dark interfaces, layout and
+small text), 176 against 177 correct answers. Five answers differed, all
+readings of characters 9 to 11 pixels tall, and in four of them both modes were
+wrong. On 20 images the first token's top choice was the same, with a median
+KL divergence of 1.3e-3 and at most 0.035 on dense text. The set has rendered
+images only, short answers and one image per request.
+
+### VISION_ATTN_LAZY: rescale only when a maximum grows
+
+`DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY=1` turns it off.
+
+The online softmax rescaled all 64 output values of every row on every tile of
+keys. It now keeps each row's running maximum until some row would grow it by
+more than ln 256, so the probabilities stay below 256 and the rescale is rare
+after the first tile. It is the same softmax after the final division, rounded
+differently. The key mask moves to the last, partial tile.
+
+Kind: arithmetic. Measured: the encoder takes 1,467 to 1,305 ms on the
+3840x2160 screenshot and 949 to 852 ms on the 1400x900 one.
+
+### VISION_ATTN_KT16: 16 keys per tile
+
+`DS4_METAL_DISABLE_V41_VISION_ATTN_KT16=1` turns it off.
+
+With 64 keys per tile each SIMD group held eight score fragments beside the
+query and the output, and the register load, not the arithmetic, set the pace.
+Sixteen keys per tile hold two. The reductions and the rescale test then come
+four times as often, and the kernel is still faster; 32 keys gained less and
+8 keys was twice as slow.
+
+Kind: occupancy (register pressure). Measured: the encoder takes 1,236 to
+1,123 ms on the 3840x2160 screenshot and 814 to 738 ms on the 1400x900 one.
+
+### Image state in the disk KV cache
+
+A checkpoint of a chat with images carries the identity of each image and of
+the encoder's numerics: the vision file's fingerprint, tagged with the flash
+kernel's version while it runs, and a tag while IMAGE_CED runs. An image chat
+stored under one setting misses under another and is read again. Text
+checkpoints are guarded by the numerics canary, a fresh prefill whose logits
+change with PREFILL_MMA and CED, so they too never cross between the default
+and `--exact`.
+
+---
+
+## Identified, not built
+
+### One routed-expert tile per expert for short prefills
+
+Expected gain: 0.10 to 0.16 s on a 4K image prompt, and some on text prompts
+longer than about 500 tokens. Decode and the decoder layers under CED gain
+nothing. Not built: the speed targets for this release were met first.
+
+**Where the time goes.** A 4K image prompt (978 rows) takes about 1.55 s of
+language-model prefill, and the routed experts are about 0.75 s of that. The
+decoder layers (20 to 39, 256 rows under CED) take about 11 ms each, already at
+the floor set by streaming the expert weights. The encoder layers (0 to 19, all
+978 rows) take about 27 ms each against a compute floor of about 14 ms: 18.2 ms
+for gate and up, 8.7 ms for down. At 978 rows each selected expert gets about
+15 rows, and the MXFP4 tile kernels cover an expert's rows in 32-row tiles,
+dequantizing each weight tile once per tile. With its matrix products skipped,
+the gate and up kernel still takes 10.2 ms; with only the dequantization
+skipped, 16.3 ms. So staging, barriers and memory latency cost about as much as
+the arithmetic, and dequantization is a small part.
+
+**The change.** A prefill kernel for about 500 to a few thousand rows, a few to
+about 64 rows per expert:
+
+1. One threadgroup per expert and 64-column block covers all of that expert's
+   rows, up to 64, so each weight tile is dequantized once per expert.
+2. The next step's weights and activations are staged through threadgroup
+   memory while the SIMD groups multiply the current one. Double buffering in
+   registers was tried and was 40% slower from register pressure; staging
+   through threadgroup memory is the open design problem.
+3. The same structure for the down projection.
+4. Its own switch, for those row counts only; above them the large-prefill
+   tiles win.
+
+**Exactness.** It can be bit for bit: the same half-precision dequantized
+weights and the same ascending order of 8x8 multiply-adds for every output.
+The gates are the usual ones: the logits after cold prefills of 8, 8K, 32K and
+131K tokens, an image prompt's first-token logits, 256 greedy steps from main's
+8K cache and the DSpark digest.
+
+**Expected gain.** 20 to 30% off the encoder layers' experts: about 5 to 8 ms
+per layer over 20 layers, 0.10 to 0.16 s per 4K image prompt. Text prompts over
+about 500 tokens gain in proportion to their encoder layers' expert time.
+
+**Already tried, slower:**
+
+- Double buffering in registers: 40% slower.
+- Skipping the products of empty 8-row blocks: the same bits, but 3 to 4%
+  slower everywhere (a 4K image prompt 1.553 to 1.606 s).
+- The other existing expert tile variants: no better than the defaults at these
+  row counts.
+
+**Effort and risk.** About a day of kernel work, with a measurement at each
+step. Two earlier attempts at this kernel were exact but slower.
