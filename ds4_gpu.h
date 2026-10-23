@@ -94,6 +94,7 @@ typedef struct {
 #define DS4_GPU_V41_CED (1ull << 46)   /* the decoder layers replay only a prefill sweep's last 256 rows, the V4.1 report's CED bounded replay (not bit-exact) */
 #define DS4_GPU_V41_IMAGE_CED (1ull << 47)   /* CED for prompts that hold images too (not bit-exact) */
 #define DS4_GPU_V41_IMAGE_TRIM (1ull << 48)   /* SUFFIX_TRIM for prompts that hold images too, at the same bits */
+#define DS4_GPU_V41_MOE_SHORT_TILES (1ull << 49)   /* routed experts of short prefills on the large-prefill MXFP4 tile variants, at the same bits */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
  * and keeps DSpark to target-only decode as --dspark-strict does. It is off by default. */
 #define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \

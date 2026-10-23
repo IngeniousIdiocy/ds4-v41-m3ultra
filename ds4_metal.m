@@ -495,6 +495,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_CED",
             "DS4_METAL_DISABLE_V41_IMAGE_CED",
             "DS4_METAL_DISABLE_V41_IMAGE_TRIM",
+            "DS4_METAL_DISABLE_V41_MOE_SHORT_TILES",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -45059,6 +45060,12 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") == NULL;
+        /* MOE_SHORT_TILES: V4.1's routed experts take the five exact large-prefill MXFP4 variants below (compact
+         * tile, map scatter, pair and down tail culls, down half table) from 9 rows instead of 2,048: a short prefill
+         * gives each expert a few rows, so most of its 32-row tiles are short. */
+        const bool v41_moe_shape = n_total_expert == 384u && n_expert == 6u && expert_in_dim == 5120u &&
+            expert_mid_dim == 2304u && out_dim == 5120u;
+        const uint32_t mxfp4_large_min = v41_moe_shape && ds4_gpu_v41_on(DS4_GPU_V41_MOE_SHORT_TILES) ? 9u : 2048u;
         /*
          * The MXFP4 32x32 specialization uses two SIMDgroups and 8 KiB of
          * threadgroup memory, and exactly culls SIMDgroup 1 on at-most-16-row
@@ -45068,7 +45075,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_pre_m5_mxfp4_mm_id_pair_swiglu_compact_tile_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_PAIR_SWIGLU_COMPACT_TILE") == NULL;
         const bool use_mxfp4_mm_id_pair_swiglu_compact_tile =
             use_mm_id_pair_swiglu &&
@@ -45084,7 +45091,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          */
         const bool use_pre_m5_mxfp4_mm_id_map_scatter_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_MAP_SCATTER") == NULL;
         const bool use_mxfp4_mm_id_map_scatter =
             use_mxfp4_mm_id_pair_swiglu_compact_tile &&
@@ -45105,7 +45112,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_pre_m5_mxfp4_mm_id_pair_tail_simdgroup_cull_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_PAIR_TAIL_SIMDGROUP_CULL") == NULL;
         const bool use_mxfp4_mm_id_pair_tail_simdgroup_cull =
             use_mm_id_pair_swiglu &&
@@ -45117,7 +45124,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_pre_m5_mxfp4_mm_id_down_tail_simdgroup_cull_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !g_ssd_streaming_mode &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_DOWN_TAIL_SIMDGROUP_CULL") == NULL;
         const bool use_mxfp4_mm_id_down_tail_simdgroup_cull =
             use_mm_id &&
@@ -45134,7 +45141,7 @@ int ds4_gpu_routed_moe_batch_tensor(
          */
         const bool use_pre_m5_mxfp4_mm_id_down_half_lut_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
-            n_tokens >= 2048u &&
+            n_tokens >= mxfp4_large_min &&
             getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_MM_ID_DOWN_HALF_LUT") == NULL;
         const bool use_mxfp4_mm_id_down_half_lut =
             use_mm_id &&
