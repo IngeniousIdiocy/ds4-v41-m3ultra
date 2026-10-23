@@ -44001,7 +44001,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * rows through them (the last 128 see full windows), their windows truncated to the replayed segment. DeepSeek
      * post-trained the model for this mode; it is not bit-identical to the full forward. */
     const uint32_t ced_tail = 256u;
-    const bool ced = ds41_on(DS4_GPU_V41_CED) && !g->quality && !g->streaming && !g->image_count &&
+    const bool ced = ds41_on(DS4_GPU_V41_CED) && !g->quality && !g->streaming &&
+        (!g->image_count || ds41_on(DS4_GPU_V41_IMAGE_CED)) &&
         total_count >= ced_tail + 256u && total_count <= g->carry_cap;
     /* SUFFIX_TRIM: sweeps of 1,024-8,191 rows trim the decoder suffix inside the plain schedule's chunks, with each
      * kept row on the kernels the untrimmed chunk would use, so the output is unchanged. Below 1,024 rows it does not

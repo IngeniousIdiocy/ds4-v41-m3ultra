@@ -92,10 +92,11 @@ typedef struct {
 #define DS4_GPU_V41_SUFFIX_TRIM (1ull << 44)   /* prefill sweeps of 1,024-8,191 rows trim the decoder suffix inside their chunks, each kept row on its own kernels */
 #define DS4_GPU_V41_PREFILL_MMA (1ull << 45)   /* prefill attention on simdgroup matrices, 32 heads of a token per threadgroup (not bit-exact: sums reassociated) */
 #define DS4_GPU_V41_CED (1ull << 46)   /* the decoder layers replay only a prefill sweep's last 256 rows, the V4.1 report's CED bounded replay (not bit-exact) */
+#define DS4_GPU_V41_IMAGE_CED (1ull << 47)   /* CED for prompts that hold images too (not bit-exact) */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
  * and keeps DSpark to target-only decode as --dspark-strict does. It is off by default. */
 #define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \
-    DS4_GPU_V41_VERIFY_INDEXED | DS4_GPU_V41_PREFILL_MMA | DS4_GPU_V41_CED)
+    DS4_GPU_V41_VERIFY_INDEXED | DS4_GPU_V41_PREFILL_MMA | DS4_GPU_V41_CED | DS4_GPU_V41_IMAGE_CED)
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

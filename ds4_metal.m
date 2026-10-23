@@ -493,6 +493,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_SUFFIX_TRIM",
             "DS4_METAL_DISABLE_V41_PREFILL_MMA",
             "DS4_METAL_DISABLE_V41_CED",
+            "DS4_METAL_DISABLE_V41_IMAGE_CED",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
