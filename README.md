@@ -4,12 +4,22 @@ This branch is [antirez's DwarfStar](https://github.com/antirez/ds4) (main at
 `5379c1c9`) plus a set of Metal speed-ups for DeepSeek V4.1 Flash. On a 512 GB
 M3 Ultra with the MXFP4 build of the October 17 checkpoint, it decodes about
 twice as fast as main: **41.4 tok/s at 8K context and 40.5 at 131K**, against
-main's 19.9 and 17.9. With DSpark drafting, code answers run at **59.0 tok/s**.
+main's 19.9 and 17.9. With DSpark drafting, code answers run at **58.8 tok/s**.
+A cold 131K-token prompt takes **138.8 s**, against main's 189.5 s, and a 4K
+screenshot reaches its first token in **2.8 s**.
 
-The speed-ups come in 43 groups. Each group does one thing, is added on top of
-main in its own commits, and has one switch that turns it off and runs main's
-code instead.
-Serial decoding gives main's output bit for bit.
+The speed-ups come in 54 groups for the language model and 8 for image input.
+Each group does one thing, is added on top of main in its own commits, and has
+one switch that turns it off and runs main's code instead.
+Serial decoding from a given cache gives main's output bit for bit. A few
+defaults trade the last bits for speed, with a measured loss within noise, most
+of all MMA prefill attention and CED, the bounded decoder replay of DeepSeek's
+V4.1 report. `--exact` (or `DS4_V41_EXACT=1`) turns off every default that is
+not bit for bit; see [Exactness](#exactness).
+
+[![V4.1 release video: DwarfStar main vs every speed group on](docs/video-poster.jpg)](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/releases/download/v41-video/v41-on-main-speedups.mp4)
+
+The video's numbers were measured at tag [`v41-video`](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/tree/v41-video). Later defaults, such as MMA attention and CED, are not in it. Also available: [720p](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/releases/download/v41-video/v41-on-main-speedups-phone.mp4) · [subtitles](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/releases/download/v41-video/v41-on-main-speedups.srt) · [release page](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/releases/tag/v41-video)
 
 Thanks to Ivan Fioravanti and Tarjei Mandt for their public V4.1 optimizations and for the ideas this work borrowed; [THIRD_PARTY-V41.md](THIRD_PARTY-V41.md) has the details.
 Everything below the line further down is DwarfStar's own README, which
@@ -27,10 +37,28 @@ a cold prompt in an empty session, without the drafter.
 | --- | ---: | ---: |
 | Serial decode, 8K | 19.9 t/s | **41.4 t/s** |
 | Serial decode, 131K | 17.9 t/s | **40.5 t/s** |
-| DSpark, prose, 8K | 18.6 t/s | **40.5 t/s** |
-| DSpark, code, 8K | 26.5 t/s | **59.0 t/s** |
-| Cold prefill, 32K | 45.0 s | **37.9 s** |
-| Cold prefill, 131K | 189.5 s | **151.6 s** |
+| DSpark, prose, 8K | 18.6 t/s | **40.1 t/s** |
+| DSpark, code, 8K | 26.5 t/s | **58.8 t/s** |
+| Cold prefill, 32K | 45.0 s | **33.7 s** |
+| Cold prefill, 131K | 189.5 s | **138.8 s** |
+| A 2K-token follow-up onto an 8K cache | 5.8 s | **2.7 s** |
+
+Prefill includes MMA attention and CED. With `--exact`, cold prefill takes
+37.3 s at 32K and 150.1 s at 131K.
+
+Image input is timed through `ds4-server` with the 1017 vision encoder
+(`--vision`), the drafter and the disk KV cache loaded: a request with one image,
+"Describe this image." and `max_tokens` 1, from sending it to receiving its one
+token, on a warm server that has not seen the image. Each figure is the median
+of four different images of that size. Main cannot load the 1017 vision file without
+DwarfStar PR #1225 (below), so the left column is this branch with that PR and
+image chats, before the image speed-ups.
+
+| First token of an image request | before the image speed-ups | this branch |
+| --- | ---: | ---: |
+| 3840x2160 screenshot (1,002 prompt tokens) | 8.0 s | **2.8 s** |
+| 1400x900 screenshot (806 prompt tokens) | 5.3 s | **2.2 s** |
+| 512x507 image (218 prompt tokens) | 1.5 s | **1.0 s** |
 
 The prose prompt is `speed-bench/promessi_sposi.txt` (an Italian novel); the
 code prompt is DwarfStar's own C and Python source. The model continues each
@@ -134,10 +162,15 @@ After `git pull`, run `make` again. Then:
   the old numerics (main changed the router's softplus).
 - **ds4-bench saved caches:** save them again. The old ones record the old
   drafter and the old numerics.
+- **From this branch's earlier build** (tag `v41-video`): run `make` again and
+  keep everything else. Text checkpoints in the disk KV cache are refused once
+  and rebuilt, because MMA attention and CED change the numerics canary; with
+  `--exact` they still restore.
 - **Options and variables:** every command-line option is kept. The release's
   DSpark tuning variables (`DS4_DS41_DSPARK_*`,
-  `DS4_DSPARK_DISABLE_ADAPTIVE_DRAFTING`), `DS4_METAL_V41_PREFILL_MMA`,
-  `DS4_V41_ENGRAM_DECODE`, `DS4_METAL_ENABLE_V41_ROWS_ATTENTION`,
+  `DS4_DSPARK_DISABLE_ADAPTIVE_DRAFTING`), `DS4_METAL_V41_PREFILL_MMA` (MMA
+  attention is now on by default; `DS4_METAL_DISABLE_V41_PREFILL_MMA=1` turns
+  it off), `DS4_V41_ENGRAM_DECODE`, `DS4_METAL_ENABLE_V41_ROWS_ATTENTION`,
   `DS4_METAL_DECODE_INDEXER_SPARSE_THRESHOLD` and its fine-grained
   `DS4_METAL_DISABLE_V41_*` switches are no longer read; setting one does
   nothing. The group switches in [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md)
@@ -224,6 +257,17 @@ that checks a draft; "TP" means two Macs.
 | SHORT_SWEEP | Prefill: 3,072 to 8,191 tokens in one sweep, with less decoder work. |
 | ENGRAM_READAHEAD | Prefill: the next sweep's Engram reads start during this one. |
 | ENGRAM_READERS | Prefill: 32 concurrent Engram readers instead of 16. |
+| SUFFIX_TRIM | Prefill of 1,024 to 8,191 tokens: the decoder layers skip the rows inside a chunk that no later row reads. |
+| PREFILL_MMA | Prefill: attention on the matrix units, 32 heads of a token at a time. Not bit for bit. |
+| CED | Prefill: the decoder layers replay only a prompt's last 256 rows (the V4.1 report's bounded replay). Not bit for bit. |
+| IMAGE_CED | Prefill: CED for prompts that hold images too. Not bit for bit. |
+| IMAGE_TRIM | Prefill: SUFFIX_TRIM for prompts that hold images too, where CED is off. |
+| MOE_SHORT_TILES | Prefill of 9 to 2,047 rows: the routed experts take the large-prefill tile kernels. |
+| PREFILL_PIPELINE | Prefill: a one-chunk layer commits without waiting, so the host encodes the next layer while the GPU runs this one. |
+| HC_NARROW | Prefill: the hyper-connection mix projection on narrow tiles. |
+| CTX_RESIDENCY | Prefill: the engine's own buffers stay resident, so a request does not wait for the driver. |
+| MOE_HALF_X | Prefill: the routed experts read their input rows as half, narrowed once per layer. |
+| CARRY_KEEP | Prefill: one-chunk layers keep their rows in place instead of reloading them. |
 | PREENCODE | Decode: the next token's first command buffer is encoded during this token's wait. |
 | SAMPLER_GPU | Sampled decode: the top-p summary is computed on the GPU. |
 | TP_BALANCED_ROUTE | TP: each Mac takes half of every token's experts. |
@@ -234,18 +278,64 @@ that checks a draft; "TP" means two Macs.
 The two-Mac groups are built and unit-tested but not measured: no second Mac was
 available.
 
+Image input has its own groups. Their switches are read straight from the
+environment:
+
+| Switch | What it speeds up |
+| --- | --- |
+| `DS4_METAL_DISABLE_V41_VISION_HOST_PREP=1` | Image preparation (orientation, resize, normalization, patches) split by rows across the CPU cores. |
+| `DS4_DISABLE_V41_VISION_PREP_REUSE=1` | Each request image is decoded and prepared once, not twice. |
+| `DS4_DISABLE_PNG_SYSTEM_INFLATE=1` | PNG decoding through the system DEFLATE decoder and faster checksums, about three times faster. |
+| `DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD=1` | The encoder's bf16 rounding inside the kernels that make each value. |
+| `DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT=1` | The encoder's exact attention takes 32 keys per step instead of one. |
+| `DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH=1` | The encoder's attention on the matrix units, softmax in registers, K and V read as half. Not bit for bit. |
+| `DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY=1` | Flash attention rescales its output only when a row's maximum grows. |
+| `DS4_METAL_DISABLE_V41_VISION_ATTN_KT16=1` | Flash attention walks the keys 16 at a time. |
+
 ### Exactness
 
-Every group has an off switch. Serial decoding gives DwarfStar main's output
-bit for bit. DSpark's verify groups are very accurate, but where two tokens are
-nearly tied their output can differ slightly from strict decoding.
+Every group has an off switch. Serial decoding from a given cache gives
+DwarfStar main's output bit for bit. Prefill has two defaults that are not:
 
-With every group on, serial decoding gives DwarfStar main's logits bit for bit:
-every one of 128 greedy steps from main's own saved caches at 8K and 131K prose,
-at every step of the progression below, and the logits after a cold 32K
-prefill. Short prompts are exact too: after prompts of three to eight tokens the
-logits and the next 32 greedy tokens are main's. Strict DSpark gives the serial
-tokens.
+- **PREFILL_MMA** runs prefill attention on the matrix units, which adds in a
+  different order.
+- **CED** replays only a prompt's last 256 rows through the 20 decoder layers,
+  as DeepSeek's V4.1 report does (its causal encoder-decoder with bounded
+  replay); IMAGE_CED does the same for prompts that hold images.
+
+Their cost is within noise. After each of 29 follow-ups of 1K tokens, from 3K
+to 32K, the next token was the same as the exact prefill's, with a mean
+full-vocabulary KL divergence of 0.014 on prose and 0.0009 on code (at most
+0.081 and 0.0091). Over 21 long DeepSeek V4.1 scoring cases, the mean negative
+log-likelihood per token is 0.3003 against 0.3010 with exact prefill (prose
+0.4452 against 0.4487, code 0.1910 against 0.1896). These were measured with
+the groups through PREFILL_PIPELINE; the four prefill groups after it give the
+same bits as the code they replace, so the figures hold for this build.
+
+**One switch for main's bits.** `--exact` on `ds4` and `ds4-server`, or
+`DS4_V41_EXACT=1` for any tool, is off by default. It turns off every default
+that is not bit for bit, so prefill, serial decoding and DSpark all give main's
+serial output:
+
+- PREFILL_MMA, CED and IMAGE_CED (prefill);
+- INDEX_SCORE_WIDE and TOPK (decode at depth), and INDEX_CANDIDATES, which
+  needs them;
+- ROWS_MMA and VERIFY_INDEXED (DSpark), and DSpark drafting itself, as
+  `--dspark-strict` does;
+- VISION_ATTN_FLASH (the vision encoder's attention).
+
+With `--exact`, the logits after cold prefills of 8, 8K, 32K and 131K tokens
+are main's, and so are 256 greedy steps of tokens and logits from main's own
+8K cache, with or without the drafter loaded. A disk KV checkpoint written in
+one mode is refused in the other, so an exact session never continues from
+state the faster defaults wrote.
+
+With every group on except PREFILL_MMA and CED, serial decoding gives DwarfStar
+main's logits bit for bit: every one of 128 greedy steps from main's own saved
+caches at 8K and 131K prose, at every step of the progression below, and the
+logits after a cold 32K prefill. Short prompts are exact too: after prompts of
+three to eight tokens the logits and the next 32 greedy tokens are main's.
+Strict DSpark gives the serial tokens.
 
 One switch exists only for exactness. An eight-token prompt is prefilled as one
 batch of eight rows, and SHORT_MMA runs that batch on the matrix units in main's
@@ -262,6 +352,10 @@ which gives serial decoding's tokens.
 
 The groups that are not bit for bit:
 
+- **PREFILL_MMA**, **CED** and **IMAGE_CED** (above).
+- **VISION_ATTN_FLASH**: the vision encoder's attention on the matrix units, in
+  float with a different order of sums. See image input below for its
+  accuracy.
 - **VERIFY_INDEXED** (the batched verify, above).
 - **ROWS_MMA**: three to eight rows of a draft or verify block on the matrix
   units add in a different order, so verify logits can differ in the last bits.
@@ -271,14 +365,39 @@ The groups that are not bit for bit:
   main's DSpark.
 - **PUBLIC_CONTROLLER**: a different drafting policy by design; it changes
   where DSpark drafts.
-- **DECODE_QUEUE with DSpark** and **SHORT_SWEEP**: in the previous release,
-  turning these off changed DSpark's verify bits and the prefill rounding of a
-  3,072- to 8,191-token prompt, while the tokens stayed the same.
+- **DECODE_QUEUE with DSpark**: in the previous release, turning it off changed
+  DSpark's verify bits, while the tokens stayed the same. (SHORT_SWEEP, listed
+  here before, gives main's logits: with `--exact`, cold prompts of 3,072,
+  4,096, 6,144 and 8,000 tokens match main bit for bit.)
 - **INDEX_SCORE_WIDE**: the wide scorer adds the index heads in a different
   order, so a key near the top-512 cut-off could change. In every check, the
   selections and logits stayed the same.
 
 [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md) gives the exactness of every switch.
+
+### Image input
+
+- **The 1017 vision encoder.** DwarfStar PR #1225 (by nazeshinjite) pairs a
+  V4.1 vision file with its language checkpoint by revision, so the encoder
+  released with the 1017 checkpoint loads beside the 1017 model.
+- **WebP images** on macOS, through ImageIO (DwarfStar PR #1197, by joohooo).
+- **Image chats in the disk KV cache.** A checkpoint of a chat that holds
+  images also stores each image's fingerprint, its rows and its place in the
+  text, and its file name covers them. A later request restores it only when
+  its images are the same, at the same places, from the same encoder running
+  the same numerics; another image behind the same text misses and is read
+  again. A restored prefix skips the encoder for the images it already holds.
+- **Faster images.** The groups above take a 4K screenshot's first token from
+  8.0 s to 2.8 s: preparation on every core, one decode per image, a
+  faster PNG decoder, the encoder's attention on the matrix units, and CED and
+  the short-prefill groups for the prompt that follows.
+- **Image accuracy.** On 216 exactly scored questions about 42 rendered images
+  (charts, tables, dark interfaces, layout and small text, at 720x450 to
+  3840x2160), the defaults answered 176 correctly and `--exact` 177: no
+  measurable loss. Five answers differed, all readings of characters 9 to 11
+  pixels tall; in four both modes were wrong, and in one a 9-pixel "8" was read
+  as "B". The set has rendered images only (no photos), short answers and one
+  image per request. Use `--exact` where bit-for-bit output matters.
 
 ### Also carried from the previous release
 
@@ -309,9 +428,12 @@ The groups that are not bit for bit:
   DSpark, and this branch keeps it. Only the release's drafting policy is
   ported, as PUBLIC_CONTROLLER. Its tuning variables, fault injection and
   deferred drafter upkeep went with the old runtime.
-- **The prefill attention on matrix units** (`DS4_METAL_V41_PREFILL_MMA`) and
-  **the shift decode of Engram codes**: experiments that were off by default
-  and did not earn a place.
+- **The shift decode of Engram codes**: an experiment that was off by default
+  and did not earn a place. (The previous release's other opt-in experiment,
+  the prefill attention on matrix units, is now the PREFILL_MMA group.)
+- **One routed-expert tile per expert for short prefills**: identified and
+  sized, not built. [docs/METAL-V41.md](docs/METAL-V41.md#identified-not-built)
+  describes it.
 - **Dense attention up to 1,024 compressed rows.** Main deliberately selects the
   model's top 512 as soon as there are more than 512 index rows, because
   attending to more changes the output. This branch keeps main's rule.
@@ -376,6 +498,12 @@ Cold prefill of 32K tokens, in seconds:
 A cold 131K prefill takes 189.5 s on main (a later quiet session), 189.4 s with
 every group off and 151.6 s with every group on.
 
+The prefill groups from SUFFIX_TRIM on came after the progression. Their gains
+are measured one by one in [docs/METAL-V41.md](docs/METAL-V41.md#prefill-after-the-progression);
+together they take a cold 32K prefill from 37.9 s to 33.7 s and 131K from
+151.6 s to 138.8 s, and a 2K-token follow-up onto an 8K cache from 4.8 s to
+2.7 s.
+
 After the progression session, ROWS_MMA and VERIFY_KERNELS were limited to
 DSpark's rows; before, they also took an eight-token prefill, which was fast but
 not main's bits. That change and the SHORT_MMA exactness switch (see Exactness)
@@ -405,7 +533,8 @@ make test-deepseek41-verify-indexed DS4_TEST_MODEL=gguf/DeepSeek-V4.1-Flash-MXFP
 
 ### V4.1 documents
 
-- [docs/METAL-V41.md](docs/METAL-V41.md): what each group does and why it is faster.
+- [docs/METAL-V41.md](docs/METAL-V41.md): what each group does and why it is faster, and one
+  speed-up identified but not built.
 - [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md): every option and switch.
 - [docs/REPRODUCE-V41.md](docs/REPRODUCE-V41.md): how the numbers were measured.
 - [CHANGES-V41.md](CHANGES-V41.md): the commits, and what changed since the previous release.
