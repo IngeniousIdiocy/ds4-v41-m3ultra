@@ -44832,6 +44832,16 @@ struct ds4_engine {
     int vision_image_token;
     int vision_start_token;
     int vision_end_token;
+    /* VISION_PREP_REUSE: patches a V4.1 describe built, for the encode of the same encoded bytes */
+    struct {
+        uint8_t *encoded;
+        size_t encoded_len;
+        uint32_t width, height;
+        uint8_t fingerprint[32];
+        ds4_deepseek4_image_patches patches;
+        uint64_t tick;
+    } vision_prep[4];
+    uint64_t vision_prep_tick;
     ds4_backend backend;
     ds4_support_kind support_kind;
     int dspark_exec_tier;
@@ -75717,13 +75727,78 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+/* VISION_PREP_REUSE (default on; DS4_DISABLE_V41_VISION_PREP_REUSE=1 off). The server describes every new V4.1
+ * image before the prompt (decode + patchify, for its token count and fingerprint), and the prefill then encoded the
+ * same bytes again from scratch. The describe step keeps its patches here, keyed by a copy of the encoded bytes
+ * (compared in full), and the encode of the same bytes takes them: the same pixels and patches, one decode. Four
+ * entries, oldest replaced; an entry is consumed by its encode. */
+static pthread_mutex_t g_vision_prep_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void vision_prep_put(ds4_engine *e, const uint8_t *encoded, size_t encoded_len, const ds4_image *image,
+                            ds4_deepseek4_image_patches *patches) {
+    if (getenv("DS4_DISABLE_V41_VISION_PREP_REUSE")) return;
+    uint8_t *copy = malloc(encoded_len ? encoded_len : 1);
+    if (!copy) return;
+    memcpy(copy, encoded, encoded_len);
+    pthread_mutex_lock(&g_vision_prep_mutex);
+    int slot = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!e->vision_prep[i].encoded) { slot = i; break; }
+        if (e->vision_prep[i].tick < e->vision_prep[slot].tick) slot = i;
+    }
+    free(e->vision_prep[slot].encoded);
+    ds4_deepseek4_image_patches_free(&e->vision_prep[slot].patches);
+    e->vision_prep[slot].encoded = copy;
+    e->vision_prep[slot].encoded_len = encoded_len;
+    e->vision_prep[slot].width = image->width;
+    e->vision_prep[slot].height = image->height;
+    memcpy(e->vision_prep[slot].fingerprint, image->fingerprint, sizeof(image->fingerprint));
+    e->vision_prep[slot].patches = *patches;
+    e->vision_prep[slot].tick = ++e->vision_prep_tick;
+    memset(patches, 0, sizeof(*patches));
+    pthread_mutex_unlock(&g_vision_prep_mutex);
+}
+
+static int vision_prep_take(ds4_engine *e, const uint8_t *encoded, size_t encoded_len, ds4_image *image,
+                            ds4_deepseek4_image_patches *patches) {
+    int found = 0;
+    pthread_mutex_lock(&g_vision_prep_mutex);
+    for (int i = 0; i < 4 && !found; i++) {
+        if (!e->vision_prep[i].encoded || e->vision_prep[i].encoded_len != encoded_len ||
+            memcmp(e->vision_prep[i].encoded, encoded, encoded_len)) continue;
+        memset(image, 0, sizeof(*image));
+        image->width = e->vision_prep[i].width;
+        image->height = e->vision_prep[i].height;
+        memcpy(image->fingerprint, e->vision_prep[i].fingerprint, sizeof(image->fingerprint));
+        *patches = e->vision_prep[i].patches;
+        free(e->vision_prep[i].encoded);
+        memset(&e->vision_prep[i], 0, sizeof(e->vision_prep[i]));
+        found = 1;
+    }
+    pthread_mutex_unlock(&g_vision_prep_mutex);
+    return found;
+}
+
+static void vision_prep_free_all(ds4_engine *e) {
+    pthread_mutex_lock(&g_vision_prep_mutex);
+    for (int i = 0; i < 4; i++) {
+        free(e->vision_prep[i].encoded);
+        ds4_deepseek4_image_patches_free(&e->vision_prep[i].patches);
+        memset(&e->vision_prep[i], 0, sizeof(e->vision_prep[i]));
+    }
+    pthread_mutex_unlock(&g_vision_prep_mutex);
+}
+
+/* prepared: V4.1 patches from vision_prep_take (consumed; image then carries only size and fingerprint), or NULL */
 static int ds4_engine_vision_encode_image(
         ds4_engine            *e,
         const ds4_image       *image,
+        ds4_deepseek4_image_patches *prepared,
         ds4_vision_embedding  *out,
         char                  *error,
         size_t                 error_cap) {
     if (!e || !image || !out || !e->vision_ready) {
+        if (prepared) ds4_deepseek4_image_patches_free(prepared);
         if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
         return 0;
     }
@@ -75749,6 +75824,7 @@ static int ds4_engine_vision_encode_image(
 #endif
     }
     if (!e->metal_ready || !e->vision_map_ready) {
+        if (prepared) ds4_deepseek4_image_patches_free(prepared);
         if (error && error_cap) {
             snprintf(error, error_cap, "unable to map vision weights on %s",
                      ds4_backend_name(e->backend));
@@ -75764,9 +75840,16 @@ static int ds4_engine_vision_encode_image(
     int ok = 0;
     if (e->vision_kind == DS4_VISION_DEEPSEEK4) {
         ds4_deepseek4_image_patches patches = {0};
-        const bool preprocessed = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
-            ds4_image_preprocess_deepseek41(&patches, image, error, error_cap) :
-            ds4_image_preprocess_deepseek4(&patches, image, error, error_cap);
+        bool preprocessed;
+        if (prepared) {
+            patches = *prepared;
+            memset(prepared, 0, sizeof(*prepared));
+            preprocessed = true;
+        } else {
+            preprocessed = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
+                ds4_image_preprocess_deepseek41(&patches, image, error, error_cap) :
+                ds4_image_preprocess_deepseek4(&patches, image, error, error_cap);
+        }
         if (!preprocessed) return 0;
         token_count = patches.llm_grid_height * patches.llm_grid_width;
         embedding = malloc((size_t)token_count * DS4_N_EMBD * sizeof(float));
@@ -75895,7 +75978,7 @@ int ds4_engine_vision_encode_file(
         size_t error_cap) {
     ds4_image image = {0};
     if (!ds4_image_decode_file(&image, path, error, error_cap)) return 0;
-    int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
+    int ok = ds4_engine_vision_encode_image(e, &image, NULL, out, error, error_cap);
     ds4_image_free(&image);
     return ok;
 }
@@ -75908,8 +75991,12 @@ int ds4_engine_vision_encode_memory(
         char *error,
         size_t error_cap) {
     ds4_image image = {0};
+    ds4_deepseek4_image_patches prepared = {0};
+    if (e && e->vision_kind == DS4_VISION_DEEPSEEK4 && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        vision_prep_take(e, encoded, encoded_len, &image, &prepared))
+        return ds4_engine_vision_encode_image(e, &image, &prepared, out, error, error_cap);
     if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
-    int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
+    int ok = ds4_engine_vision_encode_image(e, &image, NULL, out, error, error_cap);
     ds4_image_free(&image);
     return ok;
 }
@@ -75938,6 +76025,7 @@ int ds4_engine_vision_describe_memory(
         out->content_width = patches.content_width;
         out->content_height = patches.content_height;
         memcpy(out->fingerprint, image.fingerprint, sizeof(out->fingerprint));
+        vision_prep_put(e, encoded, encoded_len, &image, &patches);
     }
     ds4_deepseek4_image_patches_free(&patches);
     ds4_image_free(&image);
@@ -76236,6 +76324,7 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    vision_prep_free_all(e);
     ds4_engine_tp_unbind(e);
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     /* Built at open but never bound. */
