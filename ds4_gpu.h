@@ -89,6 +89,7 @@ typedef struct {
 #define DS4_GPU_V41_VERIFY_INDEXED (1ull << 41)   /* a DSpark verify block attends like a short prefill: index top-k and indexed attention as batches */
 #define DS4_GPU_V41_ENGRAM_READERS (1ull << 42)   /* a prefill sweep reads its Engram rows from disk with 32 concurrent readers instead of 16 */
 #define DS4_GPU_V41_SHORT_MMA (1ull << 43)   /* Q8_0 matmuls of eight rows outside a DSpark block on simdgroup matrices, at the row kernels' bits */
+#define DS4_GPU_V41_SUFFIX_TRIM (1ull << 44)   /* prefill sweeps of 1,024-8,191 rows trim the decoder suffix inside their chunks, each kept row on its own kernels */
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -1249,6 +1250,18 @@ int ds4_gpu_matmul_f32_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+/* The same over n_tok rows, with the kernel chosen as for plan_tok rows (plan_tok >= n_tok), so each row gets the
+ * bits of the larger dispatch. */
+int ds4_gpu_matmul_f32_plan_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        uint64_t                plan_tok);
 
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
