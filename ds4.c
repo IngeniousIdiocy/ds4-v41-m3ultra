@@ -44008,7 +44008,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * kept row on the kernels the untrimmed chunk would use, so the output is unchanged. Below 1,024 rows it does not
      * pay. */
     const bool trim = !ced && ds41_on(DS4_GPU_V41_SUFFIX_TRIM) && !g->quality && g->tp_world == 1 && !g->streaming &&
-        !g->image_count && total_count >= 1024u && total_count < 8192u && total_count <= g->carry_cap;
+        (!g->image_count || ds41_on(DS4_GPU_V41_IMAGE_TRIM)) &&
+        total_count >= 1024u && total_count < 8192u && total_count <= g->carry_cap;
     /* DS4_V41_SUFFIX_ALL: the exact dependency suffix for short sweeps too, without
      * tile rounding; same math, other kernels for the smaller row counts. */
     const bool suffix_all = !ced && !trim && getenv("DS4_V41_SUFFIX_ALL") && g->tp_world == 1 && !g->streaming &&
