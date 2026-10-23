@@ -48863,6 +48863,37 @@ static int deepseek4_vision_debug_dump(
     return ok;
 }
 
+/* V4.1 vision attention (switches read on every encode, default on):
+ *   DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD=1  round the output in its own pass
+ * Under the fold the scalar kernel's copy rounds in its store. */
+static int deepseek41_vision_dispatch_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows,
+        bool                  round) {
+    const char *name = round ? "kernel_deepseek41_vision_attention_round"
+                             : "kernel_glm53_vision_attention";
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(name);
+    if (!pipeline) return 0;
+    glm53_vision_attention_args args = { rows, 0.125f };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(q) offset:ds4_gpu_tensor_offset(q) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(k) offset:ds4_gpu_tensor_offset(k) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(v) offset:ds4_gpu_tensor_offset(v) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 16u, 1)
+         threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 vision attention");
+}
+
 int ds4_gpu_deepseek4_vision_encode(
         float                              *out,
         const float                        *patches,
@@ -48881,6 +48912,10 @@ int ds4_gpu_deepseek4_vision_encode(
     const uint32_t projection = weights->projection_dim ? weights->projection_dim : 4096u;
     if (projection != 4096u && projection != 5120u) return 0;
     const uint32_t rows = grid_h * grid_w;
+    const bool v41 = projection == 5120u;
+    /* VISION_ROUND_FOLD: each bf16 rounding pass moves into its producer's store
+     * or its consumer's load (the same rounded values, fewer passes). */
+    const bool fold = v41 && getenv("DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD") == NULL;
     const uint32_t aligned_rows =
         ((grid_h + 2u) / 3u) * ((grid_w + 2u) / 3u);
     const uint64_t row1024 = (uint64_t)rows * 1024u;
@@ -48923,10 +48958,10 @@ int ds4_gpu_deepseek4_vision_encode(
             a, model_map, model_size, weights->patch_weight,
             588u, 1024u, patch, rows);
     if (ok) ok = glm53_vision_dispatch_bias(
-            "kernel_glm53_vision_add_bias", a, NULL,
+            fold ? "kernel_deepseek41_vision_add_bias_round" : "kernel_glm53_vision_add_bias", a, NULL,
             model_map, model_size, weights->patch_bias,
             1024u, rows, "DeepSeek vision patch bias");
-    if (ok) ok = deepseek4_vision_dispatch_round(a, 1024u, rows);
+    if (ok && !fold) ok = deepseek4_vision_dispatch_round(a, 1024u, rows);
     if (ok) ok = deepseek4_vision_debug_dump(
             "patch_embed", a, row1024);
 
@@ -48935,10 +48970,10 @@ int ds4_gpu_deepseek4_vision_encode(
     for (uint32_t il = 0; ok && il < DS4_DEEPSEEK4_VISION_LAYERS; il++) {
         const ds4_deepseek4_vision_layer_weights *w = &weights->layer[il];
         ok = glm53_vision_dispatch_rows(
-                "kernel_glm53_vision_rms_bf16", tmp, cur,
+                fold ? "kernel_deepseek41_vision_rms_round" : "kernel_glm53_vision_rms_bf16", tmp, cur,
                 model_map, model_size, w->norm1,
                 1024u, rows, 1.0e-6f, "DeepSeek vision norm1");
-        if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_norm1", tmp, row1024);
         if (ok) ok = ds4_gpu_glm53_matmul_bf16(
@@ -48955,8 +48990,9 @@ int ds4_gpu_deepseek4_vision_encode(
                 "block0_k", k, row1024);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_v", v, row1024);
-        if (ok) ok = glm53_vision_dispatch_attention(attn, q, k, v, rows);
-        if (ok) ok = deepseek4_vision_dispatch_round(attn, 1024u, rows);
+        if (ok) ok = v41 ? deepseek41_vision_dispatch_attention(attn, q, k, v, rows, fold)
+                         : glm53_vision_dispatch_attention(attn, q, k, v, rows);
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(attn, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_attention", attn, row1024);
         if (ok) ok = ds4_gpu_glm53_matmul_bf16(
@@ -48967,25 +49003,27 @@ int ds4_gpu_deepseek4_vision_encode(
                                       "kernel_glm53_vision_bias_residual", tmp, cur,
                 model_map, model_size, w->attn_proj_bias,
                 1024u, rows, "DeepSeek vision attention bias");
-        if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+        /* kernel_deepseek41_vision_bias_residual stores rounded values; rounding again is the identity */
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_attn_residual", tmp, row1024);
         ds4_gpu_tensor *swap = cur; cur = tmp; tmp = swap;
 
         if (ok) ok = glm53_vision_dispatch_rows(
-                "kernel_glm53_vision_rms_bf16", tmp, cur,
+                fold ? "kernel_deepseek41_vision_rms_round" : "kernel_glm53_vision_rms_bf16", tmp, cur,
                 model_map, model_size, w->norm2,
                 1024u, rows, 1.0e-6f, "DeepSeek vision norm2");
-        if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
         if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
                 "block0_norm2", tmp, row1024);
         if (ok) ok = ds4_gpu_glm53_matmul_bf16(
                 mlp_w1, model_map, model_size, w->mlp_w1,
                 1024u, 5632u, tmp, rows);
-        if (ok) ok = deepseek4_vision_dispatch_round(mlp_w1, 5632u, rows);
-        if (ok && il == 0u) ok = deepseek4_vision_debug_dump(
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(mlp_w1, 5632u, rows);
+        if (ok && il == 0u && !fold) ok = deepseek4_vision_debug_dump(
                 "block0_mlp_w1", mlp_w1, row5632);
         if (ok) ok = deepseek4_vision_dispatch_two_rows(
+                fold ? "kernel_deepseek41_vision_swiglu_split_rl" :
                 projection == 5120u ? "kernel_deepseek41_vision_swiglu_split" :
                                       "kernel_deepseek4_vision_swiglu_split",
                 mlp_w1, mlp_mid, 2816u, rows,
@@ -48995,9 +49033,9 @@ int ds4_gpu_deepseek4_vision_encode(
         if (ok) ok = ds4_gpu_glm53_matmul_bf16(
                 tmp, model_map, model_size, w->mlp_w2,
                 2816u, 1024u, mlp_mid, rows);
-        if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+        if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
         if (ok) ok = deepseek4_vision_dispatch_two_rows(
-                "kernel_deepseek4_vision_add_residual",
+                fold ? "kernel_deepseek41_vision_add_residual_rl" : "kernel_deepseek4_vision_add_residual",
                 tmp, cur, 1024u, rows,
                 "DeepSeek vision MLP residual");
         swap = cur; cur = tmp; tmp = swap;
@@ -49008,10 +49046,10 @@ int ds4_gpu_deepseek4_vision_encode(
         }
     }
     if (ok) ok = glm53_vision_dispatch_rows(
-            "kernel_glm53_vision_rms_bf16", tmp, cur,
+            fold ? "kernel_deepseek41_vision_rms_round" : "kernel_glm53_vision_rms_bf16", tmp, cur,
             model_map, model_size, weights->post_norm,
             1024u, rows, 1.0e-6f, "DeepSeek vision final norm");
-    if (ok) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
+    if (ok && !fold) ok = deepseek4_vision_dispatch_round(tmp, 1024u, rows);
     if (ok) ok = deepseek4_vision_debug_dump(
             "vision_norm", tmp, row1024);
     if (ok) ok = deepseek4_vision_dispatch_aligner_reorder(
@@ -49026,10 +49064,10 @@ int ds4_gpu_deepseek4_vision_encode(
             align_a, model_map, model_size, weights->aligner_w2,
             projection, projection, align_b, aligned_rows);
     if (ok) ok = glm53_vision_dispatch_bias(
-            "kernel_glm53_vision_add_bias", align_a, NULL,
+            fold ? "kernel_deepseek41_vision_add_bias_round" : "kernel_glm53_vision_add_bias", align_a, NULL,
             model_map, model_size, weights->aligner_w2_bias,
             projection, aligned_rows, "DeepSeek vision aligner output bias");
-    if (ok) ok = deepseek4_vision_dispatch_round(
+    if (ok && !fold) ok = deepseek4_vision_dispatch_round(
             align_a, projection, aligned_rows);
     if (ok) ok = deepseek4_vision_debug_dump(
             "aligned", align_a, aligned_projection);
