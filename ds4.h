@@ -281,6 +281,22 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     ds4_vision_embedding *out,
                                     char *error,
                                     size_t error_cap);
+/* V4.1 only: the embedding of an image without running the encoder (data NULL;
+ * fingerprint, rows and layout filled). ds4_prompt_append_vision accepts it, and
+ * ds4_vision_span_fill adds the rows from the encoder output when a prefill needs
+ * them. Returns 0 for other models, which must encode. */
+int ds4_engine_vision_describe_memory(ds4_engine *e,
+                                      const uint8_t *encoded,
+                                      size_t encoded_len,
+                                      ds4_vision_embedding *out,
+                                      char *error,
+                                      size_t error_cap);
+/* Fill a described span's rows from the same image's encoder output (consumed). */
+int ds4_vision_span_fill(ds4_engine *e,
+                         ds4_vision_span *span,
+                         ds4_vision_embedding *encoded,
+                         char *error,
+                         size_t error_cap);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
 int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_tokens *tokens,
@@ -447,6 +463,10 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* The first prompt position a sync would prefill (the kept prefix length). An
+ * image span ending at or before it needs no rows; images may pass data NULL. */
+int ds4_session_prefill_start(const ds4_session *s, const ds4_tokens *prompt,
+                              const ds4_vision_span *images, size_t image_count);
 int ds4_session_sync_multimodal(ds4_session *s,
                                 const ds4_tokens *prompt,
                                 const ds4_vision_span *images,

@@ -719,6 +719,8 @@ static void server_inference_unlock(server *s);
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen);
+static bool server_image_cached(server *s, const server_image_input *input,
+                                ds4_vision_embedding *out);
 
 typedef struct {
     char *id;
@@ -810,6 +812,9 @@ typedef struct {
     server_model_syntax model_syntax;
     ds4_tokens prompt;
     ds4_vision_span *images;
+    /* Encoded bytes of each described image whose rows are not built yet
+     * (encoded NULL once filled or when it was encoded up front). */
+    server_image_input *image_pending;
     char (*image_markers)[SERVER_IMAGE_MARKER_BYTES];
     size_t image_count;
     char *model;
@@ -1028,9 +1033,12 @@ static bool request_validate_ignore_eos(const request *r,
 
 static void request_free(request *r) {
     ds4_tokens_free(&r->prompt);
-    for (size_t i = 0; i < r->image_count; i++)
+    for (size_t i = 0; i < r->image_count; i++) {
         ds4_vision_embedding_free(&r->images[i].embedding);
+        if (r->image_pending) free(r->image_pending[i].encoded);
+    }
     free(r->images);
+    free(r->image_pending);
     free(r->image_markers);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
@@ -3687,9 +3695,21 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             inputs[next++] = &msgs->v[i].images.v[j];
     }
 
+    /* An image missing from the embedding cache is only described when the
+     * model allows it (V4.1): a cached prefix that already holds it never reads
+     * its rows, and request_fill_images encodes it when a prefill does. */
+    bool *described = xmalloc(count * sizeof(described[0]));
+    bool any_described = false;
     bool ok = true;
     server_inference_lock(s);
     for (size_t i = 0; i < count; i++) {
+        described[i] = false;
+        if (server_image_cached(s, inputs[i], &embeddings[i])) continue;
+        if (ds4_engine_vision_describe_memory(e, inputs[i]->encoded, inputs[i]->encoded_len,
+                                              &embeddings[i], err, errlen)) {
+            described[i] = any_described = true;
+            continue;
+        }
         if (!server_encode_image(s, inputs[i], &embeddings[i], err, errlen)) {
             ok = false;
             break;
@@ -3722,11 +3742,23 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         cursor = marker + strlen(inputs[i]->marker);
     }
     if (ok) ds4_tokenize_rendered_chat(e, cursor, &r->prompt);
+    if (ok && any_described) {
+        r->image_pending = xmalloc(count * sizeof(r->image_pending[0]));
+        memset(r->image_pending, 0, count * sizeof(r->image_pending[0]));
+        for (size_t i = 0; i < count; i++) {
+            if (!described[i]) continue;
+            r->image_pending[i].encoded = xmalloc(inputs[i]->encoded_len);
+            memcpy(r->image_pending[i].encoded, inputs[i]->encoded, inputs[i]->encoded_len);
+            r->image_pending[i].encoded_len = inputs[i]->encoded_len;
+            memcpy(r->image_pending[i].marker, inputs[i]->marker, sizeof(inputs[i]->marker));
+        }
+    }
 
 done:
     for (size_t i = 0; i < count; i++)
         ds4_vision_embedding_free(&embeddings[i]);
     free(embeddings);
+    free(described);
     free(inputs);
     if (!ok) {
         ds4_tokens_free(&r->prompt);
@@ -10238,13 +10270,17 @@ static void server_inference_unlock(server *s) {
 }
 
 /* The caller holds inference_mu across cache lookup and encoder execution. */
+static bool server_image_cached(server *s, const server_image_input *input,
+                                ds4_vision_embedding *out) {
+    if (!server_image_cache_get(&s->image_cache, input, out)) return false;
+    server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
+    return true;
+}
+
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen) {
-    if (server_image_cache_get(&s->image_cache, input, out)) {
-        server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
-        return true;
-    }
+    if (server_image_cached(s, input, out)) return true;
     if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
                                          input->encoded_len, out, err, errlen))
         return false;
@@ -12690,14 +12726,53 @@ static int server_multimodal_resume_pos(ds4_session *session,
         ds4_session_vision_prefix_matches(session, images, image_count));
 }
 
+/* Build the rows of the described images a sync of prompt will prefill: those
+ * ending past the prefix the session keeps. An image the restored or live
+ * prefix already holds is never encoded. */
+static bool request_fill_images(server *s, server_slot *slot, request *r,
+                                const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (!r->image_pending) return true;
+    size_t skipped = 0, encoded = 0;
+    bool ok = true;
+    server_inference_lock(s);
+    const uint64_t kept = (uint64_t)ds4_session_prefill_start(slot->session, prompt,
+                                                              r->images, r->image_count);
+    for (size_t i = 0; ok && i < r->image_count; i++) {
+        server_image_input *input = &r->image_pending[i];
+        if (!input->encoded) continue;
+        ds4_vision_span *span = &r->images[i];
+        if ((uint64_t)span->token_start + span->embedding.token_count <= kept) {
+            skipped++;
+            continue;
+        }
+        ds4_vision_embedding raw = {0};
+        ok = server_encode_image(s, input, &raw, err, errlen) &&
+             ds4_vision_span_fill(s->engine, span, &raw, err, errlen);
+        ds4_vision_embedding_free(&raw);
+        if (ok) {
+            free(input->encoded);
+            input->encoded = NULL;
+            encoded++;
+        }
+    }
+    server_inference_unlock(s);
+    if (skipped)
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: vision encoder skipped images=%zu (held by the kept prefix of %llu tokens); encoded=%zu",
+                   skipped, (unsigned long long)kept, encoded);
+    return ok;
+}
+
 static int server_session_sync_multimodal(server *s, server_slot *slot,
                                           const ds4_tokens *prompt,
-                                          const ds4_vision_span *images,
-                                          size_t image_count,
+                                          request *r,
                                           char *err, size_t errlen) {
+    const ds4_vision_span *images = r ? r->images : NULL;
+    const size_t image_count = r ? r->image_count : 0;
     if (!image_count)
         return server_session_sync(s, slot, prompt, err, errlen);
     if (!s || !slot || !prompt || !images) return 1;
+    if (!request_fill_images(s, slot, r, prompt, err, errlen)) return 1;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, prompt,
@@ -12784,7 +12859,7 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
  * boundary handling and rebuild the retained prefix when rewind invalidates
  * it, retaining image conditioning as well. */
 static int server_generation_rewind(server *s, server_slot *slot,
-                                     const request *r, int pos,
+                                     request *r, int pos,
                                      bool resample, int last_token,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
@@ -12801,7 +12876,7 @@ static int server_generation_rewind(server *s, server_slot *slot,
     bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
     pthread_mutex_unlock(&s->inference_mu);
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
-        r->images, r->image_count, err, errlen) : 0;
+        r, err, errlen) : 0;
     ds4_tokens_free(&prefix);
     if (rc == 0 && resample)
         rc = server_eval_token(s, slot, last_token, err, errlen);
@@ -13973,8 +14048,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     int prompt_sync_rc = multimodal ?
-        server_session_sync_multimodal(s, slot, prompt_for_sync,
-                                       j->req.images, j->req.image_count,
+        server_session_sync_multimodal(s, slot, prompt_for_sync, &j->req,
                                        err, sizeof(err)) :
         server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
     if (prompt_sync_rc != 0) {

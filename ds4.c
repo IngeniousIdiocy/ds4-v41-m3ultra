@@ -41464,6 +41464,7 @@ static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights 
     const ds4_vision_span *image = ds41_image_at(g, pos);
     if (!image) return ds4_gpu_embed_token_hc_tensor(out, m->map, m->size,
         w->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token, DS4_N_EMBD, DS4_N_HC);
+    if (!image->embedding.data) return false;
     const float *data = image->embedding.data + (uint64_t)(pos - image->token_start) * DS4_N_EMBD;
     return ds4_gpu_tensor_write(scratch, 0, data, (uint64_t)DS4_N_EMBD * sizeof(float)) &&
         ds4_gpu_repeat_hc_tensor(out, scratch, DS4_N_EMBD, DS4_N_HC);
@@ -75332,6 +75333,30 @@ static int ds4_prompt_append_deepseek4_vision(
             snprintf(error, error_cap, "DeepSeek vision prompt is too large");
         return 0;
     }
+    if (!embedding->data) {
+        /* A described V4.1 image (ds4_engine_vision_describe_memory): its tokens
+         * do not depend on the rows, which ds4_vision_span_fill adds when a
+         * prefill needs them. V4 tokens are typed by row, so V4 never defers. */
+        if (!v41) {
+            ds4_deepseek4_image_layout_free(&layout);
+            if (error && error_cap)
+                snprintf(error, error_cap, "invalid vision prompt input");
+            return 0;
+        }
+        const uint32_t token_start = (uint32_t)tokens->len;
+        for (uint32_t i = 0; i < layout.token_count; i++)
+            ds4_tokens_push(tokens, e->vision_image_token);
+        memset(span, 0, sizeof(*span));
+        span->token_start = token_start;
+        span->embedding = *embedding;
+        span->embedding.token_count = layout.token_count;
+        span->embedding.layout = 0;
+        span->embedding.grid_width = 0;
+        span->embedding.grid_height = 0;
+        memset(embedding, 0, sizeof(*embedding));
+        ds4_deepseek4_image_layout_free(&layout);
+        return 1;
+    }
     const uint64_t values = (uint64_t)layout.token_count * DS4_N_EMBD;
     if (values > SIZE_MAX / sizeof(float)) {
         ds4_deepseek4_image_layout_free(&layout);
@@ -75439,7 +75464,9 @@ int ds4_prompt_append_vision(
         ds4_vision_embedding *embedding,
         char *error,
         size_t error_cap) {
-    if (!e || !tokens || !span || !embedding || !embedding->data ||
+    const bool described = e && e->vision_kind == DS4_VISION_DEEPSEEK4 &&
+                           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
+    if (!e || !tokens || !span || !embedding || (!embedding->data && !described) ||
         embedding->token_count == 0 || !e->vision_ready) {
         if (error && error_cap) snprintf(error, error_cap, "invalid vision prompt input");
         return 0;
@@ -75777,6 +75804,66 @@ int ds4_engine_vision_encode_memory(
     int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
     ds4_image_free(&image);
     return ok;
+}
+
+int ds4_engine_vision_describe_memory(
+        ds4_engine *e,
+        const uint8_t *encoded,
+        size_t encoded_len,
+        ds4_vision_embedding *out,
+        char *error,
+        size_t error_cap) {
+    if (!e || !out || !e->vision_ready || e->vision_kind != DS4_VISION_DEEPSEEK4 ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return 0;
+    memset(out, 0, sizeof(*out));
+    ds4_image image = {0};
+    if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
+    ds4_deepseek4_image_patches patches = {0};
+    const int ok = ds4_image_preprocess_deepseek41(&patches, &image, error, error_cap);
+    if (ok) {
+        out->token_count = patches.llm_grid_height * patches.llm_grid_width;
+        out->layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL;
+        out->grid_width = patches.llm_grid_width;
+        out->grid_height = patches.llm_grid_height;
+        out->width = image.width;
+        out->height = image.height;
+        out->content_width = patches.content_width;
+        out->content_height = patches.content_height;
+        memcpy(out->fingerprint, image.fingerprint, sizeof(out->fingerprint));
+    }
+    ds4_deepseek4_image_patches_free(&patches);
+    ds4_image_free(&image);
+    return ok;
+}
+
+int ds4_vision_span_fill(
+        ds4_engine *e,
+        ds4_vision_span *span,
+        ds4_vision_embedding *encoded,
+        char *error,
+        size_t error_cap) {
+    if (!e || !span || span->embedding.data || !encoded || !encoded->data ||
+        memcmp(span->embedding.fingerprint, encoded->fingerprint,
+               sizeof(encoded->fingerprint))) {
+        if (error && error_cap)
+            snprintf(error, error_cap, "encoded image does not match its prompt span");
+        return 0;
+    }
+    /* The rows are the ones ds4_prompt_append_vision builds; V4.1 rows do not
+     * depend on the span's position, so a scratch token list stands in. */
+    ds4_tokens scratch = {0};
+    ds4_vision_span filled = {0};
+    const int ok = ds4_prompt_append_vision(e, &scratch, &filled, encoded, error, error_cap);
+    ds4_tokens_free(&scratch);
+    if (!ok) return 0;
+    if (filled.embedding.token_count != span->embedding.token_count) {
+        ds4_vision_embedding_free(&filled.embedding);
+        if (error && error_cap)
+            snprintf(error, error_cap, "encoded image does not match its prompt span");
+        return 0;
+    }
+    span->embedding.data = filled.embedding.data;
+    return 1;
 }
 
 int ds4_engine_tp_vocab_split(ds4_engine *e) {
@@ -78698,6 +78785,26 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     return rc;
 }
 
+int ds4_session_prefill_start(const ds4_session *s, const ds4_tokens *prompt,
+                              const ds4_vision_span *images, size_t image_count) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* Mirrors ds4_session_sync: it drops a checkpoint whose images differ, and
+     * the V4.1 branch keeps the checkpoint only when the prompt extends it. */
+    if (s && prompt && ds4_session_is_ds41(s) && s->ds41_graph_ready && !s->distributed &&
+        !s->engine->tp.active && s->checkpoint_valid && s->ds41_graph.valid &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+        ds4_session_vision_prefix_matches(s, images, image_count))
+        return s->checkpoint.len;
+#else
+    (void)s;
+    (void)prompt;
+    (void)images;
+    (void)image_count;
+#endif
+    return 0;
+}
+
 int ds4_session_sync_multimodal(
         ds4_session *s,
         const ds4_tokens *prompt,
@@ -78713,12 +78820,16 @@ int ds4_session_sync_multimodal(
         snprintf(err, errlen, "vision encoder is not loaded");
         return 1;
     }
+    /* An image without rows (described, not encoded) is valid only when the
+     * kept prefix already holds all of it, so prefill never reads its rows. */
+    const uint64_t kept = image_count ?
+        (uint64_t)ds4_session_prefill_start(s, prompt, images, image_count) : 0;
     uint64_t previous_end = 0;
     for (size_t i = 0; i < image_count; i++) {
         const ds4_vision_span *span = &images[i];
         const uint64_t end = (uint64_t)span->token_start +
                              span->embedding.token_count;
-        if (!span->embedding.data || span->embedding.token_count == 0 ||
+        if ((!span->embedding.data && end > kept) || span->embedding.token_count == 0 ||
             span->token_start < previous_end || end > (uint64_t)prompt->len) {
             snprintf(err, errlen, "invalid or overlapping image token span");
             return 1;

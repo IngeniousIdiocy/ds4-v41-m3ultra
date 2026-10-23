@@ -1171,7 +1171,8 @@ clients.
   `--kv-disk-dir`. An image chat in dsh's shape (a `read_image` tool result
   resent every turn on `/v1/messages`) must be checkpointed with its image
   identity at shutdown, restored after the restart with no full re-read
-  (`multimodal disk kv hit`) and still answer from the image. The same text with
+  (`multimodal disk kv hit`) and no encoder run for the restored image (`vision
+  encoder skipped`), and still answer from the image. The same text with
   another image must miss (`multimodal disk kv miss`) and re-read. Run it again
   with `--text-only` on this build and the previous one: text checkpoint save
   and restore times must not regress.

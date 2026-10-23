@@ -5,8 +5,9 @@ Starts ds4-server twice on a fresh --kv-disk-dir with the given server
 arguments (a V4.1 model and --vision). The chat has the shape dsh sends on
 /v1/messages: a read_image tool_result carrying the image, resent byte for byte
 on every turn. After a restart the next turn must restore from the shutdown
-checkpoint (log: "multimodal disk kv hit", no full re-read) and still answer
-from the image; the same text with another image must miss and re-read.
+checkpoint (log: "multimodal disk kv hit", no full re-read, and no encoder run for
+the restored image) and still answer from the image; the same text with another
+image must miss and re-read.
 With --text-only it instead times a text-only checkpoint save and restore, to
 compare builds.
 
@@ -168,6 +169,10 @@ def main():
         _, missed, _ = ask("image-turn-3-other-image", swapped, 256)
         log = stop()
         assert re.search(r"multimodal disk kv hit images=1 cached=\d+", log), "no disk restore"
+        # The restored prefix holds the image, so the restored turn skips the
+        # encoder; only the other image is encoded.
+        assert re.search(r"vision encoder skipped images=1 ", log), "restore still ran the encoder"
+        assert log.count("vision embedding encoded") == 1, "the encoder ran more than once"
         assert re.search(r"multimodal disk kv miss images=1", log), "other image was not refused"
         assert missed["cached"] < live["prompt"] // 2, "other image reused the image prefix"
         print("PASS image chat restored after restart; other image re-read", flush=True)
