@@ -11385,7 +11385,7 @@ static bool kv_cache_session_images(server *s, server_slot *slot,
                                                 DS4_KVSTORE_IMAGES_MAX);
     if (n < 0 || (n && visible && visible->count != (size_t)n)) return false;
     out->len = (uint32_t)n;
-    out->encoder = ds4_engine_model_fingerprint(s->engine, 2);
+    out->encoder = ds4_engine_vision_encoder_identity(s->engine);
     for (int i = 0; i < n; i++) {
         ds4_kvstore_image *im = &out->v[i];
         im->text_offset = visible ? (uint32_t)visible->offsets[i] : 0;
@@ -11659,7 +11659,7 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
     if (!key) return 0;
     ds4_kvstore_images images = {
         .len = (uint32_t)req->image_count,
-        .encoder = ds4_engine_model_fingerprint(s->engine, 2),
+        .encoder = ds4_engine_vision_encoder_identity(s->engine),
     };
     for (size_t i = 0; i < req->image_count; i++) {
         ds4_kvstore_image *im = &images.v[i];

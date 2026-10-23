@@ -130,6 +130,9 @@ int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 uint64_t ds4_gpu_v41_off(void);
+/* V4.1 vision: true when the encoder attends with VISION_ATTN_FLASH (accurate, not bit-exact), that is unless
+ * DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH or DS4_V41_EXACT is set; read on every call, as the encoder does. */
+bool ds4_gpu_deepseek41_vision_attn_flash(void);
 /* V4.1 DSpark: on while the drafter's rows or a verify block are encoded. ROWS_MMA and VERIFY_KERNELS apply only then,
  * so prefills and other batches of 3-8 rows keep main's kernels. */
 void ds4_gpu_dsv41_dspark_rows(int on);

@@ -48914,6 +48914,12 @@ static int deepseek41_vision_dispatch_attention(
     return ds4_gpu_finish_command_buffer(cb, owned, "DeepSeek V4.1 vision attention");
 }
 
+bool ds4_gpu_deepseek41_vision_attn_flash(void) {
+    const char *exact_env = getenv("DS4_V41_EXACT");
+    return getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH") == NULL &&
+           !(exact_env && exact_env[0] && strcmp(exact_env, "0") != 0);
+}
+
 int ds4_gpu_deepseek4_vision_encode(
         float                              *out,
         const float                        *patches,
@@ -48936,9 +48942,7 @@ int ds4_gpu_deepseek4_vision_encode(
     /* VISION_ROUND_FOLD: each bf16 rounding pass moves into its producer's store
      * or its consumer's load (the same rounded values, fewer passes). */
     const bool fold = v41 && getenv("DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD") == NULL;
-    const char *exact_env = getenv("DS4_V41_EXACT");
-    const bool flash_attn = v41 && getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH") == NULL &&
-                            !(exact_env && exact_env[0] && strcmp(exact_env, "0") != 0);
+    const bool flash_attn = v41 && ds4_gpu_deepseek41_vision_attn_flash();
     const bool exact_attn = v41 && getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT") == NULL;
     const int attn_mode = flash_attn ? 2 : exact_attn ? 1 : 0;
     const uint32_t aligned_rows =

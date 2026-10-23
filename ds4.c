@@ -65289,6 +65289,21 @@ uint64_t ds4_engine_model_fingerprint(ds4_engine *e, int which) {
     return h ? h : 1;
 }
 
+uint64_t ds4_engine_vision_encoder_identity(ds4_engine *e) {
+    uint64_t h = ds4_engine_model_fingerprint(e, 2);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Flash attention's embeddings are accurate but not the exact encoder's, so state built
+     * from them must never restore under the exact encoder, nor the other way round. */
+    if (h && e->vision_kind == DS4_VISION_DEEPSEEK4 &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds4_gpu_deepseek41_vision_attn_flash()) {
+        h ^= UINT64_C(0x666c61736831);   /* "flash1" */
+        h *= UINT64_C(1099511628211);
+        if (!h) h = 1;
+    }
+#endif
+    return h;
+}
+
 /* The weight representation the prefill path consumes, family by family:
  * "v41pf1 engram=<E> indexer=<I> router=<R>". Decode-only sidecars (BF16
  * router, FP8 Engram/indexer/output) never shape a prefix, so this branch has

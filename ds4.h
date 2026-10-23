@@ -707,6 +707,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 /* FNV-1a of the GGUF header region (metadata + tensor table); which 0 main, 1 drafter, 2 vision. */
 uint64_t ds4_engine_model_fingerprint(ds4_engine *e, int which);
+/* Identity of the image encoder's numerics: the vision GGUF's fingerprint, tagged when the encoder's
+ * output is not the exact one (V4.1 flash attention on Metal). 0 without a vision model. */
+uint64_t ds4_engine_vision_encoder_identity(ds4_engine *e);
 /* Weight representation consumed by prefill; part of the persisted-state identity. */
 const char *ds4_engine_prefill_repr(ds4_engine *e);
 /* Value source of the narrow copies prefill reads: none | public | src:<sha256-16>. */

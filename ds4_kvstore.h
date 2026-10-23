@@ -39,7 +39,7 @@ typedef struct {
 
 typedef struct {
     uint32_t len;
-    uint64_t encoder;   /* vision GGUF fingerprint (ds4_engine_model_fingerprint 2) */
+    uint64_t encoder;   /* image encoder identity (ds4_engine_vision_encoder_identity) */
     ds4_kvstore_image v[DS4_KVSTORE_IMAGES_MAX];
 } ds4_kvstore_images;
 
