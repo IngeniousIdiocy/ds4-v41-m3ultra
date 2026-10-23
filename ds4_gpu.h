@@ -151,6 +151,8 @@ bool ds4_gpu_deepseek41_vision_attn_flash(void);
 /* VISION_ATTN_LAZY (flash only): the online softmax rescales its output only when a row maximum grows by more than
  * ln 256; off (DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY) every key tile rescales, flash v2's bits. */
 bool ds4_gpu_deepseek41_vision_attn_lazy(void);
+/* VISION_ATTN_KT16 (lazy flash only): 16-key tiles; off (DS4_METAL_DISABLE_V41_VISION_ATTN_KT16) 64-key tiles. */
+bool ds4_gpu_deepseek41_vision_attn_kt16(void);
 /* V4.1 DSpark: on while the drafter's rows or a verify block are encoded. ROWS_MMA and VERIFY_KERNELS apply only then,
  * so prefills and other batches of 3-8 rows keep main's kernels. */
 void ds4_gpu_dsv41_dspark_rows(int on);

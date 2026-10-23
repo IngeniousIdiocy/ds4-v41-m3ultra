@@ -49077,6 +49077,7 @@ static int deepseek4_vision_debug_dump(
  *   DS4_METAL_DISABLE_V41_VISION_ROUND_FOLD=1  round the output in its own pass
  *   DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH=1  (or DS4_V41_EXACT=1) the exact kernels below
  *   DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY=1   flash rescales its output on every key tile (flash v2's bits)
+ *   DS4_METAL_DISABLE_V41_VISION_ATTN_KT16=1   lazy flash walks 64-key tiles, not 16 (0a218c8e's bits)
  *   DS4_METAL_DISABLE_V41_VISION_ATTN_EXACT=1  GLM's one-key-at-a-time kernel
  * mode 2, flash: tiles on simdgroup matrices, accurate but not bit-exact.
  * mode 1, exact: 32 keys per step at the scalar kernel's bits. mode 0: the scalar kernel. */
@@ -49089,7 +49090,10 @@ static int deepseek41_vision_dispatch_attention(
         int                   mode,
         bool                  round) {
     const bool lazy = ds4_gpu_deepseek41_vision_attn_lazy();
-    const char *name = mode == 2 ? (lazy ? (round ? "kernel_deepseek41_vision_attention_flash_lazy_round"
+    const bool kt16 = lazy && ds4_gpu_deepseek41_vision_attn_kt16();
+    const char *name = mode == 2 ? (kt16 ? (round ? "kernel_deepseek41_vision_attention_flash_lazy16_round"
+                                                  : "kernel_deepseek41_vision_attention_flash_lazy16")
+                                  : lazy ? (round ? "kernel_deepseek41_vision_attention_flash_lazy_round"
                                                   : "kernel_deepseek41_vision_attention_flash_lazy")
                                          : (round ? "kernel_deepseek41_vision_attention_flash_round"
                                                   : "kernel_deepseek41_vision_attention_flash"))
@@ -49135,6 +49139,10 @@ bool ds4_gpu_deepseek41_vision_attn_flash(void) {
 
 bool ds4_gpu_deepseek41_vision_attn_lazy(void) {
     return getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_LAZY") == NULL;
+}
+
+bool ds4_gpu_deepseek41_vision_attn_kt16(void) {
+    return getenv("DS4_METAL_DISABLE_V41_VISION_ATTN_KT16") == NULL;
 }
 
 int ds4_gpu_deepseek4_vision_encode(

@@ -465,8 +465,12 @@ template [[host_name("kernel_deepseek41_vision_attention_exact_round")]] kernel 
  * VISION_ATTN_LAZY (default on): the online softmax keeps its running maximum m until some row of the SIMD group
  * would grow it by more than ln 256, so exp(s - m) <= 256 and the output and its sum are rescaled only then
  * (rarely after the first tile) instead of on every tile. The same softmax after the final 1/l, rounded
- * differently; off, every tile rescales as flash v2 did. */
-template <bool MASK, bool LAZY>
+ * differently; off, every tile rescales as flash v2 did.
+ * VISION_ATTN_KT16 (default on, with LAZY): tiles of 16 keys instead of 64. A SIMD group then holds 2 score
+ * fragments rather than 8; the lighter register load runs the kernel faster on M3 Ultra even though the max and sum
+ * reductions and the rescale test come four times as often (8-key tiles are twice as slow again). Rounded
+ * differently (the lazy maximum moves per 16 keys). */
+template <bool MASK, bool LAZY, uint KT>
 static inline void deepseek41_vision_attention_flash_tile(
         thread const simdgroup_float8x8 *Qm,
         thread simdgroup_float8x8       *O,
@@ -475,7 +479,7 @@ static inline void deepseek41_vision_attention_flash_tile(
         device const half               *Ks,        /* this tile's first key, this head */
         device const half               *Vs,
         uint key0, uint rows, ushort fn) {
-    constexpr uint KT = 64, KP = 1024;          /* keys per tile, key row stride (halves) */
+    constexpr uint KP = 1024;                   /* key row stride (halves) */
     simdgroup_float8x8 S[KT / 8];
 #pragma unroll
     for (uint n = 0; n < KT / 8u; n++) {
@@ -541,7 +545,7 @@ static inline void deepseek41_vision_attention_flash_tile(
     }
 }
 
-template <bool ROUND, bool LAZY>
+template <bool ROUND, bool LAZY, uint KT>
 kernel void kernel_deepseek41_vision_attention_flash(
         constant glm53_vision_attention_args &args,
         device const float                   *q,
@@ -551,7 +555,6 @@ kernel void kernel_deepseek41_vision_attention_flash(
         uint2 group [[threadgroup_position_in_grid]],
         ushort sg [[simdgroup_index_in_threadgroup]],
         ushort lane [[thread_index_in_simdgroup]]) {
-    constexpr uint KT = 64;                     /* keys per tile */
     const uint head = group.y;
     const uint rows = args.rows;
     const uint row0 = group.x * 64u + sg * 8u;
@@ -575,8 +578,8 @@ kernel void kernel_deepseek41_vision_attention_flash(
     for (uint key0 = 0; key0 < rows; key0 += KT) {
         device const half *Ks = k + (ulong)key0 * 1024u + (ulong)head * 64u;
         device const half *Vs = v + (ulong)key0 * 1024u + (ulong)head * 64u;
-        if (key0 + KT > rows) deepseek41_vision_attention_flash_tile<true, LAZY>(Qm, O, m, l, Ks, Vs, key0, rows, fn);
-        else                  deepseek41_vision_attention_flash_tile<false, LAZY>(Qm, O, m, l, Ks, Vs, key0, rows, fn);
+        if (key0 + KT > rows) deepseek41_vision_attention_flash_tile<true, LAZY, KT>(Qm, O, m, l, Ks, Vs, key0, rows, fn);
+        else                  deepseek41_vision_attention_flash_tile<false, LAZY, KT>(Qm, O, m, l, Ks, Vs, key0, rows, fn);
     }
     if (!qvalid) return;
     device float *op = out + (ulong)qrow * 1024u + (ulong)head * 64u;
@@ -590,8 +593,10 @@ kernel void kernel_deepseek41_vision_attention_flash(
     }
 }
 
-typedef decltype(kernel_deepseek41_vision_attention_flash<false, false>) deepseek41_vision_attention_flash_t;
-template [[host_name("kernel_deepseek41_vision_attention_flash")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false, false>;
-template [[host_name("kernel_deepseek41_vision_attention_flash_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true, false>;
-template [[host_name("kernel_deepseek41_vision_attention_flash_lazy")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false, true>;
-template [[host_name("kernel_deepseek41_vision_attention_flash_lazy_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true, true>;
+typedef decltype(kernel_deepseek41_vision_attention_flash<false, false, 64>) deepseek41_vision_attention_flash_t;
+template [[host_name("kernel_deepseek41_vision_attention_flash")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false, false, 64>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true, false, 64>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_lazy")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false, true, 64>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_lazy_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true, true, 64>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_lazy16")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<false, true, 16>;
+template [[host_name("kernel_deepseek41_vision_attention_flash_lazy16_round")]] kernel deepseek41_vision_attention_flash_t kernel_deepseek41_vision_attention_flash<true, true, 16>;

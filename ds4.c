@@ -65385,8 +65385,9 @@ uint64_t ds4_engine_vision_encoder_identity(ds4_engine *e) {
      * from them must never restore under the exact encoder, nor the other way round. */
     if (h && e->vision_kind == DS4_VISION_DEEPSEEK4 &&
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds4_gpu_deepseek41_vision_attn_flash()) {
-        /* "flash3": lazy output rescale; "flash2": every tile rescales (flash v2) */
-        h ^= ds4_gpu_deepseek41_vision_attn_lazy() ? UINT64_C(0x666c61736833) : UINT64_C(0x666c61736832);
+        /* "flash4": lazy, 16-key tiles; "flash3": lazy, 64-key tiles; "flash2": every tile rescales (flash v2) */
+        h ^= !ds4_gpu_deepseek41_vision_attn_lazy() ? UINT64_C(0x666c61736832) :
+             ds4_gpu_deepseek41_vision_attn_kt16() ? UINT64_C(0x666c61736834) : UINT64_C(0x666c61736833);
         h *= UINT64_C(1099511628211);
         if (!h) h = 1;
     }
