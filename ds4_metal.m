@@ -497,6 +497,7 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_IMAGE_TRIM",
             "DS4_METAL_DISABLE_V41_MOE_SHORT_TILES",
             "DS4_METAL_DISABLE_V41_PREFILL_PIPELINE",
+            "DS4_METAL_DISABLE_V41_HC_NARROW",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -23353,6 +23354,31 @@ static int ds4_gpu_hc_rms_scale_project_mode(
     return 1;
 }
 
+/* HC_NARROW: V4.1's 24-output HC mix projection of a prefill chunk on kernel_hc_proj24_f16_f32_narrow, at the bits
+ * of the tiled kernel it replaces (kernel_mul_mm_f16_f32 on the normalized rows, or the _scaled variant with scales). */
+static bool ds4_gpu_hc_narrow_fits(uint32_t in_dim, uint32_t out_dim, uint32_t n_rows) {
+    return in_dim == 20480u && out_dim == 24u && n_rows > 8u && ds4_gpu_v41_on(DS4_GPU_V41_HC_NARROW);
+}
+static int ds4_gpu_hc_narrow_encode(id<MTLCommandBuffer> cb, id<MTLBuffer> weightbuf, uint64_t weight_inner,
+                                    const ds4_gpu_tensor *x, ds4_gpu_tensor *out, ds4_gpu_tensor *scales,
+                                    uint32_t in_dim, uint32_t n_rows) {
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_hc_proj24_f16_f32_narrow");
+    if (!pipeline) return 0;
+    const uint32_t dims[4] = {in_dim, n_rows, scales ? 1u : 0u, 0u};
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:dims length:sizeof(dims) atIndex:0];
+    [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(scales ? scales : out)
+            offset:ds4_gpu_tensor_offset(scales ? scales : out) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 int ds4_gpu_hc_rms_scale_project_f16_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *scale_scratch,
@@ -23374,6 +23400,25 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
     const int mode =
         ds4_gpu_hc_rms_scale_project_mode(in_dim, out_dim, n_rows);
     if (mode < 0) return 0;
+    if (mode == 0 && ds4_gpu_hc_narrow_fits(in_dim, out_dim, n_rows)) {
+        if (!ds4_gpu_rms_norm_plain_rows_tensor(scale_scratch, x, in_dim, n_rows, eps)) return 0;
+        @autoreleasepool {
+            const uint64_t weight_bytes = (uint64_t)out_dim * in_dim * sizeof(uint16_t);
+            if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+                ds4_gpu_tensor_bytes(scale_scratch) < (uint64_t)n_rows * in_dim * sizeof(float) ||
+                ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) return 0;
+            uint64_t weight_inner = 0;
+            id<MTLBuffer> weightbuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, weight_offset, weight_bytes, &weight_inner);
+            if (!weightbuf) return 0;
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            if (!ds4_gpu_hc_narrow_encode(cb, weightbuf, weight_inner, scale_scratch, out, NULL, in_dim, n_rows))
+                return 0;
+            return ds4_gpu_finish_command_buffer(cb, owned, "HC narrow projection");
+        }
+    }
     if (mode == 0) {
         return ds4_gpu_rms_norm_plain_rows_tensor(
                    scale_scratch, x, in_dim, n_rows, eps) != 0 &&
@@ -23455,6 +23500,11 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
                  ds4_gpu_rms_norm_threads(in_dim), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        if (ds4_gpu_hc_narrow_fits(in_dim, out_dim, n_rows)) {
+            if (!ds4_gpu_hc_narrow_encode(cb, weightbuf, weight_inner, x, out, scale_scratch, in_dim, n_rows))
+                return 0;
+            return ds4_gpu_finish_command_buffer(cb, owned, "HC narrow projection");
+        }
         ds4_gpu_mul_mm_args mm_args = ds4_gpu_make_mm_args(
             in_dim, out_dim, n_rows, weight_row_bytes);
         enc = ds4_gpu_compute_encoder(cb);
