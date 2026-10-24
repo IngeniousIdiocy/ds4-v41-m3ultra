@@ -40892,6 +40892,7 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
  * after that step's batch finished and its logits were read back, and failed on any error; a session may consume
  * only the completed current generation of its own graph. */
 typedef struct { uint64_t cur, done; const void *owner; } ds41_sel_gen_state;
+static uint64_t sample_key_mix(uint64_t x);   /* KEYED_GPU: the keyed draw's key */
 static DS4_MAYBE_UNUSED ds41_sel_gen_state g_sel_gen;
 static DS4_MAYBE_UNUSED uint64_t ds41_sel_gen_begin(ds41_sel_gen_state *G) { G->done = 0; G->owner = NULL; return ++G->cur; }
 static DS4_MAYBE_UNUSED void ds41_sel_gen_complete(ds41_sel_gen_state *G, uint64_t gen, const void *owner) {
@@ -41093,6 +41094,12 @@ typedef struct {
      * session's last token was sampled with the settings the selector serves, so the next step encodes it. */
     bool sel_gpu, sel_done, sel_want;
     uint64_t sel_gen;
+    /* KEYED_GPU: kg_gpu latched per decode step that encodes the keyed draw's candidates instead of the selector
+     * (key kg_key for position kg_pos); kg_want, kg_seed, kg_inv_t = the session's last sample was keyed with them */
+    bool kg_gpu, kg_want;
+    float kg_inv_t;
+    uint64_t kg_seed, kg_key;
+    uint32_t kg_pos;
     /* Metal, CONCURRENT_FFN: the last ds41_moe_partial left the whole shared expert in `shared` */
     bool shared_done;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
@@ -43359,6 +43366,7 @@ static bool ds41_moe_expand_batch(ds41_prefill_row *b, const ds4_model *m,
  * slot's producer ran), so the latches can be compared with the slot's. */
 static void ds41_step_prologue(ds41_gpu_graph *g, bool logits, bool queued_head, bool ok, bool check) {
     g->sel_gpu = false;
+    g->kg_gpu = false;
     g->sel_done = false;
     g->sel_gen = 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -43367,6 +43375,10 @@ static void ds41_step_prologue(ds41_gpu_graph *g, bool logits, bool queued_head,
      * and other sampler settings never read it). */
     g->sel_gpu = g->sel_want && queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() &&
         ds41_on(DS4_GPU_V41_SAMPLER_GPU);
+    /* KEYED_GPU: the keyed draw's candidates on the same steps, while the session samples keyed */
+    g->kg_gpu = g->kg_want && queued_head && !g->streaming && !g->quality && ds4_gpu_selector_ready() &&
+        ds41_on(DS4_GPU_V41_KEYED_GPU);
+    if (g->kg_gpu) g->sel_gpu = false;
 #else
     (void)queued_head;
 #endif
@@ -43405,7 +43417,7 @@ static void ds41_step_tail_reset(ds41_gpu_graph *g) {
 typedef struct {
     uint32_t rope_tab_pos;
     bool decode_step, logits_step, hc_attn_deferred, hc_ffn_deferred, kv_stored, shared_done;
-    bool sel_gpu, sel_done;
+    bool sel_gpu, sel_done, kg_gpu;
     uint64_t sel_gen;
 } ds41_pe_host;
 
@@ -43419,20 +43431,20 @@ static void ds41_pe_save(const ds41_gpu_graph *g, ds41_pe_host *h) {
     *h = (ds41_pe_host){.rope_tab_pos = g->rope_tab_pos, .decode_step = g->decode_step, .logits_step = g->logits_step,
         .hc_attn_deferred = g->hc_attn_deferred, .hc_ffn_deferred = g->hc_ffn_deferred,
         .kv_stored = g->kv_stored, .shared_done = g->shared_done,
-        .sel_gpu = g->sel_gpu, .sel_done = g->sel_done, .sel_gen = g->sel_gen};
+        .sel_gpu = g->sel_gpu, .sel_done = g->sel_done, .sel_gen = g->sel_gen, .kg_gpu = g->kg_gpu};
 }
 
 static void ds41_pe_load(ds41_gpu_graph *g, const ds41_pe_host *h) {
     g->rope_tab_pos = h->rope_tab_pos; g->decode_step = h->decode_step; g->logits_step = h->logits_step;
     g->hc_attn_deferred = h->hc_attn_deferred; g->hc_ffn_deferred = h->hc_ffn_deferred;
     g->kv_stored = h->kv_stored; g->shared_done = h->shared_done;
-    g->sel_gpu = h->sel_gpu; g->sel_done = h->sel_done; g->sel_gen = h->sel_gen;
+    g->sel_gpu = h->sel_gpu; g->sel_done = h->sel_done; g->sel_gen = h->sel_gen; g->kg_gpu = h->kg_gpu;
 }
 
 /* the prologue's latches are equal (all: and the layer flags carried between steps) */
 static bool ds41_pe_same(const ds41_pe_host *a, const ds41_pe_host *b, bool all) {
     return a->rope_tab_pos == b->rope_tab_pos && a->decode_step == b->decode_step &&
-        a->logits_step == b->logits_step && a->sel_gpu == b->sel_gpu &&
+        a->logits_step == b->logits_step && a->sel_gpu == b->sel_gpu && a->kg_gpu == b->kg_gpu &&
         (!all || (a->hc_attn_deferred == b->hc_attn_deferred && a->hc_ffn_deferred == b->hc_ffn_deferred &&
                   a->kv_stored == b->kv_stored && a->shared_done == b->shared_done));
 }
@@ -43583,10 +43595,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         const bool drain = !queue_layers || (!queued && il == 13) || il + 1u == DS4_N_LAYER;
         if (ok && queued_head && il + 1u == DS4_N_LAYER) ok = ds41_graph_encode_logits(g, m, w);
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        if (ok && g->sel_gpu && il + 1u == DS4_N_LAYER) {   /* SAMPLER_GPU: the selector after the head, in the final buffer */
+        if (ok && (g->sel_gpu || g->kg_gpu) && il + 1u == DS4_N_LAYER) {   /* SAMPLER_GPU: the selector after the head, in the final buffer */
             g->sel_gen = ds41_sel_gen_begin(&g_sel_gen);   /* invalidate before anything can overwrite */
             sel_enc = true;
-            ok = ds4_gpu_selector_encode(g->logits) != 0;
+            if (g->kg_gpu) {   /* KEYED_GPU: or the keyed draw's candidates for the next position */
+                g->kg_pos = g->pos + 1u;
+                g->kg_key = sample_key_mix(g->kg_seed ^ sample_key_mix((uint64_t)g->kg_pos + 1u));
+                ok = ds4_gpu_keyed_encode(g->logits, 1, &g->kg_key, g->kg_inv_t) != 0;
+            } else ok = ds4_gpu_selector_encode(g->logits) != 0;
         }
 #endif
         /* the first commit follows layer 0, so the GPU starts a token early */
@@ -47399,6 +47415,11 @@ static uint64_t sample_key_mix(uint64_t x) {
     return x ^ (x >> 31);
 }
 
+/* a full-distribution row's keyed score, in one place for sample_keyed and the KEYED_GPU finish */
+static __attribute__((noinline)) double sample_keyed_full_score(float logit, float temperature, uint64_t h) {
+    return (double)logit / temperature - log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
+}
+
 static int sample_keyed(const float *logits, uint32_t n_vocab, const sample_key *k,
                         uint32_t pos, float *probs) {
     const bool full = k->top_k <= 0 && (k->top_p <= 0.0f || k->top_p >= 1.0f) &&
@@ -47424,8 +47445,8 @@ static int sample_keyed(const float *logits, uint32_t n_vocab, const sample_key 
             (double)logits[i] / k->temperature + (double)(__builtin_clzll(y) - 10) * 0.6931471805599453 < bar) {
             continue;
         }
-        const double v = (full ? (double)logits[i] / k->temperature : log((double)probs[i])) -
-                         log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
+        const double v = full ? sample_keyed_full_score(logits[i], k->temperature, h) :
+                         log((double)probs[i]) - log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
         if (best < 0 || v > best_v || (v == best_v && (int)i < best)) {
             best = (int)i;
             best_v = v;
@@ -47435,17 +47456,52 @@ static int sample_keyed(const float *logits, uint32_t n_vocab, const sample_key 
     return best >= 0 ? best : sample_argmax(logits, n_vocab);
 }
 
-/* V4.1 samples with sample_keyed (not under TP), and DSpark drafts are kept
- * only when they equal the keyed sample, so sampled output follows the target
- * distribution and is the same with or without drafting.
- * DS4_V41_KEYED_SAMPLING=0 restores greedy-match acceptance. */
-static bool ds41_keyed_sampling(const ds4_engine *e, float temperature, const uint64_t *rng) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("DS4_V41_KEYED_SAMPLING");
-        cached = !v || strcmp(v, "0") != 0;
+/* KEYED_SAMPLING: V4.1 full-distribution samples (temperature > 0, no top-k, top_p 1, no min-p) are sample_keyed
+ * draws (not under TP), and DSpark keeps a draft only while it equals its row's keyed draw, so sampled output follows
+ * the target distribution and is the same with or without drafting. Other settings keep the top-p selector and the
+ * p/q verify. DS4_METAL_DISABLE_V41_KEYED_SAMPLING=1 turns it off. */
+static bool ds41_keyed_sampling(const ds4_engine *e, float temperature, int top_k, float top_p, float min_p,
+                                const uint64_t *rng) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    return ds41_on(DS4_GPU_V41_KEYED_SAMPLING) && temperature > 0.0f && top_k <= 0 &&
+        (top_p <= 0.0f || top_p >= 1.0f) && min_p <= 0.0f && rng && !e->tp.active;
+#else
+    (void)e; (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng;
+    return false;   /* V4.1 decodes on Metal only */
+#endif
+}
+
+/* KEYED_GPU: one row's candidates from the GPU (metal/sampler_selector.metal kernel_kg1/kg2): every finite id whose
+ * float score is within the margin of the row's float maximum, which always holds the double argmax. The finish scores
+ * them with sample_keyed's own statements and tie rule, so the token is sample_keyed's. 0 decided (*token), 1 more
+ * candidates than slots, 2 invalid; nothing else changes. */
+typedef struct { uint32_t n, finite, pad[2], id[64]; } kg_gpu_row;
+_Static_assert(sizeof(kg_gpu_row) == 272, "keyed candidates row");
+/* 0 decode steps decided on the GPU, 1 a DSpark row's draw reused, 2 unbound or stale (CPU), 3 overflow (CPU),
+ * 4 invalid (CPU), 5 verify rows decided on the GPU, 6 verify rows on the CPU */
+static uint64_t g_kg_counts[7];
+void ds4_keyed_gpu_counts(uint64_t out[7]) { for (int i = 0; i < 7; i++) out[i] = g_kg_counts[i]; }
+static DS4_MAYBE_UNUSED int ds41_keyed_finish(const kg_gpu_row *r, const float *lg, const sample_key *k, uint32_t pos,
+                                              int *token) {
+    if (!r || r->finite > DS4_N_VOCAB) return 2;
+    if (!r->finite) { *token = sample_argmax(lg, DS4_N_VOCAB); return 0; }
+    if (!r->n) return 2;   /* the maximum is always a candidate */
+    if (r->n > 64u) return 1;
+    const uint64_t key = sample_key_mix(k->seed ^ sample_key_mix((uint64_t)pos + 1u));
+    int best = -1;
+    double best_v = 0.0;
+    for (uint32_t c = 0; c < r->n; c++) {
+        const uint32_t i = r->id[c];
+        uint32_t bits;
+        if (i >= DS4_N_VOCAB) return 2;
+        memcpy(&bits, &lg[i], 4);
+        if ((bits & 0x7f800000u) == 0x7f800000u) return 2;
+        const double v = sample_keyed_full_score(lg[i], k->temperature,
+                                                 sample_key_mix(key + (uint64_t)i * 0x9e3779b97f4a7c15ULL));
+        if (best < 0 || v > best_v || (v == best_v && (int)i < best)) { best = (int)i; best_v = v; }
     }
-    return cached != 0 && temperature > 0.0f && rng && !e->tp.active;
+    *token = best;
+    return 0;
 }
 
 #ifdef DS4_TEST_HOOKS
@@ -47492,6 +47548,19 @@ int ds4_test_speculative_sample(const float *target_logits,
     if (q <= 0.0f || sample_rng_f32(rng) * q <= p) return proposal;
     return sample_residual_probabilities(target_probs, draft_probs,
                                          n_vocab, rng);
+}
+
+/* KEYED_SAMPLING / KEYED_GPU: the keyed draw itself and the finish of a candidates row ({n, finite, pad[2], id[64]}) */
+int ds4_test_sample_keyed(const float *logits, uint32_t n_vocab, float temperature, int top_k, float top_p,
+                          float min_p, uint64_t seed, uint32_t pos, float *probs) {
+    const sample_key key = { temperature, top_k, top_p, min_p, seed };
+    return sample_keyed(logits, n_vocab, &key, pos, probs);
+}
+
+int ds4_test_keyed_finish(const void *row, const float *logits, float temperature, uint64_t seed, uint32_t pos,
+                          int *token) {
+    const sample_key key = { temperature, 0, 1.0f, 0.0f, seed };
+    return ds41_keyed_finish((const kg_gpu_row *)row, logits, &key, pos, token);
 }
 
 int ds4_test_speculative_delta_sample(const float *target_logits,
@@ -63143,6 +63212,13 @@ struct ds4_session {
     bool sel_bound;
     uint32_t sel_pos;
     uint64_t sel_gen;
+    /* KEYED_GPU: the bound summary is the keyed draw's candidates (key sel_key, 1/T sel_inv_t), not the selector's;
+     * kg_next_*: a DSpark cycle's draw for the position after its kept rows, from the row now in s->logits */
+    bool sel_keyed, kg_next_valid;
+    uint64_t sel_key, kg_next_seed;
+    float sel_inv_t, kg_next_t;
+    uint32_t kg_next_pos;
+    int kg_next_tok;
     bool greedy_splitkv_anchor_valid;
 };
 
@@ -65058,7 +65134,7 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
     /* keyed V4.1 sampling, like exact sampling, keeps only drafts it would sample */
     const uint64_t seed = 0;
     return e && (e->dspark_exact_sampling ||
-                 (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds41_keyed_sampling(e, 1.0f, &seed)));
+                 (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds41_keyed_sampling(e, 1.0f, 0, 1.0f, 0.0f, &seed)));
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
@@ -65354,7 +65430,7 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 
 static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
                               uint64_t remaining, char *err, size_t errlen) {
-    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
+    if (s) { s->sel_bound = false; s->kg_next_valid = false; }   /* SAMPLER_GPU, KEYED_GPU: no longer s->logits' */
     ds41_gpu_graph *g = &s->ds41_graph;
     ds41_dspark *d = ds41_payload_draft(g);
     const uint32_t pos = h[7];
@@ -66231,7 +66307,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     DS4_POOL_SCOPE();
-    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
+    if (s) { s->sel_bound = false; s->kg_next_valid = false; }   /* SAMPLER_GPU, KEYED_GPU: no longer s->logits' */
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -66909,7 +66985,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
     DS4_POOL_SCOPE();
-    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
+    if (s) { s->sel_bound = false; s->kg_next_valid = false; }   /* SAMPLER_GPU, KEYED_GPU: no longer s->logits' */
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -76712,7 +76788,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
         {   /* SAMPLER_GPU: the selector's own small library, once (a failure only leaves sampling on the CPU) */
             static bool sel_failed;
-            if (!e->tp.active && !e->ssd_streaming && !e->quality && ds41_on(DS4_GPU_V41_SAMPLER_GPU) &&
+            if (!e->tp.active && !e->ssd_streaming && !e->quality &&
+                (ds41_on(DS4_GPU_V41_SAMPLER_GPU) || ds41_on(DS4_GPU_V41_KEYED_GPU)) &&
                 !sel_failed && !ds4_gpu_selector_ready())
                 sel_failed = !ds4_gpu_selector_init();
         }
@@ -79241,7 +79318,7 @@ int ds4_session_sync_multimodal(
 }
 
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
+    if (s) { s->sel_bound = false; s->kg_next_valid = false; }   /* SAMPLER_GPU, KEYED_GPU: no longer s->logits' */
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return 1;
@@ -80469,7 +80546,7 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 /* SAMPLER_GPU: a greedy pick never reads the selector, so the session's next step does not encode it */
 static void session_sel_unwanted(ds4_session *s) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
-    if (ds4_session_is_ds41(s)) s->ds41_graph.sel_want = false;
+    if (ds4_session_is_ds41(s)) s->ds41_graph.sel_want = s->ds41_graph.kg_want = false;
 #else
     (void)s;
 #endif
@@ -80813,10 +80890,12 @@ static bool ds41_selector_sample(ds4_session *s, float temperature, int top_k, f
                                  uint64_t *rng, int *token) {
     const bool bound = s->sel_bound;
     s->sel_bound = false;   /* consumed once */
-    if (ds4_session_is_ds41(s))   /* the next step encodes the selector only if this kind of sample would read it */
+    if (ds4_session_is_ds41(s)) {   /* the next step encodes the selector only if this kind of sample would read it */
         s->ds41_graph.sel_want = temperature == 1.0f && top_k == 0 && top_p == 0.95f && min_p == 0.0f;
+        s->ds41_graph.kg_want = false;
+    }
     const bool on = ds41_on(DS4_GPU_V41_SAMPLER_GPU);
-    if (!bound) { if (on && ds4_gpu_selector_ready()) g_sel_counts[6]++; return false; }
+    if (!bound || s->sel_keyed) { if (on && ds4_gpu_selector_ready()) g_sel_counts[6]++; return false; }
     if (!on || temperature != 1.0f || top_k != 0 || top_p != 0.95f || min_p != 0.0f) { g_sel_counts[7]++; return false; }
     if (DS4_N_VOCAB != SEL_NV || !ds4_session_is_ds41(s)) { g_sel_counts[6]++; return false; }
     const int bc = ds41_sel_bind_check(&g_sel_gen, true, s->sel_gen, s->sel_pos, &s->ds41_graph, s->ds41_graph.sel_done,
@@ -80830,14 +80909,48 @@ static bool ds41_selector_sample(ds4_session *s, float temperature, int top_k, f
     g_sel_counts[path]++;
     return path == 0;
 }
+
+/* KEYED_GPU: the keyed draw of s->logits at the next position without the full-vocabulary pass: a DSpark cycle's draw
+ * for the row it left in s->logits, or the decode step's GPU candidates. Either is consumed once; the next decode
+ * step is asked for this kind of draw's candidates. false: sample_keyed decides. */
+static bool ds41_keyed_take(ds4_session *s, const sample_key *k, int *token) {
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    const bool bound = s->sel_bound && s->sel_keyed, next = s->kg_next_valid;
+    s->sel_bound = s->kg_next_valid = false;
+    const bool on = ds41_on(DS4_GPU_V41_KEYED_GPU);
+    s->ds41_graph.sel_want = false;
+    s->ds41_graph.kg_want = on;
+    s->ds41_graph.kg_seed = k->seed;
+    s->ds41_graph.kg_inv_t = 1.0f / k->temperature;
+    if (next && s->kg_next_pos == pos && s->kg_next_seed == k->seed && s->kg_next_t == k->temperature) {
+        *token = s->kg_next_tok;
+        g_kg_counts[1]++;
+        return true;
+    }
+    if (!on) return false;
+    const uint64_t key = sample_key_mix(k->seed ^ sample_key_mix((uint64_t)pos + 1u));
+    if (!bound || s->sel_key != key || s->sel_inv_t != 1.0f / k->temperature ||
+        ds41_sel_bind_check(&g_sel_gen, true, s->sel_gen, s->sel_pos, &s->ds41_graph, s->ds41_graph.sel_done,
+                            pos, s->ds41_graph.pos)) {
+        if (ds4_gpu_selector_ready()) g_kg_counts[2]++;
+        return false;
+    }
+    const int path = ds41_keyed_finish(ds4_gpu_keyed_out(), s->logits, k, pos, token);
+    g_kg_counts[path == 0 ? 0 : path == 1 ? 3 : 4]++;
+    return path == 0;
+}
 #endif
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     DS4_POOL_SCOPE();
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    if (ds4_session_is_ds41(s) && ds41_keyed_sampling(s->engine, temperature, rng)) {
+    if (ds4_session_is_ds41(s) && ds41_keyed_sampling(s->engine, temperature, top_k, top_p, min_p, rng)) {
         const sample_key key = { temperature, top_k, top_p, min_p, *rng };
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+        { int t = -1; if (ds41_keyed_take(s, &key, &t)) return t; }
+#else
         session_sel_unwanted(s);   /* the top-p selector serves no keyed sample */
+#endif
         return sample_keyed(s->logits, DS4_N_VOCAB, &key, (uint32_t)s->checkpoint.len, s->sample_probs);
     }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
@@ -80917,7 +81030,7 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     DS4_POOL_SCOPE();
-    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
+    if (s) { s->sel_bound = false; s->kg_next_valid = false; }   /* SAMPLER_GPU, KEYED_GPU: no longer s->logits' */
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
@@ -81791,6 +81904,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
     s->sel_bound = false;
+    s->kg_next_valid = false;
 #ifndef DS4_NO_GPU
     s->dspark_rewind_end = 0;
 #endif
@@ -81853,6 +81967,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         s->sel_bound = s->ds41_graph.sel_done;
         s->sel_pos = (uint32_t)s->checkpoint.len;
         s->sel_gen = s->ds41_graph.sel_gen;
+        s->sel_keyed = s->ds41_graph.kg_gpu;
+        s->sel_key = s->ds41_graph.kg_key;
+        s->sel_inv_t = s->ds41_graph.kg_inv_t;
         if (rewindable) d->rewind_end = s->ds41_graph.pos;
         return 0;
     }
@@ -89003,6 +89120,20 @@ int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
     return 0;
 }
 #endif
+/* KEYED_SAMPLING: a verify row's keyed draw: from its GPU candidates (KEYED_GPU) or sample_keyed */
+static int ds41_keyed_row(const ds41_dspark *d, uint32_t row, const float *lg, const sample_key *k, uint32_t pos,
+                          float *probs) {
+    int t = -1;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (d->kg_done && ds41_keyed_finish((const kg_gpu_row *)ds4_gpu_keyed_out() + row, lg, k, pos, &t) == 0) {
+        g_kg_counts[5]++;
+        return t;
+    }
+#endif
+    if (d->kg_done) g_kg_counts[6]++;
+    return sample_keyed(lg, DS4_N_VOCAB, k, pos, probs);
+}
+
 static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int eos,
         bool ignore_eos, ds4_think_mode think_mode, float temperature, int top_k,
         float top_p, float min_p, uint64_t *rng, int *accepted, char *err, size_t errlen) {
@@ -89035,7 +89166,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     }
     /* keyed sampling keeps a greedy draft while it is its row's keyed sample; the caller then draws the first
      * rejected row's keyed sample as plain decode would, so no correction token is evaluated here */
-    const bool keyed = ds41_keyed_sampling(e, temperature, rng);
+    const bool keyed = ds41_keyed_sampling(e, temperature, top_k, top_p, min_p, rng);
     const bool exact = !keyed && temperature > 0 && e->dspark_exact_sampling;
     const uint32_t P1 = (uint32_t)s->checkpoint.len;
     const double started = now_sec();
@@ -89083,14 +89214,21 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         s->dspark_stats.proposed_tokens += count - 1u;
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
     }
+    const sample_key kkey = { temperature, top_k, top_p, min_p, rng ? *rng : 0 };
+    /* KEYED_GPU: the verify block also finds each row's keyed-draw candidates (row r draws position P1 + 1 + r) */
+    d->kg_want = keyed && ds41_on(DS4_GPU_V41_KEYED_GPU) && ds4_gpu_selector_ready();
+    for (uint32_t r = 0; d->kg_want && r < count; r++)
+        d->kg_keys[r] = sample_key_mix(kkey.seed ^ sample_key_mix((uint64_t)(P1 + 1u + r) + 1u));
+    d->kg_inv_t = keyed ? 1.0f / temperature : 1.0f;
     if (!ds41_session_verify(s, tokens, count)) goto fail;
     uint32_t keep = 1;
-    int correction = -1;
+    int correction = -1, next = -1;
     for (; keep < count; keep++) {
         const float *p_logits = d->host_verified + (uint64_t)(keep - 1u) * DS4_N_VOCAB;
         if (keyed) {
-            const sample_key key = { temperature, top_k, top_p, min_p, *rng };
-            if (sample_keyed(p_logits, DS4_N_VOCAB, &key, P1 + keep, s->sample_probs) != tokens[keep]) break;
+            next = ds41_keyed_row(d, keep - 1u, p_logits, &kkey, P1 + keep, s->sample_probs);
+            if (next != tokens[keep]) break;
+            next = -1;
         } else if (!exact) {
             if (sample_argmax(p_logits, DS4_N_VOCAB) != tokens[keep]) break;
         } else {
@@ -89104,7 +89242,17 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             }
         }
     }
+    if (keyed && next < 0)   /* every draft kept: the draw after the block, from its last row */
+        next = ds41_keyed_row(d, count - 1u, d->host_verified + (uint64_t)(count - 1u) * DS4_N_VOCAB, &kkey,
+                              P1 + count, s->sample_probs);
     if (!ds41_session_commit(s, tokens, count, keep)) goto fail;
+    if (keyed) {   /* s->logits is row keep - 1 now: the caller's next keyed sample is NEXT */
+        s->kg_next_valid = true;
+        s->kg_next_pos = P1 + keep;
+        s->kg_next_seed = kkey.seed;
+        s->kg_next_t = temperature;
+        s->kg_next_tok = next;
+    }
     for (uint32_t i = 0; i < keep; i++) {
         accepted[i] = tokens[i];
     }
@@ -90173,7 +90321,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 
 void ds4_session_invalidate(ds4_session *s) {
     DS4_POOL_SCOPE();
-    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
+    if (s) { s->sel_bound = false; s->kg_next_valid = false; }   /* SAMPLER_GPU, KEYED_GPU: no longer s->logits' */
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
@@ -90337,7 +90485,7 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 
 void ds4_session_rewind(ds4_session *s, int pos) {
     DS4_POOL_SCOPE();
-    if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
+    if (s) { s->sel_bound = false; s->kg_next_valid = false; }   /* SAMPLER_GPU, KEYED_GPU: no longer s->logits' */
     if (!s) return;
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;

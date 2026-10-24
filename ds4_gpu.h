@@ -100,6 +100,8 @@ typedef struct {
 #define DS4_GPU_V41_CTX_RESIDENCY (1ull << 52)   /* the engine's own allocations in a residency set on the queue, so a prefill does not wait while the driver makes them resident */
 #define DS4_GPU_V41_MOE_HALF_X (1ull << 53)   /* the routed experts' compact pair tiles read the rows narrowed to half once per layer, at the same bits */
 #define DS4_GPU_V41_CARRY_KEEP (1ull << 54)   /* a one-chunk prefill layer keeps the previous layer's rows in the batch buffers instead of loading them back from the carry */
+#define DS4_GPU_V41_KEYED_SAMPLING (1ull << 55)   /* full-distribution samples (top_p 1, no top-k or min-p) are position-keyed Gumbel draws, and DSpark keeps a draft while it equals its row's draw */
+#define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step and the DSpark verify rows find the keyed draw's candidates on the GPU; the CPU scores only them */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
  * and keeps DSpark to target-only decode as --dspark-strict does. It is off by default. */
 #define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \
@@ -174,6 +176,10 @@ int ds4_gpu_selector_encode(const ds4_gpu_tensor *logits);
 const void *ds4_gpu_selector_out(int which);
 void ds4_gpu_selector_reset(void);
 uint64_t ds4_gpu_selector_encoded_count(void);
+/* KEYED_GPU: the keyed Gumbel-max sample's candidates for up to 8 rows (same library as the selector) */
+int ds4_gpu_keyed_encode(const ds4_gpu_tensor *logits, uint32_t rows, const uint64_t *keys, float inv_t);
+const void *ds4_gpu_keyed_out(void);
+uint64_t ds4_gpu_keyed_encoded_count(void);
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(

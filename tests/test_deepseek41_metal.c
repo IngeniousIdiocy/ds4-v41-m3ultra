@@ -3056,6 +3056,70 @@ static int check_sampler_gpu(void) {
     return 1;
 }
 
+/* KEYED_GPU: the keyed Gumbel-max candidates of up to 8 rows (kernel_kg1/kg2) always hold each row's double argmax of
+ * l / T + G(key, id), the token ds4.c sample_keyed draws, within 64 slots, with the row's finite count; the rows'
+ * keys and temperature are honoured. Wide logits, a peaked head, ties with the maximum and masked ids. */
+static uint64_t kgm_mix(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static int check_keyed_gpu(void) {
+    enum { NV = 129280, ROWS = 6, TRIALS = 120 };
+    typedef struct { uint32_t n, finite, pad[2], id[64]; } kgrow;
+    if (!ds4_gpu_selector_ready() && !ds4_gpu_selector_init()) {
+        fprintf(stderr, "V4.1 keyed GPU: metal/sampler_selector.metal not found (run from the tree)\n");
+        return 0;
+    }
+    ds4_gpu_tensor *logits = upload(NULL, (size_t)ROWS * NV * 4);
+    float *lg = malloc((size_t)ROWS * NV * sizeof(float));
+    CHECK(logits && lg);
+    uint32_t rows_seen = 0, max_n = 0, total_n = 0;
+    for (uint32_t trial = 0; trial < TRIALS; trial++) {
+        const float T = trial % 3u == 2u ? 0.7f : 1.0f;
+        uint64_t keys[ROWS];
+        for (uint32_t r = 0; r < ROWS; r++) {
+            float *row = lg + (size_t)r * NV;
+            const float scale = trial % 4u == 0u ? 0.5f : 2.5f;   /* flat rows and spread rows */
+            for (int i = 0; i < NV; i++) row[i] = random_value() * scale;
+            for (int k = 0; k < 8; k++) row[(trial * 131u + r * 7919u + k * 4099u) % NV] = 14.0f - (float)k * 0.5f;
+            row[(trial * 17u + 5u) % NV] = row[(trial * 131u + r * 7919u) % NV];   /* tied with the maximum */
+            row[(trial * 29u + 3u) % NV] = -INFINITY;
+            keys[r] = kgm_mix(0x1234ULL + trial ^ kgm_mix((uint64_t)(trial * ROWS + r) + 1u));
+        }
+        memcpy(ds4_gpu_tensor_contents(logits), lg, (size_t)ROWS * NV * sizeof(float));
+        const uint64_t enc = ds4_gpu_keyed_encoded_count();
+        CHECK(ds4_gpu_begin_commands() && ds4_gpu_keyed_encode(logits, ROWS, keys, 1.0f / T) && ds4_gpu_end_commands());
+        CHECK(ds4_gpu_keyed_encoded_count() == enc + 1);
+        const kgrow *out = ds4_gpu_keyed_out();
+        CHECK(out);
+        for (uint32_t r = 0; r < ROWS; r++) {
+            const float *row = lg + (size_t)r * NV;
+            int best = -1;
+            double best_v = 0.0;
+            for (int i = 0; i < NV; i++) {   /* sample_keyed's full-distribution score and tie rule */
+                if (!isfinite(row[i])) continue;
+                const uint64_t h = kgm_mix(keys[r] + (uint64_t)i * 0x9e3779b97f4a7c15ULL);
+                const double v = (double)row[i] / T - log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
+                if (best < 0 || v > best_v || (v == best_v && i < best)) { best = i; best_v = v; }
+            }
+            CHECK(out[r].finite == NV - 1u && out[r].n >= 1u && out[r].n <= 64u);
+            int found = 0;
+            for (uint32_t c = 0; c < out[r].n; c++) { CHECK(out[r].id[c] < NV); found += (int)out[r].id[c] == best; }
+            CHECK(found == 1);
+            rows_seen++;
+            total_n += out[r].n;
+            if (out[r].n > max_n) max_n = out[r].n;
+        }
+    }
+    free(lg);
+    ds4_gpu_tensor_free(logits);
+    fprintf(stderr, "V4.1 keyed GPU: %u rows, each one's keyed draw among its candidates (mean %.2f, at most %u)\n",
+            rows_seen, (double)total_n / rows_seen, max_n);
+    return 1;
+}
+
 /* TP_PREFILL_ROWS8: the two-Mac attention output's K-slice rows in one dispatch against one call per row, bit for
  * bit: 40 rows (the eight-row kernel on the M3 Ultra) and 5 rows (the two-row kernel). */
 static int check_tp_prefill_rows8(void) {
@@ -3298,6 +3362,7 @@ static int check_v41_groups(void) {
         check_prefill_matmul() &&
         check_prefill_index_batch() &&
         check_sampler_gpu() &&
+        check_keyed_gpu() &&
         check_tp_prefill_rows8() &&
         check_verify_indexed() &&
         check_short_mma();
@@ -3363,6 +3428,11 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "--index-projection")) {
         const int ok = ds4_gpu_init() && check_index_projection();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--keyed")) {
+        const int ok = ds4_gpu_init() && check_sampler_gpu() && check_keyed_gpu();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

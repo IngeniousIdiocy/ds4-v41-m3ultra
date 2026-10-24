@@ -1,5 +1,6 @@
 #include "../ds4.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -563,7 +564,141 @@ static void check_selector_consumer(void) {
     free(ref_sum);
 }
 
+
+/* KEYED_SAMPLING / KEYED_GPU: the position-keyed Gumbel-max draw follows softmax(logits / T) (chi-square over many
+ * positions), and the finish of a GPU candidates row gives sample_keyed's token. The rows are built the way
+ * metal/sampler_selector.metal kernel_kg1/kg2 build them: every finite id whose float score is within 1/64 of the row's
+ * float maximum (the kernel's float score, here with logf for precise::log). */
+typedef struct { uint32_t n, finite, pad[2], id[64]; } kgt_row;
+static uint64_t kgt_mix(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+static float kgt_score(float l, float inv_t, uint64_t key, uint32_t id) {
+    const uint64_t x = kgt_mix(key + (uint64_t)id * 0x9e3779b97f4a7c15ULL) >> 11;
+    float L;
+    if (x >= (UINT64_C(1) << 52)) {
+        const float w = ((float)((UINT64_C(1) << 53) - 1u - x) + 0.5f) * 0x1.0p-53f;
+        L = w < 0x1.0p-10f ? w * (1.0f + w * (0.5f + w * (1.0f / 3.0f))) : -logf(1.0f - w);
+    } else {
+        L = -logf(((float)x + 0.5f) * 0x1.0p-53f);
+    }
+    return l * inv_t - logf(L);
+}
+static void kgt_build(kgt_row *r, const float *lg, uint32_t n, float temperature, uint64_t seed, uint32_t pos) {
+    const uint64_t key = kgt_mix(seed ^ kgt_mix((uint64_t)pos + 1u));
+    const float inv_t = 1.0f / temperature;
+    float V = -INFINITY;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!(fabsf(lg[i]) <= FLT_MAX)) continue;
+        finite++;
+        const float v = kgt_score(lg[i], inv_t, key, i);
+        if (v > V) V = v;
+    }
+    memset(r, 0, sizeof(*r));
+    r->finite = finite;
+    for (uint32_t i = 0; finite && i < n; i++) {
+        if (!(fabsf(lg[i]) <= FLT_MAX) || kgt_score(lg[i], inv_t, key, i) < V - 0.015625f) continue;
+        if (r->n < 64u) r->id[r->n] = i;
+        r->n++;
+    }
+}
+static uint64_t kgt_s;
+static double kgt_u(void) { kgt_s = kgt_mix(kgt_s + 0x9e3779b97f4a7c15ULL); return ((double)(kgt_s >> 11) + 0.5) * 0x1.0p-53; }
+/* chi-square of COUNTS against softmax(LG / T) over the bins of expected count >= 20 (the rest pooled) */
+static double kgt_chi2(const uint32_t *counts, const float *lg, uint32_t n, float temperature, uint32_t draws, int *df) {
+    double M = -INFINITY, S = 0.0, chi = 0.0, rest_e = 0.0, rest_o = 0.0;
+    for (uint32_t i = 0; i < n; i++) if (fabsf(lg[i]) <= FLT_MAX && lg[i] > M) M = lg[i];
+    for (uint32_t i = 0; i < n; i++) if (fabsf(lg[i]) <= FLT_MAX) S += exp(((double)lg[i] - M) / temperature);
+    int bins = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const double e = fabsf(lg[i]) <= FLT_MAX ? draws * exp(((double)lg[i] - M) / temperature) / S : 0.0;
+        if (e >= 20.0) { chi += (counts[i] - e) * (counts[i] - e) / e; bins++; }
+        else { rest_e += e; rest_o += counts[i]; }
+    }
+    if (rest_e > 0.0) { chi += (rest_o - rest_e) * (rest_o - rest_e) / rest_e; bins++; }
+    *df = bins - 1;
+    return chi;
+}
+
+static void check_keyed(void) {
+    /* 1: the draw's distribution over 300,000 positions, small vocabulary, two temperatures */
+    enum { SN = 4096 };
+    static float small[SN];
+    static uint32_t counts[129280];
+    kgt_s = 0x6b657965645f7631ULL;
+    for (uint32_t i = 0; i < SN; i++) small[i] = (float)(6.0 - 3.0 * pow(-log(kgt_u()), 0.8));
+    small[5] = small[9];   /* an exact tie */
+    small[11] = -INFINITY;
+    const float temps[2] = {1.0f, 0.7f};
+    for (int ti = 0; ti < 2; ti++) {
+        memset(counts, 0, sizeof(counts));
+        const uint32_t draws = 300000;
+        for (uint32_t pos = 0; pos < draws; pos++) {
+            const int t = ds4_test_sample_keyed(small, SN, temps[ti], 0, 1.0f, 0.0f, 0x5eedULL + ti, pos, NULL);
+            CHECK(t >= 0 && t < SN && t != 11, "keyed draw %d at %u", t, pos);
+            if (t >= 0 && t < SN) counts[t]++;
+        }
+        int df = 0;
+        const double chi = kgt_chi2(counts, small, SN, temps[ti], draws, &df);
+        const double bound = df + 6.0 * sqrt(2.0 * df);   /* about p < 1e-7 */
+        printf("keyed draw T=%.1f: chi-square %.1f, %d degrees of freedom (bound %.1f), %u draws\n",
+               (double)temps[ti], chi, df, bound, draws);
+        CHECK(chi < bound, "keyed draw T=%.1f chi-square %.1f over %.1f", (double)temps[ti], chi, bound);
+    }
+    /* 2: the GPU finish equals sample_keyed on full V4.1-size rows, and its draws follow softmax too */
+    const uint32_t NV = 129280;
+    float *lg = malloc(NV * sizeof(float));
+    CHECK(lg != NULL, "keyed allocation");
+    if (!lg) return;
+    for (uint32_t i = 0; i < NV; i++) lg[i] = (float)(22.0 - 9.0 * pow(-log(kgt_u()), 0.6));
+    for (uint32_t k = 0; k < 6; k++) lg[1000u + 977u * k] = 27.0f - (float)k * 0.7f;   /* a peaked head */
+    lg[4321] = lg[1000];   /* tied with the maximum */
+    lg[77] = -INFINITY;
+    memset(counts, 0, sizeof(counts));
+    uint32_t same = 0, decided = 0, overflow = 0, maxn = 0;
+    const uint32_t positions = 4000;
+    kgt_row row;
+    for (uint32_t pos = 0; pos < positions; pos++) {
+        const float T = pos & 1u ? 0.7f : 1.0f;
+        const uint64_t seed = 0xabcdef12345ULL + (pos % 3u);
+        kgt_build(&row, lg, NV, T, seed, pos);
+        if (row.n > maxn) maxn = row.n;
+        int tf = -1;
+        const int path = ds4_test_keyed_finish(&row, lg, T, seed, pos, &tf);
+        const int tr = ds4_test_sample_keyed(lg, NV, T, 0, 1.0f, 0.0f, seed, pos, NULL);
+        if (path == 1) { overflow++; continue; }
+        CHECK(path == 0, "keyed finish path %d at %u", path, pos);
+        decided++;
+        same += tf == tr;
+        if (tf != tr && decided - same <= 5) fprintf(stderr, "keyed finish %d, sample_keyed %d at %u\n", tf, tr, pos);
+        if (T == 1.0f && tf >= 0) counts[tf]++;
+    }
+    int df = 0;
+    const double chi = kgt_chi2(counts, lg, NV, 1.0f, positions / 2u, &df);
+    const double bound = df + 6.0 * sqrt(2.0 * df);
+    printf("keyed GPU finish: %u of %u rows equal sample_keyed (%u overflow, at most %u candidates); "
+           "T=1 chi-square %.1f, %d degrees of freedom (bound %.1f)\n",
+           same, decided, overflow, maxn, chi, df, bound);
+    CHECK(same == decided && decided > positions * 9u / 10u, "keyed finish differs from sample_keyed");
+    CHECK(chi < bound, "keyed finish chi-square %.1f over %.1f", chi, bound);
+    /* 3: a row with no candidates or a bad id is refused, an all-masked row is the argmax */
+    kgt_build(&row, lg, NV, 1.0f, 1, 1);
+    kgt_row bad = row;
+    int t = -1;
+    bad.n = 0;
+    CHECK(ds4_test_keyed_finish(&bad, lg, 1.0f, 1, 1, &t) == 2, "keyed finish took an empty row");
+    bad = row; bad.id[0] = NV + 5u;
+    CHECK(ds4_test_keyed_finish(&bad, lg, 1.0f, 1, 1, &t) == 2, "keyed finish took an out-of-range id");
+    bad = row; bad.n = 65;
+    CHECK(ds4_test_keyed_finish(&bad, lg, 1.0f, 1, 1, &t) == 1, "keyed finish took an overflowing row");
+    free(lg);
+}
+
 int main(void) {
+    check_keyed();
     check_speculative_distribution();
     check_selector_consumer();
     const uint32_t semantic_n = 4096;

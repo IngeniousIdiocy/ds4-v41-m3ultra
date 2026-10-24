@@ -188,3 +188,69 @@ kernel void kernel_sel_s3(device const float *lg [[buffer(0)]], device sel_hdr *
         if (slot < SEL_SUPB) cand[slot] = sel_cand{v, i};
     }
 }
+
+/* ---- KEYED_GPU: candidates for the position-keyed Gumbel-max sample (ds4.c sample_keyed, full distribution) ----
+ * R rows of 129280 logits, row r keyed by keys[r]. The float score of id i is l * inv_t + G, with G the Gumbel noise
+ * -log(-log(u)) of u = ((h >> 11) + 0.5) 2^-53, h = mix(key + i * 0x9e3779b97f4a7c15): the same draw sample_keyed makes
+ * in double, its -log(u) taken from 1 - u where u is near 1. KG1 (505 x R threadgroups): the block maximum of the
+ * score (finite logits only) and the finite count, and clears the row's slot counter. KG2 (505 x R): the row maximum V
+ * from the 505 block records (sel_global), then every finite id whose score is at least V - KG_MARGIN into KG_SLOTS
+ * slots, the counter counting all of them. The score's float error is under 1e-4, so the double argmax (the keyed
+ * sample) is always a candidate; the CPU evaluates the candidates as sample_keyed does. */
+#define KG_SLOTS  64u
+#define KG_MARGIN 0.015625f
+struct kg_row { atomic_uint n; uint finite; uint pad[2]; uint id[KG_SLOTS]; };
+
+static inline ulong kg_mix(ulong x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9UL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebUL;
+    return x ^ (x >> 31);
+}
+static inline float kg_score(float l, float inv_t, ulong key, uint id) {
+    const ulong x = kg_mix(key + (ulong)id * 0x9e3779b97f4a7c15UL) >> 11;
+    float L;   /* -log(u) */
+    if (x >= (1UL << 52)) {
+        const float w = ((float)((1UL << 53) - 1UL - x) + 0.5f) * 0x1.0p-53f;   /* 1 - u */
+        L = w < 0x1.0p-10f ? w * (1.0f + w * (0.5f + w * (1.0f / 3.0f))) : -precise::log(1.0f - w);
+    } else {
+        L = -precise::log(((float)x + 0.5f) * 0x1.0p-53f);
+    }
+    return l * inv_t - precise::log(L);
+}
+
+kernel void kernel_kg1(device const float *lg [[buffer(0)]], device sel_part *part [[buffer(1)]],
+                       device kg_row *rows [[buffer(2)]], constant ulong *keys [[buffer(3)]],
+                       constant float &inv_t [[buffer(4)]],
+                       uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tm[8]; threadgroup uint tb[8], tf[8];
+    const uint b = g.x, r = g.y, i = b * SEL_BLK + tid;
+    if (b == 0 && tid == 0) atomic_store_explicit(&rows[r].n, 0u, memory_order_relaxed);
+    const float v = lg[(ulong)r * SEL_NV + i];
+    uint f = sel_fin(v) ? 1u : 0u;
+    float m = f ? kg_score(v, inv_t, keys[r], i) : 0.0f; uint bi = i;
+    sel_simd_maxid(m, bi, f);
+    if (lane == 0) { tm[sg] = m; tb[sg] = bi; tf[sg] = f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float M = tm[0]; uint B = tb[0], F = tf[0];
+        for (ushort j = 1; j < 8; j++) sel_take(M, B, F, tm[j], tb[j], tf[j]);
+        part[r * SEL_NB + b] = sel_part{F, M, B, 0u};
+    }
+}
+
+kernel void kernel_kg2(device const float *lg [[buffer(0)]], device const sel_part *part [[buffer(1)]],
+                       device kg_row *rows [[buffer(2)]], constant ulong *keys [[buffer(3)]],
+                       constant float &inv_t [[buffer(4)]],
+                       uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tm[8]; threadgroup uint tb[8], tf[8];
+    const uint b = g.x, r = g.y, i = b * SEL_BLK + tid;
+    uint F, B; float V;
+    sel_global(part + r * SEL_NB, tid, lane, sg, tm, tb, tf, F, V, B);
+    if (b == 0 && tid == 0) rows[r].finite = F;
+    const float v = lg[(ulong)r * SEL_NV + i];
+    if (F == 0u || !sel_fin(v) || kg_score(v, inv_t, keys[r], i) < V - KG_MARGIN) return;
+    const uint slot = atomic_fetch_add_explicit(&rows[r].n, 1u, memory_order_relaxed);
+    if (slot < KG_SLOTS) rows[r].id[slot] = i;
+}

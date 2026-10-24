@@ -501,6 +501,8 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_CTX_RESIDENCY",
             "DS4_METAL_DISABLE_V41_MOE_HALF_X",
             "DS4_METAL_DISABLE_V41_CARRY_KEEP",
+            "DS4_METAL_DISABLE_V41_KEYED_SAMPLING",
+            "DS4_METAL_DISABLE_V41_KEYED_GPU",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -22169,8 +22171,12 @@ int ds4_gpu_dsv41_prefill_folds_available(void) {
  * compiled once at load with the default compile options, so the engine library and every other kernel are
  * unchanged. Buffer indices: 0 logits, 1 block records, 2-4 histograms H1/H2/H3, 5 header, 6 block mass partials,
  * 7 slots. H1 is zeroed here once; R1 clears it at the end of every pass and K1 clears the slot counter. */
-static id<MTLComputePipelineState> g_sel_pipe[3];
+static id<MTLComputePipelineState> g_sel_pipe[5];
 static id<MTLBuffer> g_sel_buf[8];
+/* KEYED_GPU: the keyed sample's block records (DS4_KG_ROWS x 505 x 16 B) and per-row candidates (272 B each) */
+enum { DS4_KG_ROWS = 8u, DS4_KG_ROW_BYTES = 272u };
+static id<MTLBuffer> g_kg_buf[2];
+static uint64_t g_kg_encoded;
 static int g_sel_ready;
 static uint64_t g_sel_encoded;
 enum { DS4_SEL_NV = 129280u, DS4_SEL_NB = 129280u / 256u, DS4_SEL_SUPB = 2048u };
@@ -22192,8 +22198,8 @@ int ds4_gpu_selector_init(void) {
                     err ? err.localizedDescription.UTF8String : "not found");
             return 0;
         }
-        static const char *fn[3] = {"kernel_sel_k1", "kernel_sel_r1", "kernel_sel_s3"};
-        for (int k = 0; k < 3; k++) {
+        static const char *fn[5] = {"kernel_sel_k1", "kernel_sel_r1", "kernel_sel_s3", "kernel_kg1", "kernel_kg2"};
+        for (int k = 0; k < 5; k++) {
             id<MTLFunction> f = [lib newFunctionWithName:@(fn[k])];
             g_sel_pipe[k] = f ? [g_device newComputePipelineStateWithFunction:f error:&err] : nil;
             if (!g_sel_pipe[k]) { fprintf(stderr, "ds4: GPU top-p selector kernel %s missing or failed\n", fn[k]); return 0; }
@@ -22204,6 +22210,12 @@ int ds4_gpu_selector_init(void) {
             g_sel_buf[j] = [g_device newBufferWithLength:len[j] options:MTLResourceStorageModeShared];
             if (!g_sel_buf[j]) return 0;
             memset(g_sel_buf[j].contents, 0, len[j]);
+        }
+        const NSUInteger kg_len[2] = {DS4_KG_ROWS * DS4_SEL_NB * 16u, DS4_KG_ROWS * DS4_KG_ROW_BYTES};
+        for (int j = 0; j < 2; j++) {
+            g_kg_buf[j] = [g_device newBufferWithLength:kg_len[j] options:MTLResourceStorageModeShared];
+            if (!g_kg_buf[j]) return 0;
+            memset(g_kg_buf[j].contents, 0, kg_len[j]);
         }
         g_sel_ready = 1;
         return 1;
@@ -22234,6 +22246,33 @@ int ds4_gpu_selector_encode(const ds4_gpu_tensor *logits) {
     return 1;
 }
 
+/* KEYED_GPU: append the keyed sample's two passes over ROWS contiguous rows of LOGITS (row r keyed by KEYS[r]) to the
+ * open batch; ds4_gpu_keyed_out gives the rows' candidates ({n, finite, pad[2], id[64]} each) once it completed */
+int ds4_gpu_keyed_encode(const ds4_gpu_tensor *logits, uint32_t rows, const uint64_t *keys, float inv_t) {
+    if (!g_sel_ready || !logits || !keys || !rows || rows > DS4_KG_ROWS || !g_batch_cb ||
+        ds4_gpu_tensor_bytes(logits) < (uint64_t)rows * DS4_SEL_NV * 4u) return 0;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc || owned) return 0;
+    for (int k = 3; k < 5; k++) {
+        if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:g_sel_pipe[k]];
+        [enc setBuffer:ds4_gpu_tensor_buffer(logits) offset:ds4_gpu_tensor_offset(logits) atIndex:0];
+        [enc setBuffer:g_kg_buf[0] offset:0 atIndex:1];
+        [enc setBuffer:g_kg_buf[1] offset:0 atIndex:2];
+        [enc setBytes:keys length:rows * sizeof(uint64_t) atIndex:3];
+        [enc setBytes:&inv_t length:sizeof(inv_t) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(DS4_SEL_NB, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    if (enc.dispatchType == MTLDispatchTypeConcurrent) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    g_kg_encoded++;
+    return 1;
+}
+const void *ds4_gpu_keyed_out(void) { return g_sel_ready ? g_kg_buf[1].contents : NULL; }
+uint64_t ds4_gpu_keyed_encoded_count(void) { return g_kg_encoded; }
+
 /* host views after the batch completed: 0 header (64 B), 1 block mass partials (505 floats), 2 slots (2048 x 8 B) */
 const void *ds4_gpu_selector_out(int which) {
     if (!g_sel_ready) return NULL;
@@ -22244,8 +22283,9 @@ const void *ds4_gpu_selector_out(int which) {
 void ds4_gpu_selector_reset(void) { if (g_sel_ready) memset(g_sel_buf[2].contents, 0, 2048u * 4u); }
 
 static void ds4_gpu_selector_release(void) {
-    for (int k = 0; k < 3; k++) g_sel_pipe[k] = nil;
+    for (int k = 0; k < 5; k++) g_sel_pipe[k] = nil;
     for (int j = 0; j < 8; j++) g_sel_buf[j] = nil;
+    for (int j = 0; j < 2; j++) g_kg_buf[j] = nil;
     g_sel_ready = 0;
 }
 
