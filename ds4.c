@@ -143,6 +143,16 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 #include "ds4_gpu.h"
 #endif
 
+/* Every public engine/session entry point that reaches Metal runs inside an autorelease pool, popped on
+ * every return path (see ds4_gpu_autorelease_push in ds4_gpu.h). Nested scopes are fine. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static inline void ds4_pool_scope_end(void **pool) { ds4_gpu_autorelease_pop(*pool); }
+#define DS4_POOL_SCOPE() \
+    void *ds4_pool_scope_ __attribute__((cleanup(ds4_pool_scope_end), unused)) = ds4_gpu_autorelease_push()
+#else
+#define DS4_POOL_SCOPE() ((void)0)
+#endif
+
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
  * stubs for the multi-GPU plumbing multi-GPU functions and globals declared in
  * ds4_gpu_mgpu.h. These keep the linker happy on Mac/Metal and on CPU
@@ -64165,6 +64175,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
@@ -64433,6 +64444,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
@@ -65452,6 +65464,7 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -65740,6 +65753,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -66091,6 +66105,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
@@ -66721,6 +66736,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 }
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
@@ -66767,6 +66783,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
@@ -67940,6 +67957,7 @@ int ds4_engine_generate_argmax(
         void              *emit_ud,
         ds4_session_progress_fn progress,
         void              *progress_ud) {
+    DS4_POOL_SCOPE();
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
@@ -73795,12 +73813,14 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 #endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    DS4_POOL_SCOPE();
     return ds4_engine_open_internal(out, opt, NULL);
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
+    DS4_POOL_SCOPE();
     return ds4_engine_open_internal(out, opt, gpu_cfg);
 }
 
@@ -75977,6 +75997,7 @@ int ds4_engine_vision_encode_file(
         ds4_vision_embedding *out,
         char *error,
         size_t error_cap) {
+    DS4_POOL_SCOPE();
     ds4_image image = {0};
     if (!ds4_image_decode_file(&image, path, error, error_cap)) return 0;
     int ok = ds4_engine_vision_encode_image(e, &image, NULL, out, error, error_cap);
@@ -75991,6 +76012,7 @@ int ds4_engine_vision_encode_memory(
         ds4_vision_embedding *out,
         char *error,
         size_t error_cap) {
+    DS4_POOL_SCOPE();
     ds4_image image = {0};
     ds4_deepseek4_image_patches prepared = {0};
     if (e && e->vision_kind == DS4_VISION_DEEPSEEK4 && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
@@ -76324,6 +76346,7 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 }
 
 void ds4_engine_close(ds4_engine *e) {
+    DS4_POOL_SCOPE();
     if (!e) return;
     vision_prep_free_all(e);
     ds4_engine_tp_unbind(e);
@@ -76508,6 +76531,7 @@ static int ds4_session_tp_register(ds4_session *s) {
 }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+    DS4_POOL_SCOPE();
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -76998,6 +77022,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 }
 
 void ds4_session_free(ds4_session *s) {
+    DS4_POOL_SCOPE();
     if (!s) return;
     if (s->glm_reserved_graph_bytes && s->engine) {
         s->engine->glm_session_graph_bytes -= s->glm_reserved_graph_bytes;
@@ -77213,6 +77238,7 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
 }
 
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -77249,6 +77275,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          float *logits,
                                          char *err,
                                          size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s || !s->engine || !hidden_hc || n_tokens == 0 || !logits) {
         if (errlen) snprintf(err, errlen, "invalid output-head hidden-state input");
         return 1;
@@ -78048,6 +78075,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
 
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->tp.active && s->engine->tp.rank == 1 &&
         s->checkpoint_valid && ds4_session_is_glm(s) &&
@@ -78114,6 +78142,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s || !s->engine) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
@@ -78893,6 +78922,7 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
 #endif
@@ -79010,6 +79040,7 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -80239,6 +80270,7 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return DS4_SESSION_REWRITE_ERROR;
@@ -80301,12 +80333,14 @@ static void session_sel_unwanted(ds4_session *s) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
+    DS4_POOL_SCOPE();
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     session_sel_unwanted(s);
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+    DS4_POOL_SCOPE();
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     session_sel_unwanted(s);
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
@@ -80328,6 +80362,7 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
+    DS4_POOL_SCOPE();
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     session_sel_unwanted(s);
     int best = -1;
@@ -80655,6 +80690,7 @@ static bool ds41_selector_sample(ds4_session *s, float temperature, int top_k, f
 #endif
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    DS4_POOL_SCOPE();
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
     { int t = -1; if (ds41_selector_sample(s, temperature, top_k, top_p, min_p, rng, &t)) return t; }
@@ -80664,6 +80700,7 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+    DS4_POOL_SCOPE();
     if (!s || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
@@ -80701,6 +80738,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
+    DS4_POOL_SCOPE();
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
 
     float max_logit = DS4_NEG_INF;
@@ -80723,12 +80761,14 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+    DS4_POOL_SCOPE();
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
+    DS4_POOL_SCOPE();
     if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -80743,6 +80783,7 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
  * on the M5 Max pair -- the whole first-run TP deficit vs single
  * node, which pays the same cost before its timing window starts). */
 void ds4_session_gpu_warmup(ds4_session *s) {
+    DS4_POOL_SCOPE();
 #ifndef DS4_NO_GPU
     if (!s || ds4_session_is_cpu(s)) return;
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return;
@@ -81880,6 +81921,7 @@ static void ds41_cycle_done(ds4_session *s, ds41_admission *a, double started, u
 #endif
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -85735,6 +85777,7 @@ static int ds41_session_tp_verify(ds4_session *s, const int *tokens, uint32_t co
  * through the gated single-token decode in lockstep with the leader. */
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               uint32_t flags, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
 #ifdef DS4_NO_GPU
     (void)s; (void)drafts; (void)draft_n; (void)flags;
     snprintf(err, errlen, "GPU support is not compiled in");
@@ -85951,6 +85994,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
 
 int ds4_session_tp_dspark_draft(ds4_session *s, int token, int pos,
                                 uint32_t mode, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s && ds4_session_is_ds41(s)) {
         ds4_engine *e = s->engine;
@@ -89805,6 +89849,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     return ds4_session_eval_speculative_argmax_impl(
         s, first_token, max_tokens, eos_token, false, DS4_THINK_HIGH,
         accepted, accepted_cap, err, errlen);
@@ -89814,6 +89859,7 @@ int ds4_session_eval_speculative_argmax_ignoring_eos(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         ds4_think_mode think_mode,
         int *accepted, int accepted_cap, char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     return ds4_session_eval_speculative_argmax_impl(
         s, first_token, max_tokens, eos_token, true, think_mode,
         accepted, accepted_cap, err, errlen);
@@ -89825,6 +89871,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
+    DS4_POOL_SCOPE();
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,
@@ -89970,6 +90017,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    DS4_POOL_SCOPE();
     if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
@@ -89994,6 +90042,7 @@ void ds4_session_invalidate(ds4_session *s) {
 /* Internal state-only restore. The coordinator must replay from this prefix
  * before sampling; the TP worker acknowledges it before any gated eval. */
 int ds4_session_restore_speculative_prefix(ds4_session *s, int pos) {
+    DS4_POOL_SCOPE();
 #ifdef DS4_NO_GPU
     (void)s; (void)pos;
     return 1;
@@ -90097,6 +90146,7 @@ static bool dspark_rewind_recent(ds4_session *s, int pos) {
 #endif
 
 bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
+    DS4_POOL_SCOPE();
 #ifdef DS4_NO_GPU
     (void)s; (void)pos;
     return false;
@@ -90131,6 +90181,7 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    DS4_POOL_SCOPE();
     if (s) s->sel_bound = false;   /* SAMPLER_GPU: the selector summary no longer belongs to s->logits */
     if (!s) return;
     if (pos < 0) pos = 0;

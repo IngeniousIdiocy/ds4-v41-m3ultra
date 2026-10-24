@@ -9615,6 +9615,12 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return obj.bytes;
 }
 
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *);
+
+void *ds4_gpu_autorelease_push(void) { return objc_autoreleasePoolPush(); }
+void ds4_gpu_autorelease_pop(void *pool) { if (pool) objc_autoreleasePoolPop(pool); }
+
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
