@@ -46191,21 +46191,23 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 }
 
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    /* GLM spellings name the shared role ids; in other models they are text. */
+    const bool glm = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
     struct special {
         const char *text;
         int token;
     } specials[] = {
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
-        {"[gMASK]",                vocab->bos_id},
+        {"[gMASK]",                glm ? vocab->bos_id : -1},
         {"<sop>",                  vocab->sop_id},
-        {"<|system|>",             vocab->system_id},
+        {"<|system|>",             glm ? vocab->system_id : -1},
         {"<｜System｜>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ? vocab->system_id : -1},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
-        {"<|user|>",               vocab->user_id},
-        {"<|assistant|>",          vocab->assistant_id},
-        {"<|observation|>",        vocab->observation_id},
+        {"<|user|>",               glm ? vocab->user_id : -1},
+        {"<|assistant|>",          glm ? vocab->assistant_id : -1},
+        {"<|observation|>",        glm ? vocab->observation_id : -1},
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
         {"<tool_call>",            vocab->tool_call_start_id},
