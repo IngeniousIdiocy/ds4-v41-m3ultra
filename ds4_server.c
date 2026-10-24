@@ -3113,6 +3113,15 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+/* Whether the rendered prompt keeps earlier reasoning. V4.1 keeps it only
+ * when tools are declared; older templates whenever tools are in play. */
+static bool prompt_preserves_reasoning_for_syntax(server_model_syntax syntax,
+                                                  const chat_msgs *msgs,
+                                                  const char *tool_schemas) {
+    if (syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41) return tool_schemas && tool_schemas[0];
+    return chat_history_uses_tool_context(msgs, tool_schemas);
+}
+
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
@@ -3399,13 +3408,15 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
     msgs = &views;
     const chat_msg **ordered = ds41_order_messages(msgs, initial_order);
     const bool think = ds4_think_mode_enabled(mode);
-    const bool keep_reasoning = live_tail || chat_history_uses_tool_context(msgs, tool_schemas);
+    /* Declared tools keep all reasoning. Otherwise only the current turn
+     * keeps it: tool results alone do not start a new user turn. */
+    const bool keep_reasoning = tool_schemas && tool_schemas[0];
     const char *effort = ds4_deepseek41_reasoning_effort_text(mode);
     bool initial_system = false, pending = false, user_open = false;
     int last_user = -1;
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
-        if (role_is_user_like(m->role) || (i > 0 && role_is_system(m->role))) last_user = i;
+        if (!strcmp(m->role, "user") || (i > 0 && role_is_system(m->role))) last_user = i;
     }
     if (live_tail) {
         buf_puts(&out, "<｜end▁of▁sentence｜>");
@@ -4371,8 +4382,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_preserves_reasoning = prompt_preserves_reasoning_for_syntax(
+        r->model_syntax, &msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -4604,8 +4615,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     anthropic_prepare_live_continuation(s, r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_preserves_reasoning = prompt_preserves_reasoning_for_syntax(
+        r->model_syntax, &msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -5633,8 +5644,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    r->prompt_preserves_reasoning =
-        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_preserves_reasoning = prompt_preserves_reasoning_for_syntax(
+        r->model_syntax, &msgs, active_tool_schemas);
     responses_prepare_live_continuation(s, r, &msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
@@ -24928,6 +24939,48 @@ static void test_deepseek41_anthropic_results(void) {
     chat_msgs_free(&msgs);
 }
 
+static bool test_ends_with(const char *s, const char *suffix) {
+    const size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && !strcmp(s + n - m, suffix);
+}
+
+/* DeepSeek's encoder (HF 314113f8a7): without declared tools, reasoning
+ * before the latest user request is dropped, but tool results alone do not
+ * start a new turn, so the current turn keeps its reasoning. */
+static void test_deepseek41_current_turn_reasoning(void) {
+    const char *turn = "[{\"role\":\"user\",\"content\":\"q1\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"r1\"},"
+        "{\"type\":\"text\",\"text\":\"a1\"}]},"
+        "{\"role\":\"user\",\"content\":\"q2\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"r2\"},"
+        "{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"lookup\",\"input\":{}}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"c1\",\"content\":\"value\"}]}";
+    char json[1024];
+    snprintf(json, sizeof(json), "%s]", turn);
+    const char *p = json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    char *text = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_HIGH, false);
+    TEST_ASSERT(strstr(text, "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>"));
+    TEST_ASSERT(!strstr(text, "r1"));
+    TEST_ASSERT(strstr(text, "<｜User｜>q2<｜Assistant｜><think>r2</think>"));
+    TEST_ASSERT(test_ends_with(text, "<tool_result>value</tool_result><｜Assistant｜><think>"));
+    free(text);
+    const char *tools = "{\"name\":\"lookup\",\"input_schema\":{}}";
+    text = render_deepseek41_chat(&msgs, 0, tools, DS4_THINK_HIGH, false);
+    TEST_ASSERT(strstr(text, "<｜User｜>q1<｜Assistant｜><think>r1</think>a1"));
+    free(text);
+    chat_msgs_free(&msgs);
+
+    snprintf(json, sizeof(json), "%s,{\"role\":\"user\",\"content\":\"q3\"}]", turn);
+    p = json;
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    text = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_HIGH, false);
+    TEST_ASSERT(!strstr(text, "r2") && strstr(text, "q3<｜Assistant｜><think>"));
+    free(text);
+    chat_msgs_free(&msgs);
+}
+
 static void test_deepseek41_live_result_order(void) {
     server s = {0};
     server_slot slot;
@@ -24973,6 +25026,7 @@ static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
+    test_deepseek41_current_turn_reasoning();
     test_visible_image_key();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();

@@ -99,9 +99,8 @@ def check(reference, tokenizer_path, model, executable):
     ])
     for level in [0, 1, 25, 75, 100]:
         for messages in conversations:
-            keep = any(m.get("tool_calls") for m in messages)
             expected = encode(messages, "chat" if level == 0 else "thinking",
-                              drop_thinking=not keep, reasoning_effort=level or "high")
+                              reasoning_effort=level or "high")
             result = subprocess.run(["./ds4_test", "--ds41-render", str(level),
                                      json.dumps(messages)], check=True, capture_output=True, text=True)
             assert result.stdout == expected, (level, result.stdout, expected)
