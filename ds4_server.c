@@ -2649,21 +2649,228 @@ bad:
     return false;
 }
 
-static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
-    if (!tool_schemas || !tool_schemas[0]) return;
-    if (v41) buf_puts(b,
+/* Python json.dumps(value, ensure_ascii=False), which DeepSeek's encoder uses
+ * for tool schemas and non-string tool arguments: ", " and ": " separators,
+ * raw non-ASCII, and Python's int and float spellings. */
+static void json_python_string(buf *b, const char *s) {
+    buf_putc(b, '"');
+    for (; *s; s++) {
+        const unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"': buf_puts(b, "\\\""); break;
+        case '\\': buf_puts(b, "\\\\"); break;
+        case '\n': buf_puts(b, "\\n"); break;
+        case '\r': buf_puts(b, "\\r"); break;
+        case '\t': buf_puts(b, "\\t"); break;
+        case '\b': buf_puts(b, "\\b"); break;
+        case '\f': buf_puts(b, "\\f"); break;
+        default:
+            if (c < 0x20) buf_printf(b, "\\u%04x", (unsigned)c);
+            else buf_putc(b, (char)c);
+        }
+    }
+    buf_putc(b, '"');
+}
+
+/* repr(float): the shortest digits that read back, fixed notation for
+ * decimal exponents -4..15 and exponent notation otherwise. */
+static void json_python_float(buf *b, double v) {
+    if (isnan(v)) { buf_puts(b, "NaN"); return; }
+    if (isinf(v)) { buf_puts(b, v < 0 ? "-Infinity" : "Infinity"); return; }
+    char e[40];
+    for (int prec = 1; prec <= 17; prec++) {
+        snprintf(e, sizeof(e), "%.*e", prec - 1, v);
+        if (strtod(e, NULL) == v) break;
+    }
+    const char *q = e;
+    if (*q == '-') { buf_putc(b, '-'); q++; }
+    char digits[24];
+    int n = 0;
+    for (; *q && *q != 'e'; q++)
+        if (*q != '.') digits[n++] = *q;
+    while (n > 1 && digits[n - 1] == '0') n--;
+    digits[n] = '\0';
+    const int exp10 = atoi(q + 1), point = exp10 + 1;
+    if (exp10 < -4 || exp10 >= 16) {
+        buf_putc(b, digits[0]);
+        if (n > 1) { buf_putc(b, '.'); buf_puts(b, digits + 1); }
+        buf_printf(b, "e%c%02d", exp10 < 0 ? '-' : '+', exp10 < 0 ? -exp10 : exp10);
+    } else if (point <= 0) {
+        buf_puts(b, "0.");
+        for (int i = 0; i < -point; i++) buf_putc(b, '0');
+        buf_puts(b, digits);
+    } else if (point >= n) {
+        buf_puts(b, digits);
+        for (int i = n; i < point; i++) buf_putc(b, '0');
+        buf_puts(b, ".0");
+    } else {
+        buf_append(b, digits, (size_t)point);
+        buf_putc(b, '.');
+        buf_puts(b, digits + point);
+    }
+}
+
+static bool json_python_value(buf *b, const char **p, int depth) {
+    json_ws(p);
+    if (depth > 64) return false;
+    if (**p == '{' || **p == '[') {
+        const bool object = **p == '{';
+        const char close = object ? '}' : ']';
+        buf_putc(b, **p);
+        (*p)++;
+        json_ws(p);
+        for (bool first = true; **p != close; first = false) {
+            if (!first) {
+                if (**p != ',') return false;
+                (*p)++;
+                buf_puts(b, ", ");
+            }
+            if (object) {
+                char *key = NULL;
+                if (!json_string(p, &key)) return false;
+                json_python_string(b, key);
+                free(key);
+                json_ws(p);
+                if (**p != ':') return false;
+                (*p)++;
+                buf_puts(b, ": ");
+            }
+            if (!json_python_value(b, p, depth + 1)) return false;
+            json_ws(p);
+        }
+        (*p)++;
+        buf_putc(b, close);
+        return true;
+    }
+    if (**p == '"') {
+        char *s = NULL;
+        if (!json_string(p, &s)) return false;
+        json_python_string(b, s);
+        free(s);
+        return true;
+    }
+    if (json_lit(p, "true")) { buf_puts(b, "true"); return true; }
+    if (json_lit(p, "false")) { buf_puts(b, "false"); return true; }
+    if (json_lit(p, "null")) { buf_puts(b, "null"); return true; }
+    const char *start = *p;
+    if (**p == '-') (*p)++;
+    if (!isdigit((unsigned char)**p)) return false;
+    bool integer = true;
+    while (**p && (isdigit((unsigned char)**p) || strchr(".eE+-", **p))) {
+        if (!isdigit((unsigned char)**p)) integer = false;
+        (*p)++;
+    }
+    char *text = xstrndup(start, (size_t)(*p - start));
+    if (!integer) json_python_float(b, strtod(text, NULL));
+    else if (!strcmp(text, "-0")) buf_putc(b, '0');
+    else buf_puts(b, text);
+    free(text);
+    return true;
+}
+
+/* A raw JSON value in Python spelling; the input itself if it is not JSON. */
+static char *json_python_style(const char *raw) {
+    const char *p = raw ? raw : "";
+    buf b = {0};
+    if (!json_python_value(&b, &p, 0)) {
+        buf_free(&b);
+        return xstrdup(raw ? raw : "");
+    }
+    return buf_take(&b);
+}
+
+/* One tool schema as DeepSeek's encoder writes it: a Chat Completions
+ * function object as given, a Messages tool as name, description and
+ * parameters. */
+static void append_ds41_tool_schema(buf *b, const char *raw) {
+    const char *p = raw;
+    char *name = NULL, *description = NULL, *schema = NULL;
+    bool anthropic = false, ok = true;
+    json_ws(&p);
+    if (*p == '{') {
+        p++;
+        json_ws(&p);
+        while (ok && *p && *p != '}') {
+            char *key = NULL;
+            ok = json_string(&p, &key);
+            json_ws(&p);
+            ok = ok && *p == ':';
+            if (ok) p++;
+            if (ok && !strcmp(key, "name")) ok = json_string_replace(&p, &name);
+            else if (ok && !strcmp(key, "description")) ok = json_string_replace(&p, &description);
+            else if (ok && !strcmp(key, "input_schema")) {
+                anthropic = true;
+                free(schema);
+                ok = json_raw_value(&p, &schema);
+            } else if (ok) ok = json_skip_value(&p);
+            free(key);
+            json_ws(&p);
+            if (*p == ',') p++;
+            json_ws(&p);
+        }
+    }
+    if (ok && anthropic) {
+        char *parameters = json_python_style(schema);
+        buf_puts(b, "{\"name\": ");
+        json_python_string(b, name ? name : "");
+        buf_puts(b, ", \"description\": ");
+        json_python_string(b, description ? description : "");
+        buf_puts(b, ", \"parameters\": ");
+        buf_puts(b, parameters);
+        buf_putc(b, '}');
+        free(parameters);
+    } else {
+        char *dumped = json_python_style(raw);
+        buf_puts(b, dumped);
+        free(dumped);
+    }
+    free(name);
+    free(description);
+    free(schema);
+}
+
+/* DeepSeek's V4.1 TOOLS_TEMPLATE (encoding/encoding.py), byte for byte. */
+static void append_ds41_tools_prompt_text(buf *b, const char *tool_schemas) {
+    buf_puts(b,
         "## Tools\n\n"
-        "You can invoke tools using this format:\n\n"
+        "You have access to a set of tools to help answer the user's question. "
+        "You can invoke tools by writing a \"" DS41_TOOL_CALLS_START "\" block like the following:\n\n"
         DS41_TOOL_CALLS_START "\n"
         DS41_INVOKE_START " name=\"$TOOL_NAME\">\n"
         DS41_PARAM_START " name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" DS41_PARAM_END "\n"
-        DS41_INVOKE_END "\n" DS41_TOOL_CALLS_END "\n\n"
-        "String values use string=\"true\"; all other values use JSON and string=\"false\". "
-        "Inside string values only, escape a literal </｜DSML｜ parameter> as &lt;/｜DSML｜ parameter>. "
-        "To write that escaped spelling literally, use &amp;lt;/｜DSML｜ parameter>. Other HTML entities are unchanged.\n\n"
-        "Finish reasoning with </think> before tool calls or a final response.\n\n"
+        "...\n"
+        DS41_INVOKE_END "\n"
+        DS41_INVOKE_START " name=\"$TOOL_NAME2\">\n"
+        "...\n"
+        DS41_INVOKE_END "\n"
+        DS41_TOOL_CALLS_END "\n\n"
+        "String parameters should be specified as is and set `string=\"true\"`. "
+        "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning "
+        "inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+        "Otherwise, output directly after </think> with tool calls or final response.\n\n"
         "### Available Tool Schemas\n\n");
-    else buf_puts(b,
+    /* The schema list holds one raw JSON value per tool. */
+    const char *p = tool_schemas;
+    for (bool first = true;; first = false) {
+        json_ws(&p);
+        const char *start = p;
+        if (!*p || !json_skip_value(&p)) break;
+        char *raw = xstrndup(start, (size_t)(p - start));
+        if (!first) buf_putc(b, '\n');
+        append_ds41_tool_schema(b, raw);
+        free(raw);
+    }
+    buf_puts(b, "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n");
+}
+
+static void append_tools_prompt_text(buf *b, const char *tool_schemas, bool v41) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    if (v41) {
+        append_ds41_tools_prompt_text(b, tool_schemas);
+        return;
+    }
+    buf_puts(b,
         "## Tools\n\n"
         "You have access to a set of tools to help answer the user question. "
         "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
@@ -2965,8 +3172,16 @@ static void append_dsml_arg(buf *b, const json_arg *arg, bool v41) {
     buf_puts(b, "\" string=\"");
     buf_puts(b, arg->is_string ? "true" : "false");
     buf_puts(b, "\">");
-    if (arg->is_string) append_dsml_parameter_text(b, arg->value, v41);
-    else append_dsml_json_literal(b, arg->value, v41);
+    if (arg->is_string) {
+        append_dsml_parameter_text(b, arg->value, v41);
+    } else if (v41) {
+        /* DeepSeek's encoder writes json.dumps(value). */
+        char *value = json_python_style(arg->value);
+        append_dsml_json_literal(b, value, v41);
+        free(value);
+    } else {
+        append_dsml_json_literal(b, arg->value, v41);
+    }
     buf_puts(b, v41 ? DS41_PARAM_END "\n" : "</｜DSML｜parameter>\n");
 }
 
@@ -3501,22 +3716,29 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
     if (live_tail) {
         buf_puts(&out, "<｜end▁of▁sentence｜>");
     } else {
+        /* The effort line, then the initial system prompt, then the tools,
+         * as DeepSeek's encoder appends them to the first system message. */
         buf_puts(&out, "<｜begin▁of▁sentence｜>");
-        if (effort || (tool_schemas && tool_schemas[0])) {
+        const chat_msg *first = msgs && msgs->len ? ordered[0] : NULL;
+        const bool first_system = first && role_is_system(first->role);
+        if (effort || (tool_schemas && tool_schemas[0]) || first_system) {
             buf_puts(&out, "<｜System｜>");
             initial_system = true;
             if (effort) buf_puts(&out, effort);
-            if (tool_schemas && tool_schemas[0])
+            if (first_system) buf_puts(&out, first->content ? first->content : "");
+            if (tool_schemas && tool_schemas[0]) {
+                buf_puts(&out, "\n\n");
                 append_tools_prompt_text(&out, tool_schemas, true);
+            }
         }
     }
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = ordered[i];
         if (role_is_system(m->role)) {
-            if (i == 0 && initial_system) {
-                if (tool_schemas && tool_schemas[0]) buf_puts(&out, "\n\n");
-            } else buf_puts(&out, "<｜System｜>");
-            buf_puts(&out, m->content ? m->content : "");
+            if (i > 0 || !initial_system) {
+                buf_puts(&out, "<｜System｜>");
+                buf_puts(&out, m->content ? m->content : "");
+            }
             pending = i > 0 || live_tail;
             user_open = false;
         } else if (role_is_user_like(m->role)) {
@@ -25115,6 +25337,54 @@ static void test_deepseek41_block_separators(void) {
     chat_msgs_free(&msgs);
 }
 
+/* DeepSeek's encoder appends its TOOLS_TEMPLATE to the first system message
+ * and writes schemas and non-string arguments with json.dumps. */
+static void test_deepseek41_tools_prompt(void) {
+    static const struct { const char *in, *out; } values[] = {
+        {"{\"a\":[1,2.50,-0,1e2],\"b\":{\"c\":null,\"d\":true}}",
+         "{\"a\": [1, 2.5, 0, 100.0], \"b\": {\"c\": null, \"d\": true}}"},
+        {"[1e-5,1.5e-7,0.0001,1e16,1e15,-0.0,123456789012345678]",
+         "[1e-05, 1.5e-07, 0.0001, 1e+16, 1000000000000000.0, -0.0, 123456789012345678]"},
+        {"\"caf\\u00e9 \\/ \\b\\f\\u0001\"", "\"caf\xc3\xa9 / \\b\\f\\u0001\""},
+        {"not json", "not json"},
+    };
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        char *got = json_python_style(values[i].in);
+        TEST_ASSERT(!strcmp(got, values[i].out));
+        free(got);
+    }
+
+    const char *json = "[{\"role\":\"user\",\"content\":\"Run\"},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"bash\","
+        "\"input\":{\"command\":\"ls\",\"flags\":[\"-l\",\"-a\"],\"timeout\":2.50}}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"c\",\"content\":\"ok\"}]}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&json, &msgs));
+    chat_msg sys = {.role = xstrdup("system"), .content = xstrdup("Be brief.")};
+    chat_msgs_push(&msgs, sys);
+    memmove(msgs.v + 1, msgs.v, (size_t)(msgs.len - 1) * sizeof(msgs.v[0]));
+    msgs.v[0] = sys;
+    const char *tools = "{\"name\":\"bash\",\"description\":\"Shell.\","
+        "\"input_schema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}\n"
+        "{\"name\":\"read\",\"parameters\":{},\"strict\":true}";
+    char *text = render_deepseek41_chat(&msgs, 0, tools, DS4_THINK_HIGH, false);
+    const char *effort = ds4_deepseek41_reasoning_effort_text(DS4_THINK_HIGH);
+    char head[512];
+    snprintf(head, sizeof(head), "<｜begin▁of▁sentence｜><｜System｜>%sBe brief.\n\n## Tools\n\n"
+             "You have access to a set of tools to help answer the user's question.", effort);
+    TEST_ASSERT(!strncmp(text, head, strlen(head)));
+    TEST_ASSERT(strstr(text, "### Available Tool Schemas\n\n"
+        "{\"name\": \"bash\", \"description\": \"Shell.\", \"parameters\": "
+        "{\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}}}\n"
+        "{\"name\": \"read\", \"parameters\": {}, \"strict\": true}\n\n"
+        "You MUST strictly follow the above defined tool name and parameter schemas "
+        "to invoke tool calls.\n<｜User｜>Run<｜Assistant｜><think></think>"));
+    TEST_ASSERT(strstr(text, DS41_PARAM_START " name=\"flags\" string=\"false\">[\"-l\", \"-a\"]" DS41_PARAM_END "\n"
+                             DS41_PARAM_START " name=\"timeout\" string=\"false\">2.5" DS41_PARAM_END));
+    free(text);
+    chat_msgs_free(&msgs);
+}
+
 static void test_deepseek41_live_result_order(void) {
     server s = {0};
     server_slot slot;
@@ -25162,6 +25432,7 @@ static void ds4_server_unit_tests_run(void) {
     test_deepseek41_live_result_order();
     test_deepseek41_current_turn_reasoning();
     test_deepseek41_block_separators();
+    test_deepseek41_tools_prompt();
     test_visible_image_key();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
