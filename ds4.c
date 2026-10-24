@@ -64970,6 +64970,15 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
 
+/* V4.1 sweeps its prompt in chunks counted from wherever the prefill resumed
+ * (a restored checkpoint or the chat anchor), so its prefill_chunk boundaries
+ * are multiples of the KV store's continued interval only by accident.  The
+ * other backends' chunk ends and the CPU path's per-token progress land on the
+ * store's own grid and keep the exact-multiple schedule. */
+bool ds4_session_prefill_boundaries_anchored(const ds4_session *s) {
+    return ds4_session_is_ds41(s) && !ds4_session_is_cpu(s);
+}
+
 #ifndef DS4_NO_GPU
 static void spec_frontier_free(ds4_spec_frontier *f) {
     if (!f) return;
@@ -79339,8 +79348,25 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             decoder_pending = defer_decoder;
             pending_logits = true;
             s->checkpoint_valid = false;
-            if (s->progress)
+            if (s->progress) {
+                /* The KV store writes its continued checkpoints from this
+                 * callback and refuses a session whose logits do not match the
+                 * last checkpoint token, so the deferred output head meant a
+                 * long prefill left nothing on disk until it finished.  Take
+                 * the head for the chunk's last row here: every sweep ends with
+                 * that row through all layers (the decoder suffix, CED and
+                 * SUFFIX_TRIM all keep it) and g->pos at the checkpoint's
+                 * length, as the final head below relies on.  A deferred
+                 * decoder has not run its upper layers and leaves g->valid
+                 * false, so the head fails and the checkpoint stays invalid.
+                 * Two-rank TP takes its head on both ranks together, so it
+                 * keeps the deferred head. */
+                if (!decoder_pending && g->tp_world == 1 &&
+                    ds41_graph_logits(g, &e->model, &e->weights, s->logits))
+                    s->checkpoint_valid = true;
                 s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+                s->checkpoint_valid = false;
+            }
         }
         ds41_encoder_release(g, &e->model, &encoder);
         if (decoder_pending) {

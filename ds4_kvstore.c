@@ -1239,6 +1239,23 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     return live_tokens;
 }
 
+/* The same schedule read as "the next multiple has been reached or passed",
+ * storing the length the caller has.  A payload is the live frontier and cannot
+ * be trimmed back to an aligned position, and it does not need to be: lookup is
+ * by text prefix and accepts any stored length, and the boundary offered is a
+ * real backend chunk boundary, which is what the alignment grid stands in for.
+ * Where a caller's boundaries already are multiples of the step this returns
+ * exactly what ds4_kvstore_continued_store_target() returns. */
+int ds4_kvstore_continued_store_target_crossing(const ds4_kvstore *kc, int live_tokens) {
+    const int step = kv_cache_continued_step(kc);
+    if (step <= 0) return 0;
+    if (live_tokens < kc->opt.min_tokens) return 0;
+    const int last = kc->continued_last_store_tokens;
+    if (live_tokens <= last) return 0;
+    const int next = (last / step + 1) * step;
+    return live_tokens >= next ? live_tokens : 0;
+}
+
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
     if (tokens > kc->continued_last_store_tokens) {
         kc->continued_last_store_tokens = tokens;
