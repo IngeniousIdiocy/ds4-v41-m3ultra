@@ -7425,6 +7425,37 @@ int main(int argc, char **argv) {
         free(text); chat_msgs_free(&msgs);
         return 0;
     }
+    if (argc == 3 && !strcmp(argv[1], "--tokenize-json")) {
+        /* One JSON array of token ids per line for a JSON array of texts,
+         * tokenized as rendered chat text (DS4_TEST_MODEL vocabulary). */
+        char *body = test_read_file(argv[2]);
+        if (!body) return 2;
+        ds4_engine_options opt = {0};
+        opt.model_path = test_model_path();
+        opt.backend = DS4_BACKEND_CPU;
+        opt.inspect_only = true;
+        ds4_engine *e = NULL;
+        if (ds4_engine_open(&e, &opt) != 0 || !e) return 2;
+        const char *p = body;
+        json_ws(&p);
+        if (*p++ != '[') return 2;
+        for (json_ws(&p); *p && *p != ']'; json_ws(&p)) {
+            char *text = NULL;
+            if (!json_string(&p, &text)) return 2;
+            ds4_tokens tokens = {0};
+            ds4_tokenize_rendered_chat(e, text, &tokens);
+            putchar('[');
+            for (int i = 0; i < tokens.len; i++) printf(i ? ",%d" : "%d", tokens.v[i]);
+            puts("]");
+            ds4_tokens_free(&tokens);
+            free(text);
+            json_ws(&p);
+            if (*p == ',') p++;
+        }
+        free(body);
+        ds4_engine_close(e);
+        return 0;
+    }
     if (argc == 4 && !strcmp(argv[1], "--ds41-request-tokens")) {
         /* Token ids of one Chat Completions or Messages request body, through
          * the server's own parser and renderer. Each image becomes

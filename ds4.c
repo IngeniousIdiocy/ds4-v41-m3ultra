@@ -45380,36 +45380,6 @@ static uint32_t utf8_peek_one(const char *s, uint64_t len, uint64_t pos, uint64_
            ((uint32_t)((uint8_t)s[pos + 3] & 0x3f));
 }
 
-static bool joyai_letter_like_at(const char *s, uint64_t len, uint64_t pos) {
-    (void)len;
-    uint8_t c = (uint8_t)s[pos];
-    if (c < 128) return ascii_alpha(c);
-
-    /*
-     * The JoyAI tokenizer maps Unicode letters into a collapsed regex alphabet before
-     * applying the JoyAI pre-tokenizer.  The prompts we care about are mostly
-     * ASCII, but treating non-ASCII non-control bytes as letters preserves the
-     * useful behavior for ordinary UTF-8 text such as Italian accents.  CJK and
-     * kana are isolated by the JoyAI pre-tokenizer before the generic letter
-     * rule, below.
-     */
-    return true;
-}
-
-static uint64_t joyai_consume_letters(const char *s, uint64_t len, uint64_t pos) {
-    while (pos < len && joyai_letter_like_at(s, len, pos)) {
-        pos = next_utf8_char(s, len, pos);
-    }
-    return pos;
-}
-
-static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
-    if ((uint8_t)s[pos] < 128) return false;
-    uint64_t next = pos;
-    uint32_t cp = utf8_peek_one(s, len, pos, &next);
-    return utf8_is_cjk_hira_kata(cp);
-}
-
 typedef struct {
     uint32_t cp;
     uint64_t next;
@@ -45802,23 +45772,138 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
     }
 }
 
-/*
- * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
- * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
- * uses in normal text and source-code prompts:
+#include "ds4_deepseek_unicode.inc"
+
+static uint32_t deepseek_uclass(uint32_t cp) {
+    size_t lo = 0, hi = sizeof(ds4_deepseek_uranges) / sizeof(ds4_deepseek_uranges[0]);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (cp < ds4_deepseek_uranges[mid].lo) hi = mid;
+        else if (cp > ds4_deepseek_uranges[mid].hi) lo = mid + 1;
+        else return ds4_deepseek_uranges[mid].mask;
+    }
+    return 0;
+}
+
+typedef struct {
+    uint32_t cp, cls;
+    uint64_t next;
+} deepseek_char;
+
+static deepseek_char deepseek_char_at(const char *s, uint64_t end, uint64_t pos) {
+    deepseek_char c;
+    c.cp = utf8_peek_one(s, end, pos, &c.next);
+    c.cls = deepseek_uclass(c.cp);
+    return c;
+}
+
+static uint64_t deepseek_run(const char *s, uint64_t pos, uint64_t end, uint32_t mask) {
+    while (pos < end) {
+        const deepseek_char c = deepseek_char_at(s, end, pos);
+        if (!(c.cls & mask)) break;
+        pos = c.next;
+    }
+    return pos;
+}
+
+static uint64_t deepseek_run_newlines(const char *s, uint64_t pos, uint64_t end) {
+    while (pos < end && ascii_newline((uint8_t)s[pos])) pos++;
+    return pos;
+}
+
+/* End of the regex match starting at pos within [pos, end), or pos when no
+ * alternative matches there. The alternatives, tried in order:
  *
- *   \p{N}{1,3}
- *   [CJK/Hiragana/Katakana]+
- *   [P/S][A-Za-z]+
+ *   [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+
  *   [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
  *    ?[\p{P}\p{S}]+[\r\n]*
  *   \s*[\r\n]+
  *   \s+(?!\S)
  *   \s+
  *
- * The punctuation rule intentionally keeps trailing newlines in the same BPE
- * word (for example ">;\n").  Splitting those newlines separately changes the
- * token stream for code prompts and produces wrong long-context logits.
+ * The punctuation rule keeps trailing newlines in the same BPE word (for
+ * example ">;\n"), as code prompts need. */
+static uint64_t deepseek_match(const char *s, uint64_t pos, uint64_t end) {
+    const uint32_t LM = DS4_UCLASS_L | DS4_UCLASS_M, PS = DS4_UCLASS_P | DS4_UCLASS_S;
+    const deepseek_char c = deepseek_char_at(s, end, pos);
+    const bool more = c.next < end;
+    const deepseek_char n = more ? deepseek_char_at(s, end, c.next) : (deepseek_char){0};
+
+    if (c.cp < 128 && joyai_ascii_punct_symbol((uint8_t)c.cp) && more &&
+        n.cp < 128 && ascii_alpha((uint8_t)n.cp)) {
+        uint64_t p = n.next;
+        while (p < end && ascii_alpha((uint8_t)s[p])) p++;
+        return p;
+    }
+    if (c.cp != '\r' && c.cp != '\n' && !(c.cls & (DS4_UCLASS_L | PS)) && more && (n.cls & LM))
+        return deepseek_run(s, n.next, end, LM);
+    if (c.cls & LM) return deepseek_run(s, c.next, end, LM);
+    if (c.cp == ' ' && more && (n.cls & PS))
+        return deepseek_run_newlines(s, deepseek_run(s, n.next, end, PS), end);
+    if (c.cls & PS) return deepseek_run_newlines(s, deepseek_run(s, c.next, end, PS), end);
+    if (!(c.cls & DS4_UCLASS_WS)) return pos;
+    uint64_t p = pos, last = pos, newline_end = 0;
+    int count = 0;
+    while (p < end) {
+        const deepseek_char w = deepseek_char_at(s, end, p);
+        if (!(w.cls & DS4_UCLASS_WS)) break;
+        if (w.cp == '\r' || w.cp == '\n') newline_end = w.next;
+        last = p;
+        p = w.next;
+        count++;
+    }
+    if (newline_end) return newline_end;  /* \s*[\r\n]+ */
+    if (p < end && count > 1) return last; /* \s+(?!\S) leaves one space to the word */
+    return p;                              /* \s+(?!\S) at the end, or \s+ */
+}
+
+/* An isolating split emits each match and each run between matches. */
+static void deepseek_split_regex(const ds4_vocab *vocab, const char *s,
+                                 uint64_t pos, uint64_t end, token_vec *out) {
+    uint64_t gap = pos;
+    while (pos < end) {
+        const uint64_t m = deepseek_match(s, pos, end);
+        if (m == pos) {
+            pos = deepseek_char_at(s, end, pos).next;
+            continue;
+        }
+        if (gap < pos) bpe_emit_piece(vocab, (ds4_str){ s + gap, pos - gap }, out);
+        bpe_emit_piece(vocab, (ds4_str){ s + pos, m - pos }, out);
+        gap = pos = m;
+    }
+    if (gap < end) bpe_emit_piece(vocab, (ds4_str){ s + gap, end - gap }, out);
+}
+
+static void deepseek_split_cjk(const ds4_vocab *vocab, const char *s,
+                               uint64_t pos, uint64_t end, token_vec *out) {
+    uint64_t gap = pos;
+    while (pos < end) {
+        deepseek_char c = deepseek_char_at(s, end, pos);
+        if (!utf8_is_cjk_hira_kata(c.cp)) {
+            pos = c.next;
+            continue;
+        }
+        const uint64_t start = pos;
+        while (pos < end && utf8_is_cjk_hira_kata((c = deepseek_char_at(s, end, pos)).cp))
+            pos = c.next;
+        deepseek_split_regex(vocab, s, gap, start, out);
+        deepseek_split_regex(vocab, s, start, pos, out);
+        gap = pos;
+    }
+    deepseek_split_regex(vocab, s, gap, end, out);
+}
+
+/*
+ * DeepSeek V4 and V4.1 pre-tokenization (tokenizer.json, ggml pre
+ * "joyai-llm"): a sequence of three isolating splits, each applied to the
+ * pieces of the one before,
+ *
+ *   \p{N}{1,3}
+ *   [一-龥぀-ゟ゠-ヿ]+
+ *   the alternation in deepseek_match()
+ *
+ * with Unicode classes generated from the Hugging Face tokenizers regex
+ * engine (ds4_deepseek_unicode.inc).
  */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -45831,72 +45916,22 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
 
     const uint64_t len = strlen(text);
-    uint64_t pos = 0;
-
+    uint64_t pos = 0, gap = 0;
     while (pos < len) {
-        uint64_t start = pos;
-        uint8_t c = (uint8_t)text[pos];
-
-        if (ascii_digit(c)) {
-            int ndigits = 0;
-            while (pos < len && ascii_digit((uint8_t)text[pos]) && ndigits < 3) {
-                pos++;
-                ndigits++;
-            }
-        } else if (joyai_cjk_at(text, len, pos)) {
-            do {
-                pos = next_utf8_char(text, len, pos);
-            } while (pos < len && joyai_cjk_at(text, len, pos));
-        } else if (joyai_ascii_punct_symbol(c) &&
-                   pos + 1 < len &&
-                   ascii_alpha((uint8_t)text[pos + 1])) {
-            pos++;
-            while (pos < len && ascii_alpha((uint8_t)text[pos])) pos++;
-        } else if (joyai_letter_like_at(text, len, pos)) {
-            pos = joyai_consume_letters(text, len, pos);
-        } else if (!ascii_newline(c) &&
-                   !joyai_ascii_punct_symbol(c) &&
-                   pos + 1 < len &&
-                   joyai_letter_like_at(text, len, pos + 1)) {
-            pos++;
-            pos = joyai_consume_letters(text, len, pos);
-        } else if (c == ' ' &&
-                   pos + 1 < len &&
-                   joyai_ascii_punct_symbol((uint8_t)text[pos + 1])) {
-            pos++;
-            while (pos < len && joyai_ascii_punct_symbol((uint8_t)text[pos])) pos++;
-            while (pos < len && ascii_newline((uint8_t)text[pos])) pos++;
-        } else if (joyai_ascii_punct_symbol(c)) {
-            while (pos < len && joyai_ascii_punct_symbol((uint8_t)text[pos])) pos++;
-            while (pos < len && ascii_newline((uint8_t)text[pos])) pos++;
-        } else if (ascii_space(c)) {
-            uint64_t p = pos;
-            uint64_t last_newline_end = 0;
-            while (p < len && ascii_space((uint8_t)text[p])) {
-                uint8_t sc = (uint8_t)text[p++];
-                if (ascii_newline(sc)) last_newline_end = p;
-            }
-            if (last_newline_end) {
-                pos = last_newline_end;
-            } else if (p < len && p > pos + 1 &&
-                       (joyai_letter_like_at(text, len, p) ||
-                        joyai_ascii_punct_symbol((uint8_t)text[p]))) {
-                /*
-                 * JoyAI lets a single leading space join the following word or
-                 * punctuation run.  For "    int", the pre-tokenizer therefore emits
-                 * "   " then " int", not "    " then "int".
-                 */
-                pos = p - 1;
-            } else {
-                pos = p;
-            }
-        } else {
-            pos = next_utf8_char(text, len, pos);
+        deepseek_char c = deepseek_char_at(text, len, pos);
+        if (!(c.cls & DS4_UCLASS_N)) {
+            pos = c.next;
+            continue;
         }
-
-        if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+        deepseek_split_cjk(vocab, text, gap, pos, out);
+        const uint64_t start = pos;
+        for (int k = 0; k < 3 && pos < len &&
+                        ((c = deepseek_char_at(text, len, pos)).cls & DS4_UCLASS_N); k++)
+            pos = c.next;
+        deepseek_split_cjk(vocab, text, start, pos, out);
+        gap = pos;
     }
+    deepseek_split_cjk(vocab, text, gap, len, out);
 }
 
 static int vocab_lookup(const ds4_vocab *vocab, const char *text) {

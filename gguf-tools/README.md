@@ -446,6 +446,9 @@ N-grams always retain the original BF16 bytes. The converter finishes through
 the native packer above; its temporary main-weight file is removed on success.
 `gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
 pre-tokenizer from a current `regex` release.
+`gen_deepseek_unicode.py` regenerates `ds4_deepseek_unicode.inc` for the
+DeepSeek V4/V4.1 pre-tokenizer from the Hugging Face `tokenizers` regex engine;
+`tests/test_deepseek_tokenizer.py` checks the result against `tokenizer.json`.
 
 `make test-qwen4-kernels` runs the Metal kernel tests and
 `make test-qwen4-vision` checks the vision tower against the HF implementation
