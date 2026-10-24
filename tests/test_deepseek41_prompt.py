@@ -28,10 +28,8 @@ def anthropic_messages(messages):
                                "name": call["function"]["name"],
                                "input": json.loads(call["function"]["arguments"])})
         if role == "user" and converted and converted[-1]["role"] == "user":
-            # Consecutive text blocks have no separator in the Anthropic wire
-            # protocol. Insert the equivalent merged-turn boundary explicitly.
-            if blocks[0]["type"] == "text" and converted[-1]["content"][-1]["type"] == "text":
-                converted[-1]["content"].append({"type": "text", "text": "\n\n"})
+            # One message of several blocks: V4.1 joins them with a blank
+            # line, as the merged turns are.
             converted[-1]["content"].extend(blocks)
         else:
             converted.append({"content": blocks, "role": role})

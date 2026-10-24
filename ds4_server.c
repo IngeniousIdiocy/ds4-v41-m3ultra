@@ -766,6 +766,19 @@ typedef struct {
     char *id, *content;
 } tool_result_span;
 
+/* One block of a content array: its span in the message text, and for a
+ * tool_result its index in tool_results (-1 otherwise). V4.1 joins blocks
+ * with a blank line, as DeepSeek's encoder does. */
+typedef struct {
+    size_t begin, end;
+    int tool;
+} content_block;
+
+typedef struct {
+    content_block *v;
+    int len;
+} content_blocks;
+
 typedef struct {
     char *role;
     char *content;
@@ -778,6 +791,8 @@ typedef struct {
     tool_calls calls;
     tool_result_span *tool_results;
     int tool_results_len;
+    content_blocks blocks;           /* spans in content; empty for a plain string */
+    content_blocks thinking_blocks;  /* spans in reasoning */
 } chat_msg;
 
 typedef struct {
@@ -925,7 +940,37 @@ static void chat_msg_free(chat_msg *m) {
         free(m->tool_results[i].content);
     }
     free(m->tool_results);
+    free(m->blocks.v);
+    free(m->thinking_blocks.v);
     memset(m, 0, sizeof(*m));
+}
+
+static void content_blocks_push(content_blocks *b, size_t begin, size_t end, int tool) {
+    b->v = xrealloc(b->v, (size_t)(b->len + 1) * sizeof(b->v[0]));
+    b->v[b->len++] = (content_block){.begin = begin, .end = end, .tool = tool};
+}
+
+static size_t text_len(const char *s) {
+    return s ? strlen(s) : 0;
+}
+
+/* The blocks of text joined with a blank line, or text itself when it is a
+ * single block. Blocks that do not fit text are ignored. */
+static bool content_blocks_fit(const content_blocks *b, const char *text) {
+    const size_t len = text_len(text);
+    for (int i = 0; i < b->len; i++)
+        if (b->v[i].begin > b->v[i].end || b->v[i].end > len) return false;
+    return true;
+}
+
+static char *content_blocks_join(const content_blocks *b, const char *text) {
+    if (b->len < 2 || !content_blocks_fit(b, text)) return xstrdup(text ? text : "");
+    buf out = {0};
+    for (int i = 0; i < b->len; i++) {
+        if (i) buf_puts(&out, "\n\n");
+        buf_append(&out, text + b->v[i].begin, b->v[i].end - b->v[i].begin);
+    }
+    return buf_take(&out);
 }
 
 static void chat_msgs_free(chat_msgs *msgs) {
@@ -2039,13 +2084,16 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     if (**p != '}') goto bad;
     (*p)++;
 
+    const size_t begin = text_len(msg->content);
     if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
         if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
             goto bad;
         append_owned_text(&msg->content, marker);
+        content_blocks_push(&msg->blocks, begin, text_len(msg->content), -1);
     } else if (text) {
         append_owned_text(&msg->content, text);
+        content_blocks_push(&msg->blocks, begin, text_len(msg->content), -1);
     }
     free(type);
     free(text);
@@ -2075,7 +2123,9 @@ static bool parse_openai_content(const char **p, chat_msg *msg) {
         if (**p == '"') {
             char *text = NULL;
             if (!json_string(p, &text)) return false;
+            const size_t begin = text_len(msg->content);
             append_owned_text(&msg->content, text);
+            content_blocks_push(&msg->blocks, begin, text_len(msg->content), -1);
             free(text);
         } else if (**p == '{') {
             if (!parse_openai_content_object(p, msg)) return false;
@@ -2120,6 +2170,8 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 free(msg.content);
                 msg.content = NULL;
                 server_image_inputs_free(&msg.images);
+                free(msg.blocks.v);
+                msg.blocks = (content_blocks){0};
                 if (!parse_openai_content(p, &msg)) {
                     free(key);
                     goto fail;
@@ -2328,13 +2380,14 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
         append_tool_result_text(&b, nested.content);
         buf_puts(&b, "</tool_result>");
         /* Preserve parsed boundaries, not just markup which ordinary user
-         * text can also contain. V4.1 orders and separates these blocks. */
+         * text can also contain. V4.1 orders and separates these blocks,
+         * and joins a result's own blocks with a blank line. */
         msg->tool_results = xrealloc(msg->tool_results,
             (size_t)(msg->tool_results_len + 1) * sizeof(msg->tool_results[0]));
         msg->tool_results[msg->tool_results_len++] = (tool_result_span){
             .begin = begin, .end = b.len, .id = id ? xstrdup(id) : NULL,
-            .content = nested.content};
-        nested.content = NULL;
+            .content = content_blocks_join(&nested.blocks, nested.content)};
+        content_blocks_push(&msg->blocks, begin, b.len, msg->tool_results_len - 1);
         free(msg->content);
         msg->content = buf_take(&b);
         if (nested.images.len) {
@@ -2352,19 +2405,25 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
             !server_image_inputs_push_base64(&msg->images, media_type,
                                              image_data, marker))
             goto bad;
+        const size_t begin = text_len(msg->content);
         append_owned_text(&msg->content, marker);
+        content_blocks_push(&msg->blocks, begin, text_len(msg->content), -1);
     } else {
         if (text) {
             buf b = {0};
             buf_puts(&b, msg->content ? msg->content : "");
+            const size_t begin = b.len;
             append_anthropic_block_content(&b, text);
+            content_blocks_push(&msg->blocks, begin, b.len, -1);
             free(msg->content);
             msg->content = buf_take(&b);
         }
         if (thinking) {
             buf b = {0};
             buf_puts(&b, msg->reasoning ? msg->reasoning : "");
+            const size_t begin = b.len;
             append_anthropic_block_content(&b, thinking);
+            content_blocks_push(&msg->thinking_blocks, begin, b.len, -1);
             free(msg->reasoning);
             msg->reasoning = buf_take(&b);
         }
@@ -2411,7 +2470,9 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg, bool allow_to
             if (!json_string(p, &s)) return false;
             buf b = {0};
             buf_puts(&b, msg->content ? msg->content : "");
+            const size_t begin = b.len;
             buf_puts(&b, s);
+            content_blocks_push(&msg->blocks, begin, b.len, -1);
             free(msg->content);
             msg->content = buf_take(&b);
             free(s);
@@ -2499,13 +2560,15 @@ static bool anthropic_system_part_is_private(const char *s) {
     return s && !strncmp(s, "x-anthropic-", 12);
 }
 
-static void append_anthropic_system_part(buf *b, const char *s) {
+static void append_anthropic_system_part(buf *b, content_blocks *blocks, const char *s) {
     if (!s || !s[0] || anthropic_system_part_is_private(s)) return;
     if (b->len && b->ptr[b->len - 1] != '\n') buf_putc(b, '\n');
+    const size_t begin = b->len;
     buf_puts(b, s);
+    content_blocks_push(blocks, begin, b->len, -1);
 }
 
-static bool parse_anthropic_system_object(const char **p, buf *out) {
+static bool parse_anthropic_system_object(const char **p, buf *out, content_blocks *blocks) {
     if (**p != '{') return false;
     (*p)++;
     json_ws(p);
@@ -2524,7 +2587,7 @@ static bool parse_anthropic_system_object(const char **p, buf *out) {
                 free(key);
                 return false;
             }
-            append_anthropic_system_part(out, text);
+            append_anthropic_system_part(out, blocks, text);
             free(text);
         } else if (!json_skip_value(p)) {
             free(key);
@@ -2540,13 +2603,13 @@ static bool parse_anthropic_system_object(const char **p, buf *out) {
     return true;
 }
 
-static bool parse_anthropic_system(const char **p, char **out) {
+static bool parse_anthropic_system(const char **p, char **out, content_blocks *blocks) {
     json_ws(p);
     buf b = {0};
     if (**p == '"') {
         char *text = NULL;
         if (!json_string(p, &text)) return false;
-        append_anthropic_system_part(&b, text);
+        append_anthropic_system_part(&b, blocks, text);
         free(text);
         *out = buf_take(&b);
         return true;
@@ -2566,10 +2629,10 @@ static bool parse_anthropic_system(const char **p, char **out) {
         if (**p == '"') {
             char *text = NULL;
             if (!json_string(p, &text)) goto bad;
-            append_anthropic_system_part(&b, text);
+            append_anthropic_system_part(&b, blocks, text);
             free(text);
         } else if (**p == '{') {
-            if (!parse_anthropic_system_object(p, &b)) goto bad;
+            if (!parse_anthropic_system_object(p, &b, blocks)) goto bad;
         } else if (!json_skip_value(p)) {
             goto bad;
         }
@@ -3306,8 +3369,11 @@ typedef struct {
     size_t order, position;
 } ds41_tool_result_order;
 
-/* Most views borrow the original message. Only split Anthropic blocks own
- * strings, kept in fragments so the source history and image list stay intact. */
+/* Most views borrow the original message. A message whose content array
+ * has several blocks gets an owned view: user blocks become separate user
+ * and tool messages, which the renderer joins with a blank line, and other
+ * roles join their blocks the same way. Owned strings live in fragments so
+ * the source history and image list stay intact. */
 static chat_msgs ds41_message_views(const chat_msgs *msgs, chat_msgs *fragments,
                                     int *start) {
     chat_msgs views = {0};
@@ -3315,29 +3381,43 @@ static chat_msgs ds41_message_views(const chat_msgs *msgs, chat_msgs *fragments,
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (i == first) *start = views.len;
-        if (strcmp(m->role, "user") || !m->tool_results_len) {
+        bool fit = content_blocks_fit(&m->blocks, m->content);
+        for (int j = 0; fit && j < m->blocks.len; j++)
+            fit = m->blocks.v[j].tool < m->tool_results_len;
+        const bool split = fit && m->blocks.len &&
+                           (m->tool_results_len || m->blocks.len > 1);
+        if (!strcmp(m->role, "user") && split) {
+            for (int j = 0; j < m->blocks.len; j++) {
+                const content_block *block = &m->blocks.v[j];
+                chat_msg part = {0};
+                if (block->tool >= 0) {
+                    const tool_result_span *span = &m->tool_results[block->tool];
+                    part.role = xstrdup("tool");
+                    part.content = xstrdup(span->content ? span->content : "");
+                    part.tool_call_id = span->id ? xstrdup(span->id) : NULL;
+                } else {
+                    part.role = xstrdup("user");
+                    part.content = xstrndup(m->content + block->begin, block->end - block->begin);
+                }
+                chat_msgs_push(fragments, part);
+                chat_msgs_push(&views, part);
+            }
+            continue;
+        }
+        if (!strcmp(m->role, "user") || (!split && m->thinking_blocks.len < 2)) {
             chat_msgs_push(&views, *m);
             continue;
         }
-        size_t begin = 0, length = strlen(m->content);
-        for (int j = 0; j <= m->tool_results_len; j++) {
-            const tool_result_span *span = j < m->tool_results_len ? &m->tool_results[j] : NULL;
-            const size_t end = span ? span->begin : length;
-            if (end > begin) {
-                chat_msg text = {.role = xstrdup("user"),
-                    .content = xstrndup(m->content + begin, end - begin)};
-                chat_msgs_push(fragments, text);
-                chat_msgs_push(&views, text);
-            }
-            if (span) {
-                chat_msg result = {.role = xstrdup("tool"),
-                    .content = xstrdup(span->content ? span->content : ""),
-                    .tool_call_id = span->id ? xstrdup(span->id) : NULL};
-                chat_msgs_push(fragments, result);
-                chat_msgs_push(&views, result);
-                begin = span->end;
-            }
-        }
+        chat_msg joined = {.role = xstrdup(m->role),
+            .content = split ? content_blocks_join(&m->blocks, m->content) :
+                               xstrdup(m->content ? m->content : ""),
+            .reasoning = m->reasoning ?
+                content_blocks_join(&m->thinking_blocks, m->reasoning) : NULL};
+        chat_msgs_push(fragments, joined);
+        chat_msg view = *m;
+        view.content = joined.content;
+        view.reasoning = joined.reasoning;
+        chat_msgs_push(&views, view);
     }
     if (!msgs || first >= msgs->len) *start = views.len;
     return views;
@@ -4417,6 +4497,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     ds4_think_mode reasoning_effort = g_default_reasoning_effort;
     chat_msgs msgs = {0};
     char *system = NULL;
+    content_blocks system_blocks = {0};
     char *tool_schemas = NULL;
 
     json_ws(&p);
@@ -4441,7 +4522,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
             got_messages = true;
         } else if (!strcmp(key, "system")) {
             char *tmp = NULL;
-            if (!parse_anthropic_system(&p, &tmp)) {
+            free(system_blocks.v);
+            system_blocks = (content_blocks){0};
+            if (!parse_anthropic_system(&p, &tmp, &system_blocks)) {
                 free(key);
                 goto bad;
             }
@@ -4578,6 +4661,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         snprintf(err, errlen, "missing messages");
         chat_msgs_free(&msgs);
         free(system);
+        free(system_blocks.v);
         free(tool_schemas);
         request_free(r);
         return false;
@@ -4586,7 +4670,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         chat_msg msg = {0};
         msg.role = xstrdup("system");
         msg.content = system;
+        msg.blocks = system_blocks;
         system = NULL;
+        system_blocks = (content_blocks){0};
         chat_msgs_push(&msgs, msg);
         if (r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41) {
             /* This is the API's initial system prompt, not a later system
@@ -4607,6 +4693,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     {
         chat_msgs_free(&msgs);
         free(system);
+        free(system_blocks.v);
         free(tool_schemas);
         request_free(r);
         return false;
@@ -4623,17 +4710,20 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         free(system);
+        free(system_blocks.v);
         free(tool_schemas);
         request_free(r);
         return false;
     }
     chat_msgs_free(&msgs);
     free(system);
+    free(system_blocks.v);
     free(tool_schemas);
     return true;
 bad:
     chat_msgs_free(&msgs);
     free(system);
+    free(system_blocks.v);
     free(tool_schemas);
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
@@ -24981,6 +25071,50 @@ static void test_deepseek41_current_turn_reasoning(void) {
     chat_msgs_free(&msgs);
 }
 
+/* DeepSeek's encoder joins the blocks of a content array with a blank line:
+ * system parts, user text and images, tool_result parts, assistant text and
+ * thinking, and Chat Completions content parts. */
+static void test_deepseek41_block_separators(void) {
+    const char *json = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"One.\"},"
+        "{\"type\":\"text\",\"text\":\"Two.\"}]},"
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"t1\"},"
+        "{\"type\":\"thinking\",\"thinking\":\"t2\"},{\"type\":\"text\",\"text\":\"A.\"},"
+        "{\"type\":\"text\",\"text\":\"B.\"},"
+        "{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"read\",\"input\":{}}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"c\","
+        "\"content\":[{\"type\":\"text\",\"text\":\"head\"},{\"type\":\"text\",\"text\":\"tail\"}]},"
+        "{\"type\":\"text\",\"text\":\"Next.\"}]}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&json, &msgs));
+    const char *tools = "{\"name\":\"read\",\"input_schema\":{}}";
+    char *text = render_deepseek41_chat(&msgs, 0, tools, DS4_THINK_HIGH, false);
+    TEST_ASSERT(strstr(text, "<｜User｜>One.\n\nTwo.<｜Assistant｜><think>t1\n\nt2</think>A.\n\nB.\n\n"));
+    TEST_ASSERT(strstr(text, "<｜User｜><tool_result>head\n\ntail</tool_result>\n\nNext.<｜Assistant｜>"));
+    free(text);
+    /* Other templates keep their own joins. */
+    TEST_ASSERT(!strcmp(msgs.v[0].content, "One.Two.") && !strcmp(msgs.v[1].reasoning, "t1t2"));
+    chat_msgs_free(&msgs);
+
+    const char *system = "[{\"type\":\"text\",\"text\":\"Part one.\"},{\"type\":\"text\",\"text\":\"Part two.\"}]";
+    char *out = NULL;
+    content_blocks blocks = {0};
+    TEST_ASSERT(parse_anthropic_system(&system, &out, &blocks));
+    chat_msg sys = {.role = xstrdup("system"), .content = out, .blocks = blocks};
+    chat_msgs_push(&msgs, sys);
+    text = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_NONE, false);
+    TEST_ASSERT(!strcmp(text, "<｜begin▁of▁sentence｜><｜System｜>Part one.\n\nPart two."));
+    free(text);
+    chat_msgs_free(&msgs);
+
+    json = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"One.\"},"
+           "{\"type\":\"text\",\"text\":\"Two.\"}]}]";
+    TEST_ASSERT(parse_messages(&json, &msgs));
+    text = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_NONE, false);
+    TEST_ASSERT(strstr(text, "<｜User｜>One.\n\nTwo.<｜Assistant｜></think>"));
+    free(text);
+    chat_msgs_free(&msgs);
+}
+
 static void test_deepseek41_live_result_order(void) {
     server s = {0};
     server_slot slot;
@@ -25027,6 +25161,7 @@ static void ds4_server_unit_tests_run(void) {
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
     test_deepseek41_current_turn_reasoning();
+    test_deepseek41_block_separators();
     test_visible_image_key();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
