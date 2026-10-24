@@ -3676,6 +3676,18 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
 static uint32_t g_test_render_image_tokens;
 #endif
 
+typedef struct {
+    const char *at;
+    server_image_input *input;
+} server_image_order;
+
+static int server_image_order_compare(const void *a, const void *b) {
+    const server_image_order *x = a, *y = b;
+    /* A lost marker sorts first, so the splice below reports it. */
+    if (!x->at || !y->at) return (x->at != NULL) - (y->at != NULL);
+    return (x->at > y->at) - (x->at < y->at);
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3709,6 +3721,16 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         for (size_t j = 0; j < msgs->v[i].images.len; j++)
             inputs[next++] = &msgs->v[i].images.v[j];
     }
+    /* Rendering can reorder images: V4.1 sorts parallel tool results into
+     * call order. Bind each image where its marker landed, in prompt order. */
+    server_image_order *order = xmalloc(count * sizeof(order[0]));
+    for (size_t i = 0; i < count; i++) {
+        order[i].at = strstr(r->prompt_text, inputs[i]->marker);
+        order[i].input = inputs[i];
+    }
+    qsort(order, count, sizeof(order[0]), server_image_order_compare);
+    for (size_t i = 0; i < count; i++) inputs[i] = order[i].input;
+    free(order);
 
     /* An image missing from the embedding cache is only described when the
      * model allows it (V4.1): a cached prefix that already holds it never reads
