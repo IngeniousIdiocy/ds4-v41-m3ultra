@@ -47435,12 +47435,16 @@ static int sample_keyed(const float *logits, uint32_t n_vocab, const sample_key 
     return best >= 0 ? best : sample_argmax(logits, n_vocab);
 }
 
-/* DS4_V41_KEYED_SAMPLING: V4.1 samples with sample_keyed (not under TP), and
- * DSpark drafts are kept only when they equal the keyed sample, so sampled
- * output is the same with or without drafting. */
+/* V4.1 samples with sample_keyed (not under TP), and DSpark drafts are kept
+ * only when they equal the keyed sample, so sampled output follows the target
+ * distribution and is the same with or without drafting.
+ * DS4_V41_KEYED_SAMPLING=0 restores greedy-match acceptance. */
 static bool ds41_keyed_sampling(const ds4_engine *e, float temperature, const uint64_t *rng) {
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_V41_KEYED_SAMPLING") != NULL;
+    if (cached < 0) {
+        const char *v = getenv("DS4_V41_KEYED_SAMPLING");
+        cached = !v || strcmp(v, "0") != 0;
+    }
     return cached != 0 && temperature > 0.0f && rng && !e->tp.active;
 }
 

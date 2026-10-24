@@ -127,6 +127,12 @@ distribution. Greedy proposals are accepted with their target probability;
 sampled proposals use the target-to-draft probability ratio. Rejections sample
 from the remaining target probability mass.
 
+DeepSeek V4.1 instead samples with noise keyed to the seed and position, and
+keeps a DSpark draft only while it equals the token that sampling picks at
+its position. Sampled output therefore follows the target distribution, and
+the same seed gives the same text with or without drafting. Two-Mac runs keep
+the opportunistic mode; `DS4_V41_KEYED_SAMPLING=0` restores it on one Mac.
+
 When a verified block crosses a tool sampling-mode boundary (for example
 entering tool-call syntax during server decoding), the server rewinds to the
 block start and re-evaluates the boundary token so the next sample uses the
