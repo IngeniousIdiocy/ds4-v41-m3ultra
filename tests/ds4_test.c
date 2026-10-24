@@ -7425,6 +7425,45 @@ int main(int argc, char **argv) {
         free(text); chat_msgs_free(&msgs);
         return 0;
     }
+    if (argc == 4 && !strcmp(argv[1], "--ds41-request-tokens")) {
+        /* Token ids of one Chat Completions or Messages request body, through
+         * the server's own parser and renderer. Each image becomes
+         * DS4_RENDER_IMAGE_TOKENS (default 1) image-pad tokens. */
+        const bool anthropic = !strcmp(argv[2], "anthropic");
+        if (!anthropic && strcmp(argv[2], "openai")) return 2;
+        char *body = test_read_file(argv[3]);
+        if (!body) return 2;
+        const char *n = getenv("DS4_RENDER_IMAGE_TOKENS");
+        g_test_render_image_tokens = n && n[0] ? (uint32_t)strtoul(n, NULL, 10) : 1;
+        ds4_engine_options opt = {0};
+        opt.model_path = test_model_path();
+        opt.backend = DS4_BACKEND_CPU;
+        opt.inspect_only = true;
+        ds4_engine *e = NULL;
+        if (ds4_engine_open(&e, &opt) != 0 || !e) return 2;
+        request r;
+        char err[256] = {0};
+        const bool ok = anthropic ?
+            parse_anthropic_request(e, NULL, body, 128, 1 << 20, &r, err, sizeof(err)) :
+            parse_chat_request(e, NULL, body, 128, 1 << 20, &r, err, sizeof(err));
+        free(body);
+        if (!ok) {
+            fprintf(stderr, "ds4-test: %s\n", err);
+            ds4_engine_close(e);
+            return 1;
+        }
+        const char *text_path = getenv("DS4_RENDER_TEXT");
+        if (text_path && text_path[0]) {
+            FILE *fp = fopen(text_path, "w");
+            if (fp) { fputs(r.prompt_text ? r.prompt_text : "", fp); fclose(fp); }
+        }
+        putchar('[');
+        for (int i = 0; i < r.prompt.len; i++) printf(i ? ",%d" : "%d", r.prompt.v[i]);
+        puts("]");
+        request_free(&r);
+        ds4_engine_close(e);
+        return 0;
+    }
     bool run_all = argc == 1;
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
 

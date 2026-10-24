@@ -3670,6 +3670,12 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
 /* Per-request image cap; session and TP image state is sized dynamically. */
 #define SERVER_MAX_IMAGES 256
 
+#ifdef DS4_SERVER_TEST
+/* Render-only tests: each image becomes this many image-pad tokens instead of
+ * vision rows, so prompt token ids can be compared without a vision model. */
+static uint32_t g_test_render_image_tokens;
+#endif
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3685,7 +3691,12 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                  SERVER_MAX_IMAGES);
         return false;
     }
-    if (!e || !s || !ds4_engine_has_vision(e)) {
+#ifdef DS4_SERVER_TEST
+    const bool render_only = g_test_render_image_tokens > 0;
+#else
+    const bool render_only = false;
+#endif
+    if (!render_only && (!e || !s || !ds4_engine_has_vision(e))) {
         snprintf(err, errlen, "image input requires starting ds4-server with --vision FILE");
         return false;
     }
@@ -3705,9 +3716,10 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
     bool *described = xmalloc(count * sizeof(described[0]));
     bool any_described = false;
     bool ok = true;
-    server_inference_lock(s);
+    if (!render_only) server_inference_lock(s);
     for (size_t i = 0; i < count; i++) {
         described[i] = false;
+        if (render_only) continue;
         if (server_image_cached(s, inputs[i], &embeddings[i])) continue;
         if (ds4_engine_vision_describe_memory(e, inputs[i]->encoded, inputs[i]->encoded_len,
                                               &embeddings[i], err, errlen)) {
@@ -3719,7 +3731,7 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             break;
         }
     }
-    server_inference_unlock(s);
+    if (!render_only) server_inference_unlock(s);
     if (!ok) goto done;
 
     r->images = xmalloc(count * sizeof(r->images[0]));
@@ -3736,6 +3748,12 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
         ds4_tokenize_rendered_chat(e, prefix, &r->prompt);
         free(prefix);
+#ifdef DS4_SERVER_TEST
+        if (render_only) {
+            for (uint32_t k = 0; k < g_test_render_image_tokens; k++)
+                ds4_tokens_push(&r->prompt, 129264);
+        } else
+#endif
         if (!ds4_prompt_append_vision(e, &r->prompt, &r->images[i],
                                       &embeddings[i], err, errlen)) {
             ok = false;

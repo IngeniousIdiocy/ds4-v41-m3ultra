@@ -74393,7 +74393,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 #endif
         vocab_load(&e->vocab, &e->model);
-    } else if (!opt->inspect_only) {
+    } else {
+        /* Inspect-only engines tokenize too, without touching weights. */
         vocab_load(&e->vocab, &e->model);
     }
     if (e->vision_kind == DS4_VISION_QWEN4) {
