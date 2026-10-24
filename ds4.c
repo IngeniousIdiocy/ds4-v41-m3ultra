@@ -2887,8 +2887,15 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
      * the kernel can panic in VM map-count accounting instead of returning a
      * normal user-space failure. Keeping CPU inference off the shared mapping
      * avoids that VM accounting path while preserving normal file-backed reads.
+     *
+     * Only CPU inference (prefetch_cpu) takes the private mapping. Opens that
+     * read metadata only (tokenizer dumps, inspect-only engines, sidecar
+     * probes) map shared: on Darwin a private mapping of a file whose pages
+     * another process has wired (a running Metal server) is copied eagerly
+     * into anonymous memory, hundreds of GB for this model, which exhausts
+     * RAM and panics the machine.
      */
-    const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
+    const int mmap_flags = (metal_mapping || !prefetch_cpu) ? MAP_SHARED : MAP_PRIVATE;
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
 
