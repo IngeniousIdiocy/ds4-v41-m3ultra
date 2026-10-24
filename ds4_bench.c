@@ -4,6 +4,10 @@
 #include "ds4_help.h"
 #include "ds4_snapstore.h"
 #include "ds4_tp.h"
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#include "ds4_gpu.h"   /* off=: the V4.1 switch groups per run */
+#define BENCH_V41_OFF 1
+#endif
 
 /* Purpose-built throughput benchmark.
  *
@@ -68,6 +72,7 @@ typedef struct {
     ds4_tp_options tp;
     bool warm_weights;
     bool quality;
+    bool mtp_exact_sampling;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
@@ -289,6 +294,8 @@ static bench_config parse_options(int argc, char **argv) {
                 fprintf(stderr, "ds4-bench: --v41-sidecar takes at most %d files\n", DS4_V41_SIDECAR_MAX);
                 exit(2);
             }
+        } else if (!strcmp(arg, "--mtp-exact-sampling")) {
+            c.mtp_exact_sampling = true;
         } else if (!strcmp(arg, "--dspark")) {
             c.dspark = true;
         } else if (!strcmp(arg, "--dspark-confidence")) {
@@ -704,7 +711,7 @@ extern char **environ;
 /* Versioned contract of what produces a V4.1 prefix frontier. Bump it when a new
  * prefix producer appears (e.g. an FP8 prefill path), never stamp old payloads. */
 #define BENCH_CACHE_CONTRACT "v41-prefix-1"
-#define BENCH_JOB_COUNTERS 10
+#define BENCH_JOB_COUNTERS 17
 
 typedef struct {
     char path[PATH_MAX];
@@ -840,6 +847,9 @@ static void job_counters(uint64_t c[BENCH_JOB_COUNTERS]) {
     int k = 0;
     c[k++] = ds4_sampler_gpu_encoded_count();
     for (int i = 0; i < 9; i++) c[k++] = g[i];
+    uint64_t kg[7];   /* KEYED_GPU outcomes */
+    ds4_keyed_gpu_counts(kg);
+    for (int i = 0; i < 7; i++) c[k++] = kg[i];
     assert(k == BENCH_JOB_COUNTERS);
 }
 
@@ -860,7 +870,8 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
     fprintf(jo, "job,verb,label,cache,env,mode,temp,top_p,top_k,min_p,seed,warm,tokens,eos,"
                 "setup_ns,restore_ns,first_sel0_ns,last_eval1_ns,decode_tps,pos,prefix_fnv64,logits_fnv64,state_fnv64,"
                 "sel_encoded,sel_decided,sel_mass_short,sel_ambiguous,sel_overflow,sel_invalid,sel_zero,sel_unbound,"
-                "sel_settings,sel_stale\n");
+                "sel_settings,sel_stale,kg_decided,kg_dspark_reused,kg_unbound,kg_overflow,kg_invalid,kg_verify_gpu,"
+                "kg_verify_cpu,cycles,v41_off\n");
     const int eos = ds4_token_eos(engine);
     const int logits_cap = 1 << 18;
     float *logits = malloc((size_t)logits_cap * sizeof(float));
@@ -1161,6 +1172,8 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
             break;
         }
         const bool teacher = !strcmp(mode, "teacher"), greedy = !strcmp(mode, "greedy");
+        const bool dspark = !strcmp(mode, "dspark");   /* sampled DSpark cycles (ds4_session_eval_speculative) */
+        uint64_t cycles = 0;
         const ds4_tokens *forced = teacher ? job_fixture(engine, &fx, job_get(kv, n, "fixture")) : NULL;
         if (tokens <= 0 || (teacher && (!forced || forced->len < ds4_session_pos(session) + tokens))) {
             fprintf(stderr, "ds4-bench: job %d: bad tokens= or teacher fixture\n", job);
@@ -1177,6 +1190,16 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
             break;
         }
         restore_ns = bench_now_ns() - t0;
+        /* off=HEX: these V4.1 switch groups off for this run, on top of the process's own (they are read once) */
+        static uint64_t base_off;
+        static bool base_read;
+#ifdef BENCH_V41_OFF
+        if (!base_read) { base_off = ds4_gpu_v41_off(); base_read = true; }
+#endif
+        const uint64_t run_off = base_off | ((v = job_get(kv, n, "off")) ? strtoull(v, NULL, 16) : 0);
+#ifdef BENCH_V41_OFF
+        ds4_gpu_test_set_v41_off(run_off);
+#endif
         for (int i = 1; i < n; i++) {
             if (!strncmp(kv[i], "set=", 4) && strchr(kv[i] + 4, '=')) {
                 char name[128];
@@ -1215,6 +1238,23 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
                 ds4_session_sample(session, temp, top_k, top_p, min_p, &rng);
             if (!teacher && !greedy && t == eos) { eos_hit = true; break; }
             const uint64_t eval0 = bench_now_ns();
+            if (dspark) {   /* one cycle: its tokens' rows share the cycle's timestamps after the first */
+                int toks[17];
+                const int nt = t < 0 ? -1 : ds4_session_eval_speculative(session, t, tokens - done, eos, temp, top_k,
+                    top_p, min_p, &rng, toks, (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
+                if (nt <= 0) {
+                    fprintf(stderr, "ds4-bench: job %d: DSpark cycle failed: %s\n", job, err);
+                    rc = 1;
+                    break;
+                }
+                const uint64_t eval1 = bench_now_ns();
+                cycles++;
+                for (int i = 0; i < nt && done < tokens; i++, done++) {
+                    uint64_t *r = ns + (size_t)done * 4u;
+                    r[0] = (uint64_t)toks[i]; r[1] = i ? eval1 : sel0; r[2] = i ? eval1 : eval0; r[3] = eval1;
+                }
+                continue;
+            }
             if (t < 0 || ds4_session_eval(session, t, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: job %d: decode failed: %s\n", job, err);
                 rc = 1;
@@ -1256,7 +1296,10 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
                 ds4_session_pos(session), (unsigned long long)bench_fnv_tokens(have->v, pos0),
                 (unsigned long long)bench_fnv_logits(session, logits, logits_cap), state_hex);
         for (int i = 0; i < BENCH_JOB_COUNTERS; i++) fprintf(jo, ",%llu", (unsigned long long)(c1[i] - c0[i]));
-        fprintf(jo, "\n");
+        fprintf(jo, ",%llu,%llx\n", (unsigned long long)cycles, (unsigned long long)run_off);
+#ifdef BENCH_V41_OFF
+        ds4_gpu_test_set_v41_off(base_off);
+#endif
         fflush(tok);
         fflush(jo);
     }
@@ -1316,6 +1359,7 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .dspark = cfg.dspark,
+        .dspark_exact_sampling = cfg.mtp_exact_sampling,
         .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
         .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
