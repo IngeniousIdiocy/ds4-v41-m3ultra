@@ -25,10 +25,12 @@ struct ds41_dspark {
     ds41_admission admission;   /* PUBLIC_CONTROLLER */
     uint32_t admission_end;     /* the position its last measured step ended at */
     bool in_cycle;              /* a drafted cycle's own serial token, priced with the cycle */
-    /* KEYED_GPU: the next verify finds its rows' keyed-draw candidates (keys, 1/T); kg_done: the last one did */
+    /* KEYED_GPU: the next verify finds its rows' keyed-draw candidates (keys, 1/T); kg_done: the last one did, and
+     * kg_rows holds its rows' candidates (ds4.c kg_gpu_row, 272 B each), copied out of the shared buffer */
     bool kg_want, kg_done;
     float kg_inv_t;
     uint64_t kg_keys[DS41_VERIFY_ROWS];
+    uint32_t kg_rows[DS41_VERIFY_ROWS][68];
 };
 
 static void ds41_dspark_reset(ds41_dspark *d) {
@@ -450,7 +452,10 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
             d->host_verified + (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB, DS4_N_VOCAB * 4u);
     if (ok) d->verify_count = count;
     else g->valid = false;
-    d->kg_done = d->kg_done && ok;
+    d->kg_done = d->kg_done && ok && ds4_gpu_keyed_out();
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (d->kg_done) memcpy(d->kg_rows, ds4_gpu_keyed_out(), (size_t)count * sizeof(d->kg_rows[0]));
+#endif
     return ok;
 }
 

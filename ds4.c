@@ -47477,6 +47477,9 @@ static bool ds41_keyed_sampling(const ds4_engine *e, float temperature, int top_
  * candidates than slots, 2 invalid; nothing else changes. */
 typedef struct { uint32_t n, finite, pad[2], id[64]; } kg_gpu_row;
 _Static_assert(sizeof(kg_gpu_row) == 272, "keyed candidates row");
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+_Static_assert(sizeof(((ds41_dspark *)0)->kg_rows[0]) == sizeof(kg_gpu_row), "DSpark keyed rows");
+#endif
 /* 0 decode steps decided on the GPU, 1 a DSpark row's draw reused, 2 unbound or stale (CPU), 3 overflow (CPU),
  * 4 invalid (CPU), 5 verify rows decided on the GPU, 6 verify rows on the CPU */
 static uint64_t g_kg_counts[7];
@@ -89125,7 +89128,7 @@ static int ds41_keyed_row(const ds41_dspark *d, uint32_t row, const float *lg, c
                           float *probs) {
     int t = -1;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    if (d->kg_done && ds41_keyed_finish((const kg_gpu_row *)ds4_gpu_keyed_out() + row, lg, k, pos, &t) == 0) {
+    if (d->kg_done && ds41_keyed_finish((const kg_gpu_row *)d->kg_rows[row], lg, k, pos, &t) == 0) {
         g_kg_counts[5]++;
         return t;
     }
