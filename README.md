@@ -8,7 +8,7 @@ main's 19.9 and 17.9. With DSpark drafting, code answers run at **58.8 tok/s**.
 A cold 131K-token prompt takes **138.8 s**, against main's 189.5 s, and a 4K
 screenshot reaches its first token in **2.8 s**.
 
-The speed-ups come in 54 groups for the language model and 8 for image input.
+The speed-ups come in 58 groups for the language model and 8 for image input.
 Each group does one thing, is added on top of main in its own commits, and has
 one switch that turns it off and runs main's code instead.
 Serial decoding from a given cache gives main's output bit for bit. A few
@@ -204,7 +204,7 @@ As a server, with the disk KV cache and the options this branch adds:
   --mtp-model gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark \
   --kv-disk-dir kvcache --kv-disk-space-mb 98304 \
   --kv-cache-cold-max-tokens 393216 --kv-cache-continued-interval-tokens 4096 \
-  --default-top-p 0.95 --default-min-p 0 \
+  --default-top-p 1.0 --default-min-p 0 \
   --utility-ctx 32768 --serial-reasoning
 ```
 
@@ -270,6 +270,10 @@ that checks a draft; "TP" means two Macs.
 | CARRY_KEEP | Prefill: one-chunk layers keep their rows in place instead of reloading them. |
 | PREENCODE | Decode: the next token's first command buffer is encoded during this token's wait. |
 | SAMPLER_GPU | Sampled decode: the top-p summary is computed on the GPU. |
+| KEYED_SAMPLING | Sampled decode at top_p 1 (no top-k or min-p): each token is a Gumbel-max draw keyed to the seed and position (Tarjei Mandt's keyed sampling). Not bit for bit. |
+| KEYED_GPU | Sampled decode at top_p 1: the GPU finds the few ids that can win the keyed draw, and the CPU scores only those. |
+| FULL_PROBS | DSpark at top_p 1: the untruncated probabilities are the softmax in one pass, with no heap or sort. |
+| PQ_GPU | DSpark at top_p 1: the draft and target distributions for the p/q verify, and the draws' candidates, are built on the GPU. |
 | TP_BALANCED_ROUTE | TP: each Mac takes half of every token's experts. |
 | TP_SHARED_SPLIT | TP: the shared expert is split across both Macs. |
 | TP_GATES | TP: partials go straight into the exchange slots. |
@@ -322,7 +326,9 @@ serial output:
   needs them;
 - ROWS_MMA and VERIFY_INDEXED (DSpark), and DSpark drafting itself, as
   `--dspark-strict` does;
-- VISION_ATTN_FLASH (the vision encoder's attention).
+- VISION_ATTN_FLASH (the vision encoder's attention);
+- KEYED_SAMPLING, KEYED_GPU, FULL_PROBS and PQ_GPU (sampling at top_p 1), so a
+  sampled decode draws with main's sampler.
 
 With `--exact`, the logits after cold prefills of 8, 8K, 32K and 131K tokens
 are main's, and so are 256 greedy steps of tokens and logits from main's own
@@ -372,6 +378,10 @@ The groups that are not bit for bit:
 - **INDEX_SCORE_WIDE**: the wide scorer adds the index heads in a different
   order, so a key near the top-512 cut-off could change. In every check, the
   selections and logits stayed the same.
+- **KEYED_SAMPLING** and the top_p 1 sampler groups after it: the same logits
+  and the same distribution, but a different random draw from main's sampler,
+  so sampled tokens differ. Greedy decoding never takes them. FULL_PROBS sums
+  the softmax in another order (within 2.3e-6 of a double-precision softmax).
 
 [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md) gives the exactness of every switch.
 
@@ -398,6 +408,70 @@ The groups that are not bit for bit:
   pixels tall; in four both modes were wrong, and in one a 9-pixel "8" was read
   as "B". The set has rendered images only (no photos), short answers and one
   image per request. Use `--exact` where bit-for-bit output matters.
+
+### New in this update
+
+- **Prompts exactly as DeepSeek's encoder writes them.** For the same chat
+  request, ds4 now produces the token ids that the 1017 checkpoint's
+  `encoding/encoding.py` and `tokenizer.json` produce. Before, a 102K-token agent
+  chat with tools and images came out 204 tokens shorter than the reference, for
+  three reasons, all fixed:
+  - the tools block had its own wording and JSON style and came before the
+    system prompt; it now follows the encoder's template, after the system
+    prompt;
+  - content blocks were joined with nothing between them; they are now joined
+    with a blank line, as the encoder does (both the Anthropic and OpenAI
+    endpoints);
+  - the tokenizer treated only ASCII as punctuation, so text such as `.”` or `…`
+    split into the wrong tokens; it now pre-tokenizes with the Unicode classes of
+    `tokenizer.json`.
+
+  Also: images in parallel tool results that arrive out of order are bound in
+  prompt order instead of failing, earlier turns' reasoning is dropped when a
+  request declares no tools (keeping the current turn's), and other models'
+  special spellings such as `[gMASK]` stay plain text. Tests check 30 requests
+  against the encoder token for token, and the tokenizer against
+  `tokenizer.json` on 22,298 texts (27 million tokens). Prompts with tools,
+  several blocks or non-ASCII punctuation change, so their saved caches miss
+  once.
+- **DeepSeek's recommended sampling, at full speed.** DeepSeek recommends
+  temperature 1 and top_p 1.0 for the 1017 checkpoint, and the server example
+  above now uses it. At top_p 0.95, a run of repeated text can become
+  permanent: once the next repeated token is above 0.95 probability, every
+  other token is cut, so the model can never leave it. At 1.0 it escapes. Before
+  this update top_p 1.0 was slower, because it sampled the full vocabulary on
+  the CPU. The four sampler groups above make it as fast as 0.95 or faster
+  (temperature 1, 512 sampled tokens, median of three seeds; the top_p 0.95
+  column is the best of three measurement windows, the top_p 1.0 column the
+  final build's):
+
+  | | top_p 0.95 | top_p 1.0 |
+  | --- | ---: | ---: |
+  | Serial decode, prose 8K | 40.6 t/s | **41.6 t/s** |
+  | Serial decode, prose 131K | 40.7 t/s | **40.7 t/s** |
+  | DSpark, code 8K | 48.2 t/s | **49.6 t/s** |
+
+  Sampling a token at top_p 1.0 now costs about 1 µs, against 12 to 14 µs for
+  the top-p selector and about 320 µs on the previous CPU path. DSpark at top_p
+  1 verifies drafts with the p/q test, with both distributions built on the
+  GPU.
+- **Memory.** Metal objects autoreleased on ds4's C threads were never freed, so
+  a long-running server's footprint grew with every session. This carries
+  DwarfStar PR #1244 (a pool around the tensor contents, write and read
+  helpers) and adds a pool at every engine entry point.
+- **No private mapping of a served model.** Tools that read only a model's
+  metadata (the tokenizer dump, inspect-only engines, sidecar probes) mapped
+  the GGUF privately. On macOS a private mapping of a file that a running Metal
+  server holds wired is copied into anonymous memory, hundreds of GB for this
+  model, which can exhaust memory and panic the machine. They now map it shared
+  and read-only; only CPU inference keeps the private mapping.
+- **Disk KV cache.** Long V4.1 prefills store continued checkpoints as they go,
+  so a long prompt that diverges from the last one no longer re-prefills from
+  the start. The eviction ladder is back: old anchors age out on a half-life,
+  and a chat's superseded waypoints are thinned to a geometric ladder.
+- **OpenAI streaming.** A stream no longer finishes with `tool_calls` when no
+  call was emitted, and text withheld for a tool block that never parsed is
+  sent instead of dropped.
 
 ### Also carried from the previous release
 

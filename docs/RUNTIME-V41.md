@@ -215,6 +215,10 @@ These never run in one-token decoding, so serial output never depends on them.
 | ---: | --- | --- | --- |
 | 35 | `DS4_METAL_DISABLE_V41_PREENCODE` | Encoding the next token's first command buffer during the current token's wait, and the short GPU bridge kernel. | Yes |
 | 36 | `DS4_METAL_DISABLE_V41_SAMPLER_GPU` | The GPU top-p summary at temperature 1, top-p 0.95, no top-k and no min-p. | Yes: the token and the random state are the CPU sampler's. |
+| 55 | `DS4_METAL_DISABLE_V41_KEYED_SAMPLING` | Position-keyed Gumbel-max draws for samples of the full distribution (temperature above 0, top_p 1, no top-k, no min-p); main's sampler draws instead. | No: the same distribution, a different draw. Off with `--exact`. |
+| 56 | `DS4_METAL_DISABLE_V41_KEYED_GPU` | The GPU finding the keyed draw's candidates; the CPU scores the whole row instead. | Yes, against KEYED_SAMPLING on the CPU: the same token. Off with `--exact`. |
+| 57 | `DS4_METAL_DISABLE_V41_FULL_PROBS` | The one-pass softmax for an untruncated probability build; the heap and full sort run instead. | No: another order of sums, within 2.3e-6. Off with `--exact`. |
+| 58 | `DS4_METAL_DISABLE_V41_PQ_GPU` | DSpark's p/q verify at top_p 1 building q, p and the draws' candidates on the GPU; the CPU builds them. | No: the same test, keyed draws. Off with `--exact`. |
 
 ### Two Macs
 
