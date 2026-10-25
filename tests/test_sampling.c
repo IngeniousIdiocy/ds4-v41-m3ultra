@@ -697,7 +697,50 @@ static void check_keyed(void) {
     free(lg);
 }
 
+/* FULL_PROBS: an untruncated build (top_p 1, no top-k or min-p) at vocabulary size is the softmax itself: every
+ * finite entry within float rounding of a double softmax, non-finite entries 0, total 1. */
+static void check_full_probs(void) {
+    enum { FN = 129280 };
+    static float lg[FN], pr[FN];
+    uint64_t x = 0x9b1f3c27d4e6a805ULL;
+    for (uint32_t i = 0; i < FN; i++) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        const double u = ((double)(x >> 11) + 0.5) * 0x1.0p-53;
+        lg[i] = (float)(12.0 * u * u * u - 4.0);   /* a heavy head over a broad tail, like real rows */
+        if (i % 9973 == 5) lg[i] = -INFINITY;
+        if (i % 30011 == 7) lg[i] = NAN;
+    }
+    lg[4242] = 14.0f;
+    const float temps[] = {1.0f, 0.7f};
+    for (uint32_t t = 0; t < 2; t++) {
+        const float T = temps[t];
+        double mx = -INFINITY, sum = 0.0;
+        for (uint32_t i = 0; i < FN; i++) if (isfinite(lg[i]) && lg[i] > mx) mx = lg[i];
+        for (uint32_t i = 0; i < FN; i++) if (isfinite(lg[i])) sum += exp(((double)lg[i] - mx) / T);
+        const double t0 = now_sec();
+        enum { REPS = 50 };
+        for (int r = 0; r < REPS; r++)
+            CHECK(ds4_test_sampling_probabilities(lg, FN, T, 0, 1.0f, 0.0f, pr) != 0, "full build");
+        const double us = (now_sec() - t0) * 1e6 / REPS;
+        double worst = 0.0, total = 0.0;
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < FN; i++) {
+            total += pr[i];
+            if (!isfinite(lg[i])) { if (pr[i] != 0.0f) bad++; continue; }
+            const double ref = exp(((double)lg[i] - mx) / T) / sum;
+            const double rel = fabs(pr[i] - ref) / ref;
+            if (rel > worst) worst = rel;
+        }
+        CHECK(bad == 0, "full build: %u non-finite logits got probability", bad);
+        CHECK(worst < 2e-4, "full build T=%.1f: worst relative error %.3g", (double)T, worst);
+        CHECK(fabs(total - 1.0) < 1e-4, "full build T=%.1f: total %.9f", (double)T, total);
+        printf("full probabilities T=%.1f: %u entries, worst relative error %.2g vs a double softmax, total %.7f, %.0f us per build\n",
+               (double)T, FN, worst, total, us);
+    }
+}
+
 int main(void) {
+    check_full_probs();
     check_keyed();
     check_speculative_distribution();
     check_selector_consumer();

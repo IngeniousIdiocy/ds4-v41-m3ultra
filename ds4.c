@@ -46819,6 +46819,15 @@ static void sample_heap_sift_down(sample_candidate *heap, uint32_t n, uint32_t i
 /* Materialize the exact distribution represented by the public sampling
  * knobs. Speculative decoding needs probabilities, rather than only a sampled
  * token, for the p/q acceptance test and the corrected rejection sample. */
+/* FULL_PROBS (DS4_METAL_DISABLE_V41_FULL_PROBS restores the heap and full sort): on wherever V4.1's switches don't apply. */
+static bool sample_full_probs_on(void) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    return ds41_on(DS4_GPU_V41_FULL_PROBS);
+#else
+    return true;
+#endif
+}
+
 static bool sample_build_probabilities(
         const float *logits,
         uint32_t     n_vocab,
@@ -46854,6 +46863,25 @@ static bool sample_build_probabilities(
     }
     if (finite == 0) {
         probs[sample_argmax(logits, n_vocab)] = 1.0f;
+        return true;
+    }
+    if (top_k == 0 && top_p >= 1.0f && min_p <= 0.0f && sample_full_probs_on()) {
+        /* Nothing is truncated: the probabilities are the softmax itself (one exp pass and one scale; no heap, sort or cut). */
+        const float inv_t = 1.0f / temperature;
+        double sum = 0.0;   /* a float running sum over the vocabulary drifts by ~1e-4 */
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            probs[i] = expf((v - max_logit) * inv_t);
+            sum += probs[i];
+        }
+        if (!(sum > 0.0) || !isfinite(sum)) {
+            memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
+            probs[sample_argmax(logits, n_vocab)] = 1.0f;
+            return true;
+        }
+        const float inv_sum = (float)(1.0 / sum);
+        for (uint32_t i = 0; i < n_vocab; i++) probs[i] *= inv_sum;
         return true;
     }
 
@@ -47468,6 +47496,17 @@ static bool ds41_keyed_sampling(const ds4_engine *e, float temperature, int top_
 #else
     (void)e; (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng;
     return false;   /* V4.1 decodes on Metal only */
+#endif
+}
+
+/* KEYED_DSPARK: DSpark verifies keyed draws (a greedy draft kept while it equals its row's draw) rather than the p/q test */
+static bool ds41_keyed_dspark(const ds4_engine *e, float temperature, int top_k, float top_p, float min_p,
+                              const uint64_t *rng) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    return ds41_on(DS4_GPU_V41_KEYED_DSPARK) && ds41_keyed_sampling(e, temperature, top_k, top_p, min_p, rng);
+#else
+    (void)e; (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng;
+    return false;
 #endif
 }
 
@@ -65137,7 +65176,7 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
     /* keyed V4.1 sampling, like exact sampling, keeps only drafts it would sample */
     const uint64_t seed = 0;
     return e && (e->dspark_exact_sampling ||
-                 (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds41_keyed_sampling(e, 1.0f, 0, 1.0f, 0.0f, &seed)));
+                 (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && ds41_keyed_dspark(e, 1.0f, 0, 1.0f, 0.0f, &seed)));
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
@@ -89169,7 +89208,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     }
     /* keyed sampling keeps a greedy draft while it is its row's keyed sample; the caller then draws the first
      * rejected row's keyed sample as plain decode would, so no correction token is evaluated here */
-    const bool keyed = ds41_keyed_sampling(e, temperature, top_k, top_p, min_p, rng);
+    const bool keyed = ds41_keyed_dspark(e, temperature, top_k, top_p, min_p, rng);
     const bool exact = !keyed && temperature > 0 && e->dspark_exact_sampling;
     const uint32_t P1 = (uint32_t)s->checkpoint.len;
     const double started = now_sec();
