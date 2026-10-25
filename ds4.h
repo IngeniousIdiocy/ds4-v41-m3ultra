@@ -537,6 +537,9 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
 void ds4_sampler_gpu_counts(uint64_t out[9]);
 /* KEYED_GPU outcomes: 0 decode steps decided on the GPU, 1 unbound or stale, 2 overflow, 3 invalid */
 void ds4_keyed_gpu_counts(uint64_t out[4]);
+/* PQ_GPU outcomes: 0 draft draws decided on the GPU, 1 drawn on the CPU from the GPU's q, 2 residual draws decided on
+ * the GPU, 3 on the CPU, 4 verify blocks whose p was built on the GPU */
+void ds4_pq_gpu_counts(uint64_t out[5]);
 uint64_t ds4_sampler_gpu_encoded_count(void);
 #ifdef DS4_TEST_HOOKS
 /* the selector's reference and production consumers on one summary (HDR: 64-byte header, P: 505 partials,
@@ -568,6 +571,8 @@ int ds4_test_sample_keyed(const float *logits, uint32_t n_vocab, float temperatu
                           float min_p, uint64_t seed, uint32_t pos, float *probs);
 int ds4_test_keyed_finish(const void *row, const float *logits, float temperature, uint64_t seed, uint32_t pos,
                           int *token);
+int ds4_test_pq_draw_finish(const void *row, const float *logits, float temperature, uint64_t key, int *token);
+int ds4_test_pq_residual_finish(const void *row, const float *p, const float *q, uint64_t key, int *token);
 int ds4_test_speculative_delta_sample(const float *target_logits,
                                       uint32_t n_vocab,
                                       int draft_token,

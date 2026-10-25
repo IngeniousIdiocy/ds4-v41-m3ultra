@@ -586,8 +586,11 @@ static float kgt_score(float l, float inv_t, uint64_t key, uint32_t id) {
     }
     return l * inv_t - logf(L);
 }
+static void kgt_build_key(kgt_row *r, const float *lg, uint32_t n, float temperature, uint64_t key);
 static void kgt_build(kgt_row *r, const float *lg, uint32_t n, float temperature, uint64_t seed, uint32_t pos) {
-    const uint64_t key = kgt_mix(seed ^ kgt_mix((uint64_t)pos + 1u));
+    kgt_build_key(r, lg, n, temperature, kgt_mix(seed ^ kgt_mix((uint64_t)pos + 1u)));
+}
+static void kgt_build_key(kgt_row *r, const float *lg, uint32_t n, float temperature, uint64_t key) {
     const float inv_t = 1.0f / temperature;
     float V = -INFINITY;
     uint32_t finite = 0;
@@ -739,8 +742,81 @@ static void check_full_probs(void) {
     }
 }
 
+/* PQ_GPU: DSpark's exact verify with GPU-built q and p, emulated: the draft drawn by Gumbel-max from its candidates
+ * (kernel_kg1/kg2's rule), the p/q test, and on a rejection the residual max(0, p - q) drawn from its candidates
+ * (kernel_rs1/rs2's rule). The emitted token must follow p (chi-square), and the acceptance rate sum min(p, q). */
+static void kgt_build_residual(kgt_row *r, const float *P, const float *Q, uint32_t n, uint64_t key) {
+    double V = -INFINITY;
+    uint32_t finite = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float d = P[i] - Q[i];
+        if (!(d > 0.0f)) continue;
+        finite++;
+        const uint64_t h = kgt_mix(key + (uint64_t)i * 0x9e3779b97f4a7c15ULL);
+        const double v = log((double)d) - log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
+        if (v > V) V = v;
+    }
+    memset(r, 0, sizeof(*r));
+    r->finite = finite;
+    for (uint32_t i = 0; finite && i < n; i++) {
+        const float d = P[i] - Q[i];
+        if (!(d > 0.0f)) continue;
+        const uint64_t h = kgt_mix(key + (uint64_t)i * 0x9e3779b97f4a7c15ULL);
+        if (log((double)d) - log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53)) < V - 0.015625) continue;
+        if (r->n < 64u) r->id[r->n] = i;
+        r->n++;
+    }
+}
+
+static void check_pq(void) {
+    enum { N = 48 };
+    const uint32_t trials = 300000;
+    float lp[N], lq[N], P[N], Q[N];
+    const float temps[] = {1.0f, 0.7f};
+    for (uint32_t t = 0; t < 2; t++) {
+        const float T = temps[t];
+        kgt_s = 0x51ed2701c3a9b4f7ULL + t;
+        for (uint32_t i = 0; i < N; i++) {
+            lp[i] = (float)(4.0 * kgt_u() - 2.0) + (i % 7 == 0 ? 2.0f : 0.0f);
+            lq[i] = lp[i] + (float)(2.4 * kgt_u() - 1.2);   /* a drafter that disagrees */
+        }
+        lq[3] = -INFINITY;   /* an id the drafter never proposes */
+        CHECK(ds4_test_sampling_probabilities(lp, N, T, 0, 1.0f, 0.0f, P) != 0, "pq build p");
+        CHECK(ds4_test_sampling_probabilities(lq, N, T, 0, 1.0f, 0.0f, Q) != 0, "pq build q");
+        double accept_e = 0.0;
+        for (uint32_t i = 0; i < N; i++) accept_e += fmin(P[i], Q[i]);
+        uint32_t counts[N] = {0}, accepted = 0, residual_gpu = 0;
+        for (uint32_t k = 0; k < trials; k++) {
+            kgt_row row;
+            const uint64_t kd = kgt_mix(kgt_s += 0x9e3779b97f4a7c15ULL);
+            kgt_build_key(&row, lq, N, T, kd);
+            int x = -1;
+            CHECK(ds4_test_pq_draw_finish(&row, lq, T, kd, &x) == 0 && x >= 0 && x < N, "pq draw finish");
+            int out = x;
+            if ((float)kgt_u() * Q[x] > P[x]) {
+                const uint64_t kr = kgt_mix(kgt_s += 0x9e3779b97f4a7c15ULL);
+                kgt_build_residual(&row, P, Q, N, kr);
+                const int path = ds4_test_pq_residual_finish(&row, P, Q, kr, &out);
+                CHECK(path == 0 && out >= 0 && out < N, "pq residual finish path %d", path);
+                residual_gpu++;
+            } else accepted++;
+            if (out >= 0 && out < N) counts[out]++;
+        }
+        int df = 0;
+        const double chi = kgt_chi2(counts, lp, N, T, trials, &df);
+        const double bound = df + 6.0 * sqrt(2.0 * df);
+        const double rate = (double)accepted / trials, se = sqrt(accept_e * (1.0 - accept_e) / trials);
+        CHECK(chi < bound, "pq output T=%.1f: chi-square %.1f, %d degrees of freedom (bound %.1f)", (double)T, chi, df, bound);
+        CHECK(fabs(rate - accept_e) < 6.0 * se, "pq acceptance T=%.1f: %.5f, sum min(p, q) %.5f", (double)T, rate, accept_e);
+        printf("pq GPU verify (emulated) T=%.1f: output chi-square %.1f, %d degrees of freedom (bound %.1f); "
+               "acceptance %.4f against sum min(p, q) %.4f; %u residual draws from candidates\n",
+               (double)T, chi, df, bound, rate, accept_e, residual_gpu);
+    }
+}
+
 int main(void) {
     check_full_probs();
+    check_pq();
     check_keyed();
     check_speculative_distribution();
     check_selector_consumer();

@@ -3120,6 +3120,110 @@ static int check_keyed_gpu(void) {
     return 1;
 }
 
+/* PQ_GPU: (1) kernel_pq1/pq2's softmax rows equal the one-pass CPU build (ds4.c sample_build_probabilities at top_p 1:
+ * expf((l - max) / T), a double sum, one scale) within float tolerance, non-finite logits 0; (2) a row's draw
+ * candidates (kernel_kg1/kg2 under a key) hold the double argmax of l / T + G; (3) the residual candidates
+ * (kernel_rs1/rs2) of p and q rows hold the double argmax of log(p - q) + G over p > q. */
+static int check_pq_gpu(void) {
+    enum { NV = 129280, ROWS = 5, TRIALS = 24 };
+    typedef struct { uint32_t n, finite, pad[2], id[64]; } kgrow;
+    if (!ds4_gpu_selector_ready() && !ds4_gpu_selector_init()) {
+        fprintf(stderr, "V4.1 p/q GPU: metal/sampler_selector.metal not found (run from the tree)\n");
+        return 0;
+    }
+    ds4_gpu_tensor *logits = upload(NULL, (size_t)ROWS * NV * 4);
+    float *lg = malloc((size_t)ROWS * NV * sizeof(float)), *ref = malloc((size_t)NV * sizeof(float));
+    CHECK(logits && lg && ref);
+    double worst = 0.0;
+    uint32_t draws = 0, residuals = 0, max_n = 0;
+    for (uint32_t trial = 0; trial < TRIALS; trial++) {
+        const float T = trial % 3u == 2u ? 0.7f : 1.0f;
+        for (uint32_t r = 0; r < ROWS; r++) {
+            float *row = lg + (size_t)r * NV;
+            const float scale = trial % 4u == 0u ? 0.5f : 2.5f;
+            for (int i = 0; i < NV; i++) row[i] = random_value() * scale;
+            for (int k = 0; k < 8; k++) row[(trial * 131u + r * 7919u + k * 4099u) % NV] = 14.0f - (float)k * 0.5f;
+            if (r & 1u) for (int k = 0; k < 8; k++) row[(trial * 131u + (r - 1u) * 7919u + k * 4099u) % NV] += 1.5f;
+            row[(trial * 29u + 3u) % NV] = -INFINITY;
+        }
+        memcpy(ds4_gpu_tensor_contents(logits), lg, (size_t)ROWS * NV * sizeof(float));
+        /* rows 0..4 -> probability slots 0..4 (q), and the same rows -> slots 5..9 as p with q's row shifted by one */
+        uint64_t dkeys[ROWS], rkeys[ROWS - 1];
+        for (uint32_t r = 0; r < ROWS; r++) dkeys[r] = kgm_mix(0x7777ULL + trial * 31u + r);
+        for (uint32_t r = 0; r + 1u < ROWS; r++) rkeys[r] = kgm_mix(0x9999ULL + trial * 17u + r);
+        CHECK(ds4_gpu_begin_commands() && ds4_gpu_pq_softmax(logits, ROWS, 1.0f / T, 0));
+        for (uint32_t r = 0; r < ROWS; r++) {
+            ds4_gpu_tensor *v = ds4_gpu_tensor_view(logits, (uint64_t)r * NV * 4u, (uint64_t)NV * 4u);
+            CHECK(v && ds4_gpu_pq_draw(v, 1.0f / T, dkeys[r], r));
+            ds4_gpu_tensor_free(v);
+        }
+        ds4_gpu_tensor *pv = ds4_gpu_tensor_view(logits, (uint64_t)NV * 4u, (uint64_t)(ROWS - 1u) * NV * 4u);
+        CHECK(pv && ds4_gpu_pq_softmax(pv, ROWS - 1u, 1.0f / T, 5) && ds4_gpu_pq_residual(5, 0, ROWS - 1u, rkeys, 5));
+        CHECK(ds4_gpu_end_commands());
+        ds4_gpu_tensor_free(pv);
+        for (uint32_t r = 0; r < ROWS; r++) {   /* (1) */
+            const float *row = lg + (size_t)r * NV, *gp = ds4_gpu_pq_probs(r);
+            float mx = -INFINITY;
+            for (int i = 0; i < NV; i++) if (isfinite(row[i]) && row[i] > mx) mx = row[i];
+            double sum = 0.0;
+            for (int i = 0; i < NV; i++) { ref[i] = isfinite(row[i]) ? expf((row[i] - mx) * (1.0f / T)) : 0.0f; sum += ref[i]; }
+            const float inv = (float)(1.0 / sum);
+            for (int i = 0; i < NV; i++) {
+                ref[i] *= inv;
+                if (!isfinite(row[i])) { CHECK(gp[i] == 0.0f); continue; }
+                const double err = fabs((double)gp[i] - ref[i]) / fmax(ref[i], 1e-30);
+                if (ref[i] > 1e-30f && err > worst) worst = err;
+            }
+        }
+        for (uint32_t r = 0; r < ROWS; r++) {   /* (2) */
+            const float *row = lg + (size_t)r * NV;
+            const kgrow *c = ds4_gpu_pq_cand(r);
+            int best = -1;
+            double bv = 0.0;
+            for (int i = 0; i < NV; i++) {
+                if (!isfinite(row[i])) continue;
+                const uint64_t h = kgm_mix(dkeys[r] + (uint64_t)i * 0x9e3779b97f4a7c15ULL);
+                const double v = (double)row[i] / T - log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
+                if (best < 0 || v > bv || (v == bv && i < best)) { best = i; bv = v; }
+            }
+            CHECK(c->finite == NV - 1u && c->n >= 1u && c->n <= 64u);
+            int found = 0;
+            for (uint32_t k = 0; k < c->n; k++) found += (int)c->id[k] == best;
+            CHECK(found == 1);
+            draws++;
+            if (c->n > max_n) max_n = c->n;
+        }
+        for (uint32_t r = 0; r + 1u < ROWS; r++) {   /* (3): p = slot 5 + r (row r + 1), q = slot r */
+            const float *P = ds4_gpu_pq_probs(5u + r), *Q = ds4_gpu_pq_probs(r);
+            const kgrow *c = ds4_gpu_pq_cand(5u + r);
+            int best = -1;
+            double bv = 0.0;
+            uint32_t pos = 0;
+            for (int i = 0; i < NV; i++) {
+                const float d = P[i] - Q[i];
+                if (!(d > 0.0f)) continue;
+                pos++;
+                const uint64_t h = kgm_mix(rkeys[r] + (uint64_t)i * 0x9e3779b97f4a7c15ULL);
+                const double v = log((double)d) - log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
+                if (best < 0 || v > bv || (v == bv && i < best)) { best = i; bv = v; }
+            }
+            CHECK(c->finite == pos);
+            CHECK(pos == 0 || (c->n >= 1u && c->n <= 64u));
+            int found = 0;
+            for (uint32_t k = 0; k < c->n && k < 64u; k++) found += (int)c->id[k] == best;
+            CHECK(pos == 0 || found == 1);
+            residuals++;
+            if (c->n > max_n) max_n = c->n;
+        }
+    }
+    CHECK(worst < 1e-5);
+    free(lg); free(ref);
+    ds4_gpu_tensor_free(logits);
+    fprintf(stderr, "V4.1 p/q GPU: softmax rows within %.2g relative of the one-pass CPU build; %u draws and %u residual "
+            "draws each among their candidates (at most %u)\n", worst, draws, residuals, max_n);
+    return 1;
+}
+
 /* TP_PREFILL_ROWS8: the two-Mac attention output's K-slice rows in one dispatch against one call per row, bit for
  * bit: 40 rows (the eight-row kernel on the M3 Ultra) and 5 rows (the two-row kernel). */
 static int check_tp_prefill_rows8(void) {
@@ -3363,6 +3467,7 @@ static int check_v41_groups(void) {
         check_prefill_index_batch() &&
         check_sampler_gpu() &&
         check_keyed_gpu() &&
+        check_pq_gpu() &&
         check_tp_prefill_rows8() &&
         check_verify_indexed() &&
         check_short_mma();
@@ -3432,7 +3537,7 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
     if (argc == 2 && !strcmp(argv[1], "--keyed")) {
-        const int ok = ds4_gpu_init() && check_sampler_gpu() && check_keyed_gpu();
+        const int ok = ds4_gpu_init() && check_sampler_gpu() && check_keyed_gpu() && check_pq_gpu();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

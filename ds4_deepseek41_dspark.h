@@ -25,6 +25,13 @@ struct ds41_dspark {
     ds41_admission admission;   /* PUBLIC_CONTROLLER */
     uint32_t admission_end;     /* the position its last measured step ended at */
     bool in_cycle;              /* a drafted cycle's own serial token, priced with the cycle */
+    /* PQ_GPU (ds4.c ds41_pq_gpu): this cycle's q and p are built on the GPU at 1/T pq_inv_t. pq_key: the next draft
+     * row's draw key; pq_q[r]: draft row r's q (probability slot r) and draw candidates (candidate slot r) were
+     * built; pq_keys: the verify rows' residual keys; pq_done: the verify built p for its rows (probability slots
+     * DS41_DRAFT_ROWS + r) and their residual candidates (candidate slots DS41_DRAFT_ROWS + r) */
+    bool pq_on, pq_done, pq_q[DS41_DRAFT_ROWS];
+    float pq_inv_t;
+    uint64_t pq_key, pq_keys[DS41_DRAFT_ROWS];
 };
 
 static void ds41_dspark_reset(ds41_dspark *d) {
@@ -345,7 +352,14 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
         ds4_gpu_tensor_copy(d->confidence_input, (uint64_t)DS4_N_EMBD * 4u,
             d->markov_embed, 0, rank * 4u) &&
         ds41_matmul(d->confidence, m, last->confidence_proj, d->confidence_input, false);
+    d->pq_q[row] = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ok && d->pq_on)   /* PQ_GPU: the row's q and its draft draw's candidates */
+        d->pq_q[row] = ds4_gpu_pq_softmax(logits, 1, d->pq_inv_t, row) &&
+            ds4_gpu_pq_draw(logits, d->pq_inv_t, d->pq_key, row);
+#endif
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (!ok) d->pq_q[row] = false;
     if (ok) ok = ds4_gpu_tensor_read(logits, 0, d->host_logits + (uint64_t)row * DS4_N_VOCAB, bytes) &&
         ds4_gpu_tensor_read(d->confidence, 0, confidence, sizeof(*confidence));
     ds4_gpu_tensor_free(logits);
@@ -426,6 +440,19 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
     ds41_dspark_rows(true);
     if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
     ds41_dspark_rows(false);
+    d->pq_done = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ok && d->pq_on) {   /* PQ_GPU: the drafted rows' p and their residual draws' candidates, after the head */
+        bool all = true;
+        for (uint32_t r = 0; r + 1u < count; r++) all = all && d->pq_q[r];
+        if (all) {
+            if (!ds4_gpu_commands_active()) ok = ds4_gpu_begin_commands();
+            d->pq_done = ok && ds4_gpu_pq_softmax(d->verify_logits, count - 1u, d->pq_inv_t, DS41_DRAFT_ROWS) &&
+                ds4_gpu_pq_residual(DS41_DRAFT_ROWS, 0, count - 1u, d->pq_keys, DS41_DRAFT_ROWS);
+        }
+    }
+#endif
+    d->pq_on = false;
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
         ds4_tp_mark_failed(g_tp_block_ctx);
@@ -437,6 +464,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
             d->host_verified + (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB, DS4_N_VOCAB * 4u);
     if (ok) d->verify_count = count;
     else g->valid = false;
+    d->pq_done = d->pq_done && ok;
     return ok;
 }
 

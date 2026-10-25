@@ -101,6 +101,7 @@ typedef struct {
 #define DS4_GPU_V41_MOE_HALF_X (1ull << 53)   /* the routed experts' compact pair tiles read the rows narrowed to half once per layer, at the same bits */
 #define DS4_GPU_V41_CARRY_KEEP (1ull << 54)   /* a one-chunk prefill layer keeps the previous layer's rows in the batch buffers instead of loading them back from the carry */
 #define DS4_GPU_V41_KEYED_SAMPLING (1ull << 55)   /* plain decode's full-distribution samples (top_p 1, no top-k or min-p) are position-keyed Gumbel draws */
+#define DS4_GPU_V41_PQ_GPU (1ull << 58)   /* DSpark's exact verify at the full distribution builds q and p on the GPU and finds the draft and residual draws' candidates there */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
 #define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
@@ -181,6 +182,13 @@ uint64_t ds4_gpu_selector_encoded_count(void);
 int ds4_gpu_keyed_encode(const ds4_gpu_tensor *logits, uint32_t rows, const uint64_t *keys, float inv_t);
 const void *ds4_gpu_keyed_out(void);
 uint64_t ds4_gpu_keyed_encoded_count(void);
+/* PQ_GPU (same library): DSpark's exact p/q verify at the full distribution. Probability slots and candidate slots
+ * 0..10 (rows of 129280 floats; {n, finite, pad[2], id[64]}); the encoders append to the open batch. */
+int ds4_gpu_pq_softmax(const ds4_gpu_tensor *logits, uint32_t rows, float inv_t, uint32_t slot);
+int ds4_gpu_pq_draw(const ds4_gpu_tensor *logits, float inv_t, uint64_t key, uint32_t slot);
+int ds4_gpu_pq_residual(uint32_t p_slot, uint32_t q_slot, uint32_t rows, const uint64_t *keys, uint32_t c_slot);
+const float *ds4_gpu_pq_probs(uint32_t slot);
+const void *ds4_gpu_pq_cand(uint32_t slot);
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
 int ds4_gpu_parallel_ffn_start(

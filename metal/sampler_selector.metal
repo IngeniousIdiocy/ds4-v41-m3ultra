@@ -206,7 +206,7 @@ static inline ulong kg_mix(ulong x) {
     x ^= x >> 27; x *= 0x94d049bb133111ebUL;
     return x ^ (x >> 31);
 }
-static inline float kg_score(float l, float inv_t, ulong key, uint id) {
+static inline float kg_noise(ulong key, uint id) {   /* the Gumbel noise -log(-log(u)) */
     const ulong x = kg_mix(key + (ulong)id * 0x9e3779b97f4a7c15UL) >> 11;
     float L;   /* -log(u) */
     if (x >= (1UL << 52)) {
@@ -215,8 +215,9 @@ static inline float kg_score(float l, float inv_t, ulong key, uint id) {
     } else {
         L = -precise::log(((float)x + 0.5f) * 0x1.0p-53f);
     }
-    return l * inv_t - precise::log(L);
+    return -precise::log(L);
 }
+static inline float kg_score(float l, float inv_t, ulong key, uint id) { return l * inv_t + kg_noise(key, id); }
 
 kernel void kernel_kg1(device const float *lg [[buffer(0)]], device sel_part *part [[buffer(1)]],
                        device kg_row *rows [[buffer(2)]], constant ulong *keys [[buffer(3)]],
@@ -251,6 +252,103 @@ kernel void kernel_kg2(device const float *lg [[buffer(0)]], device const sel_pa
     if (b == 0 && tid == 0) rows[r].finite = F;
     const float v = lg[(ulong)r * SEL_NV + i];
     if (F == 0u || !sel_fin(v) || kg_score(v, inv_t, keys[r], i) < V - KG_MARGIN) return;
+    const uint slot = atomic_fetch_add_explicit(&rows[r].n, 1u, memory_order_relaxed);
+    if (slot < KG_SLOTS) rows[r].id[slot] = i;
+}
+
+/* ---- PQ_GPU: DSpark's exact p/q verify at the full distribution (top_p 1, no top-k or min-p) ----
+ * PQ1 (505 x R threadgroups): per block of row r, m = the maximum of x = l * inv_t over its finite logits and
+ * s = sum exp(x - m). PQ2 (505 x R): the row's M and S = sum s exp(m - M) from its 505 records, then each id's
+ * probability exp(x - M) / S (0 for a non-finite logit). RS1/RS2: KG1/KG2's candidates over the residual
+ * d = p - q of rows of two probability arrays, scoring log d + G where d > 0: a Gumbel-max draw from max(0, p - q),
+ * which needs no normalisation; the CPU scores the candidates from the same floats. */
+struct pq_part { float m, s; };
+
+kernel void kernel_pq1(device const float *lg [[buffer(0)]], device pq_part *part [[buffer(1)]],
+                       constant float &inv_t [[buffer(2)]],
+                       uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tm[8], ts[8];
+    const uint b = g.x, r = g.y, i = b * SEL_BLK + tid;
+    const float v = lg[(ulong)r * SEL_NV + i];
+    const bool f = sel_fin(v);
+    const float x = f ? v * inv_t : -INFINITY;
+    const float m = simd_max(x);
+    if (lane == 0) tm[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float M = tm[0];
+    for (ushort j = 1; j < 8; j++) M = max(M, tm[j]);
+    const float e = f ? precise::exp(x - M) : 0.0f;
+    const float s = simd_sum(e);
+    if (lane == 0) ts[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float S = 0.0f;
+        for (ushort j = 0; j < 8; j++) S += ts[j];
+        part[r * SEL_NB + b] = pq_part{M, S};
+    }
+}
+
+kernel void kernel_pq2(device const float *lg [[buffer(0)]], device const pq_part *part [[buffer(1)]],
+                       device float *out [[buffer(2)]], constant float &inv_t [[buffer(3)]],
+                       uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tm[8], ts[8];
+    const uint b = g.x, r = g.y, i = b * SEL_BLK + tid;
+    device const pq_part *pr = part + r * SEL_NB;
+    float m = -INFINITY;
+    for (uint k = tid; k < SEL_NB; k += SEL_BLK) m = max(m, pr[k].m);
+    m = simd_max(m);
+    if (lane == 0) tm[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float M = tm[0];
+    for (ushort j = 1; j < 8; j++) M = max(M, tm[j]);
+    float s = 0.0f;
+    for (uint k = tid; k < SEL_NB; k += SEL_BLK) { const pq_part q = pr[k]; if (q.s > 0.0f) s += q.s * precise::exp(q.m - M); }
+    s = simd_sum(s);
+    if (lane == 0) ts[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float S = 0.0f;
+    for (ushort j = 0; j < 8; j++) S += ts[j];
+    const float v = lg[(ulong)r * SEL_NV + i];
+    out[(ulong)r * SEL_NV + i] = sel_fin(v) && S > 0.0f ? precise::exp(v * inv_t - M) / S : 0.0f;
+}
+
+kernel void kernel_rs1(device const float *p [[buffer(0)]], device const float *q [[buffer(1)]],
+                       device sel_part *part [[buffer(2)]], device kg_row *rows [[buffer(3)]],
+                       constant ulong *keys [[buffer(4)]],
+                       uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tm[8]; threadgroup uint tb[8], tf[8];
+    const uint b = g.x, r = g.y, i = b * SEL_BLK + tid;
+    if (b == 0 && tid == 0) atomic_store_explicit(&rows[r].n, 0u, memory_order_relaxed);
+    const ulong o = (ulong)r * SEL_NV + i;
+    const float d = p[o] - q[o];
+    uint f = d > 0.0f ? 1u : 0u;
+    float m = f ? precise::log(d) + kg_noise(keys[r], i) : 0.0f; uint bi = i;
+    sel_simd_maxid(m, bi, f);
+    if (lane == 0) { tm[sg] = m; tb[sg] = bi; tf[sg] = f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float M = tm[0]; uint B = tb[0], F = tf[0];
+        for (ushort j = 1; j < 8; j++) sel_take(M, B, F, tm[j], tb[j], tf[j]);
+        part[r * SEL_NB + b] = sel_part{F, M, B, 0u};
+    }
+}
+
+kernel void kernel_rs2(device const float *p [[buffer(0)]], device const float *q [[buffer(1)]],
+                       device const sel_part *part [[buffer(2)]], device kg_row *rows [[buffer(3)]],
+                       constant ulong *keys [[buffer(4)]],
+                       uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tm[8]; threadgroup uint tb[8], tf[8];
+    const uint b = g.x, r = g.y, i = b * SEL_BLK + tid;
+    uint F, B; float V;
+    sel_global(part + r * SEL_NB, tid, lane, sg, tm, tb, tf, F, V, B);
+    if (b == 0 && tid == 0) rows[r].finite = F;
+    const ulong o = (ulong)r * SEL_NV + i;
+    const float d = p[o] - q[o];
+    if (F == 0u || !(d > 0.0f) || precise::log(d) + kg_noise(keys[r], i) < V - KG_MARGIN) return;
     const uint slot = atomic_fetch_add_explicit(&rows[r].n, 1u, memory_order_relaxed);
     if (slot < KG_SLOTS) rows[r].id[slot] = i;
 }

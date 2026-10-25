@@ -47508,13 +47508,13 @@ _Static_assert(sizeof(kg_gpu_row) == 272, "keyed candidates row");
 /* 0 decode steps decided on the GPU, 1 unbound or stale (CPU), 2 overflow (CPU), 3 invalid (CPU) */
 static uint64_t g_kg_counts[4];
 void ds4_keyed_gpu_counts(uint64_t out[4]) { for (int i = 0; i < 4; i++) out[i] = g_kg_counts[i]; }
-static DS4_MAYBE_UNUSED int ds41_keyed_finish(const kg_gpu_row *r, const float *lg, const sample_key *k, uint32_t pos,
-                                              int *token) {
+/* the Gumbel-max draw of softmax(LG / T) under KEY from a candidates row (also PQ_GPU's draft draws) */
+static DS4_MAYBE_UNUSED int ds41_kg_finish(const kg_gpu_row *r, const float *lg, float temperature, uint64_t key,
+                                           int *token) {
     if (!r || r->finite > DS4_N_VOCAB) return 2;
     if (!r->finite) { *token = sample_argmax(lg, DS4_N_VOCAB); return 0; }
     if (!r->n) return 2;   /* the maximum is always a candidate */
     if (r->n > 64u) return 1;
-    const uint64_t key = sample_key_mix(k->seed ^ sample_key_mix((uint64_t)pos + 1u));
     int best = -1;
     double best_v = 0.0;
     for (uint32_t c = 0; c < r->n; c++) {
@@ -47523,13 +47523,60 @@ static DS4_MAYBE_UNUSED int ds41_keyed_finish(const kg_gpu_row *r, const float *
         if (i >= DS4_N_VOCAB) return 2;
         memcpy(&bits, &lg[i], 4);
         if ((bits & 0x7f800000u) == 0x7f800000u) return 2;
-        const double v = sample_keyed_full_score(lg[i], k->temperature,
+        const double v = sample_keyed_full_score(lg[i], temperature,
                                                  sample_key_mix(key + (uint64_t)i * 0x9e3779b97f4a7c15ULL));
         if (best < 0 || v > best_v || (v == best_v && (int)i < best)) { best = (int)i; best_v = v; }
     }
     *token = best;
     return 0;
 }
+
+static DS4_MAYBE_UNUSED int ds41_keyed_finish(const kg_gpu_row *r, const float *lg, const sample_key *k, uint32_t pos,
+                                              int *token) {
+    return ds41_kg_finish(r, lg, k->temperature, sample_key_mix(k->seed ^ sample_key_mix((uint64_t)pos + 1u)), token);
+}
+
+/* PQ_GPU: DSpark's exact verify at the full distribution (temperature > 0, no top-k, top_p 1, no min-p, not under TP):
+ * each draft row's q = softmax(row / T) is built on the GPU and its draft drawn by Gumbel-max under a key taken from
+ * the RNG; the verify block builds the rows' p and the candidates of each row's residual max(0, p - q) draw. The CPU
+ * reads p(x) and q(x) for the p/q test and scores only candidates. DS4_METAL_DISABLE_V41_PQ_GPU=1 builds on the CPU. */
+static bool ds41_pq_gpu(const ds4_engine *e, float temperature, int top_k, float top_p, float min_p) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    return ds41_on(DS4_GPU_V41_PQ_GPU) && temperature > 0.0f && top_k <= 0 && (top_p <= 0.0f || top_p >= 1.0f) &&
+        min_p <= 0.0f && !e->tp.active && ds4_gpu_selector_ready();
+#else
+    (void)e; (void)temperature; (void)top_k; (void)top_p; (void)min_p;
+    return false;
+#endif
+}
+
+/* PQ_GPU: the residual draw from max(0, P - Q) under KEY from a candidates row: log d + G(KEY, id) over the
+ * candidates, d = P - Q in float as the GPU took it. 0 decided, 1 overflow, 2 invalid, 3 no residual mass (the caller
+ * takes p's argmax, as sample_residual_probabilities does). */
+static DS4_MAYBE_UNUSED int ds41_pq_residual_finish(const kg_gpu_row *r, const float *P, const float *Q, uint64_t key,
+                                                    int *token) {
+    if (!r || r->finite > DS4_N_VOCAB) return 2;
+    if (!r->finite) return 3;
+    if (!r->n) return 2;
+    if (r->n > 64u) return 1;
+    int best = -1;
+    double best_v = 0.0;
+    for (uint32_t c = 0; c < r->n; c++) {
+        const uint32_t i = r->id[c];
+        if (i >= DS4_N_VOCAB) return 2;
+        const float d = P[i] - Q[i];
+        if (!(d > 0.0f) || !isfinite(d)) return 2;
+        const uint64_t h = sample_key_mix(key + (uint64_t)i * 0x9e3779b97f4a7c15ULL);
+        const double v = log((double)d) - log(-log(((double)(h >> 11) + 0.5) * 0x1.0p-53));
+        if (best < 0 || v > best_v || (v == best_v && (int)i < best)) { best = (int)i; best_v = v; }
+    }
+    *token = best;
+    return 0;
+}
+/* 0 draft draws decided on the GPU, 1 drawn on the CPU from the GPU's q, 2 residual draws decided on the GPU,
+ * 3 on the CPU, 4 verify blocks whose p was built on the GPU */
+static uint64_t g_pq_counts[5];
+void ds4_pq_gpu_counts(uint64_t out[5]) { for (int i = 0; i < 5; i++) out[i] = g_pq_counts[i]; }
 
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
@@ -47588,6 +47635,15 @@ int ds4_test_keyed_finish(const void *row, const float *logits, float temperatur
                           int *token) {
     const sample_key key = { temperature, 0, 1.0f, 0.0f, seed };
     return ds41_keyed_finish((const kg_gpu_row *)row, logits, &key, pos, token);
+}
+
+/* PQ_GPU: a draft draw's finish under KEY, and a residual draw's */
+int ds4_test_pq_draw_finish(const void *row, const float *logits, float temperature, uint64_t key, int *token) {
+    return ds41_kg_finish((const kg_gpu_row *)row, logits, temperature, key, token);
+}
+
+int ds4_test_pq_residual_finish(const void *row, const float *p, const float *q, uint64_t key, int *token) {
+    return ds41_pq_residual_finish((const kg_gpu_row *)row, p, q, key, token);
 }
 
 int ds4_test_speculative_delta_sample(const float *target_logits,
@@ -76810,7 +76866,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         {   /* SAMPLER_GPU: the selector's own small library, once (a failure only leaves sampling on the CPU) */
             static bool sel_failed;
             if (!e->tp.active && !e->ssd_streaming && !e->quality &&
-                (ds41_on(DS4_GPU_V41_SAMPLER_GPU) || ds41_on(DS4_GPU_V41_KEYED_GPU)) &&
+                (ds41_on(DS4_GPU_V41_SAMPLER_GPU) || ds41_on(DS4_GPU_V41_KEYED_GPU) || ds41_on(DS4_GPU_V41_PQ_GPU)) &&
                 !sel_failed && !ds4_gpu_selector_ready())
                 sel_failed = !ds4_gpu_selector_init();
         }
@@ -89166,6 +89222,11 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         return 1;
     }
     const bool exact = temperature > 0 && e->dspark_exact_sampling;
+    /* PQ_GPU: q, p and the draft and residual draws' candidates on the GPU; each draw's Gumbel key comes from the RNG */
+    const bool pq = exact && rng && ds41_pq_gpu(e, temperature, top_k, top_p, min_p);
+    d->pq_on = pq;
+    d->pq_inv_t = pq ? 1.0f / temperature : 1.0f;
+    const float *qrow[DS41_VERIFY_ROWS] = {0};   /* each drafted row's q: the GPU's slot or d->draft_probs */
     const double started = now_sec();
     if (!ds41_session_draft(s, first_token))
         goto fail;
@@ -89174,6 +89235,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     for (; count < (uint32_t)cap; count++) {
         const uint32_t row = count - 1u;
         float confidence;
+        if (pq) d->pq_key = sample_key_mix(sample_rng_next(rng));
         if (!ds41_dspark_markov(d, &e->mtp_model, row, tokens[row], &confidence)) goto fail;
         if (a ? !ds41_admit_confident(row, sigmoid_stable(confidence)) :
             e->dspark_confidence_threshold > 0 &&
@@ -89182,10 +89244,18 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             break;
         }
         const float *qlogits = d->host_logits + (uint64_t)row * DS4_N_VOCAB;
-        if (exact) {
+        if (exact && pq && d->pq_q[row]) {
+            qrow[row] = ds4_gpu_pq_probs(row);
+            int t = -1;
+            const int path = ds41_kg_finish(ds4_gpu_pq_cand(row), qlogits, temperature, d->pq_key, &t);
+            if (path) t = sample_probabilities(qrow[row], DS4_N_VOCAB, rng);   /* the GPU's q, drawn on the CPU */
+            g_pq_counts[path ? 1 : 0]++;
+            tokens[count] = t;
+        } else if (exact) {
             float *q = d->draft_probs + (uint64_t)row * DS4_N_VOCAB;
             if (!rng || !sample_build_probabilities(qlogits, DS4_N_VOCAB,
                 temperature, top_k, top_p, min_p, q)) goto fail;
+            qrow[row] = q;
             tokens[count] = sample_probabilities(q, DS4_N_VOCAB, rng);
         } else tokens[count] = sample_argmax(qlogits, DS4_N_VOCAB);
         if (ignore_eos && ds4_token_is_stop_for_think_mode(e, tokens[count], think_mode)) break;
@@ -89211,7 +89281,9 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         s->dspark_stats.proposed_tokens += count - 1u;
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
     }
+    for (uint32_t r = 0; pq && r + 1u < count; r++) d->pq_keys[r] = sample_key_mix(sample_rng_next(rng));
     if (!ds41_session_verify(s, tokens, count)) goto fail;
+    if (d->pq_done) g_pq_counts[4]++;
     uint32_t keep = 1;
     int correction = -1;
     for (; keep < count; keep++) {
@@ -89219,12 +89291,26 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         if (!exact) {
             if (sample_argmax(p_logits, DS4_N_VOCAB) != tokens[keep]) break;
         } else {
-            float *q = d->draft_probs + (uint64_t)(keep - 1u) * DS4_N_VOCAB;
-            if (!sample_build_probabilities(p_logits, DS4_N_VOCAB,
-                temperature, top_k, top_p, min_p, s->sample_probs)) goto fail;
+            const float *q = qrow[keep - 1u];
+            const float *P = d->pq_done ? ds4_gpu_pq_probs(DS41_DRAFT_ROWS + keep - 1u) : NULL;
+            if (!P) {
+                if (!sample_build_probabilities(p_logits, DS4_N_VOCAB,
+                    temperature, top_k, top_p, min_p, s->sample_probs)) goto fail;
+                P = s->sample_probs;
+            }
             const int token = tokens[keep];
-            if (sample_rng_f32(rng) * q[token] > s->sample_probs[token]) {
-                correction = sample_residual_probabilities(s->sample_probs, q, DS4_N_VOCAB, rng);
+            if (sample_rng_f32(rng) * q[token] > P[token]) {
+                int path = -1;
+                if (d->pq_done) {   /* PQ_GPU: the residual draw from its candidates */
+                    path = ds41_pq_residual_finish(ds4_gpu_pq_cand(DS41_DRAFT_ROWS + keep - 1u), P, q,
+                                                   d->pq_keys[keep - 1u], &correction);
+                    if (path == 3) correction = sample_argmax(P, DS4_N_VOCAB);   /* no residual mass */
+                    g_pq_counts[path == 0 || path == 3 ? 2 : 3]++;
+                }
+                if (path != 0 && path != 3) {
+                    if (P != s->sample_probs) memcpy(s->sample_probs, P, (size_t)DS4_N_VOCAB * sizeof(float));
+                    correction = sample_residual_probabilities(s->sample_probs, q, DS4_N_VOCAB, rng);
+                }
                 break;
             }
         }
