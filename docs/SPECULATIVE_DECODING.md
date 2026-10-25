@@ -127,18 +127,15 @@ distribution. Greedy proposals are accepted with their target probability;
 sampled proposals use the target-to-draft probability ratio. Rejections sample
 from the remaining target probability mass.
 
-DeepSeek V4.1 instead samples the full distribution (top_p 1, no top-k or
-min-p) with noise keyed to the seed and position, and keeps a DSpark draft only
-while it equals the token that sampling picks at its position. Sampled output
-therefore follows the target distribution, and the same seed gives the same
-text with or without drafting, up to the verify block's own arithmetic. The
-first rejected row's draw is the next token, so a rejection costs no correction
-step. Other settings (for example top_p 0.95) keep the GPU top-p selector and,
-with `--mtp-exact-sampling`, the p/q acceptance above. Two-Mac runs keep the
-opportunistic mode; `DS4_METAL_DISABLE_V41_KEYED_SAMPLING=1` restores it on one
-Mac. The decode step and the verify block find each draw's few candidates on
-the GPU (`DS4_METAL_DISABLE_V41_KEYED_GPU=1` scores the whole vocabulary on the
-CPU instead).
+DeepSeek V4.1's plain decode samples the full distribution (top_p 1, no top-k
+or min-p) with noise keyed to the seed and position, its few candidates found
+on the GPU (`DS4_METAL_DISABLE_V41_KEYED_SAMPLING=1` and
+`DS4_METAL_DISABLE_V41_KEYED_GPU=1` turn these off). DSpark keeps the p/q
+acceptance above at every setting: keeping a greedy draft only while it equals
+the keyed draw accepts it with p(draft), less than the p/q test's
+sum of min(p, q). At top_p 1 the target and draft probabilities are the softmax
+itself, built in one pass without a sort (`DS4_METAL_DISABLE_V41_FULL_PROBS=1`
+restores the sorting build).
 
 When a verified block crosses a tool sampling-mode boundary (for example
 entering tool-call syntax during server decoding), the server rewinds to the

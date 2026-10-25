@@ -711,7 +711,7 @@ extern char **environ;
 /* Versioned contract of what produces a V4.1 prefix frontier. Bump it when a new
  * prefix producer appears (e.g. an FP8 prefill path), never stamp old payloads. */
 #define BENCH_CACHE_CONTRACT "v41-prefix-1"
-#define BENCH_JOB_COUNTERS 17
+#define BENCH_JOB_COUNTERS 14
 
 typedef struct {
     char path[PATH_MAX];
@@ -847,9 +847,9 @@ static void job_counters(uint64_t c[BENCH_JOB_COUNTERS]) {
     int k = 0;
     c[k++] = ds4_sampler_gpu_encoded_count();
     for (int i = 0; i < 9; i++) c[k++] = g[i];
-    uint64_t kg[7];   /* KEYED_GPU outcomes */
+    uint64_t kg[4];   /* KEYED_GPU outcomes */
     ds4_keyed_gpu_counts(kg);
-    for (int i = 0; i < 7; i++) c[k++] = kg[i];
+    for (int i = 0; i < 4; i++) c[k++] = kg[i];
     assert(k == BENCH_JOB_COUNTERS);
 }
 
@@ -870,8 +870,7 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
     fprintf(jo, "job,verb,label,cache,env,mode,temp,top_p,top_k,min_p,seed,warm,tokens,eos,"
                 "setup_ns,restore_ns,first_sel0_ns,last_eval1_ns,decode_tps,pos,prefix_fnv64,logits_fnv64,state_fnv64,"
                 "sel_encoded,sel_decided,sel_mass_short,sel_ambiguous,sel_overflow,sel_invalid,sel_zero,sel_unbound,"
-                "sel_settings,sel_stale,kg_decided,kg_dspark_reused,kg_unbound,kg_overflow,kg_invalid,kg_verify_gpu,"
-                "kg_verify_cpu,cycles,v41_off\n");
+                "sel_settings,sel_stale,kg_decided,kg_unbound,kg_overflow,kg_invalid,cycles,v41_off\n");
     const int eos = ds4_token_eos(engine);
     const int logits_cap = 1 << 18;
     float *logits = malloc((size_t)logits_cap * sizeof(float));

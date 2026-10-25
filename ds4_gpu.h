@@ -100,10 +100,9 @@ typedef struct {
 #define DS4_GPU_V41_CTX_RESIDENCY (1ull << 52)   /* the engine's own allocations in a residency set on the queue, so a prefill does not wait while the driver makes them resident */
 #define DS4_GPU_V41_MOE_HALF_X (1ull << 53)   /* the routed experts' compact pair tiles read the rows narrowed to half once per layer, at the same bits */
 #define DS4_GPU_V41_CARRY_KEEP (1ull << 54)   /* a one-chunk prefill layer keeps the previous layer's rows in the batch buffers instead of loading them back from the carry */
-#define DS4_GPU_V41_KEYED_SAMPLING (1ull << 55)   /* full-distribution samples (top_p 1, no top-k or min-p) are position-keyed Gumbel draws, and DSpark keeps a draft while it equals its row's draw */
-#define DS4_GPU_V41_KEYED_DSPARK (1ull << 58)   /* with KEYED_SAMPLING, DSpark keeps a greedy draft while it equals its row's keyed draw (off: drafts are sampled and verified by the p/q test) */
+#define DS4_GPU_V41_KEYED_SAMPLING (1ull << 55)   /* plain decode's full-distribution samples (top_p 1, no top-k or min-p) are position-keyed Gumbel draws */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
-#define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step and the DSpark verify rows find the keyed draw's candidates on the GPU; the CPU scores only them */
+#define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
  * and keeps DSpark to target-only decode as --dspark-strict does. It is off by default. */
 #define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \

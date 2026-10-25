@@ -535,9 +535,8 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
  * 3 overflow, 4 invalid, 5 zero finite, 6 unbound, 7 settings outside temp 1 / top_k 0 / top_p 0.95 / min_p 0,
  * 8 stale (paths 1-8 fell back to the CPU sampler); and the decode steps that encoded it. */
 void ds4_sampler_gpu_counts(uint64_t out[9]);
-/* KEYED_GPU outcomes: 0 decode steps decided on the GPU, 1 a DSpark row's draw reused, 2 unbound or stale, 3 overflow,
- * 4 invalid, 5 verify rows decided on the GPU, 6 verify rows on the CPU */
-void ds4_keyed_gpu_counts(uint64_t out[7]);
+/* KEYED_GPU outcomes: 0 decode steps decided on the GPU, 1 unbound or stale, 2 overflow, 3 invalid */
+void ds4_keyed_gpu_counts(uint64_t out[4]);
 uint64_t ds4_sampler_gpu_encoded_count(void);
 #ifdef DS4_TEST_HOOKS
 /* the selector's reference and production consumers on one summary (HDR: 64-byte header, P: 505 partials,
