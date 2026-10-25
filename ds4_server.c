@@ -14104,6 +14104,20 @@ static void *decode_worker_main(void *arg) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+/* V4.1 sampler outcomes since process start: [0] top-p selector samples decided on the GPU, [1] all samples that
+ * reached the selector (decided or fallen back to the CPU), [2] unused; [3..6] KEYED_GPU (decided, unbound, overflow,
+ * invalid); [7..11] PQ_GPU (draft draws on the GPU, on the CPU, residual draws on the GPU, on the CPU, verify blocks) */
+static void sampler_counts(uint64_t c[3 + 4 + 5]) {
+    uint64_t sel[9];
+    ds4_sampler_gpu_counts(sel);
+    c[0] = sel[0];
+    c[1] = 0;
+    for (int k = 0; k < 9; k++) c[1] += sel[k];
+    c[2] = 0;
+    ds4_keyed_gpu_counts(c + 3);
+    ds4_pq_gpu_counts(c + 7);
+}
+
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -14346,6 +14360,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
+    uint64_t samp0[3 + 4 + 5];   /* the request's sampler paths, logged at its finish */
+    sampler_counts(samp0);
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
     char ctx_span[48];
@@ -15454,6 +15470,19 @@ decode_again:
                        final_finish,
                        now_sec() - t0);
         }
+    }
+    {   /* which sampler served the request's sampled tokens */
+        uint64_t samp1[3 + 4 + 5];
+        sampler_counts(samp1);
+        for (int k = 0; k < 12; k++) samp1[k] -= samp0[k];
+        if (samp1[0] + samp1[1] + samp1[2] + samp1[3] + samp1[4] + samp1[7] + samp1[9])
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: sampler top_p=%.2f keyed_gpu=%llu keyed_cpu=%llu selector_gpu=%llu selector_cpu=%llu "
+                       "dspark_pq_gpu_draws=%llu dspark_pq_cpu_draws=%llu",
+                       (double)j->req.top_p, (unsigned long long)samp1[3],
+                       (unsigned long long)(samp1[4] + samp1[5] + samp1[6]), (unsigned long long)samp1[0],
+                       (unsigned long long)(samp1[1] - samp1[0]), (unsigned long long)(samp1[7] + samp1[9]),
+                       (unsigned long long)(samp1[8] + samp1[10]));
     }
     free(parsed_content);
     free(parsed_reasoning);
