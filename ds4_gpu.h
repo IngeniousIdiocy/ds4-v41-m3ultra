@@ -107,7 +107,8 @@ typedef struct {
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
  * and keeps DSpark to target-only decode as --dspark-strict does. It is off by default. */
 #define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \
-    DS4_GPU_V41_VERIFY_INDEXED | DS4_GPU_V41_PREFILL_MMA | DS4_GPU_V41_CED | DS4_GPU_V41_IMAGE_CED)
+    DS4_GPU_V41_VERIFY_INDEXED | DS4_GPU_V41_PREFILL_MMA | DS4_GPU_V41_CED | DS4_GPU_V41_IMAGE_CED | \
+    DS4_GPU_V41_KEYED_SAMPLING | DS4_GPU_V41_KEYED_GPU | DS4_GPU_V41_FULL_PROBS | DS4_GPU_V41_PQ_GPU)
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
