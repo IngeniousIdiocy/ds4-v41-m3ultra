@@ -583,6 +583,7 @@ uint64_t ds4_gpu_v41_off2(void) {
             "DS4_METAL_DISABLE_V41_MIXED_STEP",
             "DS4_METAL_DISABLE_V41_MIXED_CARRY",
             "DS4_METAL_DISABLE_V41_READ_ONCE",
+            "DS4_METAL_DISABLE_V41_FP4_NO_TABLE",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -42912,6 +42913,11 @@ int ds4_gpu_routed_moe_one_tensor(
             gate_args.ne11 == 1 && gate_args.tp_world == 1 && gate_args.tp_expert_base == 0 &&
             g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1 != nil) {
             pair_swiglu_pipeline = g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_pipeline_nsg1;
+            if (ds4_gpu_v41_on2(DS4_GPU_V41B_FP4_NO_TABLE)) {
+                static id<MTLComputePipelineState> pair;
+                if (!pair) pair = ds4_gpu_new_mul_mv_tg_multiple_pipeline("kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_no_table_v41_f32", 1);
+                pair_swiglu_pipeline = pair;
+            }
             DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32");
         }
         const bool use_iq2_pair_pack2 =
@@ -42954,6 +42960,11 @@ int ds4_gpu_routed_moe_one_tensor(
                                 g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple :
                                 g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1));
                 down_sum6_nsg = 1;
+                if (use_mxfp4_moe_decode_static_trip_down && v41_fixed && ds4_gpu_v41_on2(DS4_GPU_V41B_FP4_NO_TABLE)) {
+                    static id<MTLComputePipelineState> sum;
+                    if (!sum) sum = ds4_gpu_new_mul_mv_tg_multiple_pipeline("kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_no_table_f32", 1);
+                    down_sum6_pipeline = sum;
+                }
             }
         } else if (down_type == DS4_METAL_TENSOR_IQ2_XXS &&
                    g_tp_split_world == 2) {
@@ -46267,11 +46278,22 @@ int ds4_gpu_routed_moe_batch_tensor(
             }
             tiny_pair_swiglu_pipeline = pair_kernels[rblock];
             down_sum6_pipeline = sum_kernels[rblock];
+            const int no_table = rblock && ds4_gpu_v41_on2(DS4_GPU_V41B_FP4_NO_TABLE);
+            if (no_table) {
+                static id<MTLComputePipelineState> pair, sum;
+                if (!pair) {
+                    pair = ds4_gpu_new_mul_mv_tg_multiple_pipeline("kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_no_table_v41_f32", 1);
+                    sum = ds4_gpu_new_mul_mv_tg_multiple_pipeline("kernel_mul_mv_id_mxfp4_sum6_rows_rblock_no_table_v41_f32", 1);
+                }
+                tiny_pair_swiglu_pipeline = pair;
+                down_sum6_pipeline = sum;
+            }
             if (g_once_planned) {
-                static id<MTLComputePipelineState> once;
-                if (!once) once = ds4_gpu_new_mul_mv_tg_multiple_pipeline("kernel_mul_mv_id_mxfp4_pair_once_v41_f32", 1);
-                if (!once) return 0;
-                tiny_pair_swiglu_pipeline = once;
+                static id<MTLComputePipelineState> once[2];
+                if (!once[no_table]) once[no_table] = ds4_gpu_new_mul_mv_tg_multiple_pipeline(no_table ?
+                    "kernel_mul_mv_id_mxfp4_pair_once_no_table_v41_f32" : "kernel_mul_mv_id_mxfp4_pair_once_v41_f32", 1);
+                if (!once[no_table]) return 0;
+                tiny_pair_swiglu_pipeline = once[no_table];
                 DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_once_v41_f32");
             }
             if (!tiny_pair_swiglu_pipeline || !down_sum6_pipeline) return 0;

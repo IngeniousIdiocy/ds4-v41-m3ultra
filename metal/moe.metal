@@ -414,6 +414,59 @@ struct block_mxfp4 {
     uchar qs[QK_MXFP4/2];
 };
 
+/* FP4_NO_TABLE: two codes 16 bits apart are one half2's bits, each the code's value times 2^-14 */
+static inline float2 ds4_mxfp4_codes(const uint p) {
+    return float2(as_type<half2>(((p & 0x00080008u) << 12) | ((p & 0x00070007u) << 9)));
+}
+
+/* the down kernels' activations a lane loads, times 2^14 without the table: the products are the table form's whatever
+ * y's size, and a mid can be small enough that y times 2^-14 flushes and breaks a tie the table form's term breaks */
+template<bool NO_TABLE>
+static inline float4 ds4_mxfp4_y(const float4 y) {
+    return NO_TABLE ? y * 16384.0f : y;
+}
+
+/* a lane's eight bytes as sixteen weights, times 2^-14 without the table */
+template<bool NO_TABLE>
+static inline void ds4_mxfp4_lane(device const uchar *q, threadgroup const float *lut, thread float4 *w) {
+    if (NO_TABLE) {
+        const uint a = uint(q[0]) | uint(q[1]) << 8 | uint(q[2]) << 16 | uint(q[3]) << 24;
+        const uint b = uint(q[4]) | uint(q[5]) << 8 | uint(q[6]) << 16 | uint(q[7]) << 24;
+        const uint au = a >> 8, bu = b >> 8;
+        const float2 a0 = ds4_mxfp4_codes(a), a1 = ds4_mxfp4_codes(au), a2 = ds4_mxfp4_codes(a >> 4), a3 = ds4_mxfp4_codes(au >> 4);
+        const float2 b0 = ds4_mxfp4_codes(b), b1 = ds4_mxfp4_codes(bu), b2 = ds4_mxfp4_codes(b >> 4), b3 = ds4_mxfp4_codes(bu >> 4);
+        w[0] = float4(a0.x, a1.x, a0.y, a1.y);
+        w[1] = float4(a2.x, a3.x, a2.y, a3.y);
+        w[2] = float4(b0.x, b1.x, b0.y, b1.y);
+        w[3] = float4(b2.x, b3.x, b2.y, b3.y);
+    } else {
+        w[0] = float4(lut[q[0] & 15], lut[q[1] & 15], lut[q[2] & 15], lut[q[3] & 15]);
+        w[1] = float4(lut[q[0] >> 4], lut[q[1] >> 4], lut[q[2] >> 4], lut[q[3] >> 4]);
+        w[2] = float4(lut[q[4] & 15], lut[q[5] & 15], lut[q[6] & 15], lut[q[7] & 15]);
+        w[3] = float4(lut[q[4] >> 4], lut[q[5] >> 4], lut[q[6] >> 4], lut[q[7] >> 4]);
+    }
+}
+
+/* The block's dot. Fast math flattens the table form to one chain of sixteen terms in this order; it orders terms by
+ * where they are defined, and decoded weights are defined together, so without the table the chain is spelled out. */
+template<bool NO_TABLE, bool Y_SCALED = false>
+static inline float ds4_mxfp4_dot(const float4 y0, const float4 y1, const float4 y2, const float4 y3, thread const float4 *w) {
+    if (NO_TABLE) {
+#pragma clang fp reassociate(off)
+        float a = y0.x * w[0].x;
+        a = fma(y0.y, w[0].y, a); a = fma(y0.z, w[0].z, a); a = fma(y0.w, w[0].w, a);
+        a = fma(y1.x, w[1].x, a); a = fma(y1.y, w[1].y, a); a = fma(y1.z, w[1].z, a); a = fma(y1.w, w[1].w, a);
+        a = fma(y2.x, w[2].x, a); a = fma(y2.y, w[2].y, a); a = fma(y2.z, w[2].z, a); a = fma(y2.w, w[2].w, a);
+        a = fma(y3.x, w[3].x, a); a = fma(y3.y, w[3].y, a); a = fma(y3.z, w[3].z, a); a = fma(y3.w, w[3].w, a);
+        return Y_SCALED ? a : a * 16384.0f;
+    }
+    float4 a = y0 * w[0];
+    a += y1 * w[1];
+    a += y2 * w[2];
+    a += y3 * w[3];
+    return (a.x + a.y) + (a.z + a.w);
+}
+
 struct ds4_metal_glm_routed_moe_args {
     uint32_t in_dim;
     uint32_t mid_dim;
@@ -5089,7 +5142,7 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_f32(
 #define DS4_MXFP4_PAIR_STATIC_NB_V41 160
 
 template<typename args_t, int STATIC_NB = DS4_MXFP4_PAIR_STATIC_NB,
-         int STATIC_ROW_BLOCKS = DS4_MXFP4_PAIR_STATIC_ROW_BLOCKS>
+         int STATIC_ROW_BLOCKS = DS4_MXFP4_PAIR_STATIC_ROW_BLOCKS, bool NO_TABLE = false>
 void kernel_mul_mv_mxfp4_pair_swiglu_static_impl(
         args_t args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
@@ -5110,8 +5163,10 @@ void kernel_mul_mv_mxfp4_pair_swiglu_static_impl(
     const short it = tiisg & 1;
 
     threadgroup float *lut = (threadgroup float *)shmem;
-    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!NO_TABLE) {
+        if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     device const block_mxfp4 *xg =
         (device const block_mxfp4 *)(src0_gate + (uint64_t)first_row * args.nb01);
@@ -5136,28 +5191,12 @@ void kernel_mul_mv_mxfp4_pair_swiglu_static_impl(
             device const uchar *qg = bg.qs + 8 * it;
             device const uchar *qu = bu.qs + 8 * it;
 
-            float4 ag = yl0 * float4(lut[qg[0] & 15], lut[qg[1] & 15],
-                                      lut[qg[2] & 15], lut[qg[3] & 15]);
-            ag += yl1 * float4(lut[qg[0] >> 4], lut[qg[1] >> 4],
-                               lut[qg[2] >> 4], lut[qg[3] >> 4]);
-            ag += yl2 * float4(lut[qg[4] & 15], lut[qg[5] & 15],
-                               lut[qg[6] & 15], lut[qg[7] & 15]);
-            ag += yl3 * float4(lut[qg[4] >> 4], lut[qg[5] >> 4],
-                               lut[qg[6] >> 4], lut[qg[7] >> 4]);
+            float4 wg[4], wu[4];
+            ds4_mxfp4_lane<NO_TABLE>(qg, lut, wg);
+            ds4_mxfp4_lane<NO_TABLE>(qu, lut, wu);
 
-            float4 au = yl0 * float4(lut[qu[0] & 15], lut[qu[1] & 15],
-                                      lut[qu[2] & 15], lut[qu[3] & 15]);
-            au += yl1 * float4(lut[qu[0] >> 4], lut[qu[1] >> 4],
-                               lut[qu[2] >> 4], lut[qu[3] >> 4]);
-            au += yl2 * float4(lut[qu[4] & 15], lut[qu[5] & 15],
-                               lut[qu[6] & 15], lut[qu[7] & 15]);
-            au += yl3 * float4(lut[qu[4] >> 4], lut[qu[5] >> 4],
-                               lut[qu[6] >> 4], lut[qu[7] >> 4]);
-
-            sumg[row] += ds4_metal_e8m0_to_f32(bg.e) *
-                         ((ag.x + ag.y) + (ag.z + ag.w));
-            sumu[row] += ds4_metal_e8m0_to_f32(bu.e) *
-                         ((au.x + au.y) + (au.z + au.w));
+            sumg[row] += ds4_metal_e8m0_to_f32(bg.e) * ds4_mxfp4_dot<NO_TABLE>(yl0, yl1, yl2, yl3, wg);
+            sumu[row] += ds4_metal_e8m0_to_f32(bu.e) * ds4_mxfp4_dot<NO_TABLE>(yl0, yl1, yl2, yl3, wu);
         }
         yb += 16 * QK_MXFP4;
     }
@@ -5240,7 +5279,8 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32(
 
 /* kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_f32 at the V4.1 shape (5120 -> 2304, 384 experts, six
  * selected, one token) with every shape and stride as literals. */
-kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32(
+template<bool NO_TABLE>
+kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41(
         constant ds4_metal_args_mul_mv_id &args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
         device const char *src0_gate,
@@ -5277,13 +5317,18 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32(
     device const char *up_expert = src0_up + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
     tgpig.z = 0;
     kernel_mul_mv_mxfp4_pair_swiglu_static_impl<thread ds4_metal_args_mul_mv_id &,
-        DS4_MXFP4_PAIR_STATIC_NB_V41, DS4_MXFP4_PAIR_STATIC_NB_V41>(
+        DS4_MXFP4_PAIR_STATIC_NB_V41, DS4_MXFP4_PAIR_STATIC_NB_V41, NO_TABLE>(
         sa, act, gate_expert, up_expert, src1, gate_cur, up_cur, mid_cur,
         route[0], shmem, tgpig, tiisg, sgitg);
     (void)tiitg;
 }
 
+typedef decltype(kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41<false>) kernel_mxfp4_pair_one_v41_t;
+template [[host_name("kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32")]] kernel kernel_mxfp4_pair_one_v41_t kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41<false>;
+template [[host_name("kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_no_table_v41_f32")]] kernel kernel_mxfp4_pair_one_v41_t kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41<true>;
+
 /* BATCH_STATIC: that kernel with a row count, six pairs a row and each row's activation 20480 bytes on. */
+template<bool NO_TABLE = false>
 static inline void ds4_mxfp4_pair_swiglu_rows_static_v41(
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
         device const char *src0_gate,
@@ -5315,7 +5360,7 @@ static inline void ds4_mxfp4_pair_swiglu_rows_static_v41(
     device const char *gate_expert = src0_gate + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
     device const char *up_expert = src0_up + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
     kernel_mul_mv_mxfp4_pair_swiglu_static_impl<thread ds4_metal_args_mul_mv_id &,
-        DS4_MXFP4_PAIR_STATIC_NB_V41, DS4_MXFP4_PAIR_STATIC_NB_V41>(
+        DS4_MXFP4_PAIR_STATIC_NB_V41, DS4_MXFP4_PAIR_STATIC_NB_V41, NO_TABLE>(
         sa, act, gate_expert, up_expert, src1 + (uint64_t)(pair / 6u) * 20480u, gate_cur, up_cur, mid_cur,
         route[0], shmem, uint3(row_group, 0, 0), tiisg, sgitg);
 }
@@ -5342,7 +5387,8 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_rows_static_v41_f32(
 }
 
 /* BATCH_RBLOCK: the same with the grid's fastest axis on the pairs */
-kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41_f32(
+template<bool NO_TABLE>
+kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41(
         constant ds4_metal_args_mul_mv_id &args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
         device const char *src0_gate,
@@ -5358,14 +5404,18 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41_f32(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     (void)args;
-    ds4_mxfp4_pair_swiglu_rows_static_v41(act, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
-                                          ((device const int32_t *)ids)[tgpig.x], weights,
-                                          shmem, tgpig.x, tgpig.y, tiisg, sgitg);
+    ds4_mxfp4_pair_swiglu_rows_static_v41<NO_TABLE>(act, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
+                                                    ((device const int32_t *)ids)[tgpig.x], weights,
+                                                    shmem, tgpig.x, tgpig.y, tiisg, sgitg);
 }
+
+typedef decltype(kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41<false>) kernel_mxfp4_pair_rows_v41_t;
+template [[host_name("kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41_f32")]] kernel kernel_mxfp4_pair_rows_v41_t kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41<false>;
+template [[host_name("kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_no_table_v41_f32")]] kernel kernel_mxfp4_pair_rows_v41_t kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41<true>;
 
 /* READ_ONCE: K pairs on one expert, each weight row loaded and decoded once, every pair keeping its own accumulators in
  * the one-row order */
-template<int K>
+template<int K, bool NO_TABLE>
 static inline void ds4_mxfp4_pair_once_v41(
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
         device const char *gate_expert,
@@ -5403,29 +5453,15 @@ static inline void ds4_mxfp4_pair_once_v41(
             device const block_mxfp4 &bu = xu[row * DS4_MXFP4_PAIR_STATIC_NB_V41 + ib];
             device const uchar *qg = bg.qs + 8 * it;
             device const uchar *qu = bu.qs + 8 * it;
-            wg[row][0] = float4(lut[qg[0] & 15], lut[qg[1] & 15], lut[qg[2] & 15], lut[qg[3] & 15]);
-            wg[row][1] = float4(lut[qg[0] >> 4], lut[qg[1] >> 4], lut[qg[2] >> 4], lut[qg[3] >> 4]);
-            wg[row][2] = float4(lut[qg[4] & 15], lut[qg[5] & 15], lut[qg[6] & 15], lut[qg[7] & 15]);
-            wg[row][3] = float4(lut[qg[4] >> 4], lut[qg[5] >> 4], lut[qg[6] >> 4], lut[qg[7] >> 4]);
-            wu[row][0] = float4(lut[qu[0] & 15], lut[qu[1] & 15], lut[qu[2] & 15], lut[qu[3] & 15]);
-            wu[row][1] = float4(lut[qu[0] >> 4], lut[qu[1] >> 4], lut[qu[2] >> 4], lut[qu[3] >> 4]);
-            wu[row][2] = float4(lut[qu[4] & 15], lut[qu[5] & 15], lut[qu[6] & 15], lut[qu[7] & 15]);
-            wu[row][3] = float4(lut[qu[4] >> 4], lut[qu[5] >> 4], lut[qu[6] >> 4], lut[qu[7] >> 4]);
+            ds4_mxfp4_lane<NO_TABLE>(qg, lut, wg[row]);
+            ds4_mxfp4_lane<NO_TABLE>(qu, lut, wu[row]);
             eg[row] = ds4_metal_e8m0_to_f32(bg.e);
             eu[row] = ds4_metal_e8m0_to_f32(bu.e);
         }
         FOR_UNROLL (short k = 0; k < K; k++) {
             FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
-                float4 ag = yl[k][0] * wg[row][0];
-                ag += yl[k][1] * wg[row][1];
-                ag += yl[k][2] * wg[row][2];
-                ag += yl[k][3] * wg[row][3];
-                float4 au = yl[k][0] * wu[row][0];
-                au += yl[k][1] * wu[row][1];
-                au += yl[k][2] * wu[row][2];
-                au += yl[k][3] * wu[row][3];
-                sumg[k][row] += eg[row] * ((ag.x + ag.y) + (ag.z + ag.w));
-                sumu[k][row] += eu[row] * ((au.x + au.y) + (au.z + au.w));
+                sumg[k][row] += eg[row] * ds4_mxfp4_dot<NO_TABLE>(yl[k][0], yl[k][1], yl[k][2], yl[k][3], wg[row]);
+                sumu[k][row] += eu[row] * ds4_mxfp4_dot<NO_TABLE>(yl[k][0], yl[k][1], yl[k][2], yl[k][3], wu[row]);
             }
         }
     }
@@ -5454,7 +5490,8 @@ static inline void ds4_mxfp4_pair_once_v41(
     }
 }
 
-kernel void kernel_mul_mv_id_mxfp4_pair_once_v41_f32(
+template<bool NO_TABLE>
+kernel void kernel_mul_mv_id_mxfp4_pair_once_v41(
         constant ds4_metal_args_mul_mv_id &args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
         device const char *src0_gate,
@@ -5476,21 +5513,27 @@ kernel void kernel_mul_mv_id_mxfp4_pair_once_v41_f32(
     const uint first = group & 63u, size = (group >> 6) & 15u;
     const int64_t expert = (int64_t)(group >> 10);
     if (size == 1) {
-        ds4_mxfp4_pair_swiglu_rows_static_v41(act, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, (int32_t)expert, weights,
-                                              shmem, first, tgpig.y, tiisg, sgitg);
+        ds4_mxfp4_pair_swiglu_rows_static_v41<NO_TABLE>(act, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, (int32_t)expert, weights,
+                                                        shmem, first, tgpig.y, tiisg, sgitg);
         return;
     }
     device const char *gate_expert = src0_gate + expert * (int64_t)V41_EXPERT_BYTES;
     device const char *up_expert = src0_up + expert * (int64_t)V41_EXPERT_BYTES;
     device const uint *members = plan->member + first;
     threadgroup float *lut = (threadgroup float *)shmem;
-    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (size == 2) ds4_mxfp4_pair_once_v41<2>(act, gate_expert, up_expert, src1, dst_gate, dst_up, dst_mid, members, weights, lut,
+    if (!NO_TABLE) {
+        if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (size == 2) ds4_mxfp4_pair_once_v41<2, NO_TABLE>(act, gate_expert, up_expert, src1, dst_gate, dst_up, dst_mid, members, weights, lut,
+                                                        (int)tgpig.y * N_R0_MXFP4, tiisg);
+    else ds4_mxfp4_pair_once_v41<3, NO_TABLE>(act, gate_expert, up_expert, src1, dst_gate, dst_up, dst_mid, members, weights, lut,
                                               (int)tgpig.y * N_R0_MXFP4, tiisg);
-    else ds4_mxfp4_pair_once_v41<3>(act, gate_expert, up_expert, src1, dst_gate, dst_up, dst_mid, members, weights, lut,
-                                    (int)tgpig.y * N_R0_MXFP4, tiisg);
 }
+
+typedef decltype(kernel_mul_mv_id_mxfp4_pair_once_v41<false>) kernel_mxfp4_pair_once_v41_t;
+template [[host_name("kernel_mul_mv_id_mxfp4_pair_once_v41_f32")]] kernel kernel_mxfp4_pair_once_v41_t kernel_mul_mv_id_mxfp4_pair_once_v41<false>;
+template [[host_name("kernel_mul_mv_id_mxfp4_pair_once_no_table_v41_f32")]] kernel kernel_mxfp4_pair_once_v41_t kernel_mul_mv_id_mxfp4_pair_once_v41<true>;
 
 /* TP-safe exact-shape sibling. The resident model view starts at this rank's
  * first expert, while IDs remain global, so preserve the ownership test and
@@ -7226,7 +7269,7 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_f32(
 /* DeepSeek V4.1 Flash: 2304-wide down rows, 72 blocks. */
 #define DS4_MXFP4_DOWN_STATIC_NB_V41 72
 
-template<int STATIC_NB = DS4_MXFP4_DOWN_STATIC_NB>
+template<int STATIC_NB = DS4_MXFP4_DOWN_STATIC_NB, bool NO_TABLE = false>
 static inline float2 ds4_mxfp4_accumulate_full_rows_static(
         device const char *src0,
         device const float *y,
@@ -7244,31 +7287,25 @@ static inline float2 ds4_mxfp4_accumulate_full_rows_static(
 
     for (int ib = ix; ib < STATIC_NB; ib += 16) {
         device const float4 *y4 = (device const float4 *)yb;
-        const float4 yl0 = y4[0];
-        const float4 yl1 = y4[4];
-        const float4 yl2 = y4[1];
-        const float4 yl3 = y4[5];
+        const float4 yl0 = ds4_mxfp4_y<NO_TABLE>(y4[0]);
+        const float4 yl1 = ds4_mxfp4_y<NO_TABLE>(y4[4]);
+        const float4 yl2 = ds4_mxfp4_y<NO_TABLE>(y4[1]);
+        const float4 yl3 = ds4_mxfp4_y<NO_TABLE>(y4[5]);
         FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
             device const block_mxfp4 &b =
                 x[row * STATIC_NB + ib];
             device const uchar *q = b.qs + 8 * it;
-            float4 acc = yl0 * float4(lut[q[0] & 15], lut[q[1] & 15],
-                                      lut[q[2] & 15], lut[q[3] & 15]);
-            acc += yl1 * float4(lut[q[0] >> 4], lut[q[1] >> 4],
-                                lut[q[2] >> 4], lut[q[3] >> 4]);
-            acc += yl2 * float4(lut[q[4] & 15], lut[q[5] & 15],
-                                lut[q[6] & 15], lut[q[7] & 15]);
-            acc += yl3 * float4(lut[q[4] >> 4], lut[q[5] >> 4],
-                                lut[q[6] >> 4], lut[q[7] >> 4]);
-            sums[row] += ds4_metal_e8m0_to_f32(b.e) *
-                         ((acc.x + acc.y) + (acc.z + acc.w));
+            float4 w[4];
+            ds4_mxfp4_lane<NO_TABLE>(q, lut, w);
+            sums[row] += ds4_metal_e8m0_to_f32(b.e) * ds4_mxfp4_dot<NO_TABLE, true>(yl0, yl1, yl2, yl3, w);
         }
         yb += 16 * QK_MXFP4;
     }
     return sums;
 }
 
-kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32(
+template<bool NO_TABLE>
+kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static(
         constant ds4_metal_args_mul_mv_id &args,
         device const char *src0s,
         device const char *src1,
@@ -7285,8 +7322,10 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32(
     device const int32_t *token_ids = (device const int32_t *)ids;
     device const char *token_src1 = src1;
     threadgroup float *lut = (threadgroup float *)shmem;
-    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!NO_TABLE) {
+        if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     /* Defensive: unreachable in production because the host proves the shape
      * before selecting this pipeline; identical results either way. */
@@ -7309,9 +7348,9 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32(
             device const float *y =
                 (device const float *)(token_src1 + (uint64_t)slot * args.nb11);
             sumf += static_shape
-                ? ds4_mxfp4_accumulate_full_rows_static(
+                ? ds4_mxfp4_accumulate_full_rows_static<DS4_MXFP4_DOWN_STATIC_NB, NO_TABLE>(
                       expert_base, y, first_row, lut, tiisg)
-                : ds4_mxfp4_accumulate_full_rows_static<DS4_MXFP4_DOWN_STATIC_NB_V41>(
+                : ds4_mxfp4_accumulate_full_rows_static<DS4_MXFP4_DOWN_STATIC_NB_V41, NO_TABLE>(
                       expert_base, y, first_row, lut, tiisg);
         }
     } else {
@@ -7337,7 +7376,12 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32(
     (void)tiitg;
 }
 
+typedef decltype(kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static<false>) kernel_mxfp4_sum6_one_t;
+template [[host_name("kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32")]] kernel kernel_mxfp4_sum6_one_t kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static<false>;
+template [[host_name("kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_no_table_f32")]] kernel kernel_mxfp4_sum6_one_t kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static<true>;
+
 /* BATCH_STATIC: the fixed-route static sum at the V4.1 shape with a row count and every stride a literal */
+template<bool NO_TABLE = false>
 static inline void ds4_mxfp4_sum6_rows_static_v41(
         device const char *src0s,
         device const char *src1,
@@ -7353,14 +7397,16 @@ static inline void ds4_mxfp4_sum6_rows_static_v41(
     device const int32_t *token_ids = (device const int32_t *)ids + token * DS4_MXFP4_DOWN_STATIC_SLOTS;
     device const char *token_src1 = src1 + (uint64_t)token * 6u * 9216u;
     threadgroup float *lut = (threadgroup float *)shmem;
-    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!NO_TABLE) {
+        if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     float2 sumf = 0.0f;
     for (short slot = 0; slot < DS4_MXFP4_DOWN_STATIC_SLOTS; slot++) {
         device const char *expert_base = src0s + (int64_t)token_ids[slot] * (int64_t)V41_DOWN_EXPERT_BYTES;
         device const float *y = (device const float *)(token_src1 + (uint64_t)slot * 9216u);
-        sumf += ds4_mxfp4_accumulate_full_rows_static<DS4_MXFP4_DOWN_STATIC_NB_V41>(
+        sumf += ds4_mxfp4_accumulate_full_rows_static<DS4_MXFP4_DOWN_STATIC_NB_V41, NO_TABLE>(
             expert_base, y, first_row, lut, tiisg);
     }
 
@@ -7387,7 +7433,8 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_rows_static_v41_f32(
 }
 
 /* BATCH_RBLOCK */
-kernel void kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41_f32(
+template<bool NO_TABLE>
+kernel void kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41(
         constant ds4_metal_args_mul_mv_id &args,
         device const char *src0s,
         device const char *src1,
@@ -7399,8 +7446,12 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41_f32(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     (void)args; (void)add_in;
-    ds4_mxfp4_sum6_rows_static_v41(src0s, src1, dst, ids, shmem, tgpig.x, tgpig.y, tiisg, sgitg);
+    ds4_mxfp4_sum6_rows_static_v41<NO_TABLE>(src0s, src1, dst, ids, shmem, tgpig.x, tgpig.y, tiisg, sgitg);
 }
+
+typedef decltype(kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41<false>) kernel_mxfp4_sum6_rows_v41_t;
+template [[host_name("kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41_f32")]] kernel kernel_mxfp4_sum6_rows_v41_t kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41<false>;
+template [[host_name("kernel_mul_mv_id_mxfp4_sum6_rows_rblock_no_table_v41_f32")]] kernel kernel_mxfp4_sum6_rows_v41_t kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41<true>;
 
 kernel void kernel_mul_mv_id_mxfp4_sum6_tp_full_rows_static_f32(
         constant ds4_metal_args_mul_mv_id &args,
