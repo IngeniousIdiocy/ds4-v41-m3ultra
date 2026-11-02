@@ -42714,26 +42714,39 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
 /* HC_FUSION: the HC input of up to DS4_TP_BATCH_MAX_ROWS rows in one kernel, the pre weights pre_stride floats
  * apart. */
 static bool ds41_hc_input_rows(ds41_prefill_row *b, const ds4_model *m, const ds4_layer_weights *l, bool ffn,
-                               const ds4_gpu_tensor *pre, uint32_t pre_stride, uint32_t count) {
+                               const ds4_gpu_tensor *pre, uint32_t pre_stride, uint32_t count, ds4_gpu_tensor *norm_out) {
 #ifdef __APPLE__
     const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
     const ds4_tensor *norm = ffn ? l->ffn_norm : l->attn_norm;
     return count <= DS4_TP_BATCH_MAX_ROWS && fn->type == DS4_TENSOR_F16 && ds41_on(DS4_GPU_V41_HC_FUSION) &&
-        ds4_gpu_dsv41_hc_block_input_rows(b->mix, b->x, b->norm, ffn ? b->ffn_split : b->attn_split,
+        ds4_gpu_dsv41_hc_block_input_rows(b->mix, b->x, norm_out, ffn ? b->ffn_split : b->attn_split,
             ffn ? b->after_attn : b->residual, pre, m->map, m->size, fn->abs_offset, scale->abs_offset,
             base->abs_offset, norm->abs_offset, DS4_N_HC * DS4_N_EMBD, 24u, DS4_N_EMBD, DS4_N_HC,
             DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS, count, pre_stride);
 #else
-    (void)b; (void)m; (void)l; (void)ffn; (void)pre; (void)pre_stride; (void)count;
+    (void)b; (void)m; (void)l; (void)ffn; (void)pre; (void)pre_stride; (void)count; (void)norm_out;
     return false;
 #endif
 }
 
+#ifdef __APPLE__
+/* BATCH_OVERLAP: 2-4 cross-session decode rows defer the FFN block's HC mix to the routed experts' concurrent encoder
+ * as one-row decode does (ds41_hc_defer): the collapse and its norm run first. */
+static bool ds41_rows_defer(const ds41_gpu_graph *g, const ds4_layer_weights *l, uint32_t count) {
+    return g->rows_decode && count >= 2u && count <= 4u && g->tp_world == 1 && !g->imatrix && !g->image_count &&
+        ds41_on(DS4_GPU_V41_HC_FUSION) && ds41_on(DS4_GPU_V41_ROWS_REG) && ds41_on2(DS4_GPU_V41B_BATCH_OVERLAP) &&
+        l->hc_ffn_fn->type == DS4_TENSOR_F16 && l->ffn_norm->type == DS4_TENSOR_F32 && ds41_concurrent_ffn(g, l) &&
+        ds41_on(DS4_GPU_V41_ROUTER_SELECT) && l->ffn_gate_inp->type == DS4_TENSOR_F32;
+}
+#endif
+
+
+/* *defer (BATCH_MIX): leave the block's HC mix for later if the collapse can run now; cleared otherwise. */
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
-                                         uint32_t il, uint32_t count) {
+                                         uint32_t il, uint32_t count, bool *defer) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
         if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
@@ -42743,25 +42756,37 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
             return false;
     }
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
-    if (ds41_hc_input_rows(b, m, l, false, il ? b->ffn_split : b->pre, il ? 24u : DS4_N_HC, count)) return true;
+#ifdef __APPLE__
+    if (defer && *defer && ds4_gpu_dsv41_deferred_collapse_rows(b->x, b->norm, b->residual, il ? b->ffn_split : b->pre,
+            m->map, m->size, l->attn_norm->abs_offset, DS4_RMS_EPS, count, il ? 24u : DS4_N_HC)) return true;
+#endif
+    if (defer) *defer = false;
+    if (ds41_hc_input_rows(b, m, l, false, il ? b->ffn_split : b->pre, il ? 24u : DS4_N_HC, count, b->norm)) return true;
     if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
     return ds41_hc_sum_batch(b->x, b->residual, il ? b->ffn_split : b->pre, count, il != 0) &&
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
 }
 
-static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
-                                        const ds4_layer_weights *l, uint32_t count, bool expanded) {
-    return (expanded || ds41_hc_expand_batch(b->after_attn, b->block, b->residual, b->attn_split, count)) &&
-        (ds41_hc_input_rows(b, m, l, true, b->attn_split, 24u, count) ||
-         (ds41_hc_mix_batch(b, m, l, true, count) &&
-          ds41_hc_sum_batch(b->x, b->after_attn, b->attn_split, count, true) &&
-          ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count)));
+/* *defer (BATCH_OVERLAP): leave the block's HC mix for later if the collapse can run now; cleared otherwise. */
+static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m, const ds4_layer_weights *l,
+                                        uint32_t count, bool expanded, bool *defer) {
+    if (!expanded && !ds41_hc_expand_batch(b->after_attn, b->block, b->residual, b->attn_split, count)) return false;
+#ifdef __APPLE__
+    if (defer && *defer && ds4_gpu_dsv41_deferred_collapse_rows(b->x, b->norm, b->after_attn, b->attn_split, m->map, m->size,
+            l->ffn_norm->abs_offset, DS4_RMS_EPS, count, 24u)) return true;
+#endif
+    if (defer) *defer = false;
+    return ds41_hc_input_rows(b, m, l, true, b->attn_split, 24u, count, b->norm) ||
+        (ds41_hc_mix_batch(b, m, l, true, count) &&
+         ds41_hc_sum_batch(b->x, b->after_attn, b->attn_split, count, true) &&
+         ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count));
 }
 
 /* tab_il >= 0 (BATCH_ROPE): q_b may rotate the rows at that layer as it stores them, with the tables in g->batch.rope_tab
  * (*roped then says so). */
 static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
-                                         const ds4_layer_weights *l, uint32_t count, int tab_il, bool *roped) {
+                                         const ds4_layer_weights *l, uint32_t count, int tab_il, bool *roped,
+                                         const ds4_gpu_tensor *mix_pre, uint32_t mix_stride) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
 #ifdef __APPLE__
@@ -42777,13 +42802,15 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
               ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
                   l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
               ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16))) return false;
-        if (tab_il >= 0 && l->attn_q_b->type == DS4_TENSOR_Q8_0 &&
+        /* BATCH_MIX: mix_pre, the block's deferred HC mix beside q_b (its norm goes to dead after_attn, not flat_norm,
+         * which can alias q); the caller closes the section */
+        if (mix_pre && (!ds4_gpu_overlap_begin() ||
+                        !ds41_hc_input_rows(b, m, l, false, mix_pre, mix_stride, count, b->after_attn))) return false;
+        const bool table = tab_il >= 0 && l->attn_q_b->type == DS4_TENSOR_Q8_0 &&
             ds4_gpu_dsv41_project_q_rows(b->q, m->map, m->size, l->attn_q_b->abs_offset, (uint32_t)l->attn_q_b->dim[0], q_dim,
-                b->qr, count, b->rope_tab, ds4_layer_compress_ratio((uint32_t)tab_il) != 0)) {
-            *roped = true;
-            return true;
-        }
-        return ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr, g->tp_rank * q_dim, q_dim, count);
+                b->qr, count, b->rope_tab, ds4_layer_compress_ratio((uint32_t)tab_il) != 0);
+        if (table) *roped = true;
+        return table || ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr, g->tp_rank * q_dim, q_dim, count);
     }
 #endif
     return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
@@ -43388,6 +43415,33 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 #ifdef __APPLE__
+/* BATCH_OVERLAP: the FFN of 2-4 cross-session decode rows as one-row decode runs it. After the router and the pair
+ * kernel's plan, the block's deferred HC mix and the shared gate and up ride the routed pair kernel's concurrent
+ * encoder; with BATCH_DOWN (*down) the shared down rides the routed sum's level. The shared mid is already rounded. */
+static bool ds41_moe_overlap(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
+                             uint32_t count, bool *down) {
+    ds41_prefill_row *b = &g->batch;
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    bool mid_f16 = false;
+    *down = ds41_on2(DS4_GPU_V41B_BATCH_DOWN);
+    if (!ds41_router_rows(g, m, l, il, count) ||
+        (ds41_on(DS4_GPU_V41_MOE_DEDUP) && !ds4_gpu_dsv41_moe_plan_rows(b->selected, DS4_N_EXPERT_USED, count)) ||
+        !ds4_gpu_overlap_begin()) return false;
+    const bool ok = ds41_hc_input_rows(b, m, l, true, b->attn_split, 24u, count, b->flat_norm) &&
+        ds41_shared_swiglu(b->shared_mid, m, l, b->norm, count) &&
+        ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
+            il, count, &mid_f16, !g->verify_prefix) &&
+        (!*down || ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true));
+    ds4_gpu_overlap_end();
+    return ok;
+}
+
 /* VERIFY_BATCH: a few rows' shared down projection adds the routed sum and expands into the HC streams; otherwise
  * the shared down, the add and the expand as the batch tail runs them. */
 static bool ds41_moe_expand_batch(ds41_prefill_row *b, const ds4_model *m,
@@ -44388,7 +44442,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_hc)
                 ok = ds41_dspark_capture(g->dspark, il, start, active.residual, count) &&
-                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count, NULL);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -44401,7 +44455,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_attention) {
                 const ds4_layer_weights *l = &w->layer[il];
-                ok = ds41_attention_project_batch(g, m, l, count, -1, NULL);
+                ok = ds41_attention_project_batch(g, m, l, count, -1, NULL, NULL, 0);
                 DS41_STAGE("attention projections");
                 if (ok && batch_core) ok = ds41_attention_batch(g, NULL, m, l, il, count);
                 for (uint32_t t = 0; ok && !batch_core && t < count; t++) {
@@ -44433,7 +44487,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                                    g->batch.low, count, true);
                 }
                 DS41_STAGE("attention output");
-                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count, false);
+                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count, false, NULL);
                 DS41_STAGE("hc/ffn norm");
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                     row.pos = start + t;
@@ -44685,8 +44739,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
                 g->rows_view[i].residual, 1);
         bool q_roped = false, kv_stored = false;
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
-            ds41_attention_project_batch(g, model, l, rows, rope_tabs ? (int)il : -1, &q_roped);
+        bool attn_mix = false;
+#ifdef __APPLE__
+        attn_mix = rope_tabs && !rows_batch && ds41_rows_defer(g, l, rows) && ds41_on2(DS4_GPU_V41B_BATCH_MIX) &&
+            l->attn_q_b->type == DS4_TENSOR_Q8_0 && l->hc_attn_fn->type == DS4_TENSOR_F16 && l->attn_norm->type == DS4_TENSOR_F32;
+#endif
+        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows, &attn_mix) &&
+            ds41_attention_project_batch(g, model, l, rows, rope_tabs ? (int)il : -1, &q_roped,
+                !attn_mix ? NULL : il ? active.ffn_split : active.pre, il ? 24u : DS4_N_HC);
 #ifdef __APPLE__
         if (ok && rope_tabs && ds41_on2(DS4_GPU_V41B_BATCH_KV)) {
             ds4_gpu_tensor *windows[DS4_TP_BATCH_MAX_ROWS];
@@ -44698,6 +44758,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             kv_stored = ds4_gpu_dsv41_rope_quantize_rows(active.kv, windows, offsets, 512, rows, active.rope_tab,
                 ds4_layer_compress_ratio(il) != 0, DS4_V41_FP8_E8M0) != 0;
         }
+        if (attn_mix) ds4_gpu_overlap_end();
 #endif
 #ifdef __APPLE__
         /* VERIFY_BATCH: one session's consecutive rows on one host attend together (a short prefill through the
@@ -44724,7 +44785,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
             !getenv("DS4_DISABLE_V41_BATCH_OUTPUT");
 #endif
+#ifdef __APPLE__
+        const bool wave = decode_rows && !rows_batch && !expanded && rows >= 2u && g->tp_world == 1 &&
+            ds41_on2(DS4_GPU_V41B_BATCH_WAVE);
+        if (wave) ds4_gpu_wave_begin(rows);
+#endif
         for (int i = 0; ok && !expanded && !(rows_batch && batch_output) && i < count; i++) {
+#ifdef __APPLE__
+            if (wave) ds4_gpu_wave_row(i);
+#endif
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
@@ -44740,6 +44809,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 (batch_output || tail_rows || ds41_attention_output(&row, model, l, -1));
         }
 #ifdef __APPLE__
+        if (wave && !ds4_gpu_wave_end()) ok = false;
         if (ok && tail_rows) ok = expanded = ds41_attention_low_batch(g, model, l, rows) &&
             ds41_attention_expand_rows(&active, model, l, rows);
 #endif
@@ -44753,10 +44823,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
         if (ok && !expanded) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows) &&
             ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
-        if (ok) ok = ds41_after_attention_batch(&active, model, l, rows, expanded) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner, !expanded) &&
+        bool ffn_mix = false, ffn_down = false;
 #ifdef __APPLE__
-            (expanded ? ds41_moe_expand_batch(&active, model, l, rows) :
+        ffn_mix = expanded && ds41_rows_defer(g, l, rows);
+#endif
+        if (ok) ok = ds41_after_attention_batch(&active, model, l, rows, expanded, &ffn_mix) &&
+#ifdef __APPLE__
+            (ffn_mix ? ds41_moe_overlap(g, model, l, il, rows, &ffn_down) :
+#else
+            (
+#endif
+             ds41_moe_batch(g, model, l, il, rows, shared_owner, !expanded)) &&
+#ifdef __APPLE__
+            (ffn_down ? ds4_gpu_hc_expand_add_split_bf16_tensor(active.residual, active.routed, active.shared,
+                            active.after_attn, active.ffn_split, DS4_N_EMBD, DS4_N_HC) :
+             expanded ? ds41_moe_expand_batch(&active, model, l, rows) :
 #else
             (
 #endif

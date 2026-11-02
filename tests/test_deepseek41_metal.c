@@ -2437,6 +2437,7 @@ static int check_rows_reg(void) {
             CHECK(xr && yr && ds4_gpu_dsv41_shared_swiglu(yr, map, bytes, 0, up_off, in, out, xr, 10.0f, 1));
             ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
         }
+        CHECK(ds4_gpu_dsv41_quantize(ref, out, rows, DS4_V41_BF16));   /* these kernels round the mid at its store */
         CHECK(ds4_gpu_synchronize());
         memset(gv, 0xff, (size_t)rows * out * 4);
         ds4_gpu_dsv41_decode_rows(1);
@@ -2665,6 +2666,113 @@ static int check_batch_router(void) {
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
     /* the map stays: the model views may wrap it */
     fprintf(stderr, "V4.1 batch router: rows' BF16 router and hierarchical selection == each row's one-row kernels\n");
+    return 1;
+}
+
+/* BATCH_OVERLAP: the HC collapse of 2-4 cross-session decode rows, each row's bits as its one-row kernels (poisoned
+ * outputs, kernel-run counts), and a two-level concurrent section against the same dispatches in a serial encoder. */
+static int check_batch_overlap(void) {
+    enum { ROWS = 4, D = 5120, FF = 2304, OUT = 512, REPS = 36 };
+    const uint64_t page = (uint64_t)getpagesize(), norm_bytes = (D * 4 + page - 1) / page * page;
+    uint64_t q8_bytes = 0, draws = 0;
+    float *nw = NULL;
+    uint8_t *q8 = q8_weights(2 * FF, D, &q8_bytes);
+    CHECK(q8 && posix_memalign((void **)&nw, page, norm_bytes) == 0);
+    ds4_gpu_tensor *res = upload(NULL, ROWS * 20480 * 4), *pre = upload(NULL, ROWS * 24 * 4), *x = upload(NULL, ROWS * D * 4);
+    ds4_gpu_tensor *a[2], *b[2];
+    for (int i = 0; i < 2; i++) {
+        a[i] = upload(NULL, ROWS * (uint64_t)D * 4);
+        b[i] = upload(NULL, ROWS * (uint64_t)D * 4);
+        CHECK(a[i] && b[i]);
+    }
+    CHECK(res && pre && x);
+    float *rv = ds4_gpu_tensor_contents(res), *pv = ds4_gpu_tensor_contents(pre), *xv = ds4_gpu_tensor_contents(x);
+    for (uint32_t i = 0; i < D; i++) nw[i] = 1.0f + random_value() / 8.0f;
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t part = ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse_part_rows");
+    for (uint32_t rep = 0; rep < REPS; rep++) {
+        const uint32_t rows = 2u + rep % 3u, stride = (rep / 3u) & 1u ? 24 : 4;
+        for (uint32_t i = 0; i < rows * 20480; i++) rv[i] = random_value() * (rep % 4 == 3 ? 64.0f : 1.0f);
+        for (uint32_t i = 0; i < rows * 24; i++) pv[i] = random_value();
+        for (uint32_t i = 0; i < rows * D; i++) xv[i] = random_value() / 4;
+        for (int i = 0; i < 2; i++) memset(ds4_gpu_tensor_contents(b[i]), 0xff, rows * (uint64_t)D * 4);
+        CHECK(ds4_gpu_set_model_map(nw, norm_bytes));
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *rr = ds4_gpu_tensor_view(res, (uint64_t)r * 20480 * 4, 20480 * 4);
+            ds4_gpu_tensor *pr = ds4_gpu_tensor_view(pre, (uint64_t)r * stride * 4, 4 * 4);
+            ds4_gpu_tensor *c = ds4_gpu_tensor_view(a[0], (uint64_t)r * D * 4, D * 4), *n = ds4_gpu_tensor_view(a[1], (uint64_t)r * D * 4, D * 4);
+            CHECK(rr && pr && c && n && ds4_gpu_dsv41_deferred_collapse(c, n, rr, pr, nw, norm_bytes, 0, 1e-6f));
+            ds4_gpu_tensor *t[] = {rr, pr, c, n};
+            for (size_t i = 0; i < sizeof(t) / sizeof(*t); i++) ds4_gpu_tensor_free(t[i]);
+        }
+        CHECK(ds4_gpu_dsv41_deferred_collapse_rows(b[0], b[1], res, pre, nw, norm_bytes, 0, 1e-6f, rows, stride));
+        CHECK(ds4_gpu_synchronize() && same_bits(a[0], b[0], rows * (uint64_t)D) && same_bits(a[1], b[1], rows * (uint64_t)D));
+        /* a section: the shared mid's rows, a level, a projection that reads them */
+        CHECK(ds4_gpu_set_model_map(q8, q8_bytes));
+        for (int concurrent = 0; concurrent < 2; concurrent++) {
+            ds4_gpu_tensor **o = concurrent ? b : a;
+            memset(ds4_gpu_tensor_contents(o[0]), 0xff, rows * (uint64_t)FF * 4);
+            memset(ds4_gpu_tensor_contents(o[1]), 0xff, rows * OUT * 4);
+            ds4_gpu_dsv41_decode_rows(1);
+            CHECK(ds4_gpu_begin_commands());
+            if (concurrent) CHECK(ds4_gpu_overlap_begin());
+            CHECK(ds4_gpu_dsv41_shared_swiglu(o[0], q8, q8_bytes, 0, (uint64_t)FF * (D / 32 * 34), D, FF, x, 10.0f, rows));
+            if (concurrent) ds4_gpu_overlap_level();
+            CHECK(ds4_gpu_dsv41_matmul_q8_0_bf16_rows(o[1], q8, q8_bytes, 0, FF, OUT, o[0], rows));
+            if (concurrent) ds4_gpu_overlap_end();
+            CHECK(ds4_gpu_end_commands());
+            ds4_gpu_dsv41_decode_rows(0);
+        }
+        CHECK(ds4_gpu_synchronize() && same_bits(a[0], b[0], rows * (uint64_t)FF) && same_bits(a[1], b[1], rows * OUT));
+        draws += rows * (uint64_t)(2 * D + FF + OUT);
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse_part_rows") == part + REPS);
+    ds4_gpu_test_set_flags(0);
+    ds4_gpu_tensor *tensors[] = {res, pre, x, a[0], a[1], b[0], b[1]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    /* the maps stay: the model views may wrap them */
+    fprintf(stderr, "V4.1 batch overlap: rows' collapse and a concurrent section == one-row and serial (%llu values)\n",
+            (unsigned long long)draws);
+    return 1;
+}
+
+/* BATCH_WAVE: a section's rows, each a producer, a copy that a blit can break up and a consumer, against the same
+ * dispatches in order, and a row's stages through the process-wide top-k scratch against one row at a time. */
+static int check_batch_wave(void) {
+    enum { ROWS = 4, D = 4096, N = 65536, K = 512, REPS = 24 };
+    ds4_gpu_tensor *x = upload(NULL, ROWS * D * 4), *ref = upload(NULL, ROWS * D * 4), *got = upload(NULL, ROWS * D * 4);
+    ds4_gpu_tensor *mid = upload(NULL, ROWS * D * 4), *sc = upload(NULL, ROWS * N * 4), *id[2] = {upload(NULL, ROWS * K * 4), upload(NULL, ROWS * K * 4)};
+    CHECK(x && ref && got && mid && sc && id[0] && id[1]);
+    float *xv = ds4_gpu_tensor_contents(x), *sv = ds4_gpu_tensor_contents(sc);
+    for (uint32_t rep = 0; rep < REPS; rep++) {
+        const uint32_t rows = 2u + rep % 3u;
+        const uint64_t misaligned = rep & 1u ? 4 : 0;   /* a copy that must blit */
+        for (uint32_t i = 0; i < rows * D; i++) xv[i] = random_value();
+        for (uint32_t i = 0; i < rows * N; i++) sv[i] = random_value();
+        for (int wave = 0; wave < 2; wave++) {
+            ds4_gpu_tensor *out = wave ? got : ref;
+            memset(ds4_gpu_tensor_contents(out), 0xff, rows * D * 4);
+            CHECK(ds4_gpu_begin_commands());
+            if (wave) ds4_gpu_wave_begin(rows);
+            for (uint32_t r = 0; r < rows; r++) {
+                if (wave) ds4_gpu_wave_row((int)r);
+                ds4_gpu_tensor *a = ds4_gpu_tensor_view(x, (uint64_t)r * D * 4, D * 4), *b = ds4_gpu_tensor_view(mid, (uint64_t)r * D * 4, D * 4);
+                ds4_gpu_tensor *c = ds4_gpu_tensor_view(out, (uint64_t)r * D * 4, D * 4);
+                ds4_gpu_tensor *s = ds4_gpu_tensor_view(sc, (uint64_t)r * N * 4, N * 4), *t = ds4_gpu_tensor_view(id[wave], (uint64_t)r * K * 4, K * 4);
+                CHECK(a && b && c && s && t && ds4_gpu_tensor_copy(b, 0, a, 0, D * 4) && ds4_gpu_dsv41_quantize(b, D, 1, DS4_V41_BF16) &&
+                      ds4_gpu_tensor_copy(c, misaligned, b, misaligned, (D - 2) * 4) && ds4_gpu_add_tensor(c, c, c, D) &&
+                      ds4_gpu_dsv41_indexer_topk_tensor(t, s, N, 1, K));
+                ds4_gpu_tensor *f[] = {a, b, c, s, t};
+                for (size_t i = 0; i < sizeof(f) / sizeof(*f); i++) ds4_gpu_tensor_free(f[i]);
+            }
+            if (wave) CHECK(ds4_gpu_wave_end());
+            CHECK(ds4_gpu_end_commands());
+        }
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, rows * D) && same_bits(id[0], id[1], rows * K));
+    }
+    ds4_gpu_tensor *tensors[] = {x, ref, got, mid, sc, id[0], id[1]};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    fprintf(stderr, "V4.1 batch wave: a recorded section's replay == its dispatches in order, blits and top-k scratch too\n");
     return 1;
 }
 
@@ -3795,7 +3903,7 @@ static int check_v41_groups(void) {
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
         check_index_bf16() && check_topk() && check_index_candidates() &&
         check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
-        check_row_matmuls() && check_head_rows() && check_rows_reg() && check_batch_rope() && check_batch_tail() && check_batch_router() && check_rows_mma() && check_verify_kernels() &&
+        check_row_matmuls() && check_head_rows() && check_rows_reg() && check_batch_rope() && check_batch_tail() && check_batch_router() && check_batch_overlap() && check_batch_wave() && check_rows_mma() && check_verify_kernels() &&
         check_public_controller() && check_prefill_index() && check_prefill_attention() &&
         check_prefill_folds() &&
         check_moe_dedup() &&
@@ -3816,6 +3924,16 @@ static int check_v41_groups(void) { return 1; }
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--batch-router")) {
         const int ok = ds4_gpu_init() && check_batch_router();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--batch-wave")) {
+        const int ok = ds4_gpu_init() && check_batch_wave();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--batch-overlap")) {
+        const int ok = ds4_gpu_init() && check_batch_overlap();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

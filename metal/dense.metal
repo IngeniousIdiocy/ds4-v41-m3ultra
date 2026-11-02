@@ -2376,7 +2376,7 @@ kernel void kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows(
 }
 
 /* ROWS_REG with kernel_dsv4_shared_mid_swiglu_q8_0_bf16's gate and up: both matrices' K rows in one pass, the SwiGLU
- * after the second sum. */
+ * after the second sum, rounded to bf16 at its store (the mid's boundary either way, and idempotent). */
 template<short K, short NR0 = N_R0_Q8_0>
 void kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows_reg_impl(
         constant ds4_metal_args_mul_mv & args,
@@ -2454,7 +2454,7 @@ void kernel_dsv4_shared_mid_swiglu_q8_0_bf16_rows_reg_impl(
                 u = clamp(u, -clamp_value, clamp_value);
             }
             const float silu = g / (1.0f + exp(-g));
-            ((device float *)dst_mid)[(uint64_t)r * args.ne0 + r0 + row] = silu * u;
+            ((device float *)dst_mid)[(uint64_t)r * args.ne0 + r0 + row] = ds4_bf16_round(silu * u);
         }
     }
 }

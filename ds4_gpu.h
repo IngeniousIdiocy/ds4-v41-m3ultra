@@ -113,6 +113,10 @@ typedef struct {
 #define DS4_GPU_V41B_BATCH_LOW (1ull << 2)   /* the low projection of 2-4 cross-session decode rows accumulates in registers, one weight pass per group */
 #define DS4_GPU_V41B_BATCH_NARROW (1ull << 3)   /* 2-4 cross-session decode rows read the narrow router copy */
 #define DS4_GPU_V41B_BATCH_HIER (1ull << 4)   /* 2-4 cross-session decode rows select experts with the hierarchical router */
+#define DS4_GPU_V41B_BATCH_OVERLAP (1ull << 5)   /* 2-4 cross-session decode rows' FFN runs the HC mix and the shared gate and up beside the routed pair kernel */
+#define DS4_GPU_V41B_BATCH_DOWN (1ull << 6)   /* with BATCH_OVERLAP the shared down also runs beside the routed sum, and a plain add and expand follows */
+#define DS4_GPU_V41B_BATCH_WAVE (1ull << 7)   /* cross-session decode rows' attention stages run in waves: every row's k-th dispatch together */
+#define DS4_GPU_V41B_BATCH_MIX (1ull << 8)   /* 2-4 cross-session decode rows' attention runs the HC mix beside q_b */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
 #define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
@@ -287,6 +291,16 @@ int ds4_gpu_kv_norm_task_pending(void);
 int ds4_gpu_kv_norm_task_flush(void);
 int ds4_gpu_kv_norm_task_begin_concurrent(void);
 void ds4_gpu_kv_norm_task_end_concurrent(void);
+/* BATCH_OVERLAP: the dispatches encoded between begin and end share one concurrent encoder of the open batch; level
+ * runs the ones encoded after it behind the ones before it. */
+int ds4_gpu_overlap_begin(void);
+void ds4_gpu_overlap_level(void);
+void ds4_gpu_overlap_end(void);
+/* BATCH_WAVE: between begin and end the compute dispatches of the row named by ds4_gpu_wave_row are recorded, then
+ * replayed with every row's k-th dispatch in one concurrent level. 0 from end: a section outgrew the recorder. */
+void ds4_gpu_wave_begin(uint32_t rows);
+void ds4_gpu_wave_row(int row);
+int ds4_gpu_wave_end(void);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);

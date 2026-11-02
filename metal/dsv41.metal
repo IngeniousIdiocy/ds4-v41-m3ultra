@@ -570,12 +570,11 @@ kernel void kernel_dsv41_deferred_collapse(
  * Norm: every simdgroup reloads the 32 partials, lane = slot, and repeats the original's second simd_sum over the same 32
  * values in the same lanes, then normalizes its elements from the stored collapsed values. Group 0 resets the counter as
  * the original does at its end. Host contract: n_embd 5120, n_hc 4 (as the original). */
-kernel void kernel_dsv41_deferred_collapse_part(
+static inline void dsv41_collapse_part(
         constant ds4_deferred_hc_args &args,
         device const float *x, device const float *pre,
         device float *collapsed, device float *slots,
-        uint group [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]]) {
+        uint group, ushort tiisg) {
     const uint n_embd = (uint)args.n_embd, n4 = n_embd >> 2;
     const uint i0 = group * 32u + tiisg, i1 = i0 + 1024u;
     const bool h0 = i0 < n4, h1 = i1 < n4;
@@ -603,12 +602,11 @@ kernel void kernel_dsv41_deferred_collapse_part(
     if (tiisg == 0) slots[group] = sumf;
 }
 
-kernel void kernel_dsv41_deferred_collapse_norm(
+static inline void dsv41_collapse_norm(
         constant ds4_deferred_hc_args &args,
         device const float *collapsed, device const float *slots,
-        device const float *norm_weight, device float *norm_dst, device atomic_uint *counter,
-        uint gid [[thread_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]]) {
+        device const float *norm_weight, device float *norm_dst,
+        uint gid, ushort tiisg) {
     const uint n4 = (uint)args.n_embd >> 2;
     float sumf = slots[tiisg];
     sumf = simd_sum(sumf);
@@ -619,7 +617,49 @@ kernel void kernel_dsv41_deferred_collapse_norm(
         const float4 v = (r * rscale) * ((device const float4 *)norm_weight)[gid];
         ((device float4 *)norm_dst)[gid] = float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
     }
+}
+
+kernel void kernel_dsv41_deferred_collapse_part(
+        constant ds4_deferred_hc_args &args,
+        device const float *x, device const float *pre,
+        device float *collapsed, device float *slots,
+        uint group [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    dsv41_collapse_part(args, x, pre, collapsed, slots, group, tiisg);
+}
+
+kernel void kernel_dsv41_deferred_collapse_norm(
+        constant ds4_deferred_hc_args &args,
+        device const float *collapsed, device const float *slots,
+        device const float *norm_weight, device float *norm_dst, device atomic_uint *counter,
+        uint gid [[thread_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    dsv41_collapse_norm(args, collapsed, slots, norm_weight, norm_dst, gid, tiisg);
     if (gid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
+}
+
+/* BATCH_OVERLAP: the same two dispatches over 2-4 session rows, grid row = session row, with the pre weights
+ * pre_stride floats apart and 32 slots per row. */
+kernel void kernel_dsv41_deferred_collapse_part_rows(
+        constant ds4_deferred_hc_args &args,
+        device const float *x, device const float *pre,
+        device float *collapsed, device float *slots, constant uint &pre_stride,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n = (uint)args.n_embd;
+    dsv41_collapse_part(args, x + (ulong)group.y * 4u * n, pre + group.y * pre_stride, collapsed + (ulong)group.y * n,
+                        slots + group.y * 32u, group.x, tiisg);
+}
+
+kernel void kernel_dsv41_deferred_collapse_norm_rows(
+        constant ds4_deferred_hc_args &args,
+        device const float *collapsed, device const float *slots,
+        device const float *norm_weight, device float *norm_dst,
+        uint2 gid [[thread_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint n = (uint)args.n_embd;
+    dsv41_collapse_norm(args, collapsed + (ulong)gid.y * n, slots + gid.y * 32u, norm_weight,
+                        norm_dst + (ulong)gid.y * n, gid.x, tiisg);
 }
 
 /* The attention query projection (1280 -> 32768, bf16, RoPE on the outputs) of a block whose HC input was deferred:
