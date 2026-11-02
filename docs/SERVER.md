@@ -85,6 +85,11 @@ use the ordered fallback.
 
 Long prefills yield to active decoders in bounded intervals, normally 128
 tokens. `--mixed-prefill-quantum N` changes that interval for testing.
+DeepSeek V4.1 prefills 2,048 tokens per interval, because any chunk sweeps the
+experts, and after each one decoders keep the model for as long as the chunk
+took, so they run at about half speed instead of one token per chunk.
+`DS4_SERVER_MIXED_DECODE_SHARE` sets that decode time as a percentage of the
+chunk's (default 100; 0 returns to one decode step per chunk).
 Session-batched serving uses ordinary target decoding, except Qwen3.8 on
 Metal, where `--mtp` also batches speculative decoding. Its
 `--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature

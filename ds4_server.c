@@ -10651,6 +10651,9 @@ struct server {
     int mixed_prefill_quantum;
     int idle_prefill_quantum;   /* the engine's prefill cap: wide chunks while nothing generates */
     int last_prefill_slot;
+    double mixed_decode_share;  /* decode wall time owed per second of prefill wall time */
+    double prefill_started;
+    double prefill_resume_at;   /* active generations hold the model until this time */
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -13025,6 +13028,26 @@ static int server_next_prefill_slot_locked(const server *s) {
     return -1;
 }
 
+static void timespec_add_us(struct timespec *ts, long us);
+
+static bool server_prefill_yielding_locked(const server *s) {
+    return s->active_generations > 0 && now_sec() < s->prefill_resume_at;
+}
+
+/* A prefill chunk costs a sweep of the experts while a decode step costs one
+ * row of them, so handing the model back for a single step leaves decoders
+ * with one token per chunk. Decoders get their share of the wall clock. */
+static void server_prefill_wait_locked(server *s) {
+    if (!server_prefill_yielding_locked(s)) {
+        pthread_cond_wait(&s->model_cv, &s->model_mu);
+        return;
+    }
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    timespec_add_us(&deadline, (long)((s->prefill_resume_at - now_sec()) * 1e6) + 1);
+    pthread_cond_timedwait(&s->model_cv, &s->model_mu, &deadline);
+}
+
 static bool server_prefill_enter(server *s, server_slot *slot) {
     if (!s || !slot || slot_job_cancelled(slot)) return false;
     if (!s->batched_mode) {
@@ -13041,8 +13064,9 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (s->model_busy || s->decode_pending > 0 ||
-            server_next_prefill_slot_locked(s) != slot->id)) {
-        pthread_cond_wait(&s->model_cv, &s->model_mu);
+            server_next_prefill_slot_locked(s) != slot->id ||
+            server_prefill_yielding_locked(s))) {
+        server_prefill_wait_locked(s);
     }
     if (g_stop_requested || slot_job_cancelled(slot)) {
         slot->prefill_waiting = false;
@@ -13053,6 +13077,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     slot->prefill_waiting = false;
     s->last_prefill_slot = slot->id;
     s->model_busy = true;
+    s->prefill_started = now_sec();
     pthread_mutex_unlock(&s->model_mu);
     pthread_mutex_lock(&s->inference_mu);
     return true;
@@ -13064,6 +13089,8 @@ static void server_prefill_leave(server *s) {
     if (!s->batched_mode) return;
     pthread_mutex_lock(&s->model_mu);
     s->model_busy = false;
+    const double now = now_sec();
+    s->prefill_resume_at = now + (now - s->prefill_started) * s->mixed_decode_share;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
 }
@@ -13979,6 +14006,17 @@ static long server_decode_coalesce_us(void) {
         if (end != env && *end == '\0' && v >= 0 && v <= 100000) us = v;
     }
     return us;
+}
+
+static double server_mixed_decode_share(void) {
+    double percent = 100;
+    const char *env = getenv("DS4_SERVER_MIXED_DECODE_SHARE");
+    if (env && env[0]) {
+        char *end = NULL;
+        double v = strtod(env, &end);
+        if (end != env && *end == '\0' && v >= 0 && v <= 1000) percent = v;
+    }
+    return percent / 100;
 }
 
 static void timespec_add_us(struct timespec *ts, long us) {
@@ -16276,6 +16314,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    bool mixed_prefill_quantum_set;
     int utility_ctx;
     bool serial_reasoning;
 } server_config;
@@ -16548,6 +16587,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--serial-reasoning")) {
             c.serial_reasoning = true;
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
+            c.mixed_prefill_quantum_set = true;
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -16826,7 +16866,11 @@ int main(int argc, char **argv) {
     s.batched_mode = cfg.batched_sessions > 0;
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
-    s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
+    /* A V4.1 chunk sweeps the experts (about 0.55 s) however short it is, so
+     * small chunks only waste the sweep, and decoders need the wall clock. */
+    s.mixed_prefill_quantum = ds4_engine_is_deepseek41(engine) && !cfg.mixed_prefill_quantum_set ?
+        2048 : cfg.mixed_prefill_quantum;
+    s.mixed_decode_share = ds4_engine_is_deepseek41(engine) ? server_mixed_decode_share() : 0;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
@@ -17119,6 +17163,24 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+}
+
+static void test_mixed_decode_share(void) {
+    server s = {0};
+    TEST_ASSERT(!server_prefill_yielding_locked(&s));
+    s.prefill_resume_at = now_sec() + 60;
+    TEST_ASSERT(!server_prefill_yielding_locked(&s));   /* nothing to yield to */
+    s.active_generations = 1;
+    TEST_ASSERT(server_prefill_yielding_locked(&s));
+    s.prefill_resume_at = now_sec() - 1;
+    TEST_ASSERT(!server_prefill_yielding_locked(&s));
+
+    TEST_ASSERT(server_mixed_decode_share() == 1.0);
+    setenv("DS4_SERVER_MIXED_DECODE_SHARE", "0", 1);
+    TEST_ASSERT(server_mixed_decode_share() == 0.0);
+    setenv("DS4_SERVER_MIXED_DECODE_SHARE", "bad", 1);
+    TEST_ASSERT(server_mixed_decode_share() == 1.0);
+    unsetenv("DS4_SERVER_MIXED_DECODE_SHARE");
 }
 
 /* Reuse-aware slot routing: the probe must recognize every way a request
@@ -25468,6 +25530,7 @@ static void ds4_server_unit_tests_run(void) {
     test_server_image_embedding_cache();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_mixed_decode_share();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
