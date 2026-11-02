@@ -10626,7 +10626,7 @@ struct server {
     server_slot *slots;
     int slot_count;
     int ctx_size;
-    server_slot *utility_slot;   /* NULL unless --utility-ctx; non-batched only */
+    server_slot *utility_slot;   /* NULL unless --utility-ctx */
     int utility_ctx;
     bool serial_reasoning;       /* --serial-reasoning: V4.1 reasoning never drafts */
     bool batched_mode;
@@ -13019,11 +13019,19 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
 
+/* The slots the decode coordinator and the prefill turns serve: slots[], then the utility session (id slot_count). */
+static int server_decode_slots(const server *s) { return s->slot_count + (s->utility_slot ? 1 : 0); }
+
+static server_slot *server_decode_slot(const server *s, int id) {
+    return id < s->slot_count ? &s->slots[id] : s->utility_slot;
+}
+
 static int server_next_prefill_slot_locked(const server *s) {
     if (!s || s->slot_count <= 0) return -1;
-    for (int n = 1; n <= s->slot_count; n++) {
-        int id = (s->last_prefill_slot + n) % s->slot_count;
-        if (s->slots[id].prefill_waiting) return id;
+    const int slots = server_decode_slots(s);
+    for (int n = 1; n <= slots; n++) {
+        int id = (s->last_prefill_slot + n) % slots;
+        if (server_decode_slot(s, id)->prefill_waiting) return id;
     }
     return -1;
 }
@@ -14028,10 +14036,11 @@ static void timespec_add_us(struct timespec *ts, long us) {
 
 static void *decode_worker_main(void *arg) {
     server *s = arg;
-    ds4_decode_item *items = xmalloc((size_t)s->slot_count * sizeof(*items));
-    server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
-    int (*accepted)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
-    int *n_accepted = xmalloc((size_t)s->slot_count * sizeof(*n_accepted));
+    const int slots = server_decode_slots(s);
+    ds4_decode_item *items = xmalloc((size_t)slots * sizeof(*items));
+    server_slot **members = xmalloc((size_t)slots * sizeof(*members));
+    int (*accepted)[2] = xmalloc((size_t)slots * sizeof(*accepted));
+    int *n_accepted = xmalloc((size_t)slots * sizeof(*n_accepted));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
@@ -14042,12 +14051,12 @@ static void *decode_worker_main(void *arg) {
         }
         if (s->decode_pending == 0 && s->model_stopping) break;
 
-        if (coalesce_us > 0 && s->decode_pending < s->slot_count) {
+        if (coalesce_us > 0 && s->decode_pending < slots) {
             struct timespec deadline;
             clock_gettime(CLOCK_REALTIME, &deadline);
             timespec_add_us(&deadline, coalesce_us);
             int observed = s->decode_pending;
-            while (!s->model_stopping && s->decode_pending < s->slot_count &&
+            while (!s->model_stopping && s->decode_pending < slots &&
                    s->decode_pending < s->active_generations) {
                 int rc = pthread_cond_timedwait(&s->model_cv, &s->model_mu,
                                                 &deadline);
@@ -14065,8 +14074,8 @@ static void *decode_worker_main(void *arg) {
         int count = 0, plain_count = 0;
         /* Keep sampled/exact requests out of the greedy speculative group. */
         for (int speculative = 0; speculative <= 1; speculative++) {
-            for (int i = 0; i < s->slot_count; i++) {
-                server_slot *slot = &s->slots[i];
+            for (int i = 0; i < slots; i++) {
+                server_slot *slot = server_decode_slot(s, i);
                 if (!slot->decode_pending || slot->decode_speculative != (bool)speculative) continue;
                 slot->decode_pending = false;
                 slot->decode_in_flight = true;
@@ -15664,12 +15673,17 @@ static void dispatch_jobs_locked(server *s) {
             int required = job_required_slot_locked(s, j);
             server_slot *best = NULL;
             int best_score = INT_MIN;
-            for (int i = 0; i < s->slot_count; i++) {
+            const bool utility = j->req.utility && s->utility_slot;   /* its own session, or it waits for it */
+            for (int i = 0; !utility && i < s->slot_count; i++) {
                 int score = job_slot_score(s, &s->slots[i], j, required, now);
                 if (score > best_score) {
                     best_score = score;
                     best = &s->slots[i];
                 }
+            }
+            if (utility && !s->utility_slot->busy && !s->utility_slot->assigned) {
+                best = s->utility_slot;
+                best_score = 0;
             }
             if (best) {
                 chosen = j;
@@ -15853,7 +15867,7 @@ static void *slot_worker_main(void *arg) {
          * cache the memory-text probe relies on before the slot becomes
          * visible to the router as free again.  Also stamp the activity
          * time the router's staleness tiers rely on. */
-        slot_refresh_live_text(s, slot);
+        if (!slot->utility) slot_refresh_live_text(s, slot);
         slot->last_used = time(NULL);
 
         pthread_mutex_lock(&s->mu);
@@ -16101,8 +16115,8 @@ static void server_cancel_job(server *s, job *j) {
         break;
     }
     if (!detached && s->batched_mode) {
-        for (int i = 0; i < s->slot_count; i++) {
-            server_slot *slot = &s->slots[i];
+        for (int i = 0; i < server_decode_slots(s); i++) {
+            server_slot *slot = server_decode_slot(s, i);
             if (slot->assigned != j) continue;
             slot->assigned = NULL;
             slot->busy = false;
@@ -16115,8 +16129,8 @@ static void server_cancel_job(server *s, job *j) {
     pthread_mutex_unlock(&s->mu);
 
     pthread_mutex_lock(&s->model_mu);
-    for (int i = 0; i < s->slot_count; i++) {
-        server_slot *slot = &s->slots[i];
+    for (int i = 0; i < server_decode_slots(s); i++) {
+        server_slot *slot = server_decode_slot(s, i);
         if (slot->running == j) {
             (void)server_cancel_pending_decode_locked(s, slot);
             break;
@@ -16704,9 +16718,9 @@ static server_config parse_options(int argc, char **argv) {
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
-    if (c.utility_ctx > 0 && c.batched_sessions > 0) {
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: --utility-ctx requires non-batched mode; drop --batched-session");
+    if (c.utility_ctx > 0 && c.batched_sessions > 7) {
+        /* its row joins the batch, and a decode batch holds eight */
+        server_log(DS4_LOG_DEFAULT, "ds4-server: --utility-ctx allows at most --batched-session 7");
         exit(2);
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
@@ -16778,7 +16792,7 @@ int main(int argc, char **argv) {
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
     cfg.engine.placement_session_count_hint =
-        cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
+        (cfg.batched_sessions > 0 ? cfg.batched_sessions : 1) + (cfg.utility_ctx > 0 ? 1 : 0);
     cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
@@ -16880,8 +16894,8 @@ int main(int argc, char **argv) {
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
-        s.slot_threads = xmalloc((size_t)slot_count * sizeof(*s.slot_threads));
-        memset(s.slot_threads, 0, (size_t)slot_count * sizeof(*s.slot_threads));
+        s.slot_threads = xmalloc((size_t)(slot_count + 1) * sizeof(*s.slot_threads));
+        memset(s.slot_threads, 0, (size_t)(slot_count + 1) * sizeof(*s.slot_threads));
     }
 
     pthread_mutex_init(&s.mu, NULL);
@@ -16988,12 +17002,12 @@ int main(int argc, char **argv) {
             return 1;
         }
         decode_thread_started = true;
-        for (int i = 0; i < s.slot_count; i++) {
+        for (int i = 0; i < server_decode_slots(&s); i++) {
             if (pthread_create(&s.slot_threads[i], NULL, slot_worker_main,
-                               &s.slots[i]) != 0) {
+                               server_decode_slot(&s, i)) != 0) {
                 server_log(DS4_LOG_DEFAULT,
                            "ds4-server: failed to start session worker %d/%d",
-                           i + 1, s.slot_count);
+                           i + 1, server_decode_slots(&s));
                 server_request_worker_stop(&s);
                 for (int j = 0; j < slot_threads_started; j++) {
                     pthread_join(s.slot_threads[j], NULL);

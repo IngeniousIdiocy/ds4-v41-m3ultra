@@ -114,8 +114,9 @@ DeepSeek's encoder does.
 requests that set `"ds4_utility": true`, such as titles, tags or follow-up
 suggestions. They never think, never draft and never read or write the disk
 KV cache, and they leave the main session's state alone. A utility request
-whose prompt plus `max_tokens` does not fit in N tokens is refused. It needs
-non-batched mode.
+whose prompt plus `max_tokens` does not fit in N tokens is refused. With
+`--batched-session` its row joins the decode batch beside the slots, so at most
+7 sessions can run with it.
 
 `--serial-reasoning` (default off) makes DeepSeek V4.1 decode every reasoning
 span serially; DSpark then drafts only answers and tool calls. It changes
