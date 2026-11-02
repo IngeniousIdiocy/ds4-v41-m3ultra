@@ -214,12 +214,12 @@ These never run in one-token decoding, so serial output never depends on them.
 
 | Bit | Switch | Turns off | Exact |
 | ---: | --- | --- | --- |
-| 21 | `DS4_METAL_DISABLE_V41_ROW_MATMULS` | Q8_0 and F16 products of 2 to 8 rows sharing one weight pass (every model). | Yes |
+| 21 | `DS4_METAL_DISABLE_V41_ROW_MATMULS` | Q8_0 and F16 products of 2 to 8 rows sharing one weight pass (every model). Several sessions' rows use them too (ROWS_REG, BATCH_TAIL). | Yes for verify blocks. Off, several sessions' rows take the general batch path: slower, and not each session's one-row bits. |
 | 22 | `DS4_METAL_DISABLE_V41_ROWS_MMA` | Q8_0 products of 3 to 8 rows of a DSpark block (the drafter's rows and the verify block) on simdgroup matrices. Prefills never take it. | Yes with the defaults: a verify block's logits are serial decoding's bits (VERIFY_STACK and VERIFY_DECODE, below). No with either of those off: verify rows can differ from serial decoding in the last bits. |
 | 23 | `DS4_METAL_DISABLE_V41_VERIFY_KERNELS` | 6 to 8 V4.1 MXFP4 verify rows through the fused decode MoE kernels (DSpark blocks only; prefills keep main's MoE kernels). | No, compared with main's DSpark: each verify row now gives the bits of that row decoded alone, not the batch kernels' bits, so DSpark's tokens can change. |
 | 24 | `DS4_METAL_DISABLE_V41_PUBLIC_CONTROLLER` | Drafting by measured cost (`ds4_deepseek41_admission.h`). Off brings back main's confidence cut-off and scheduler. One Mac only. | A different policy by design: it changes where DSpark drafts, so DSpark's tokens can change. |
 | 28 | `DS4_METAL_DISABLE_V41_MOE_DEDUP` | 2 to 8 MXFP4 rows reading each selected expert once (any MXFP4 model). | Yes |
-| 29 | `DS4_METAL_DISABLE_V41_VERIFY_BATCH` | A session's 2 to 8 consecutive rows attending together and expanding their outputs into the streams. | Yes per row, except where ROWS_MMA applies. |
+| 29 | `DS4_METAL_DISABLE_V41_VERIFY_BATCH` | A session's 2 to 8 consecutive rows attending together and expanding their outputs into the streams. Several sessions' rows are not affected. | Yes per row, except where ROWS_MMA applies. |
 | 30 | `DS4_METAL_DISABLE_V41_FLASH_HEAD_SHARE` | Eight heads per threadgroup in multi-row flash attention (every model). | Yes |
 | 41 | `DS4_METAL_DISABLE_V41_VERIFY_INDEXED` | The batched verify: a draft block attends like a short prefill. Off verifies row by row, and its tokens are serial decoding's. | Yes with VERIFY_DECODE on (the default): the block attends with the decode kernels. With VERIFY_DECODE off, verified logits are not serial decoding's bits, so greedy DSpark output can differ where two tokens are nearly tied. |
 
@@ -290,7 +290,7 @@ the bits of that session decoded alone.
 | 10 | `DS4_METAL_DISABLE_V41_BATCH_RBLOCK` | With BATCH_STATIC, the routed grids visiting every pair at one row block before the next (oMLX's row-block-major order). | Yes: the same reads in another order. |
 | 11 | `DS4_METAL_DISABLE_V41_BATCH_EXPAND` | The rows' FFN join with its shape as literals. | Yes |
 | 12 | `DS4_METAL_DISABLE_V41_BATCH_QKV` | With BATCH_MIX, q_a and kv side by side at the head of that section. | Yes |
-| 13 | `DS4_METAL_DISABLE_V41_BATCH_MMA` | Five to seven rows on SHORT_MMA's exact eight-row kernels, the row count an argument. | Yes |
+| 13 | `DS4_METAL_DISABLE_V41_BATCH_MMA` | Five to seven rows on SHORT_MMA's exact eight-row kernels, the row count an argument. | Yes. Off alone (the other five-to-eight-row groups on), five rows' logits differ from one-row decode; off with them, they do not. |
 | 14 | `DS4_METAL_DISABLE_V41_BATCH_TAIL8` | BATCH_TAIL's and BATCH_LOW's fused tail through eight rows. | Yes |
 | 15 | `DS4_METAL_DISABLE_V41_BATCH_DEFER8` | BATCH_OVERLAP and what rides on it through eight rows. | Yes |
 | 16 | `DS4_METAL_DISABLE_V41_BATCH_ROUTER8` | BATCH_NARROW and BATCH_HIER through eight rows. | Yes |

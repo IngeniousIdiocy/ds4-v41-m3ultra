@@ -150,6 +150,7 @@ is faster, and [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every switch.
 | 138 | Token id fixtures for ds4-bench, per-token scores for `score_official`, request spans in the server log. | (tool) |
 | 139 | ds4-server: serve decoders and short requests between V4.1 prefill chunks. | `DS4_SERVER_DISABLE_PREFILL_YIELD=1` |
 | 140 | Rename the rows' Engram switch, which had main's name `BATCH_ENGRAM`. | `BATCH_NARROW_ENGRAM` |
+| 141 | Keep session rows running with VERIFY_BATCH or ROW_MATMULS off. | `VERIFY_BATCH`, `ROW_MATMULS` |
 
 Commits 59 to 93 came after the first release on main and are kept as they
 were committed. Commit 59 was committed as a work in progress; commits 60 to 62
@@ -157,7 +158,7 @@ complete it with its tests.
 
 Commits 94 to 119 are the previous update: prompts as DeepSeek's encoder
 writes them, sampling at top_p 1, memory and disk cache fixes. Commits 120 to
-140 add batched decoding of several sessions at once. They are grouped by
+141 add batched decoding of several sessions at once. They are grouped by
 mechanism rather than one commit per group: a commit holds the groups that
 share one change of approach (for example, two to four rows taking one-row
 decode's fused stages), and each group inside it still has its own off switch

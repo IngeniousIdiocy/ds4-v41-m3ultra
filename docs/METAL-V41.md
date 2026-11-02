@@ -452,6 +452,12 @@ operations, so the results are the same bits.
 Kind: bytes moved. Step, measured together with SAMPLER_SCAN: DSpark prose
 31.2 to 32.4 t/s, code 43.3 to 48.2; serial unchanged.
 
+Several sessions' rows run on these kernels too (ROWS_REG, BATCH_TAIL). With
+ROW_MATMULS off they take the general batch path: the steps still run, but
+slower (30.06 to 37.69 ms at N=2, 67.75 to 104.28 at N=8) and not at each
+session's one-row bits. A verify block with ROW_MATMULS off still equals serial
+decoding bit for bit.
+
 ### ROWS_MMA: three to eight DSpark rows on simdgroup matrices
 
 `DS4_METAL_DISABLE_V41_ROWS_MMA=1` turns it off.
@@ -548,6 +554,15 @@ Kind: kernel launches and bytes moved. Step, measured together with
 FLASH_HEAD_SHARE: DSpark prose 40.3 to 40.2 t/s, code 52.6 to 54.0; serial
 unchanged. Its prefill step, together with MOE_DEDUP and FLASH_HEAD_SHARE: cold
 32K 40.9 to 40.9 s.
+
+The expand kernel also serves several sessions' rows (BATCH_TAIL), and it used to
+check this switch itself, so with VERIFY_BATCH off every step of two to eight
+session rows failed at its first layer. The kernel now leaves the choice to its
+callers, and BATCH_TAIL needs ROW_MATMULS, whose kernel it is. With VERIFY_BATCH
+off, session rows at N=2 to 8 keep all-on's bits, and a verify
+block's 96 rows over six-row blocks still equal serial decoding bit for bit. One
+128-token DSpark run on a short prompt gave the same tokens at 56.2 t/s off
+against 61.0 on.
 
 ### FLASH_HEAD_SHARE: eight heads share their key reads
 
@@ -1109,14 +1124,13 @@ builds for one-row decode, half the bytes of the stored F32 gate. BATCH_HIER has
 them pick the top six with one-row decode's hierarchical router.
 
 Kind: bytes moved, kernel launches. Measured while building it: BATCH_HIER −0.39
-ms at N=3, −0.33 at N=2, −0.26 at N=4. BATCH_NARROW measured +0.05 at N=3,
-−0.26 at N=2 and +0.14 at N=4, in an arm that also carried a narrow Engram form
-that was later removed, so its own effect was not separated; it is within
-0.3 ms either way. It stays as the rows' form of NARROW_WEIGHTS and is the path
-BATCH_ROUTER8 extends to eight rows: with BATCH_NARROW off, five to eight rows
-read the F32 gate too. Its own gain is therefore not known. It has not been
-measured on its own, at two to four rows or, through BATCH_ROUTER8, at five to
-eight.
+ms at N=3, −0.33 at N=2, −0.26 at N=4. BATCH_NARROW was first measured in an arm
+that also carried a narrow Engram form that was later removed, so it was
+measured again on this build, switched off with everything else on (short
+prompts, 128 greedy tokens, median of three in serpentine order). Turning it off
+costs 0.34 ms a step at N=2 (29.87 to 30.20), 0.42 at N=3, 0.37 at N=4, and,
+since BATCH_ROUTER8 carries it on, 0.40 at N=5 and 0.57 at N=8, where five to
+eight rows then read the F32 gate.
 
 ### BATCH_OVERLAP, BATCH_DOWN, BATCH_WAVE, BATCH_MIX, BATCH_QKV: work side by side
 
@@ -1194,10 +1208,32 @@ register kernels.
 
 Kind: arithmetic, kernel launches. Measured while building it, all six together:
 N=5 75.0 to 59.7 ms, N=6 86.6 to 67.3, N=7 98.9 to 75.6, N=8 95.4 to 83.6, about
-8 ms a row with no cliff. The six were not measured one by one, so how the gain
-splits among them is not known. All but BATCH_MMA carry a two-to-four-row group
+8 ms a row with no cliff. All but BATCH_MMA carry a two-to-four-row group
 (BATCH_TAIL and BATCH_LOW, BATCH_OVERLAP, BATCH_NARROW and BATCH_HIER, the
 rotation of BATCH_ROPE, HEAD_ROWS) on to eight rows.
+
+On this build each was then switched off with everything else on, at N=5 and
+N=8 (short prompts, 128 greedy tokens, median of three in serpentine order; all
+on, a step takes 49.61 ms at N=5 and 68.01 at N=8). What turning each off costs:
+
+| Group | N=5 | N=8 |
+| --- | ---: | ---: |
+| BATCH_MMA | +10.69 | +0.10 |
+| BATCH_TAIL8 | +6.51 | +8.64 |
+| BATCH_DEFER8 | +2.65 | +2.69 |
+| BATCH_HEAD8 | +1.06 | +2.06 |
+| BATCH_ROUTER8 | +0.75 | +0.75 |
+| BATCH_QROPE | +0.28 | +0.33 |
+| all six | +15.97 | +12.38 |
+
+Each pays where it applies. BATCH_MMA covers five to seven rows; eight rows fill
+SHORT_MMA's tile and take it anyway, so at N=8 its switch changes nothing, and
+its 0.10 ms there is the noise of the method (the three runs of an arm spread by
+0.01 to 0.27 ms). BATCH_QROPE is the smallest, a third of a millisecond. The
+costs do not add up: at N=5 the six one at a time sum to 22.4 ms, against 16.0
+for all six off together. With BATCH_MMA off and the other five on, five rows'
+logits are no longer those of each session decoded alone (the other arms, and all
+six off together, keep them); why was not traced.
 
 ### BATCH_NARROW_ENGRAM, BATCH_READS, BATCH_PE: Engram and the handoff for rows
 
