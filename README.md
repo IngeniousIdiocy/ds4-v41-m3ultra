@@ -356,7 +356,7 @@ that checks a draft; "Batch" means one step that decodes several sessions
 | BATCH_HEAD8 | Batch: the head of five to eight rows on sixteen SIMD groups. |
 | BATCH_LOWBF | Batch: the low projection rounds to bf16 as it stores. |
 | BATCH_PE | Batch: the next step's first command buffer is encoded during the final wait. |
-| BATCH_ENGRAM | Batch: two to eight rows read the Engram copy in one pass. |
+| BATCH_NARROW_ENGRAM | Batch: two to eight rows read the Engram copy in one pass. |
 | BATCH_READS | Batch: the second Engram table is read once the first has joined. |
 | VERIFY_STACK | DSpark, batch: a verify block on the batch's FFN, Engram, router and head kernels. |
 | VERIFY_COPIES | DSpark: a verify block's rollback and commit copies in one concurrent level. |

@@ -1507,7 +1507,7 @@ static int check_narrow_weights(void) {
         CHECK(same_bits(a, b, outs[k]));
     }
     for (int k = 0; k < 3; k++) CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs[k] + 1);
-    /* BATCH_ENGRAM: 2-8 rows of the Engram reader, each row's bits as its one-row reader (poisoned outputs) */
+    /* BATCH_NARROW_ENGRAM: 2-8 rows of the Engram reader, each row's bits as its one-row reader (poisoned outputs) */
     const uint64_t engram_rows = ds4_gpu_test_kernel_runs("kernel_engram_blend_rows_reg_bf16");
     ds4_gpu_tensor *ex = upload(NULL, 8 * ins[0] * 4), *er = upload(NULL, 8 * outs[0] * 4), *eg = upload(NULL, 8 * outs[0] * 4);
     CHECK(ex && er && eg);

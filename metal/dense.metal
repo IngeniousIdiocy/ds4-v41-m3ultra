@@ -4914,7 +4914,7 @@ kernel void kernel_engram_blend_r2_bf16(
     helper_mv_reduce_and_write<NR0, true>((device float *) dst, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
-/* BATCH_ENGRAM: K activation rows on that reader's layout in one pass: a lane decodes its weight words once and keeps a
+/* BATCH_NARROW_ENGRAM: K activation rows on that reader's layout in one pass: a lane decodes its weight words once and keeps a
  * sumf per (output, row), so the rows load the weights once */
 template<short K>
 static inline void kernel_engram_blend_rows_reg_impl(

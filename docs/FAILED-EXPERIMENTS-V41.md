@@ -88,7 +88,7 @@ more in cache. It measured -0.05 / -0.09 ms at N=3, -0.08 / -0.03 at N=2 and
 
 V4.1 reads 24 rows from each of its two Engram tables per token, from disk.
 Batched rows read the narrow (FP8) copy with one register kernel at every row
-count (BATCH_ENGRAM), and start the second table's reads as soon as the first
+count (BATCH_NARROW_ENGRAM), and start the second table's reads as soon as the first
 has joined (BATCH_READS).
 
 **One-row narrow Engram kernel, run once per row.** *Superseded.* One-row decode

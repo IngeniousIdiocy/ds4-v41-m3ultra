@@ -1193,14 +1193,12 @@ Kind: arithmetic, kernel launches. Measured while building it, all six together:
 N=5 75.0 to 59.7 ms, N=6 86.6 to 67.3, N=7 98.9 to 75.6, N=8 95.4 to 83.6, about
 8 ms a row with no cliff. The six were not measured one by one.
 
-### BATCH_ENGRAM, BATCH_READS, BATCH_PE: Engram and the handoff for rows
+### BATCH_NARROW_ENGRAM, BATCH_READS, BATCH_PE: Engram and the handoff for rows
 
-`DS4_METAL_DISABLE_V41_<NAME>=1` turns each off. Note that
-`DS4_METAL_DISABLE_V41_BATCH_ENGRAM` is also one of main's own switches; see
-[RUNTIME-V41.md](RUNTIME-V41.md#mains-own-v41-switches).
+`DS4_METAL_DISABLE_V41_<NAME>=1` turns each off.
 
-BATCH_ENGRAM has two to eight rows read the narrow (FP8) Engram copy in one
-pass: a lane decodes each weight word once and keeps a sum per output and row.
+BATCH_NARROW_ENGRAM has two to eight rows read the narrow (FP8) Engram copy in
+one pass: a lane decodes each weight word once and keeps a sum per output and row.
 An earlier form ran a SIMD group per row, so above four rows it started a second
 pass that read the weights again.
 
@@ -1218,9 +1216,9 @@ Cross-session rows also find their keyed draws on the GPU now (KEYED_GPU, at
 top_p 1), as one row does.
 
 Kind: idle time, bytes moved. Measured while building it:
-- BATCH_ENGRAM, one pass against the form before it (sampled at temperature 1):
-  −0.11 ms at N=3, −0.08 at N=2, −0.27 at N=4, −1.1 at N=5, −1.0 at N=6 and
-  N=7, −0.61 at N=8.
+- BATCH_NARROW_ENGRAM, one pass against the form before it (sampled at
+  temperature 1): −0.11 ms at N=3, −0.08 at N=2, −0.27 at N=4, −1.1 at N=5,
+  −1.0 at N=6 and N=7, −0.61 at N=8.
 - BATCH_READS: about 0 at N=2 and N=3, −0.40 at N=4, −0.25 at N=5, −0.49 at
   N=6, −0.69 at N=7, −0.97 at N=8. It pays from four rows and costs nothing
   below.

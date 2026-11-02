@@ -575,7 +575,7 @@ uint64_t ds4_gpu_v41_off2(void) {
             "DS4_METAL_DISABLE_V41_BATCH_HEAD8",
             "DS4_METAL_DISABLE_V41_BATCH_LOWBF",
             "DS4_METAL_DISABLE_V41_BATCH_PE",
-            "DS4_METAL_DISABLE_V41_BATCH_ENGRAM",
+            "DS4_METAL_DISABLE_V41_BATCH_NARROW_ENGRAM",
             "DS4_METAL_DISABLE_V41_BATCH_READS",
             "DS4_METAL_DISABLE_V41_VERIFY_STACK",
             "DS4_METAL_DISABLE_V41_VERIFY_COPIES",
@@ -22308,7 +22308,7 @@ int ds4_gpu_matmul_engram_fp8_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor 
     return ds4_gpu_fp8_reader(out, codes, e8m0, in_dim, out_dim, x, 1);
 }
 
-/* BATCH_ENGRAM: rows of the Engram reader in one pass, one simdgroup group; its reduction is the tree over at most 8
+/* BATCH_NARROW_ENGRAM: rows of the Engram reader in one pass, one simdgroup group; its reduction is the tree over at most 8
  * simdgroups. */
 int ds4_gpu_matmul_engram_fp8_weights_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
                                            uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t rows) {

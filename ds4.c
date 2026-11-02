@@ -41816,11 +41816,11 @@ static bool ds41_narrow_engram_mv(ds41_gpu_graph *g, const ds4_model *m, const d
 }
 
 #ifdef __APPLE__
-/* BATCH_ENGRAM: cross-session decode rows, each a logits step, read the same Engram copy. */
+/* BATCH_NARROW_ENGRAM: cross-session decode rows, each a logits step, read the same Engram copy. */
 static bool ds41_narrow_engram_rows(ds41_gpu_graph *g, ds41_prefill_row *b, const ds4_model *m, const ds4_layer_weights *l,
                                     unsigned table, uint32_t count) {
     const ds41_fp8_copy *c = &g_ds41_narrow.engram[table];
-    return g->rows_decode && count <= 8u && ds41_narrow_on(g, m) && ds41_on2(DS4_GPU_V41B_BATCH_ENGRAM) && c->codes &&
+    return g->rows_decode && count <= 8u && ds41_narrow_on(g, m) && ds41_on2(DS4_GPU_V41B_BATCH_NARROW_ENGRAM) && c->codes &&
         ds4_gpu_matmul_engram_fp8_weights_rows(b->engram_kv, c->codes, c->e8m0, (uint32_t)l->engram_kv->dim[0],
                                                (uint32_t)l->engram_kv->dim[1], b->engram_rows, count);
 }

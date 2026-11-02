@@ -298,7 +298,7 @@ the bits of that session decoded alone.
 | 18 | `DS4_METAL_DISABLE_V41_BATCH_HEAD8` | With SHORT_MMA, the head of five to eight rows on sixteen SIMD groups. | Yes |
 | 19 | `DS4_METAL_DISABLE_V41_BATCH_LOWBF` | With BATCH_LOW, the low projection rounding to bf16 as it stores, so output-B need not as it loads. | Yes |
 | 20 | `DS4_METAL_DISABLE_V41_BATCH_PE` | With PREENCODE, the rows' next first command buffer encoded during the final wait. | Yes |
-| 21 | `DS4_METAL_DISABLE_V41_BATCH_ENGRAM` | Two to eight rows reading the narrow Engram copy in one pass. The same variable is also main's own switch: it turns off main's batched Engram reads for prefill and ENGRAM_READAHEAD's use of the next sweep's rows (see [Main's own V4.1 switches](#mains-own-v41-switches)). | Yes |
+| 21 | `DS4_METAL_DISABLE_V41_BATCH_NARROW_ENGRAM` | Two to eight rows reading the narrow Engram copy in one pass. | Yes |
 | 22 | `DS4_METAL_DISABLE_V41_BATCH_READS` | The rows' second Engram table read once the first has joined, instead of beside it. | Yes |
 | 23 | `DS4_METAL_DISABLE_V41_VERIFY_STACK` | A DSpark verify block on the cross-session rows' FFN, Engram, router and head kernels. Also for one session's blocks. | Yes |
 | 24 | `DS4_METAL_DISABLE_V41_VERIFY_COPIES` | A verify block's rollback snapshot and commit copies as one concurrent level. | Yes |
@@ -379,13 +379,12 @@ queue, among others: `DS4_METAL_DISABLE_V41_` followed by `8K_CHUNK`,
 timing variables that help find idle GPU time are main's too, notably
 `DS4_METAL_ENCODER_TIMELINE`.
 
-One of these names is also a group switch of this branch:
-`DS4_METAL_DISABLE_V41_BATCH_ENGRAM` turns off main's batched Engram reads
-for prefill (each row then reads on its own) and the reuse of the next
-sweep's read-ahead rows, and it turns off this branch's BATCH_ENGRAM group
-(bit 21 of the second word). Setting it changes both. `TOPK_SHUFFLE` is
-main's; this branch's tie-ordered verify sort (VERIFY_DECODE) is chosen
-before it.
+Main's `DS4_METAL_DISABLE_V41_BATCH_ENGRAM` turns off main's batched Engram
+reads for prefill (each row then reads on its own), and with them
+ENGRAM_READAHEAD's reuse of the next sweep's read-ahead rows. It does not touch
+batched decode rows, whose Engram group has its own switch, BATCH_NARROW_ENGRAM
+(bit 21 of the second word). `TOPK_SHUFFLE` is main's; this branch's
+tie-ordered verify sort (VERIFY_DECODE) is chosen before it.
 
 ## Tests
 

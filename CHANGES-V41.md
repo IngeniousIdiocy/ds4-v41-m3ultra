@@ -138,10 +138,10 @@ is faster, and [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every switch.
 | 126 | Give session rows one-row decode's fixed-shape expert kernels. | `BATCH_STATIC`, `BATCH_RBLOCK`, `BATCH_EXPAND` |
 | 127 | Run session rows' q_a and kv side by side. | `BATCH_QKV` |
 | 128 | Run five to eight session rows on the exact eight-row tiles. | `BATCH_MMA`, `BATCH_TAIL8`, `BATCH_DEFER8`, `BATCH_ROUTER8`, `BATCH_QROPE`, `BATCH_HEAD8`, `BATCH_LOWBF` |
-| 129 | Pre-encode session rows' next buffer; narrow Engram and the second table's reads for rows. | `BATCH_PE`, `BATCH_ENGRAM`, `BATCH_READS` |
+| 129 | Pre-encode session rows' next buffer; narrow Engram and the second table's reads for rows. | `BATCH_PE`, `BATCH_NARROW_ENGRAM`, `BATCH_READS` |
 | 130 | Find session rows' keyed draws on the GPU. | `KEYED_GPU` |
 | 131 | ds4-server: run the utility session beside batched sessions. | (server) |
-| 132 | Read session rows' Engram in one pass at two to eight rows. | `BATCH_ENGRAM` |
+| 132 | Read session rows' Engram in one pass at two to eight rows. | `BATCH_NARROW_ENGRAM` |
 | 133 | ds4-bench: sample `nrun` rows, change their count between steps, report cycle time. | (tool) |
 | 134 | Batch DSpark sessions, with verify blocks beside other sessions' rows. | `MIXED_STEP`, `MIXED_CARRY`, `VERIFY_STACK`, `VERIFY_COPIES`, `VERIFY_DECODE` |
 | 135 | Read a shared expert once across decode rows. | `READ_ONCE` |
@@ -149,6 +149,7 @@ is faster, and [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every switch.
 | 137 | Decode attention on simdgroup matrices, live splits only, and a spin on the final wait. | `ATTN_TILES`, `LIVE_SPLITS`, `FINAL_SPIN` |
 | 138 | Token id fixtures for ds4-bench, per-token scores for `score_official`, request spans in the server log. | (tool) |
 | 139 | ds4-server: serve decoders and short requests between V4.1 prefill chunks. | `DS4_SERVER_DISABLE_PREFILL_YIELD=1` |
+| 140 | Rename the rows' Engram switch, which had main's name `BATCH_ENGRAM`. | `BATCH_NARROW_ENGRAM` |
 
 Commits 59 to 93 came after the first release on main and are kept as they
 were committed. Commit 59 was committed as a work in progress; commits 60 to 62
@@ -156,12 +157,14 @@ complete it with its tests.
 
 Commits 94 to 119 are the previous update: prompts as DeepSeek's encoder
 writes them, sampling at top_p 1, memory and disk cache fixes. Commits 120 to
-139 add batched decoding of several sessions at once. They are grouped by
+140 add batched decoding of several sessions at once. They are grouped by
 mechanism rather than one commit per group: a commit holds the groups that
 share one change of approach (for example, two to four rows taking one-row
 decode's fused stages), and each group inside it still has its own off switch
 and its own bits against one-row decode. [docs/METAL-V41.md](docs/METAL-V41.md#several-sessions-at-once)
-explains each group.
+explains each group. Commits 129 and 132 call BATCH_NARROW_ENGRAM by its first
+name, BATCH_ENGRAM, which is also one of main's own switches (main's batched
+Engram reads for prefill); commit 140 gave the batched rows' group its own name.
 
 Switch names without a prefix are `DS4_METAL_DISABLE_V41_<NAME>=1`, except
 `COMPUTE_TENSOR_COPY`, which is `DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY=1`.
