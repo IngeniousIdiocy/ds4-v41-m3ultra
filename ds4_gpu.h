@@ -104,6 +104,15 @@ typedef struct {
 #define DS4_GPU_V41_PQ_GPU (1ull << 58)   /* DSpark's exact verify at the full distribution builds q and p on the GPU and finds the draft and residual draws' candidates there */
 #define DS4_GPU_V41_HEAD_ROWS (1ull << 59)   /* cross-session decode rows' vocabulary head on the Q8_0 row kernel, each row's bits as its one-row head */
 #define DS4_GPU_V41_DECODE_ROWS (1ull << 60)   /* 6-8 cross-session decode rows through the fused decode MoE kernels, as a DSpark verify block */
+#define DS4_GPU_V41_BATCH_FLUSH (1ull << 61)   /* cross-session decode rows commit after layer 0 too, as one-row decode does */
+#define DS4_GPU_V41_ROWS_REG (1ull << 62)   /* Q8_0 matmuls of 2-4 cross-session decode rows accumulate in registers, one weight pass and one reduction, each row's bits as its one-row kernel */
+#define DS4_GPU_V41_BATCH_ROPE (1ull << 63)   /* cross-session decode rows keep one-row decode's RoPE tables: the reduce and q_b apply the rotations */
+/* The mask's second word, ds4_gpu_v41_off2(): the same rules, its own list of off switches. */
+#define DS4_GPU_V41B_BATCH_KV (1ull << 0)   /* cross-session decode rows rope, quantize and store their KV rows in one dispatch */
+#define DS4_GPU_V41B_BATCH_TAIL (1ull << 1)   /* 2-4 cross-session decode rows' output and shared projections expand straight into the HC streams, as one-row decode's do */
+#define DS4_GPU_V41B_BATCH_LOW (1ull << 2)   /* the low projection of 2-4 cross-session decode rows accumulates in registers, one weight pass per group */
+#define DS4_GPU_V41B_BATCH_NARROW (1ull << 3)   /* 2-4 cross-session decode rows read the narrow router copy */
+#define DS4_GPU_V41B_BATCH_HIER (1ull << 4)   /* 2-4 cross-session decode rows select experts with the hierarchical router */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
 #define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
@@ -159,6 +168,7 @@ int ds4_gpu_commands_active(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 uint64_t ds4_gpu_v41_off(void);
+uint64_t ds4_gpu_v41_off2(void);
 /* V4.1 vision: true when the encoder attends with VISION_ATTN_FLASH (accurate, not bit-exact), that is unless
  * DS4_METAL_DISABLE_V41_VISION_ATTN_FLASH or DS4_V41_EXACT is set; read on every call, as the encoder does. */
 bool ds4_gpu_deepseek41_vision_attn_flash(void);
@@ -446,6 +456,7 @@ void ds4_gpu_test_set_flags(uint32_t flags);
 uint64_t ds4_gpu_test_kernel_runs(const char *name);
 /* Replaces the V4.1 off mask read from the environment. */
 void ds4_gpu_test_set_v41_off(uint64_t off);
+void ds4_gpu_test_set_v41_off2(uint64_t off);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }

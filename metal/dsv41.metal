@@ -116,15 +116,15 @@ kernel void kernel_dsv41_router_one(
 
 /* SIMD nominations for the unique finite top-six case; ties use the original
  * bitonic order. Keep six active lanes in the normalization reduction. */
-kernel void kernel_dsv41_router_hier(
+static inline void dsv41_router_hier_body(
         constant ds4_metal_args_dsv41_router & args,
         device const float *logits,
         device const float *bias,
         device       float *probs,
         device     int32_t *selected,
         device       float *weights,
-        threadgroup   char *shmem [[threadgroup(0)]],
-        uint tid [[thread_position_in_threadgroup]]) {
+        threadgroup   char *shmem,
+        uint tid) {
     const uint lane = tid % 32u, sg = tid / 32u;
     threadgroup float *cscore = (threadgroup float *)shmem;
     threadgroup uint *cid = (threadgroup uint *)(shmem + 128u*4u);
@@ -253,6 +253,33 @@ kernel void kernel_dsv41_router_hier(
     }
 }
 
+kernel void kernel_dsv41_router_hier(
+        constant ds4_metal_args_dsv41_router & args,
+        device const float *logits,
+        device const float *bias,
+        device       float *probs,
+        device     int32_t *selected,
+        device       float *weights,
+        threadgroup   char *shmem [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    dsv41_router_hier_body(args, logits, bias, probs, selected, weights, shmem, tid);
+}
+
+/* BATCH_HIER: one threadgroup per session row. */
+kernel void kernel_dsv41_router_hier_rows(
+        constant ds4_metal_args_dsv41_router & args,
+        device const float *logits,
+        device const float *bias,
+        device       float *probs,
+        device     int32_t *selected,
+        device       float *weights,
+        threadgroup   char *shmem [[threadgroup(0)]],
+        uint2 tg [[threadgroup_position_in_grid]],
+        uint2 tid [[thread_position_in_threadgroup]]) {
+    dsv41_router_hier_body(args, logits + tg.y * args.n_expert, bias, probs + tg.y * args.n_expert,
+                           selected + tg.y * args.top_k, weights + tg.y * args.top_k, shmem, tid.x);
+}
+
 struct ds4_metal_args_dsv41_rope {
     uint width, heads, rows, start, inverse, stride;
     float frequencies[32];
@@ -355,20 +382,18 @@ kernel void kernel_dsv41_rope_quantize(
     dsv41_rope_quantize_body(args, x, dst, group, lane);
 }
 
-/* The decode indexer query's rope and quantization in ONE dispatch over every head, in place: grid
- * (width / block, heads) x 32, each threadgroup one block of one head row. The arithmetic is dsv41_rope_quantize_body
- * with the coefficients read from the step's RoPE coefficient table (kernel_dsv41_rope_coeff_table: float2(cos, sin)
- * of the same theta; the host binds the half the frequencies select, compressed = entries 32..63 at byte 256). Each
- * lane reads its own word before the pair shuffle and writes it last. */
-kernel void kernel_dsv41_rope_quantize_heads_tab(
+/* dsv41_rope_quantize_body with the coefficients read from the step's RoPE coefficient table
+ * (kernel_dsv41_rope_coeff_table: float2(cos, sin) of the same theta; the host binds the half the frequencies select,
+ * compressed = entries 32..63 at byte 256). Each lane reads its own word before the pair shuffle and writes it last. */
+static inline void dsv41_rope_quantize_tab_body(
         constant ds4_metal_args_dsv41_rope_quantize &args,
-        device float *x,
+        device const float *row,
+        device float *dst,
         device const float2 *tab,
-        uint2 group [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_simdgroup]]) {
-    device float *row = x + (ulong)group.y * args.width;
+        uint group,
+        uint lane) {
     const uint block = args.mode == 3u ? 16u : 32u;
-    const uint column = group.x * block + lane;
+    const uint column = group * block + lane;
     const bool valid = lane < block && column < args.width;
     float value = valid ? row[column] : 0.0f;
     const float other = simd_shuffle_xor(value, 1u);
@@ -394,7 +419,34 @@ kernel void kernel_dsv41_rope_quantize_heads_tab(
             : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
         result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
     }
-    if (valid) row[column] = dsv41_bf16(result);
+    if (valid) dst[column] = dsv41_bf16(result);
+}
+
+/* The decode indexer query's rope and quantization in ONE dispatch over every head, in place: grid
+ * (width / block, heads) x 32, each threadgroup one block of one head row. */
+kernel void kernel_dsv41_rope_quantize_heads_tab(
+        constant ds4_metal_args_dsv41_rope_quantize &args,
+        device float *x,
+        device const float2 *tab,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    device float *row = x + (ulong)group.y * args.width;
+    dsv41_rope_quantize_tab_body(args, row, row, tab, group.x, lane);
+}
+
+/* BATCH_KV: cross-session rows' KV rows roped, quantized and stored in one dispatch, each into its session's cache
+ * row at its own position: grid (width / block, rows) x 32. tab holds each row's coefficient half, 64 float2 apart. */
+kernel void kernel_dsv41_rope_quantize_rows(
+        constant ds4_metal_args_dsv41_rope_quantize &args,
+        device const float *x,
+        device const float2 *tab,
+        device float *d0, device float *d1, device float *d2, device float *d3,
+        device float *d4, device float *d5, device float *d6, device float *d7,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    device float *dst = group.y < 4u ? (group.y < 2u ? (group.y == 0u ? d0 : d1) : (group.y == 2u ? d2 : d3)) :
+        (group.y < 6u ? (group.y == 4u ? d4 : d5) : (group.y == 6u ? d6 : d7));
+    dsv41_rope_quantize_tab_body(args, x + (ulong)group.y * args.width, dst, tab + (ulong)group.y * 64u, group.x, lane);
 }
 
 /* The per-step RoPE coefficient table (512 B): entries 0..31 the raw frequencies, 32..63 the compressed ones,

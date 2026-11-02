@@ -3496,6 +3496,61 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows(
         sgitg);
 }
 
+/* BATCH_LOW: ROWS_REG on the low projection: K tokens of a group in one weight pass, grid z the group. */
+template<short K, short NR0>
+void kernel_dsv4_attn_out_low_q8_0_f32_rows_reg_impl(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const int idx = tgpig.z;
+    tgpig.z = 0;
+    ds4_metal_args_mul_mv args0 = {
+        /*.ne00 =*/ args.ne00,
+        /*.ne01 =*/ args.ne01,
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ args.nb00,
+        /*.nb01 =*/ args.nb01,
+        /*.nb02 =*/ args.nb02,
+        /*.nb03 =*/ args.nb02,
+        /*.ne10 =*/ args.ne10,
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ args.nb10,
+        /*.nb11 =*/ args.nb12,
+        /*.nb12 =*/ args.nb12,
+        /*.nb13 =*/ args.nb12,
+        /*.ne0  =*/ args.ne1*args.ne0,
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ args.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+    kernel_mul_mv_q8_0_f32_rows_reg_impl<K, false, NR0, false, false, thread ds4_metal_args_mul_mv &>(
+        args0, src0s + idx*args.nb02, src1 + idx*args.nb11, dst + idx*args.ne0*sizeof(float), shmem,
+        tgpig, tiisg, sgitg);
+}
+#define DS4_ATTN_OUT_LOW_ROWS_REG(NAME, K, NR0) \
+kernel void NAME( \
+        constant ds4_metal_args_mul_mv_id & args, \
+        device const char * src0s, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv4_attn_out_low_q8_0_f32_rows_reg_impl<K, NR0>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows2_reg, 2, 4)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows3_reg, 3, 4)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows4_reg, 4, 2)
+#undef DS4_ATTN_OUT_LOW_ROWS_REG
+
 /* The matrix rows form: grid z is the group, ne12 carries the token count. */
 kernel void kernel_dsv4_attn_out_low_q8_0_f32_mma_rows8(
         constant ds4_metal_args_mul_mv_id & args,

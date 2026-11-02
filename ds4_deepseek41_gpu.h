@@ -76,6 +76,9 @@ int ds4_gpu_dsv41_norm_pair_rows(ds4_gpu_tensor *out0, const ds4_gpu_tensor *x0,
 int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                             uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
                             const ds4_gpu_tensor *x, uint32_t pos, bool compressed);
+int ds4_gpu_dsv41_project_q_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+                                 uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t n_rows,
+                                 const ds4_gpu_tensor *tab, bool compressed);
 /* ROPE. rope_quantize: one row's RoPE and quantization stored into dst at dst_offset bytes, x unchanged.
  * rope_coeff_table: one decode step's RoPE coefficients (64 float2: (cos, sin) of float(pos) * frequency, entries
  * 0..31 raw, 32..63 compressed). rope_quantize_heads_tab: RoPE + quantization of heads rows of width in place, in one
@@ -86,6 +89,9 @@ int ds4_gpu_dsv41_project_q(ds4_gpu_tensor *out, const void *model_map, uint64_t
 int ds4_gpu_dsv41_rope_quantize(const ds4_gpu_tensor *x, ds4_gpu_tensor *dst, uint64_t dst_offset,
                                 uint32_t width, uint32_t start, bool compressed,
                                 ds4_v41_activation_format format);
+int ds4_gpu_dsv41_rope_quantize_rows(const ds4_gpu_tensor *x, ds4_gpu_tensor *const *dst, const uint64_t *dst_offset,
+                                     uint32_t width, uint32_t rows, const ds4_gpu_tensor *tab, bool compressed,
+                                     ds4_v41_activation_format format);
 int ds4_gpu_dsv41_rope_coeff_table(ds4_gpu_tensor *tab, uint32_t pos);
 int ds4_gpu_dsv41_rope_quantize_heads_tab(ds4_gpu_tensor *x, uint32_t width, uint32_t heads, uint32_t start,
                                           bool compressed, ds4_v41_activation_format format, const ds4_gpu_tensor *tab);
@@ -205,6 +211,9 @@ int ds4_gpu_matmul_bf16_router_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor
                                        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x);
 int ds4_gpu_matmul_engram_fp8_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
                                       uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
+/* BATCH_NARROW: the router copy's reader over a few rows. */
+int ds4_gpu_matmul_bf16_router_weights_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights, uint64_t in_dim,
+                                            uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t rows);
 int ds4_gpu_dsv41_project_fp8_bf16_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
                                            uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
 #endif

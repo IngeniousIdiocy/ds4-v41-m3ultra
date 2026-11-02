@@ -702,7 +702,7 @@ extern char **environ;
  *                                           environment changes, reset the RNG, decode
  *   session idx=I ctx=C                     make session I (1..8, created or resized to ctx C)
  *                                           current; save, load and run then act on it
- *   nrun label=L rows=K tokens=N [first=I] [hash=1] [live=1] [off=HEX] [set=NAME=VALUE ...] [unset=NAME ...] [warm=1]
+ *   nrun label=L rows=K tokens=N [first=I] [hash=1] [live=1] [off=HEX] [off2=HEX] [set=NAME=VALUE ...] [unset=NAME ...] [warm=1]
  *                                           sessions I..I+K-1 restore their frontiers and decode
  *                                           greedily together through ds4_sessions_eval_batch; per
  *                                           row and step: PATH.steps.csv; per job: PATH.nruns.csv;
@@ -871,14 +871,15 @@ static void job_counters(uint64_t c[BENCH_JOB_COUNTERS]) {
 static uint64_t job_switch(char **kv, int n, char *env_desc, size_t env_cap, uint64_t *base) {
     const char *v;
     /* off=HEX: these V4.1 switch groups off for this run, on top of the process's own (they are read once) */
-    static uint64_t base_off;
+    static uint64_t base_off, base_off2;
     static bool base_read;
 #ifdef BENCH_V41_OFF
-    if (!base_read) { base_off = ds4_gpu_v41_off(); base_read = true; }
+    if (!base_read) { base_off = ds4_gpu_v41_off(); base_off2 = ds4_gpu_v41_off2(); base_read = true; }
 #endif
     const uint64_t run_off = base_off | ((v = job_get(kv, n, "off")) ? strtoull(v, NULL, 16) : 0);
 #ifdef BENCH_V41_OFF
     ds4_gpu_test_set_v41_off(run_off);
+    ds4_gpu_test_set_v41_off2(base_off2 | ((v = job_get(kv, n, "off2")) ? strtoull(v, NULL, 16) : 0));
 #endif
     for (int i = 1; i < n; i++) {
         if (!strncmp(kv[i], "set=", 4) && strchr(kv[i] + 4, '=')) {
