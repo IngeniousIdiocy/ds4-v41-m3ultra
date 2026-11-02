@@ -43402,7 +43402,9 @@ static bool ds41_router_rows(ds41_gpu_graph *g, const ds4_model *m, const ds4_la
                 DS4_N_EMBD, DS4_N_EXPERT, b->norm, count)) &&
         ds4_gpu_dsv41_router_rows(b->selected, b->route_weights, b->route_probs, b->route_logits,
             m->map, m->size, l->ffn_exp_probs_b->abs_offset, DS4_N_EXPERT, DS4_N_EXPERT_USED,
-            DS4_EXPERT_WEIGHT_SCALE, count);
+            DS4_EXPERT_WEIGHT_SCALE, count) &&
+        (!g->rows_decode || !ds41_on2(DS4_GPU_V41B_READ_ONCE) || !(g->verify_prefix || count >= 4u) ||
+         ds4_gpu_dsv41_once_plan(b->selected, count));   /* few plain rows repeat too little to pay for the plan */
 }
 #endif
 

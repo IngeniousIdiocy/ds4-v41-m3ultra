@@ -582,6 +582,7 @@ uint64_t ds4_gpu_v41_off2(void) {
             "DS4_METAL_DISABLE_V41_VERIFY_DECODE",
             "DS4_METAL_DISABLE_V41_MIXED_STEP",
             "DS4_METAL_DISABLE_V41_MIXED_CARRY",
+            "DS4_METAL_DISABLE_V41_READ_ONCE",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -33967,6 +33968,9 @@ static int ds4_gpu_encode_mul_mv_id_pair(
 }
 
 static BOOL g_moe_rblock;   /* BATCH_RBLOCK: the next routed dispatch's grid has the pairs or rows on its fastest axis */
+static id<MTLBuffer> g_once_plan;   /* READ_ONCE: this layer's plan, which the pair stage's grid reads */
+static BOOL g_once_planned;         /* the plan is encoded and no pair stage has read it */
+static BOOL g_moe_once;             /* the next pair dispatch runs from the plan */
 
 static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
         id<MTLCommandBuffer>        cb,
@@ -34018,8 +34022,14 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:g_moe_rblock ? MTLSizeMake(pairs, row_groups, 1) : MTLSizeMake(row_groups, 1, pairs)
-         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    if (g_moe_once) {
+        [enc setBuffer:g_once_plan offset:0 atIndex:10];
+        [enc dispatchThreadgroupsWithIndirectBuffer:g_once_plan indirectBufferOffset:0
+                              threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    } else {
+        [enc dispatchThreadgroups:g_moe_rblock ? MTLSizeMake(pairs, row_groups, 1) : MTLSizeMake(row_groups, 1, pairs)
+             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    }
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -46257,6 +46267,13 @@ int ds4_gpu_routed_moe_batch_tensor(
             }
             tiny_pair_swiglu_pipeline = pair_kernels[rblock];
             down_sum6_pipeline = sum_kernels[rblock];
+            if (g_once_planned) {
+                static id<MTLComputePipelineState> once;
+                if (!once) once = ds4_gpu_new_mul_mv_tg_multiple_pipeline("kernel_mul_mv_id_mxfp4_pair_once_v41_f32", 1);
+                if (!once) return 0;
+                tiny_pair_swiglu_pipeline = once;
+                DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_once_v41_f32");
+            }
             if (!tiny_pair_swiglu_pipeline || !down_sum6_pipeline) return 0;
         }
         /* BATCH_OVERLAP admits the tiny pair kernel and its direct sum, the two levels it brackets; anything else
@@ -46483,6 +46500,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             if (dedup) DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32");
             if (rows_static) DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_rows_static_v41_f32");
             g_moe_rblock = rblock;
+            g_moe_once = rows_static && g_once_planned;
+            g_once_planned = NO;
             ok = dedup ? ds4_gpu_encode_mul_mv_id_pair_swiglu_dedup(cb, &gate_args, &act_args,
                     gate_buf, (NSUInteger)gate_inner, up_buf, (NSUInteger)up_inner,
                     xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
@@ -46513,6 +46532,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        use_tp_mxfp4_static_batch || rows_static ? 1 : 2,
                                                        false);
             g_moe_rblock = NO;
+            g_moe_once = NO;
         } else if (use_tiny_pair_mv) {
             id<MTLComputePipelineState> pair_pipeline =
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
@@ -51446,6 +51466,31 @@ int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
         [enc dispatchThreadgroups:MTLSizeMake(1, rows, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 router");
+    }
+}
+
+/* READ_ONCE: one layer's expert pairs as a list of groups (kernel_dsv41_once_plan) */
+int ds4_gpu_dsv41_once_plan(const ds4_gpu_tensor *selected, uint32_t rows) {
+    if (!selected || !rows) return 0;
+    if (rows > 8u) return 1;   /* the rows' kernels, read by read */
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_once_plan");
+        if (!g_once_plan) g_once_plan = [g_device newBufferWithLength:512 options:MTLResourceStorageModePrivate];
+        if (!pipeline || !g_once_plan) return 0;
+        const uint32_t pairs = rows * 6u;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&pairs length:sizeof(pairs) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+        [enc setBuffer:g_once_plan offset:0 atIndex:2];
+        [enc setThreadgroupMemoryLength:384 atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(pairs, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        g_once_planned = YES;
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 read-once plan");
     }
 }
 

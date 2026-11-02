@@ -132,6 +132,7 @@ typedef struct {
 #define DS4_GPU_V41B_BATCH_READS (1ull << 22)   /* cross-session decode rows read the second Engram table after the first has joined */
 #define DS4_GPU_V41B_MIXED_STEP (1ull << 26)   /* a DSpark verify block shares its step with other sessions' rows */
 #define DS4_GPU_V41B_MIXED_CARRY (1ull << 27)   /* with MIXED_STEP a block's correction is its stream's row in the next step */
+#define DS4_GPU_V41B_READ_ONCE (1ull << 28)   /* decode rows that share an expert read its gate and up weights once */
 #define DS4_GPU_V41B_VERIFY_DECODE (1ull << 25)   /* with VERIFY_INDEXED a DSpark verify block attends with the decode kernels */
 #define DS4_GPU_V41B_VERIFY_COPIES (1ull << 24)   /* a DSpark verify block's rollback snapshot and commit copies run as one concurrent level */
 #define DS4_GPU_V41B_VERIFY_STACK (1ull << 23)   /* a DSpark verify block runs the cross-session rows' FFN, Engram, router and head stack */

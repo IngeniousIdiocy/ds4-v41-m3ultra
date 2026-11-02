@@ -30,6 +30,7 @@ int ds4_gpu_dsv41_router_one(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
                              const void *model_map, uint64_t model_size, uint64_t bias_offset,
                              uint32_t n_expert, uint32_t top_k, float scale);
 /* The same for a few rows, and the rows' F32 logits with the single-row matvec's reduction. */
+int ds4_gpu_dsv41_once_plan(const ds4_gpu_tensor *selected, uint32_t rows);
 int ds4_gpu_dsv41_router_rows(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
                               ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits,
                               const void *model_map, uint64_t model_size, uint64_t bias_offset,
