@@ -182,9 +182,14 @@ static int check_quantization(void) {
                 scale = exp2f(ceilf(log2f(fmaxf(amax, 0x1.8p-124f) * (1.0f / 6.0f))));
             if (mode == DS4_V41_FP4_E4M3) scale = nearest(fmaxf(amax, 6.0f / 512.0f) / 6.0f, 0);
             for (int i = 0; i < block; i++) {
-                float expected = bf16(source[start + i]);
-                if (mode) expected = bf16(nearest(expected / scale, mode != 1) * scale);
-                if (memcmp(&expected, actual + start + i, 4)) {
+                float expected = bf16(source[start + i]), either = expected;
+                /* fast-math divides E4M3 scales by reciprocal: a value at a rounding tie takes either code, same error */
+                if (mode == DS4_V41_FP4_E4M3) {
+                    const float q = expected / scale;
+                    expected = bf16(nearest(q * (1.0f - 4.0f * 0x1p-23f), 1) * scale);
+                    either = bf16(nearest(q * (1.0f + 4.0f * 0x1p-23f), 1) * scale);
+                } else if (mode) either = expected = bf16(nearest(expected / scale, mode != 1) * scale);
+                if (memcmp(&expected, actual + start + i, 4) && memcmp(&either, actual + start + i, 4)) {
                     fprintf(stderr, "quantization mode=%d index=%d: %.9g != %.9g\n",
                             mode, start + i, actual[start + i], expected);
                     return 0;
@@ -1152,6 +1157,9 @@ static int check_tp_attention(void) {
     for (int h = 0; h < H; h++) sinks[h] = random_value();
     CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
     ds4_gpu_set_quality(false);
+#ifdef __APPLE__
+    ds4_gpu_test_set_v41_off(DS4_GPU_V41_PREFILL_MMA);   /* not bit-exact; check_prefill_attention has it */
+#endif
     for (unsigned s = 0; s < sizeof(cases) / sizeof(*cases); s++) {
         const uint32_t n = cases[s].rows, nr = n + 127, start = 3073;
         const uint32_t ratio = 1u + s % 2u;
@@ -1253,6 +1261,9 @@ static int check_tp_attention(void) {
         ds4_gpu_tensor_free(op);
         free(q); free(actual); free(compact); free(part); free(raw); free(comp); free(ids);
     }
+#ifdef __APPLE__
+    ds4_gpu_test_set_v41_off(0);
+#endif
     ds4_gpu_cleanup();
     free(sinks);
     return 1;
@@ -2382,7 +2393,8 @@ static int check_rows_mma(void) {
         const float *a = ds4_gpu_tensor_contents(got), *b = ds4_gpu_tensor_contents(ref);
         float scale = 0;
         for (uint32_t i = 0; i < rows * 1280; i++) scale = fmaxf(scale, fabsf(b[i]));
-        for (uint32_t i = 0; i < rows * 1280; i++) CHECK(fabsf(a[i] - b[i]) <= 1e-5f * scale + fabsf(b[i]) / 64.0f);
+        /* one bf16 step of a gate or up near a zero crossing moves a small product further than its own step */
+        for (uint32_t i = 0; i < rows * 1280; i++) CHECK(fabsf(a[i] - b[i]) <= 1e-5f * scale + fabsf(b[i]) / 16.0f);
     }
     CHECK(ds4_gpu_test_kernel_runs("kernel_dsv4_shared_mid_swiglu_q8_0_bf16_mma_rows8") == sw_runs + 6);
     /* 1024: 3-8 rows on four simdgroups; 4096: 3-8 rows on eight; 8192: 4-8 rows on eight */
