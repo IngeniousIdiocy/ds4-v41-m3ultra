@@ -120,6 +120,13 @@ typedef struct {
 #define DS4_GPU_V41B_BATCH_RBLOCK (1ull << 10)   /* with BATCH_STATIC the routed grids visit every pair at a row block before the next block */
 #define DS4_GPU_V41B_BATCH_EXPAND (1ull << 11)   /* cross-session decode rows' FFN join with its shape as literals */
 #define DS4_GPU_V41B_BATCH_QKV (1ull << 12)   /* with BATCH_MIX q_a and kv run side by side at the head of that section */
+#define DS4_GPU_V41B_BATCH_MMA (1ull << 13)   /* 5-7 cross-session decode rows take SHORT_MMA's kernels, the row count an argument */
+#define DS4_GPU_V41B_BATCH_TAIL8 (1ull << 14)   /* BATCH_TAIL and BATCH_LOW's fused tail through 8 rows */
+#define DS4_GPU_V41B_BATCH_DEFER8 (1ull << 15)   /* BATCH_OVERLAP and what rides on it through 8 rows */
+#define DS4_GPU_V41B_BATCH_ROUTER8 (1ull << 16)   /* BATCH_NARROW and BATCH_HIER through 8 rows */
+#define DS4_GPU_V41B_BATCH_QROPE (1ull << 17)   /* with BATCH_MMA q_b of 5-8 rows rotates as it stores, as BATCH_ROPE does at 2-4 */
+#define DS4_GPU_V41B_BATCH_HEAD8 (1ull << 18)   /* with SHORT_MMA the vocabulary head of 5-8 decode rows on sixteen simdgroups */
+#define DS4_GPU_V41B_BATCH_LOWBF (1ull << 19)   /* with BATCH_LOW the low projection rounds to bf16 as it stores, so output-B need not as it loads */
 #define DS4_GPU_V41B_BATCH_MIX (1ull << 8)   /* 2-4 cross-session decode rows' attention runs the HC mix beside q_b */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
 #define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */

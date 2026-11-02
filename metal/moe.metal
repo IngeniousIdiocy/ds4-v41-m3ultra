@@ -3497,7 +3497,7 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_rows(
 }
 
 /* BATCH_LOW: ROWS_REG on the low projection: K tokens of a group in one weight pass, grid z the group. */
-template<short K, short NR0>
+template<short K, short NR0, bool ROUND>
 void kernel_dsv4_attn_out_low_q8_0_f32_rows_reg_impl(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
@@ -3530,11 +3530,11 @@ void kernel_dsv4_attn_out_low_q8_0_f32_rows_reg_impl(
         /*.r2   =*/ 1,
         /*.r3   =*/ 1,
     };
-    kernel_mul_mv_q8_0_f32_rows_reg_impl<K, false, NR0, false, false, thread ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_q8_0_f32_rows_reg_impl<K, ROUND, NR0, false, false, thread ds4_metal_args_mul_mv &>(
         args0, src0s + idx*args.nb02, src1 + idx*args.nb11, dst + idx*args.ne0*sizeof(float), shmem,
         tgpig, tiisg, sgitg);
 }
-#define DS4_ATTN_OUT_LOW_ROWS_REG(NAME, K, NR0) \
+#define DS4_ATTN_OUT_LOW_ROWS_REG(NAME, K, NR0, ROUND) \
 kernel void NAME( \
         constant ds4_metal_args_mul_mv_id & args, \
         device const char * src0s, \
@@ -3544,11 +3544,14 @@ kernel void NAME( \
         uint3  tgpig[[threadgroup_position_in_grid]], \
         ushort tiisg[[thread_index_in_simdgroup]], \
         ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
-    kernel_dsv4_attn_out_low_q8_0_f32_rows_reg_impl<K, NR0>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg); \
+    kernel_dsv4_attn_out_low_q8_0_f32_rows_reg_impl<K, NR0, ROUND>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg); \
 }
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows2_reg, 2, 4)
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows3_reg, 3, 4)
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows4_reg, 4, 2)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows2_reg, 2, 4, false)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows3_reg, 3, 4, false)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows4_reg, 4, 2, false)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows2_reg, 2, 4, true)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows3_reg, 3, 4, true)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows4_reg, 4, 2, true)
 #undef DS4_ATTN_OUT_LOW_ROWS_REG
 
 /* The matrix rows form: grid z is the group, ne12 carries the token count. */
@@ -3590,27 +3593,44 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32_mma_rows8(
     kernel_mul_mv_q8_0_f32_mma_rows_impl<false, false, false, 8, thread ds4_metal_args_mul_mv &>(
         args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
 }
-/* SHORT_MMA: eight tokens of one group through the exact tiles, with kernel_dsv4_attn_out_low_q8_0_f32_rows's bits:
- * grid z is the group. */
-kernel void kernel_dsv4_attn_out_low_q8_0_f32_mma8_exact(
+/* SHORT_MMA: up to eight tokens of one group through the exact tiles, with kernel_dsv4_attn_out_low_q8_0_f32_rows's
+ * bits: grid z is the group, ne12 carries the token count. */
+template<bool ROUND>
+void kernel_dsv4_attn_out_low_q8_0_f32_mma8_exact_impl(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     const int idx = tgpig.z;
     const int r0 = (int)tgpig.x * 8;
     simdgroup_float8x8 P[4][4];
     ds4_q8_exact8_walk<false>(src0s + idx*args.nb02 + (uint64_t)r0 * args.nb01, args.nb01, args.ne00 / QK8_0,
-                              (device const float *)(src1 + idx*args.nb11), args.nb12 / sizeof(float),
+                              (device const float *)(src1 + idx*args.nb11), args.nb12 / sizeof(float), args.ne12,
                               tiisg, sgitg, P);
     const float tot = ds4_q8_exact8_reduce(P, (threadgroup float *)shmem, tiisg, sgitg);
-    if (tiisg < 8)
-        ((device float *)dst)[(uint64_t)idx * args.ne0 + (uint64_t)tiisg * args.ne1 * args.ne0 + r0 + sgitg] = tot;
+    if (tiisg < args.ne12)
+        ((device float *)dst)[(uint64_t)idx * args.ne0 + (uint64_t)tiisg * args.ne1 * args.ne0 + r0 + sgitg] =
+            ROUND ? ds4_bf16_round(tot) : tot;
 }
+#define DS4_ATTN_OUT_LOW_MMA8_EXACT(NAME, ROUND) \
+kernel void NAME( \
+        constant ds4_metal_args_mul_mv_id & args, \
+        device const char * src0s, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_dsv4_attn_out_low_q8_0_f32_mma8_exact_impl<ROUND>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+DS4_ATTN_OUT_LOW_MMA8_EXACT(kernel_dsv4_attn_out_low_q8_0_f32_mma8_exact, false)
+DS4_ATTN_OUT_LOW_MMA8_EXACT(kernel_dsv4_attn_out_low_q8_0_f32_bf16_mma8_exact, true)
+#undef DS4_ATTN_OUT_LOW_MMA8_EXACT
 /* kernel_dsv4_attn_out_low_q8_0_f32 at the V4.1 decode shape (4096, 1024, 8) as literals. */
 kernel void kernel_dsv4_attn_out_low_q8_0_f32_static(
         constant ds4_metal_args_mul_mv_id & args,

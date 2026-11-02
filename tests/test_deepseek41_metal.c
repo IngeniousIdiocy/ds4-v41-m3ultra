@@ -2373,6 +2373,24 @@ static int check_head_rows(void) {
         CHECK(same_bits(ref, got, rows * OUT));
     }
     CHECK(ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_rows_seq4") == runs + REPS);
+    /* BATCH_HEAD8: 5-8 decode rows of the last draw's first rows, each as its one-row head */
+    const uint64_t head8 = ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_mma8_nsg8_exact");
+    for (uint32_t rows = 5u; rows <= ROWS; rows++) {
+        for (uint32_t i = 0; i < rows * IN; i++) xv[i] = random_value();
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (uint64_t)r * IN * 4, IN * 4);
+            ds4_gpu_tensor *yr = ds4_gpu_tensor_view(ref, (uint64_t)r * OUT * 4, (uint64_t)OUT * 4);
+            CHECK(xr && yr && ds4_gpu_matmul_q8_0_tensor(yr, map, bytes, 0, IN, OUT, xr, 1));
+            ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
+        }
+        CHECK(ds4_gpu_synchronize());
+        memset(gv, 0xff, (size_t)rows * OUT * 4);
+        ds4_gpu_dsv41_decode_rows(1);
+        CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(got, map, bytes, 0, IN, OUT, x, rows));
+        ds4_gpu_dsv41_decode_rows(0);
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, rows * OUT));
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_mma8_nsg8_exact") == head8 + 4);
     ds4_gpu_test_set_flags(0);
     ((uint32_t *)xv)[IN + 7] += 1;   /* the control: row 1 moves, row 0 does not */
     CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(got, map, bytes, 0, IN, OUT, x, 2));
@@ -2455,7 +2473,7 @@ static int check_rows_reg(void) {
     for (uint32_t i = 0; i < 2 * 5120; i++) xv[i] = random_value();
     ds4_gpu_dsv41_decode_rows(1);
     CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ref, map, bytes, 0, 5120, 1280, x, 2));
-    ((uint32_t *)xv)[5120 + 7] += 1;   /* the control: row 1 moves, row 0 does not */
+    ((uint32_t *)xv)[5120 + 7] += 1u << 16;   /* the control: row 1 moves, row 0 does not */
     CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(got, map, bytes, 0, 5120, 1280, x, 2));
     ds4_gpu_dsv41_decode_rows(0);
     CHECK(same_bits(ref, got, 1280) && !same_bits(ref, got, 2u * 1280));
@@ -2466,10 +2484,11 @@ static int check_rows_reg(void) {
     return 1;
 }
 
-/* BATCH_ROPE, BATCH_KV: q_b and the KV row of 2-4 cross-session decode rows, at their own positions with their own
- * tables, each row's bits as its one-row kernel (poisoned outputs, raw and compressed frequencies, kernel-run counts). */
+/* BATCH_ROPE, BATCH_KV, BATCH_QROPE: q_b and the KV row of 2-8 cross-session decode rows, at their own positions with
+ * their own tables, each row's bits as its one-row kernel (poisoned outputs, raw and compressed frequencies, kernel-run
+ * counts). */
 static int check_batch_rope(void) {
-    enum { ROWS = 4, IN = 1280, OUT = 32768, KV = 512, REPS = 90 };
+    enum { ROWS = 8, IN = 1280, OUT = 32768, KV = 512, REPS = 140 };
     uint64_t bytes = 0;
     uint8_t *map = q8_weights(OUT, IN, &bytes);
     CHECK(map);
@@ -2486,14 +2505,14 @@ static int check_batch_rope(void) {
     float *xv = ds4_gpu_tensor_contents(x), *kvv = ds4_gpu_tensor_contents(kv);
     uint32_t *gv = ds4_gpu_tensor_contents(got);
     ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
-    const char *names[3] = {"kernel_mul_mv_q8_0_f32_bf16_rows2_rope_reg", "kernel_mul_mv_q8_0_f32_bf16_rows3_rope_reg",
-                            "kernel_mul_mv_q8_0_f32_bf16_rows4_rope_reg"};
-    uint64_t runs[3], want[3] = {0}, kv_want = 0, draws = 0;
-    for (int k = 0; k < 3; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
+    const char *names[4] = {"kernel_mul_mv_q8_0_f32_bf16_rows2_rope_reg", "kernel_mul_mv_q8_0_f32_bf16_rows3_rope_reg",
+                            "kernel_mul_mv_q8_0_f32_bf16_rows4_rope_reg", "kernel_mul_mv_q8_0_f32_bf16_rope_mma8_exact"};
+    uint64_t runs[4], want[4] = {0}, kv_want = 0, draws = 0;
+    for (int k = 0; k < 4; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
     const uint64_t kv_runs = ds4_gpu_test_kernel_runs("kernel_dsv41_rope_quantize_rows");
     for (uint32_t rep = 0; rep < REPS; rep++) {
-        const uint32_t rows = 2u + rep % 3u;
-        const bool compressed = (rep / 3u) & 1u;
+        const uint32_t rows = 2u + rep % 7u;
+        const bool compressed = (rep / 7u) & 1u;
         uint32_t pos[ROWS];
         for (uint32_t i = 0; i < rows * IN; i++) xv[i] = random_value();
         for (uint32_t i = 0; i < rows * KV; i++) kvv[i] = random_value();
@@ -2521,10 +2540,10 @@ static int check_batch_rope(void) {
         CHECK(same_bits(ref, got, rows * OUT));
         for (uint32_t r = 0; r < rows; r++)
             CHECK(!memcmp((char *)ds4_gpu_tensor_contents(w0[r]) + offs[r], (char *)ds4_gpu_tensor_contents(w1[r]) + offs[r], KV * 4));
-        want[rows - 2]++; kv_want++;
+        want[rows < 4u ? rows - 2u : rows == 4u ? 2u : 3u]++; kv_want++;
         draws += rows * (OUT + KV);
     }
-    for (int k = 0; k < 3; k++) CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs[k] + want[k]);
+    for (int k = 0; k < 4; k++) CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs[k] + want[k]);
     CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_rope_quantize_rows") == kv_runs + kv_want);
     CHECK(!ds4_gpu_dsv41_project_q_rows(got, map, bytes, 0, IN, OUT, x, 2, tab, false));   /* only decode rows */
     ds4_gpu_test_set_flags(0);
@@ -2551,14 +2570,14 @@ static int check_batch_tail(void) {
     float *sv = ds4_gpu_tensor_contents(split), *hv = ds4_gpu_tensor_contents(heads);
     uint32_t *gv = ds4_gpu_tensor_contents(got);
     ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
-    const char *names[6] = {"kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows2_reg", "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows3_reg",
-                            "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows4_reg", "kernel_dsv4_attn_out_low_q8_0_f32_rows2_reg",
-                            "kernel_dsv4_attn_out_low_q8_0_f32_rows3_reg", "kernel_dsv4_attn_out_low_q8_0_f32_rows4_reg"};
+    const char *names[6] = {"kernel_mul_mv_q8_0_f32_hc_expand4_rows2_reg", "kernel_mul_mv_q8_0_f32_hc_expand4_rows3_reg",
+                            "kernel_mul_mv_q8_0_f32_hc_expand4_rows4_reg", "kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows2_reg",
+                            "kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows3_reg", "kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows4_reg"};
     uint64_t runs[6], want[6] = {0};
     for (int k = 0; k < 6; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
     for (uint32_t rep = 0; rep < REPS; rep++) {
         const uint32_t rows = 2u + rep % 3u, shape = (rep / 3u) & 1u, k = shape ? FF : 8192;
-        for (int i = 0; i < ROWS * 8192; i++) xv[i] = random_value();
+        for (int i = 0; i < ROWS * 8192; i++) xv[i] = bf16(random_value());   /* BATCH_LOWBF: as stored */
         for (int i = 0; i < ROWS * D; i++) av[i] = bf16(random_value());
         for (int i = 0; i < ROWS * HC * D; i++) rv[i] = bf16(random_value());
         for (int i = 0; i < ROWS * 24; i++) sv[i] = random_value();
@@ -2589,7 +2608,7 @@ static int check_batch_tail(void) {
             ds4_gpu_tensor_free(o);
             ds4_gpu_tensor_free(h);
         }
-        CHECK(ds4_gpu_synchronize());
+        CHECK(ds4_gpu_dsv41_quantize(ref, GROUPS * RANK, rows, DS4_V41_BF16) && ds4_gpu_synchronize());
         memset(gv, 0xff, (size_t)rows * GROUPS * RANK * 4);
         ds4_gpu_dsv41_decode_rows(1);
         CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(got, low_map, lb, 0, GROUP, RANK, GROUPS, 0, GROUPS, heads, rows));
@@ -2669,10 +2688,10 @@ static int check_batch_router(void) {
     return 1;
 }
 
-/* BATCH_OVERLAP: the HC collapse of 2-4 cross-session decode rows, each row's bits as its one-row kernels (poisoned
+/* BATCH_OVERLAP: the HC collapse of 2-8 cross-session decode rows, each row's bits as its one-row kernels (poisoned
  * outputs, kernel-run counts), and a two-level concurrent section against the same dispatches in a serial encoder. */
 static int check_batch_overlap(void) {
-    enum { ROWS = 4, D = 5120, FF = 2304, OUT = 512, REPS = 36 };
+    enum { ROWS = 8, D = 5120, FF = 2304, OUT = 512, REPS = 63 };
     const uint64_t page = (uint64_t)getpagesize(), norm_bytes = (D * 4 + page - 1) / page * page;
     uint64_t q8_bytes = 0, draws = 0;
     float *nw = NULL;
@@ -2691,7 +2710,7 @@ static int check_batch_overlap(void) {
     ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
     const uint64_t part = ds4_gpu_test_kernel_runs("kernel_dsv41_deferred_collapse_part_rows");
     for (uint32_t rep = 0; rep < REPS; rep++) {
-        const uint32_t rows = 2u + rep % 3u, stride = (rep / 3u) & 1u ? 24 : 4;
+        const uint32_t rows = 2u + rep % 7u, stride = (rep / 7u) & 1u ? 24 : 4;
         for (uint32_t i = 0; i < rows * 20480; i++) rv[i] = random_value() * (rep % 4 == 3 ? 64.0f : 1.0f);
         for (uint32_t i = 0; i < rows * 24; i++) pv[i] = random_value();
         for (uint32_t i = 0; i < rows * D; i++) xv[i] = random_value() / 4;
@@ -3858,7 +3877,8 @@ static int check_short_mma(void) {
     CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(gate, map, wb, 0, D, FF, x, ROWS) &&
           ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(up, map, wb, up_off, D, FF, x, ROWS) &&
           ds4_gpu_dsv41_quantize(gate, FF, ROWS, DS4_V41_BF16) && ds4_gpu_dsv41_quantize(up, FF, ROWS, DS4_V41_BF16) &&
-          ds4_gpu_swiglu_tensor(ref, gate, up, ROWS * FF, 10.0f, 1.0f));
+          ds4_gpu_swiglu_tensor(ref, gate, up, ROWS * FF, 10.0f, 1.0f) &&
+          ds4_gpu_dsv41_quantize(ref, FF, ROWS, DS4_V41_BF16));
     ds4_gpu_test_set_v41_off(0);
     CHECK(ds4_gpu_dsv41_shared_swiglu(got, map, wb, 0, up_off, D, FF, x, 10.0f, ROWS));
     CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)ROWS * FF));
@@ -3907,6 +3927,63 @@ static int check_short_mma(void) {
     ds4_gpu_test_set_v41_off(0);
     CHECK(ds4_gpu_synchronize());
     for (int k = 0; k < NN; k++) CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs[k]);
+    /* BATCH_MMA: 5-7 decode rows on the same kernels: each row as at eight rows, NaNs in the rows past the count read
+     * by none of them, nothing stored past it */
+    float *x_all = malloc((size_t)ROWS * 8192 * 4), *h_all = malloc((size_t)ROWS * GROUPS * GROUP * 4);
+    CHECK(x_all && h_all);
+    for (uint32_t i = 0; i < ROWS * 8192; i++) x_all[i] = bf16(xv[i]);   /* BATCH_LOWBF: as stored */
+    memcpy(h_all, hv, (size_t)ROWS * GROUPS * GROUP * 4);
+    uint32_t *gv = ds4_gpu_tensor_contents(got);
+    const uint32_t nan_bits = 0x7fc12345u, mark = 0x7fa5a5a5u;
+    #define MMA_ROWS(call8, call, width, in) do { \
+        memcpy(xv, x_all, (size_t)ROWS * 8192 * 4); \
+        ds4_gpu_dsv41_decode_rows(0); \
+        CHECK(call8); \
+        CHECK(ds4_gpu_synchronize()); \
+        for (uint32_t i = (uint32_t)rows * (in); i < ROWS * (uint32_t)(in); i++) memcpy(&xv[i], &nan_bits, 4); \
+        for (uint64_t i = 0; i < (uint64_t)ROWS * (width); i++) gv[i] = mark; \
+        ds4_gpu_dsv41_decode_rows(1); \
+        CHECK(call); \
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)rows * (width))); \
+        for (uint64_t i = (uint64_t)rows * (width); i < (uint64_t)ROWS * (width); i++) CHECK(gv[i] == mark); \
+    } while (0)
+    for (int k = 0; k < NN; k++) runs[k] = ds4_gpu_test_kernel_runs(names[k]);
+    const uint64_t in_bf16 = ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_hc_expand4_mma8_exact");
+    CHECK(ds4_gpu_set_model_map(map, wb));
+    for (int rows = 5; rows < ROWS; rows++) {
+        MMA_ROWS(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ref, map, wb, 0, 5120, 1280, x, ROWS),
+                 ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(got, map, wb, 0, 5120, 1280, x, rows), 1280, 5120);
+        MMA_ROWS(ds4_gpu_dsv41_matmul_q8_0_bf16_rows(ref, map, wb, 0, 1280, 32768, x, ROWS),
+                 ds4_gpu_dsv41_matmul_q8_0_bf16_rows(got, map, wb, 0, 1280, 32768, x, rows), 32768, 1280);
+        MMA_ROWS(ds4_gpu_dsv41_shared_swiglu(ref, map, wb, 0, up_off, D, FF, x, 10.0f, ROWS),
+                 ds4_gpu_dsv41_shared_swiglu(got, map, wb, 0, up_off, D, FF, x, 10.0f, rows), FF, D);
+        MMA_ROWS(ds4_gpu_dsv41_matmul_expand_rows(ref, map, wb, 0, FF, D, x, add, res, split, HC, ROWS),
+                 ds4_gpu_dsv41_matmul_expand_rows(got, map, wb, 0, FF, D, x, add, res, split, HC, rows), HC * D, FF);
+    }
+    memcpy(xv, x_all, (size_t)ROWS * 8192 * 4);
+    CHECK(ds4_gpu_test_kernel_runs(names[0]) == runs[0] + 6 && ds4_gpu_test_kernel_runs(names[1]) == runs[1] + 6 &&
+          ds4_gpu_test_kernel_runs(names[2]) == runs[2] + 3 && ds4_gpu_test_kernel_runs(names[3]) == runs[3] + 6 &&
+          ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_hc_expand4_mma8_exact") == in_bf16 + 3);
+    CHECK(ds4_gpu_set_model_map(low_map, lb));
+    for (int rows = 5; rows < ROWS; rows++) {
+        memcpy(hv, h_all, (size_t)ROWS * GROUPS * GROUP * 4);
+        ds4_gpu_dsv41_decode_rows(0);
+        CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(ref, low_map, lb, 0, GROUP, RANK, GROUPS, 0, GROUPS, heads,
+                                                                ROWS) && ds4_gpu_dsv41_quantize(ref, GROUPS * RANK, ROWS, DS4_V41_BF16));
+        CHECK(ds4_gpu_synchronize());
+        for (uint32_t i = (uint32_t)rows * GROUPS * GROUP; i < ROWS * GROUPS * GROUP; i++) memcpy(&hv[i], &nan_bits, 4);
+        for (uint64_t i = 0; i < (uint64_t)ROWS * GROUPS * RANK; i++) gv[i] = mark;
+        ds4_gpu_dsv41_decode_rows(1);
+        CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(got, low_map, lb, 0, GROUP, RANK, GROUPS, 0, GROUPS, heads,
+                                                                rows));
+        CHECK(ds4_gpu_synchronize() && same_bits(ref, got, (uint64_t)rows * GROUPS * RANK));
+        for (uint64_t i = (uint64_t)rows * GROUPS * RANK; i < (uint64_t)ROWS * GROUPS * RANK; i++) CHECK(gv[i] == mark);
+    }
+    memcpy(hv, h_all, (size_t)ROWS * GROUPS * GROUP * 4);
+    ds4_gpu_dsv41_decode_rows(0);
+    #undef MMA_ROWS
+    free(x_all);
+    free(h_all);
     ds4_gpu_test_set_flags(0);
     ds4_gpu_tensor *tensors[] = {x, ref, got, gate, up, add, res, split, heads};
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);

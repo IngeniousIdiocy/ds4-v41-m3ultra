@@ -638,7 +638,7 @@ kernel void kernel_dsv41_deferred_collapse_norm(
     if (gid == 0) atomic_store_explicit(counter, 0u, memory_order_relaxed);
 }
 
-/* BATCH_OVERLAP: the same two dispatches over 2-4 session rows, grid row = session row, with the pre weights
+/* BATCH_OVERLAP: the same two dispatches over 2-8 session rows, grid row = session row, with the pre weights
  * pre_stride floats apart and 32 slots per row. */
 kernel void kernel_dsv41_deferred_collapse_part_rows(
         constant ds4_deferred_hc_args &args,

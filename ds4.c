@@ -41816,7 +41816,8 @@ static bool ds41_narrow_engram_mv(ds41_gpu_graph *g, const ds4_model *m, const d
 #ifdef __APPLE__
 /* BATCH_NARROW: 2-4 cross-session decode rows read the same router copy. */
 static bool ds41_narrow_router_rows(ds41_gpu_graph *g, const ds4_model *m, uint32_t il, uint32_t count) {
-    return g->rows_decode && count >= 2u && count <= 4u && ds41_narrow_on(g, m) && ds41_on2(DS4_GPU_V41B_BATCH_NARROW) &&
+    return g->rows_decode && count >= 2u && (count <= 4u || ds41_on2(DS4_GPU_V41B_BATCH_ROUTER8)) && ds41_narrow_on(g, m) &&
+        ds41_on2(DS4_GPU_V41B_BATCH_NARROW) &&
         il < DS41_NARROW_LAYERS && g_ds41_narrow.router[il] &&
         ds4_gpu_matmul_bf16_router_weights_rows(g->batch.route_logits, g_ds41_narrow.router[il], DS4_N_EMBD,
                                                 DS4_N_EXPERT, g->batch.norm, count);
@@ -42735,8 +42736,8 @@ static bool ds41_hc_input_rows(ds41_prefill_row *b, const ds4_model *m, const ds
 /* BATCH_OVERLAP: 2-4 cross-session decode rows defer the FFN block's HC mix to the routed experts' concurrent encoder
  * as one-row decode does (ds41_hc_defer): the collapse and its norm run first. */
 static bool ds41_rows_defer(const ds41_gpu_graph *g, const ds4_layer_weights *l, uint32_t count) {
-    return g->rows_decode && count >= 2u && count <= 4u && g->tp_world == 1 && !g->imatrix && !g->image_count &&
-        ds41_on(DS4_GPU_V41_HC_FUSION) && ds41_on(DS4_GPU_V41_ROWS_REG) && ds41_on2(DS4_GPU_V41B_BATCH_OVERLAP) &&
+    return g->rows_decode && count >= 2u && (count <= 4u || ds41_on2(DS4_GPU_V41B_BATCH_DEFER8)) && g->tp_world == 1 &&
+        !g->imatrix && !g->image_count && ds41_on(DS4_GPU_V41_HC_FUSION) && ds41_on(DS4_GPU_V41_ROWS_REG) && ds41_on2(DS4_GPU_V41B_BATCH_OVERLAP) &&
         l->hc_ffn_fn->type == DS4_TENSOR_F16 && l->ffn_norm->type == DS4_TENSOR_F32 && ds41_concurrent_ffn(g, l) &&
         ds41_on(DS4_GPU_V41_ROUTER_SELECT) && l->ffn_gate_inp->type == DS4_TENSOR_F32;
 }
@@ -44772,8 +44773,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         const bool fused_tail = !shared_owner && ds41_on(DS4_GPU_V41_HC_FUSION) &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0 && l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
         /* BATCH_TAIL: cross-session rows take the same tail once each row has attended below */
-        const bool tail_rows = fused_tail && decode_rows && !rows_batch && rows <= 4u && g->tp_world == 1 &&
-            ds41_on2(DS4_GPU_V41B_BATCH_TAIL);
+        const bool tail_rows = fused_tail && decode_rows && !rows_batch && (rows <= 4u || ds41_on2(DS4_GPU_V41B_BATCH_TAIL8)) &&
+            g->tp_world == 1 && ds41_on2(DS4_GPU_V41B_BATCH_TAIL);
         bool expanded = ok && fused_tail && rows_batch && ds41_attention_low_batch(g, model, l, rows) &&
             ds41_attention_expand_rows(&active, model, l, rows);
 #else
