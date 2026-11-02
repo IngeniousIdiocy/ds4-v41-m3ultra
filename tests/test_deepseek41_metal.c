@@ -2343,6 +2343,46 @@ static int check_row_matmuls(void) {
     return 1;
 }
 
+/* HEAD_ROWS: the vocabulary head's 2-8 rows in one weight pass, each row's bits as its one-row head (poisoned outputs,
+ * a one-ulp input as the control). */
+static int check_head_rows(void) {
+    enum { IN = 5120, OUT = 129280, ROWS = 8, REPS = 70 };
+    uint64_t bytes = 0;
+    uint8_t *map = q8_weights(OUT, IN, &bytes);
+    CHECK(map);
+    CHECK(ds4_gpu_set_model_map(map, bytes));
+    ds4_gpu_tensor *x = upload(NULL, ROWS * IN * 4), *ref = upload(NULL, ROWS * (uint64_t)OUT * 4),
+                   *got = upload(NULL, ROWS * (uint64_t)OUT * 4);
+    CHECK(x && ref && got);
+    float *xv = ds4_gpu_tensor_contents(x);
+    uint32_t *gv = ds4_gpu_tensor_contents(got);
+    ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
+    const uint64_t runs = ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_rows_seq4");
+    for (uint32_t rep = 0; rep < REPS; rep++) {
+        const uint32_t rows = 2u + rep % 7u;
+        for (uint32_t i = 0; i < rows * IN; i++) xv[i] = random_value();
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (uint64_t)r * IN * 4, IN * 4);
+            ds4_gpu_tensor *yr = ds4_gpu_tensor_view(ref, (uint64_t)r * OUT * 4, (uint64_t)OUT * 4);
+            CHECK(xr && yr && ds4_gpu_matmul_q8_0_tensor(yr, map, bytes, 0, IN, OUT, xr, 1));
+            ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
+        }
+        CHECK(ds4_gpu_synchronize());
+        memset(gv, 0xff, (size_t)rows * OUT * 4);
+        CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(got, map, bytes, 0, IN, OUT, x, rows));
+        CHECK(same_bits(ref, got, rows * OUT));
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_mul_mv_q8_0_f32_rows_seq4") == runs + REPS);
+    ds4_gpu_test_set_flags(0);
+    ((uint32_t *)xv)[IN + 7] += 1;   /* the control: row 1 moves, row 0 does not */
+    CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(got, map, bytes, 0, IN, OUT, x, 2));
+    CHECK(same_bits(ref, got, OUT) && !same_bits(ref, got, 2u * OUT));
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(got);
+    /* map stays: the model views may wrap it */
+    fprintf(stderr, "V4.1 head rows: 2-8 rows in one weight pass == each row's one-row head\n");
+    return 1;
+}
+
 /* ROWS_MMA: a DSpark block's Q8_0 matmuls of 3-8 rows on simdgroup matrices against the row kernels. The sums run in
  * another order, so the outputs agree to float rounding (and to one bf16 step when rounded), not bit for bit. Any other
  * batch of 3-8 rows, such as a short prefill, keeps the row kernels and their bits. */
@@ -3470,7 +3510,7 @@ static int check_v41_groups(void) {
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
         check_index_bf16() && check_topk() && check_index_candidates() &&
         check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
-        check_row_matmuls() && check_rows_mma() && check_verify_kernels() &&
+        check_row_matmuls() && check_head_rows() && check_rows_mma() && check_verify_kernels() &&
         check_public_controller() && check_prefill_index() && check_prefill_attention() &&
         check_prefill_folds() &&
         check_moe_dedup() &&
@@ -3489,6 +3529,11 @@ static int check_v41_groups(void) { return 1; }
 #endif
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--head-rows")) {
+        const int ok = ds4_gpu_init() && check_head_rows();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--embedding")) {
         const int ok = ds4_gpu_init() && check_embedding();
         ds4_gpu_cleanup();

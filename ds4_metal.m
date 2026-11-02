@@ -524,6 +524,8 @@ uint64_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_KEYED_GPU",
             "DS4_METAL_DISABLE_V41_FULL_PROBS",
             "DS4_METAL_DISABLE_V41_PQ_GPU",
+            "DS4_METAL_DISABLE_V41_HEAD_ROWS",
+            "DS4_METAL_DISABLE_V41_DECODE_ROWS",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -542,6 +544,9 @@ void ds4_gpu_test_set_v41_off(uint64_t off) {
 static inline int ds4_gpu_v41_on(uint64_t group) { return (ds4_gpu_v41_off() & group) == 0; }
 static int g_v41_dspark_rows;
 void ds4_gpu_dsv41_dspark_rows(int on) { g_v41_dspark_rows = on; }
+/* DECODE_ROWS: the batch is cross-session decode rows */
+static int g_v41_decode_rows;
+void ds4_gpu_dsv41_decode_rows(int on) { g_v41_decode_rows = on; }
 /* ROWS_MMA: only a DSpark block's rows (the drafter's and the verify block's); any other batch keeps the row kernels */
 static inline int ds4_gpu_v41_rows_mma(void) { return g_v41_dspark_rows && ds4_gpu_v41_on(DS4_GPU_V41_ROWS_MMA); }
 /* SHORT_MMA: eight rows outside a DSpark block (a short prefill) on simdgroup matrices with the row kernels' bits; the
@@ -45234,10 +45239,11 @@ int ds4_gpu_routed_moe_batch_tensor(
             out_dim == 5120u &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K) ||
              (gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K) ||
-             /* VERIFY_KERNELS: V4.1's MXFP4 experts too, so a DSpark verify block of 6-8 rows runs every row as
-              * decode does; a prefill or any other batch keeps the batch kernels */
-             (gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4 && g_v41_dspark_rows &&
-              ds4_gpu_v41_on(DS4_GPU_V41_VERIFY_KERNELS)));
+             /* VERIFY_KERNELS, DECODE_ROWS: V4.1's MXFP4 experts too, so a DSpark verify block or cross-session decode
+              * of 6-8 rows runs every row as decode does; a prefill or any other batch keeps the batch kernels */
+             (gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4 &&
+              ((g_v41_dspark_rows && ds4_gpu_v41_on(DS4_GPU_V41_VERIFY_KERNELS)) ||
+               (g_v41_decode_rows && ds4_gpu_v41_on(DS4_GPU_V41_DECODE_ROWS)))));
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
             (n_tokens <= 5u || v41_decode_batch ||

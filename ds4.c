@@ -42945,6 +42945,14 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+static void ds41_decode_rows(bool on) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_gpu_dsv41_decode_rows(on);
+#else
+    (void)on;
+#endif
+}
+
 static void ds41_verify_rows(bool on) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     ds4_gpu_dsv41_verify_rows(on);
@@ -44546,6 +44554,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
     const bool prefill_only = prefill_rows == rows && !g->verify_prefix;
+    const bool decode_rows = !prefill_only && !g->verify_prefix;   /* other sessions' rows, not a verify block */
     bool rows_batch = false;   /* VERIFY_BATCH, decided once the positions are known */
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
@@ -44571,6 +44580,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    ds41_decode_rows(decode_rows);
     /* ENGRAM_ASYNC: every row's Engram rows are read on workers while the first layers are encoded; each table
      * joins before the layer that uploads it */
     const bool engram_async = ds41_on(DS4_GPU_V41_ENGRAM_ASYNC);
@@ -44717,6 +44727,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     /* Pure prefill publishes only its final row; the caller computes the head
      * once at the complete prompt frontier. */
     const int first_output = prefill_only ? count - 1 : 0;
+    /* HEAD_ROWS: cross-session rows' logits are the bits of their one-row heads (a verify block keeps its own) */
+    const ds4_tensor *head = weights->output;
+    const bool head_rows = decode_rows && !g->tp_logits_half && head->type == DS4_TENSOR_Q8_0 &&
+        ds41_on(DS4_GPU_V41_HEAD_ROWS);
     for (int i = first_output; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         ok = ds4_gpu_tensor_copy(s->residual, 0, g->rows_view[i].residual, 0,
@@ -44731,7 +44745,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                                     model, weights, s->norm, 1);
     }
     if (ok && batch_logits)
-        ok = ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
+        ok = head_rows ?
+            ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(batch_logits, model->map, model->size, head->abs_offset,
+                head->dim[0], head->dim[1], active.norm, rows) != 0 :
+            ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
     for (int i = first_output; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         if (batch_logits)
@@ -44740,6 +44757,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
+    ds41_decode_rows(false);
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)

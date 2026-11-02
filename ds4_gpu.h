@@ -102,6 +102,8 @@ typedef struct {
 #define DS4_GPU_V41_CARRY_KEEP (1ull << 54)   /* a one-chunk prefill layer keeps the previous layer's rows in the batch buffers instead of loading them back from the carry */
 #define DS4_GPU_V41_KEYED_SAMPLING (1ull << 55)   /* plain decode's full-distribution samples (top_p 1, no top-k or min-p) are position-keyed Gumbel draws */
 #define DS4_GPU_V41_PQ_GPU (1ull << 58)   /* DSpark's exact verify at the full distribution builds q and p on the GPU and finds the draft and residual draws' candidates there */
+#define DS4_GPU_V41_HEAD_ROWS (1ull << 59)   /* cross-session decode rows' vocabulary head on the Q8_0 row kernel, each row's bits as its one-row head */
+#define DS4_GPU_V41_DECODE_ROWS (1ull << 60)   /* 6-8 cross-session decode rows through the fused decode MoE kernels, as a DSpark verify block */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
 #define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */
 /* DS4_V41_EXACT=1 (or --exact) turns off the groups that are not bit-identical to main's serial decode and prefill,
@@ -168,6 +170,7 @@ bool ds4_gpu_deepseek41_vision_attn_kt16(void);
 /* V4.1 DSpark: on while the drafter's rows or a verify block are encoded. ROWS_MMA and VERIFY_KERNELS apply only then,
  * so prefills and other batches of 3-8 rows keep main's kernels. */
 void ds4_gpu_dsv41_dspark_rows(int on);
+void ds4_gpu_dsv41_decode_rows(int on);
 /* Model views skip hazard tracking by default (call before the model is mapped). */
 void ds4_gpu_set_model_untracked_default(int on);
 /* The V4.1 GPU top-p selector (Metal): init compiles metal/sampler_selector.metal once (0: unavailable); encode
