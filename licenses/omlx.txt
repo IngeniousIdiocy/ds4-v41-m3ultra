@@ -1,0 +1,17 @@
+ds4's V4.1 Metal decode adapts two pieces of oMLX, https://github.com/jundot/omlx:
+
+- kernel_dsv41_attn_tile in metal/flash_attn.metal, from attn_scores and attn_pv in
+  omlx/patches/deepseek_v41/decode_layer.py and decode_fused.py, rewritten in Metal for ds4's
+  key cache, partials and reduce, with a verify block's rows added.
+- ds4_mxfp4_codes in metal/moe.metal, the FP4 decode by shifts, after
+  omlx/patches/deepseek_v41/decode_moe.py.
+
+The oMLX package is licensed under the Apache License 2.0, see Apache-2.0.txt in this directory:
+Copyright the omlx contributors. Those source files carry SPDX MIT headers, and the LICENSE in
+that directory reads:
+
+MIT License
+
+Copyright (c) 2023 DeepSeek
+
+The MIT permission text is the one in ds4's LICENSE file, which keeps the same notice.

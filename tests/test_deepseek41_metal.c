@@ -2163,10 +2163,22 @@ static int check_decode_attention(void) {
                                                 NULL, 0, H, D));
     ds4_gpu_test_set_flags(DS4_GPU_TEST_COUNT_KERNELS);
     const uint64_t staged = ds4_gpu_test_kernel_runs("kernel_dsv41_flash_kv_stage");
+    ds4_gpu_test_set_v41_off2(DS4_GPU_V41B_ATTN_TILES);
     CHECK(ds4_gpu_dsv41_attention_decode(got, sinks, getpagesize(), 0, q, raw, R, R, 37, cache, it, C, K, H, D));
+    ds4_gpu_test_set_v41_off2(0);
     CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_flash_kv_stage") == staged + 1);
-    ds4_gpu_test_set_flags(0);
     CHECK(same_bits(want, got, H * D));
+    /* ATTN_TILES: no staging, and the heads of the vec kernel but for rounding */
+    const uint64_t tiled = ds4_gpu_test_kernel_runs("kernel_dsv41_attn_tile");
+    CHECK(ds4_gpu_dsv41_attention_decode(got, sinks, getpagesize(), 0, q, raw, R, R, 37, cache, it, C, K, H, D));
+    CHECK(ds4_gpu_test_kernel_runs("kernel_dsv41_attn_tile") == tiled + 1 &&
+          ds4_gpu_test_kernel_runs("kernel_dsv41_flash_kv_stage") == staged + 1);
+    ds4_gpu_test_set_flags(0);
+    double diff = 0, size = 0;
+    const float *wv = ds4_gpu_tensor_contents(want), *gv = ds4_gpu_tensor_contents(got);
+    for (int i = 0; i < H * D; i++) { diff += fabs((double)wv[i] - gv[i]); size += fabs((double)wv[i]); }
+    fprintf(stderr, "V4.1 decode attention: tiles against the vec kernel, relative L1 %.6f\n", diff / size);
+    CHECK(diff < .01 * size);
     ds4_gpu_test_set_v41_off(DS4_GPU_V41_DECODE_ATTENTION);
     CHECK(!ds4_gpu_dsv41_attention_decode(got, sinks, getpagesize(), 0, q, raw, R, R, 37, cache, it, C, K, H, D));
     ds4_gpu_test_set_v41_off(0);

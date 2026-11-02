@@ -129,6 +129,7 @@ struct ds4_metal_args_flash_attn_ext_vec {
 
 struct ds4_metal_args_flash_attn_ext_vec_reduce {
     int32_t nrows;
+    int32_t live;   /* splits that ran, the rest have no keys (0: all) */
 };
 
 constant bool FC_flash_attn_ext_pad_has_mask [[function_constant(FC_FLASH_ATTN_EXT_PAD + 0)]];
@@ -1374,6 +1375,135 @@ kernel void kernel_flash_attn_ext_vec(
 #undef HS
 }
 
+/* ATTN_TILES: scores and PV of 8 heads against 64 keys on simdgroup matrices, one threadgroup, the keys read from the
+ * cache by index, each key block one of the partials the reduce merges. The rows of a verify block are consecutive
+ * tokens: row r's raw window starts r rows later and its ids are row r of the list, so a row's bits are its one-row
+ * call's. Adapted from oMLX's attn_scores and attn_pv, see licenses/omlx.txt. */
+struct ds4_attn_tile_args { int n_keys; float scale; uint raw_cap, raw_start, n_raw, ids_stride; };
+
+static inline float4 ds4_attn_tile_key4(constant ds4_attn_tile_args & args, device const float * raw, device const float * comp,
+                                        device const int * ids, uint row, int key, uint col) {
+    device const float * kv;
+    if (uint(key) < args.n_raw) {
+        uint r = args.raw_start + row + uint(key);
+        if (r >= args.raw_cap) r -= args.raw_cap;
+        kv = raw + size_t(r) * 512;
+    } else {
+        kv = comp + size_t(uint(ids[row * args.ids_stride + uint(key) - args.n_raw])) * 512;
+    }
+    return float4(half4(float4(*(device const packed_float4 *)(kv + col))));
+}
+
+kernel void kernel_dsv41_attn_tile(
+        constant ds4_attn_tile_args & args,
+        device const float * q,
+        device const float * sinks,
+        device float * tmp,
+        device const float * raw,
+        device const float * comp,
+        device const int * ids,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tgpg [[threadgroups_per_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort lane_ [[thread_index_in_simdgroup]],
+        ushort sg_ [[simdgroup_index_in_threadgroup]]) {
+    constexpr int D = 512, CH = 32, TILES = 2, NWG = 32;
+    threadgroup float dots[4 * 8 * 64];
+    threadgroup float prob[8 * 64];
+    threadgroup half qs[8 * D];
+    threadgroup float scale_o[8];
+    const uint lane = lane_, sg = sg_, hg = tgpig.x, b = tgpig.y, row = hg / 8;
+    device float * ss = tmp + uint64_t(tgpg.x) * 8 * D * NWG;
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    for (uint i = tid * 4; i < 8 * D; i += 4096) {
+        const float4 v = *(device const packed_float4 *)(q + hg * 8 * D + i);
+        *(threadgroup packed_half4 *)(qs + i) = half4(v);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        const uint tile = sg % 8, quarter = sg / 8;
+        const int key = int(b) * 64 + int(tile * 8 + fm);
+        float kvv[CH];
+        if (key < args.n_keys) {
+            for (int j = 0; j < CH / 4; ++j) {
+                const float4 v = ds4_attn_tile_key4(args, raw, comp, ids, row, key, quarter * (D / 4) + (fn / 2) * CH + 4 * j);
+                kvv[4 * j] = v.x; kvv[4 * j + 1] = v.y; kvv[4 * j + 2] = v.z; kvv[4 * j + 3] = v.w;
+            }
+        } else {
+            for (int j = 0; j < CH; ++j) kvv[j] = 0.0f;
+        }
+        simdgroup_matrix<float, 8, 8> score, a, bm;
+        score.thread_elements()[0] = 0.0f; score.thread_elements()[1] = 0.0f;
+        const uint qd = quarter * (D / 4) + (fm / 2) * CH + (fm & 1);
+        for (int s_ = 0; s_ < CH / 2; ++s_) {
+            a.thread_elements()[0] = kvv[2 * s_];
+            a.thread_elements()[1] = kvv[2 * s_ + 1];
+            bm.thread_elements()[0] = float(qs[fn * D + qd + 2 * s_]);
+            bm.thread_elements()[1] = float(qs[(fn + 1) * D + qd + 2 * s_]);
+            simdgroup_multiply_accumulate(score, a, bm, score);
+        }
+        dots[(quarter * 8 + fn) * 64 + tile * 8 + fm] = score.thread_elements()[0];
+        dots[(quarter * 8 + fn + 1) * 64 + tile * 8 + fm] = score.thread_elements()[1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 512) {
+        const uint hh = tid / 64, key = tid % 64;
+        const float dot = dots[hh * 64 + key] + dots[(8 + hh) * 64 + key] + dots[(16 + hh) * 64 + key] + dots[(24 + hh) * 64 + key];
+        prob[hh * 64 + key] = int(b) * 64 + int(key) < args.n_keys ? dot * args.scale : -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg < 8) {
+        const uint head = hg * 8 + sg;
+        const float m = simd_max(max(prob[sg * 64 + lane], prob[sg * 64 + 32 + lane]));
+        float psum = 0.0f;
+        for (uint t = lane; t < 64; t += 32) {
+            const float s_ = prob[sg * 64 + t];
+            const float p = s_ > -INFINITY ? exp(s_ - m) : 0.0f;
+            psum += p;
+            prob[sg * 64 + t] = p;
+        }
+        psum = simd_sum(psum);
+        float M = m, S = psum, ms = 1.0f;
+        if (b == 0) {
+            const float sink = sinks[head % 64];
+            M = max(m, sink);
+            ms = exp(m - M);
+            S = psum * ms + exp(sink - M);
+        }
+        if (lane == 0) {
+            scale_o[sg] = ms;
+            ss[head * (2 * NWG) + 2 * b + 0] = S;
+            ss[head * (2 * NWG) + 2 * b + 1] = M;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        simdgroup_matrix<float, 8, 8> pv[TILES], a, bm;
+        for (int v = 0; v < TILES; ++v) { pv[v].thread_elements()[0] = 0.0f; pv[v].thread_elements()[1] = 0.0f; }
+        const int d0 = int(sg) * (D / 32) + int(fn / 2) * 2 * TILES;
+        for (uint tile = 0; tile < 8; ++tile) {
+            a.thread_elements()[0] = prob[fm * 64 + tile * 8 + fn];
+            a.thread_elements()[1] = prob[fm * 64 + tile * 8 + fn + 1];
+            const int key = int(b) * 64 + int(tile * 8 + fm);
+            float4 vv = 0.0f;
+            if (key < args.n_keys) vv = ds4_attn_tile_key4(args, raw, comp, ids, row, key, d0);
+            bm.thread_elements()[0] = vv.x; bm.thread_elements()[1] = vv.y;
+            simdgroup_multiply_accumulate(pv[0], a, bm, pv[0]);
+            bm.thread_elements()[0] = vv.z; bm.thread_elements()[1] = vv.w;
+            simdgroup_multiply_accumulate(pv[1], a, bm, pv[1]);
+        }
+        const uint head = hg * 8 + fm;
+        const float ms = scale_o[fm];
+        for (int v = 0; v < TILES; ++v) {
+            for (int e = 0; e < 2; ++e) {
+                const uint d = d0 + 2 * v + e;
+                tmp[(uint64_t)head * D * NWG + 4 * (NWG * (d / 4) + b) + d % 4] = pv[v].thread_elements()[e] * ms;
+            }
+        }
+    }
+}
+
 #define FA_TYPES \
            half4,  \
            half4,  \
@@ -1427,8 +1557,10 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV_*NWG_;
 
-    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    /* a split past args.live reads as the empty one the vec kernel would have written */
+    const bool live = !args.live || iwg < args.live;
+    float S = live ? ss[rid*(2*NWG_) + 2*iwg + 0] : 0.0f;
+    float M = live ? ss[rid*(2*NWG_) + 2*iwg + 1] : -FLT_MAX / 2;
 
     const float m  = simd_max(M);
     const float ms = exp(M - m);
@@ -1442,7 +1574,7 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG_) {
-        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        const float4 v = simd_sum(live ? htmp4[i*NWG_ + iwg]*ms : float4(0.0f));
 
         if (iwg == 0) {
             if (!HEADS) {

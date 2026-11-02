@@ -134,6 +134,9 @@ typedef struct {
 #define DS4_GPU_V41B_MIXED_CARRY (1ull << 27)   /* with MIXED_STEP a block's correction is its stream's row in the next step */
 #define DS4_GPU_V41B_READ_ONCE (1ull << 28)   /* decode rows that share an expert read its gate and up weights once */
 #define DS4_GPU_V41B_FP4_NO_TABLE (1ull << 29)   /* V4.1's decode expert kernels turn FP4 codes into floats with shifts: no table in threadgroup memory, no barrier a threadgroup */
+#define DS4_GPU_V41B_FINAL_SPIN (1ull << 31)   /* a decode step's final wait spins on an event the head buffer signals, ahead of the buffer's completion */
+#define DS4_GPU_V41B_LIVE_SPLITS (1ull << 30)   /* decode attention launches only the splits that have keys, and its reduce reads only those */
+#define DS4_GPU_V41B_ATTN_TILES (1ull << 32)   /* decode attention's scores and PV on simdgroup matrices, 8 heads by 64 keys a threadgroup; not bit-identical to the vec kernel */
 #define DS4_GPU_V41B_VERIFY_DECODE (1ull << 25)   /* with VERIFY_INDEXED a DSpark verify block attends with the decode kernels */
 #define DS4_GPU_V41B_VERIFY_COPIES (1ull << 24)   /* a DSpark verify block's rollback snapshot and commit copies run as one concurrent level */
 #define DS4_GPU_V41B_VERIFY_STACK (1ull << 23)   /* a DSpark verify block runs the cross-session rows' FFN, Engram, router and head stack */
@@ -145,6 +148,7 @@ typedef struct {
 #define DS4_GPU_V41_NOT_EXACT (DS4_GPU_V41_INDEX_SCORE_WIDE | DS4_GPU_V41_TOPK | DS4_GPU_V41_ROWS_MMA | \
     DS4_GPU_V41_VERIFY_INDEXED | DS4_GPU_V41_PREFILL_MMA | DS4_GPU_V41_CED | DS4_GPU_V41_IMAGE_CED | \
     DS4_GPU_V41_KEYED_SAMPLING | DS4_GPU_V41_KEYED_GPU | DS4_GPU_V41_FULL_PROBS | DS4_GPU_V41_PQ_GPU)
+#define DS4_GPU_V41B_NOT_EXACT DS4_GPU_V41B_ATTN_TILES
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);

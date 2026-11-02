@@ -584,11 +584,16 @@ uint64_t ds4_gpu_v41_off2(void) {
             "DS4_METAL_DISABLE_V41_MIXED_CARRY",
             "DS4_METAL_DISABLE_V41_READ_ONCE",
             "DS4_METAL_DISABLE_V41_FP4_NO_TABLE",
+            "DS4_METAL_DISABLE_V41_LIVE_SPLITS",
+            "DS4_METAL_DISABLE_V41_FINAL_SPIN",
+            "DS4_METAL_DISABLE_V41_ATTN_TILES",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
             if (v && v[0] && strcmp(v, "0") != 0) g_v41_off2 |= 1ull << i;
         }
+        const char *exact = getenv("DS4_V41_EXACT");
+        if (exact && exact[0] && strcmp(exact, "0") != 0) g_v41_off2 |= DS4_GPU_V41B_NOT_EXACT;
         g_v41_off2_read = 1;
     }
     return g_v41_off2;
@@ -6292,6 +6297,7 @@ typedef struct {
 
 typedef struct {
     int32_t nrows;
+    int32_t live;
 } ds4_gpu_flash_attn_reduce_args;
 
 typedef struct {
@@ -31370,7 +31376,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         uint32_t               n_head,
         uint32_t               head_dim,
         uint32_t               rows,
-        uint32_t               ids_stride) {
+        uint32_t               ids_stride,
+        uint32_t               tiles) {
     const uint32_t n_keys = n_raw + n_comp;
     if (!rows || rows > 8u || (rows > 1u && (use_mask || !comp_ids || n_comp == 0u))) return 0;
     if (head_dim != 512 || n_head == 0 || n_raw == 0 || n_keys == 0 ||
@@ -31422,7 +31429,11 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     }
     if (nwg > 32u) nwg = 32u;
     if (nwg < 1u) nwg = 1u;
-    const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(n_keys, nwg, ncpsg);
+    /* ATTN_TILES: each key block is one partial; the keys are read from the cache, so there is nothing to stage */
+    const bool tile_att = tiles && !use_mask && comp_ids && !comp_kv_f16 && n_comp && n_head == 64u && nwg == 32u &&
+        n_keys <= 2048u;
+    const uint32_t tile_blocks = tile_att ? (n_keys + 63u) / 64u : 0u;
+    const uint32_t nsg = tile_att ? 1u : ds4_gpu_flash_attn_vec_nsg(n_keys, nwg, ncpsg);
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
     const NSUInteger row_bytes_f16 = (NSUInteger)head_dim * sizeof(uint16_t);
     const NSUInteger mask_bytes = (NSUInteger)n_keys * sizeof(uint16_t);
@@ -31556,8 +31567,9 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         return 0;
     }
 
-    bool pad_fused = false;
-    for (uint32_t r = 0; r < rows; r++) {
+    bool pad_fused = tile_att;
+    if (tile_att && g_kv_task.pending && !ds4_gpu_kv_norm_task_flush()) return 0;
+    for (uint32_t r = 0; !tile_att && r < rows; r++) {
         if (!ds4_gpu_encode_flash_kv_stage_f16(
                 cb,
                 rawbuf,
@@ -31685,23 +31697,46 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         return 1;
     }
 
+    /* the keys fill the first splits, the others would only write an empty partial for the reduce to read */
+    const uint32_t chunks = (n_keys + ncpsg - 1u) / ncpsg;
+    const uint32_t live = tile_att ? tile_blocks : rows == 1u && nsg_tg == 1u && hs == 1 && chunks < nwg &&
+        ds4_gpu_v41_on2(DS4_GPU_V41B_LIVE_SPLITS) ? chunks : 0u;
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:vec_pipeline];
-    [enc setBytes:&vec_args length:sizeof(vec_args) atIndex:0];
-    [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
-    [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
-    [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:3];
-    [enc setBuffer:flash_mask_buffer offset:0 atIndex:4];
-    [enc setBuffer:sinks_buf offset:sinks_offset atIndex:5];
-    [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
-    [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
-    [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(1, n_head / (uint32_t)hs, nwg * rows)
-         threadsPerThreadgroup:MTLSizeMake(32, nsg_tg, 1)];
+    if (tile_att) {
+        static id<MTLComputePipelineState> tile;
+        if (!tile) tile = ds4_gpu_get_pipeline("kernel_dsv41_attn_tile");
+        if (!tile) return 0;
+        DS4_TEST_NOTE("kernel_dsv41_attn_tile");
+        const struct { int32_t n_keys; float scale; uint32_t raw_cap, raw_start, n_raw, ids_stride; } tile_args = {
+            (int32_t)n_keys, vec_args.scale, raw_cap, raw_start, n_raw, ids_stride};
+        [enc setComputePipelineState:tile];
+        [enc setBytes:&tile_args length:sizeof(tile_args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:sinks_buf offset:sinks_offset atIndex:2];
+        [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:3];
+        [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_kv) atIndex:4];
+        [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(comp_kv) atIndex:5];
+        [enc setBuffer:idsbuf offset:ds4_gpu_tensor_offset(comp_ids) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(8u * rows, tile_blocks, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    } else {
+        [enc setComputePipelineState:vec_pipeline];
+        [enc setBytes:&vec_args length:sizeof(vec_args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:3];
+        [enc setBuffer:flash_mask_buffer offset:0 atIndex:4];
+        [enc setBuffer:sinks_buf offset:sinks_offset atIndex:5];
+        [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
+        [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
+        [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, n_head / (uint32_t)hs, (live ? live : nwg) * rows)
+             threadsPerThreadgroup:MTLSizeMake(32, nsg_tg, 1)];
+    }
     ds4_gpu_end_compute_encoder(cb, enc);
 
     ds4_gpu_flash_attn_reduce_args reduce_args = {
         .nrows = (int32_t)(nrows * rows),
+        .live = (int32_t)live,
     };
     /* When ds4.c defers the inverse RoPE tail, the reduce threadgroup that owns
      * a head's whole row rotates it in place, removing a dispatch per layer. */
@@ -33162,7 +33197,7 @@ int ds4_gpu_attention_decode_heads_tensor(
                                                              comp_mask,
                                                              use_mask,
                                                              n_head,
-                                                             head_dim, 1u, 0u)) {
+                                                             head_dim, 1u, 0u, 0u)) {
             return 0;
         }
 
@@ -50783,7 +50818,7 @@ int ds4_gpu_dsv41_attention_decode(ds4_gpu_tensor *heads, const void *model_map,
         if (!cb) return 0;
         if (!ds4_gpu_encode_flash_attention_gathered_heads(cb, heads, sinks_buf, (NSUInteger)sinks_inner,
                 q, raw_kv, n_raw, raw_cap, raw_start, comp_cache, 0, ids, attended, NULL, 0,
-                n_head, head_dim, 1, 0)) return 0;
+                n_head, head_dim, 1, 0, ds4_gpu_v41_on2(DS4_GPU_V41B_ATTN_TILES))) return 0;
         if (g_kv_task.pending && !ds4_gpu_kv_norm_task_flush()) return 0;
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 gathered decode attention");
     }
@@ -50822,7 +50857,7 @@ int ds4_gpu_dsv41_attention_decode_rows(ds4_gpu_tensor *heads, const void *model
         DS4_TEST_NOTE("ds4_gpu_dsv41_attention_decode_rows");
         if (!ds4_gpu_encode_flash_attention_gathered_heads(cb, heads, sinks_buf, (NSUInteger)sinks_inner,
                 q, raw_kv, n_raw, raw_cap, raw_start, comp_cache, 0, ids, attended, NULL, 0,
-                n_head, head_dim, rows, ids_stride)) return 0;
+                n_head, head_dim, rows, ids_stride, ds4_gpu_v41_on2(DS4_GPU_V41B_ATTN_TILES))) return 0;
         if (g_kv_task.pending && !ds4_gpu_kv_norm_task_flush()) return 0;
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 gathered attention rows");
     }
@@ -54493,6 +54528,11 @@ static void ds4_gpu_bridge_commit(void) {
     }
 }
 
+/* FINAL_SPIN: the value the final buffer signals, 0 for none. Its completion reaches this thread about 0.33 ms after
+ * the GPU ends, the GPU idle until the tokens are back, so the wait reads the event. */
+static id<MTLSharedEvent> g_final_event;
+static uint64_t g_final_seq, g_final_wait;
+
 /* ds4_gpu_end_commands split around the slot: commit the final buffer (with the bridge behind it), then, after the
  * slot is encoded, wait. 1 committed, 0 not committed. */
 int ds4_gpu_end_commands_commit(bool bridge) {
@@ -54502,6 +54542,11 @@ int ds4_gpu_end_commands_commit(bool bridge) {
     if (bridge && !g_bridge_event) g_bridge_event = [g_device newEvent];
     bridge = bridge && g_bridge_event;
     if (bridge) [cb encodeSignalEvent:g_bridge_event value:++g_bridge_seq];   /* after the head's last encoder */
+    g_final_wait = 0;
+    if (ds4_gpu_v41_on2(DS4_GPU_V41B_FINAL_SPIN) && !getenv("DS4_METAL_CB_TIMES")) {
+        if (!g_final_event) g_final_event = [g_device newSharedEvent];
+        if (g_final_event) [cb encodeSignalEvent:g_final_event value:g_final_wait = ++g_final_seq];
+    }
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
     g_pe_final_commit_ms = ds4_gpu_now_ms();
@@ -54525,6 +54570,18 @@ int ds4_gpu_end_commands_wait(void) {
     id<MTLCommandBuffer> cb = g_pe_final_cb;
     g_pe_final_cb = nil;
     if (!cb || g_pe_preparing) return 0;
+    if (g_final_wait) {
+        /* a failed buffer may never signal: it completes, and its status sends it the ordinary way */
+        while (g_final_event.signaledValue < g_final_wait && cb.status < MTLCommandBufferStatusCompleted) {}
+        if (g_final_event.signaledValue >= g_final_wait) {
+            const int done = ds4_gpu_wait_pending_command_buffers("command batch");
+            ds4_gpu_stream_expert_cache_note_owned_completed();
+            [g_transient_buffers removeAllObjects];
+            ds4_gpu_model_buffer_cache_maybe_evict("command batch");
+            if (!done) ds4_gpu_pe_drop();
+            return done;
+        }
+    }
     const int ok = ds4_gpu_finish_committed(cb, "command batch", g_pe_final_commit_ms);
     if (!ok) ds4_gpu_pe_drop();
     return ok;
