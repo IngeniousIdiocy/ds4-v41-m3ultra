@@ -9,10 +9,13 @@ use `DS4_METAL_MODEL_TRACKED=1` and `DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY=1`). 
 engine runs main's code again. [RUNTIME-V41.md](RUNTIME-V41.md) lists every
 switch; [REPRODUCE-V41.md](REPRODUCE-V41.md) says how to measure them.
 
-The page ends with the image input groups and one speed-up that was identified
-and sized but not built.
+After the one-session groups, [Several sessions at once](#several-sessions-at-once)
+explains the groups that decode several sessions in one step. The page ends
+with the image input groups and one speed-up that was identified and sized but
+not built.
 
-Some of the code here started in forks by Ivan Fioravanti and Tarjei Mandt;
+Some of the code here started in forks by Ivan Fioravanti and Tarjei Mandt,
+and three pieces of the batched decode started in oMLX;
 [THIRD_PARTY-V41.md](../THIRD_PARTY-V41.md) has the details.
 
 ## Where the time goes
@@ -974,6 +977,476 @@ Kind: idle time, sampled decoding only. Not measured on its own: the
 progression decodes greedily, where this group never runs.
 
 ---
+
+## Several sessions at once
+
+`ds4-server --batched-session N` keeps N sessions resident and decodes the ones
+that are ready in one step: one token per session, one pass over the dense
+weights for all of them. The groups in this part make such a step cost what it
+should. "N" is the number of sessions in a step, and a **row** is one session's
+token in it. N=3 comes first throughout, because three streams (a chat and two
+agents) is the main use.
+
+At the start, a step at N=4 took 71.3 ms against a byte floor of 38.0 ms, and
+almost all of the 33 ms gap grew with the rows: each added row cost 14.0 ms,
+where its own experts' bytes cost 6.4. A row paid for about 330 extra dispatches
+(RoPE, rounding, expands), dense products that multiplied one row at a time,
+and kernels that had no fixed shapes. The attention itself was not the
+problem: 2.1 ms a row, the same as one-row decode.
+
+**How these numbers were measured.** They were measured while building each
+group, not on the release build; the release's own figures are in the README.
+Unless a section says otherwise: ds4-bench's resident job runner (`nrun`),
+sessions restored from saved caches of 2,000 to 3,000 tokens, greedy decoding,
+DSpark off, milliseconds per step, serpentine order, median of three, on a quiet
+machine. Each group was measured on top of the groups before it. Lower is
+better, so "−1.3 ms" is a saving.
+
+Over the whole part, measured the same way:
+
+| N | before, ms per step | after, ms per step | after, t/s for all rows |
+| ---: | ---: | ---: | ---: |
+| 3 | 57.4 | 36.6 | 81.9 |
+| 1 | 24.0 | 22.7 | 44.0 |
+| 2 | 43.8 | 30.0 | 66.7 |
+| 4 | 71.4 | 43.7 | 91.6 |
+| 8 | 112.6 | 68.5 | 116.9 |
+
+(Greedy, DSpark off. The N=8 "before" is after HEAD_ROWS and DECODE_ROWS, the
+first groups below.)
+
+**Exactness.** Every group here gives each row the bits of the same session
+decoded alone, except ATTN_TILES. Every group was checked by hashing each row's
+full logits at every step against that session's own one-row run, at N=2 to 8,
+at short depth and at 34K to 300K. ATTN_TILES changes the attention sums for
+one-row decode as well, so a row still equals its session decoded alone, but
+neither equals main's vec kernel; `--exact` keeps the vec kernel (see
+ATTN_TILES).
+
+### HEAD_ROWS, DECODE_ROWS: each row at its one-row bits
+
+`DS4_METAL_DISABLE_V41_HEAD_ROWS=1` and `DS4_METAL_DISABLE_V41_DECODE_ROWS=1`
+turn them off.
+
+Before these, a row's logits differed from its one-row run from the first step.
+A trace of every stage of every layer showed that at two to four rows the whole
+body already matched one-row decode bit for bit; only the vocabulary head
+differed, because the batch took a head kernel that sums in another order.
+HEAD_ROWS runs the rows' head on the Q8_0 row kernel, which gives each row its
+one-row head's bits. From six rows a batch took the grouped MoE kernels, and the
+first difference appeared in layer 0's routed experts; at eight rows that
+changed tokens within 64 steps. DECODE_ROWS sends six to eight rows through the
+fused decode MoE kernels that a DSpark verify block already uses. Prefill keeps
+its kernels, and a verify block keeps its own head.
+
+Kind: exactness. Cost: HEAD_ROWS +0.19 ms at N=3, +0.07 at N=2, +0.16 at N=4;
+DECODE_ROWS −0.28 ms at N=6, +0.67 at N=8. These are the reference every later
+group is checked against.
+
+### BATCH_FLUSH, ROWS_REG: commit early, multiply in registers
+
+`DS4_METAL_DISABLE_V41_BATCH_FLUSH=1` and `DS4_METAL_DISABLE_V41_ROWS_REG=1`
+turn them off.
+
+One-row decode commits its first command buffer after layer 0, so the GPU
+starts while the host encodes the rest; the rows' step committed after two
+layers. BATCH_FLUSH commits after layer 0 too.
+
+ROWS_REG is the largest group for two to four rows. The dense Q8_0 products
+(projections, the head, the shared expert) ran each row through the weights in
+turn. Now one kernel keeps a sum per output and row in registers, reads each
+weight once for all rows, and merges the lane sums along `simd_sum`'s own tree,
+so each row keeps its one-row bits. On a microbenchmark of the 1,280 to 32,768
+projection at four rows it took 84 µs, against 118 for the exact eight-row tiles
+and 147 for the older four-row kernel. The rows' Q8 cost fell from 2.1 to about
+0.6 ms a row. The number of outputs per threadgroup fits the row count: two at
+two rows, three at three and four.
+
+Kind: idle time (BATCH_FLUSH), arithmetic (ROWS_REG). Measured while building
+it: BATCH_FLUSH −1.3 ms at N=3, −0.72 at N=2, −1.6 at N=4; ROWS_REG −4.5 ms at
+N=3, −1.9 at N=2, −6.0 at N=4. Fitting outputs per threadgroup later took another
+0.28 ms at N=3 and 0.23 at N=4.
+
+### BATCH_ROPE, BATCH_KV: RoPE and the KV row as one-row decode does them
+
+`DS4_METAL_DISABLE_V41_BATCH_ROPE=1` and `DS4_METAL_DISABLE_V41_BATCH_KV=1`
+turn them off. BATCH_KV is the first switch of the second word (below).
+
+Rows roped, stored and unroped in separate passes: about 133 dispatches a row,
+1.2 ms a row, nearly all launch cost. With BATCH_ROPE the rows keep one-row
+decode's per-step RoPE tables, one per session at its own position: the
+attention reduce writes the heads already rotated back, and q_b rotates its rows
+as it stores. With BATCH_KV the rows rope, quantize and store their KV rows in
+one dispatch.
+
+Kind: kernel launches. Measured while building it: BATCH_ROPE −1.4 ms at N=3,
+−1.0 at N=2, −1.7 at N=4; BATCH_KV −0.54 at N=3, −0.21 at N=2, −0.83 at N=4.
+
+### BATCH_TAIL, BATCH_LOW, BATCH_LOWBF: the layer's tail
+
+`DS4_METAL_DISABLE_V41_BATCH_TAIL=1`, `…_BATCH_LOW=1` and `…_BATCH_LOWBF=1`
+turn them off.
+
+One-row decode's fused tail was gated off for rows, so a step at N=4 ran 246
+separate bf16 rounding passes and 80 expands. With BATCH_TAIL the output and
+shared-expert projections of two to four rows expand straight into the
+hyper-connection streams, with no separate add, expand or rounding pass.
+BATCH_LOW runs the attention low projection in registers, one weight pass for
+all rows. BATCH_LOWBF has that projection store bf16, so output-B no longer
+rounds every row again in each threadgroup.
+
+Kind: kernel launches. Measured while building it: BATCH_TAIL −1.7 ms at N=3,
+−1.5 at N=2, −1.8 at N=4; BATCH_LOW, measured after the tail had taken part of
+its share, −0.38 at N=3, −0.21 at N=2, −0.95 at N=4; BATCH_LOWBF −0.18 at N=3,
+−0.45 at N=4 and above, not distinguishable from noise at N=2.
+
+### BATCH_NARROW, BATCH_HIER: the router for rows
+
+`DS4_METAL_DISABLE_V41_BATCH_NARROW=1` and `…_BATCH_HIER=1` turn them off.
+
+BATCH_NARROW lets two to four rows read the BF16 router copy that NARROW_WEIGHTS
+builds for one-row decode, half the bytes of the stored F32 gate. BATCH_HIER has
+them pick the top six with one-row decode's hierarchical router.
+
+Kind: bytes moved, kernel launches. Measured while building it: BATCH_HIER −0.39
+ms at N=3, −0.33 at N=2, −0.26 at N=4. BATCH_NARROW measured +0.05 at N=3,
+−0.26 at N=2 and +0.14 at N=4, in an arm that also carried a narrow Engram form
+that was later removed, so its own effect was not separated; it is within
+0.3 ms either way. It stays as the rows' form of NARROW_WEIGHTS and is the path
+BATCH_ROUTER8 extends to eight rows.
+
+### BATCH_OVERLAP, BATCH_DOWN, BATCH_WAVE, BATCH_MIX, BATCH_QKV: work side by side
+
+`DS4_METAL_DISABLE_V41_<NAME>=1` turns each off.
+
+These run independent work in concurrent encoder sections, as one-row decode
+does with its shared expert.
+
+- **BATCH_OVERLAP**: the hyper-connection mix and the shared expert's gate and
+  up run beside the routed pair kernel. **BATCH_DOWN** adds the shared down
+  beside the routed sum.
+- **BATCH_WAVE**: each row's attention section (RoPE, key store, index, KV
+  stage, vec, reduce) runs in waves: every row's k-th dispatch together in one
+  concurrent level. Each row gets its own copy of the process-wide attention
+  scratch. One session's vec stage nearly fills the GPU (overlapped, it keeps
+  78% of its time at N=4), but the small stages are launch-bound and overlap
+  almost completely. The section recorder first cost more host time than the
+  waves saved; a table of the objects it holds, instead of a map lookup and an
+  array append per bind, took the idle time at N=4 from 1.7 to 1.3 ms.
+- **BATCH_MIX**: the mix the next block needs runs beside q_b, the short stage
+  that otherwise leaves the GPU idle. Beside q_a and kv the same mix saved
+  nothing.
+- **BATCH_QKV**: q_a and kv run side by side at the head of that section, as
+  one-row decode fuses them.
+
+Kind: occupancy. Measured while building it: BATCH_OVERLAP −1.1 ms at N=3, −1.0
+at N=2, −0.99 at N=4; BATCH_DOWN −0.57, −0.27, −0.72; BATCH_WAVE, after the
+recorder fix, −1.1, −0.40, −2.0; BATCH_MIX −1.1, −0.79, −2.0; BATCH_QKV −0.20,
+−0.21, −0.28. BATCH_QKV is small but removes all of the 0.35 ms that separate
+q_a and kv passes cost against one-row decode's fused pair.
+
+### BATCH_STATIC, BATCH_RBLOCK, BATCH_EXPAND: fixed-shape experts
+
+`DS4_METAL_DISABLE_V41_<NAME>=1` turns each off.
+
+BATCH_STATIC gives two to eight rows one-row decode's fixed-shape routed pair
+and sum kernels, with every stride a literal and the row count an argument. They
+need no plan dispatch, so MOE_DEDUP's plan (0.18 ms plus 0.24 a row) leaves the
+rows' path; it stays for verify rows. After it, a line through the step times at
+N=2 to 4 met one-row decode at N=1 within 0.31 ms: the fixed cost that rows had
+carried was gone.
+
+BATCH_RBLOCK reorders the routed grids so every pair visits one row block before
+the next, oMLX's row-block-major order. The reads and the bits are the same;
+only their order changes, and the routed section then streamed at about 790
+GB/s against the 705 GB/s measured in the old order. oMLX reports about 4% at
+four rows from this order, and it measured 3.3% at N=4 here.
+
+BATCH_EXPAND writes the FFN join with its shape as literals, as one-row decode
+does.
+
+Kind: kernel efficiency. Measured while building it: BATCH_STATIC −1.1 ms at
+N=3, −1.3 at N=2, −1.0 at N=4; BATCH_RBLOCK −0.86, −0.29, −1.7; BATCH_EXPAND
+−0.21, −0.22, −0.25 (small and steady: the generic join cost 0.23 ms more than
+one-row decode's).
+
+### BATCH_MMA, BATCH_TAIL8, BATCH_DEFER8, BATCH_ROUTER8, BATCH_QROPE, BATCH_HEAD8: five to eight rows
+
+`DS4_METAL_DISABLE_V41_<NAME>=1` turns each off.
+
+The register kernels hold four rows; past that, rows fell back to slower
+general paths, and the step jumped by a cliff at five rows (N=7 was even slower
+than N=8). From five rows, the dense products run on SHORT_MMA's exact eight-row
+simdgroup-matrix tiles (BATCH_MMA), which now take a row count: a tile row past
+the count repeats row 0, and its outputs are not stored, so each row has the
+same bits as in a full tile. BATCH_TAIL8, BATCH_DEFER8 and BATCH_ROUTER8 carry
+the fused tail, the overlap section and the router through eight rows.
+BATCH_QROPE rotates q_b as it stores on the tiles; an output's partner sits in
+the next SIMD group, so the two meet in threadgroup memory. BATCH_HEAD8 runs the
+head of five to eight rows on sixteen SIMD groups.
+
+The tiles lose below five rows: an 8x8 tile is the hardware's shape, so unused
+rows cost the same multiplies. At N=3 the tiles cost 1.8 ms more than the
+register kernels.
+
+Kind: arithmetic, kernel launches. Measured while building it, all six together:
+N=5 75.0 to 59.7 ms, N=6 86.6 to 67.3, N=7 98.9 to 75.6, N=8 95.4 to 83.6, about
+8 ms a row with no cliff. The six were not measured one by one.
+
+### BATCH_ENGRAM, BATCH_READS, BATCH_PE: Engram and the handoff for rows
+
+`DS4_METAL_DISABLE_V41_<NAME>=1` turns each off. Note that
+`DS4_METAL_DISABLE_V41_BATCH_ENGRAM` is also one of main's own switches; see
+[RUNTIME-V41.md](RUNTIME-V41.md#mains-own-v41-switches).
+
+BATCH_ENGRAM has two to eight rows read the narrow (FP8) Engram copy in one
+pass: a lane decodes each weight word once and keeps a sum per output and row.
+An earlier form ran a SIMD group per row, so above four rows it started a second
+pass that read the weights again.
+
+Layer 1's command buffer waits for the first Engram table. The second table's
+24 reads per row queued beside the first, though nothing needs them for
+thirteen layers. BATCH_READS starts them once the first table has joined, which
+took the idle time before layer 1's buffer from 0.76 ms to 0 at N=4 and from
+1.5 ms to 0 at N=8. The cost had been the 48N disk reads, not the kernels.
+
+BATCH_PE is PREENCODE for rows: the next step's first command buffer is
+encoded during the final wait, with each row's token read from a device word at
+commit; any change of rows or positions drops it.
+
+Cross-session rows also find their keyed draws on the GPU now (KEYED_GPU, at
+top_p 1), as one row does.
+
+Kind: idle time, bytes moved. Measured while building it:
+- BATCH_ENGRAM, one pass against the form before it (sampled at temperature 1):
+  −0.11 ms at N=3, −0.08 at N=2, −0.27 at N=4, −1.1 at N=5, −1.0 at N=6 and
+  N=7, −0.61 at N=8.
+- BATCH_READS: about 0 at N=2 and N=3, −0.40 at N=4, −0.25 at N=5, −0.49 at
+  N=6, −0.69 at N=7, −0.97 at N=8. It pays from four rows and costs nothing
+  below.
+- BATCH_PE: small. Alone it moved the idle time to the second buffer, which
+  waited on the Engram join (0 at N=3, +0.19 at N=2). With BATCH_READS: −0.13 ms
+  at N=3, −0.10 at N=2, −0.07 at N=4, −0.09 at N=8 greedy; −0.09 and −0.06 at
+  N=3 and N=2 sampled. Rows already committed their first buffer about as fast
+  as one row does with the slot, so there was little left for it to remove. It
+  stays on: exact and never a loss with BATCH_READS.
+- KEYED_GPU for rows, sampled at temperature 1 and top_p 1: −0.28 ms at N=3; at
+  the server, three streams went from 71.8 to 72.7 t/s.
+
+### MIXED_STEP, MIXED_CARRY, VERIFY_STACK, VERIFY_COPIES, VERIFY_DECODE: DSpark in a batch
+
+`DS4_METAL_DISABLE_V41_<NAME>=1` turns each off.
+
+Before this release, `--dspark` with `--batched-session` was accepted but ran
+every step one session at a time, with no drafting: three streams took 73.1 ms a
+step, 41 t/s in all. Now rows capture the drafter's features, so a batched
+session stays ready to draft.
+
+- **MIXED_STEP**: one session's verify block leads a step and the other
+  sessions follow as plain rows. One block a step, rotating among the sessions
+  whose controllers would draft, and only while at most three sessions decode
+  together (`DS4_SERVER_MIXED_ROWS`). Two blocks in a step lose: at N=3, one
+  block computes to 82 t/s, three blocks of 3, 3 and 2 rows to 68, plain rows
+  to 74. A lone stream keeps the one-row DSpark path.
+- **MIXED_CARRY**: a rejected block's correction token becomes that stream's
+  row in the next shared step, instead of a one-row step that the other
+  sessions wait for.
+- **VERIFY_STACK**: the verify block runs the rows' FFN, Engram, router and head
+  kernels from this part. On one timeline, a six-row verify block had cost 18.9
+  ms more than six rows from different sessions: 1,756 passes a step against
+  684 (598 of them one small copy each), about 7 µs of idle per extra pass, and
+  an FFN without the rows' fused input.
+- **VERIFY_COPIES**: the block's rollback snapshot and commit copies run as one
+  concurrent level, since their destinations are distinct.
+- **VERIFY_DECODE**: with VERIFY_INDEXED, the block attends with the decode
+  kernels while keys and selection stay batched. Rows with at most top_k
+  visible keys keep their own pick's order, and past 16,384 keys tied index
+  scores are ordered by id, as decode's radix select orders them. Every verify
+  row's logits then equal serial decoding's.
+
+Kind: wasted work, kernel launches. Measured while building it, DSpark on:
+- Verify time on 60 replayed real agent requests (one stream, 134K to 278K
+  context, temperature 1, top_p 1), median per block: 79.8 ms before, 70.1 with
+  VERIFY_STACK, 72.5 with VERIFY_DECODE too, which makes it exact. Decode speed
+  over the same requests: +3.7% (95% interval +1.8% to +5.9%).
+- VERIFY_COPIES: −0.51 ms per verify at short depth and at 300K, +0.2% and
+  +0.6% t/s.
+- MIXED_STEP: a step with a block beside two other sessions takes 84.5 ms at
+  short depth and 88.5 ms at 131K, against 40.8 and 43.4 ms for three plain
+  rows. On three real streams at 134K, 190K and 263K, replayed together, the
+  stretches with all three decoding ran 3.8% faster than plain rows (95%
+  interval +2.5% to +5.0%); with two streams, 8.1% (+5.7% to +10.3%).
+- MIXED_CARRY: rejected blocks went from 115.6 to 91.1 ms with accepted blocks
+  unchanged, an implied +1.4% at three streams. (That replay's warm start was
+  flawed; the blocks' rows were not affected by it.)
+
+Every row and every draw of a mixed step was checked against each stream's
+serial chain: greedy and sampled, rejections, streams joining and leaving, and
+the server's real step replayed serially, with 0 differing logits and 0
+differing state bytes; and exact verify against serial on 44 saved sessions
+from short to 400K.
+
+### READ_ONCE: a shared expert read once
+
+`DS4_METAL_DISABLE_V41_READ_ONCE=1` turns it off.
+
+Rows that pick the same expert ran their pairs separately. MOE_DEDUP had shared
+those reads in name only: every SIMD group still issued its own loads, so the
+rows shared the cache, not the load. With READ_ONCE, rows that picked the same
+expert run as a group in one launch: one load and one decode of the gate and up
+weights feed one sum per row. Each row adds in its one-row order, with its
+inputs loaded before the weights, because library fast math orders a sum by
+where its terms are defined. A thread per (row, expert) pair counts its own
+company to build the plan.
+
+How much there is to share decides where it runs. Real sessions at 131K repeat
+3.9% of their experts at N=3 and 14% at N=8. A six-row verify block repeats 31
+to 34%. So a step with a verify block always takes READ_ONCE, and plain rows
+take it from four rows.
+
+Kind: bytes moved. Measured while building it: a block beside two other
+sessions at short depth 84.7 to 80.9 ms (DSpark on), at 131K 88.6 to 86.0; a
+block alone 68.4 to 66.1; plain rows at N=8 81.9 to 79.5 at short depth, 86.8
+to 86.0 at 131K. Plain rows at N=4: −0.29 ms on the short caches, −0.17 on
+oMLX-style prompts (one shared text with a unique prefix per row, 1,024
+tokens), +0.02 on 1,024-token distinct texts, and +0.17 at 131K. Plain rows at N=2 and N=3 do
+not take it: they repeat too few experts for the plan's cost.
+
+### FP4_NO_TABLE: FP4 codes without a table
+
+`DS4_METAL_DISABLE_V41_FP4_NO_TABLE=1` turns it off.
+
+V4.1's decode expert kernels turned FP4 codes into floats through a table in
+threadgroup memory, which every threadgroup filled behind a barrier. They now
+decode with shifts on the packed bytes, after oMLX's FP4 decode. The dot keeps
+the table form's chain of sixteen terms, spelled out with `fma`, so every row
+keeps its bits: left to library fast math, the chain was flattened into another
+order. The pair kernels scale the dot once; the down kernels, whose activations
+can be small enough for the scale to matter, keep it on their activations. It
+applies to one-row decode too.
+
+Kind: kernel efficiency. Measured while building it, 128 tokens (64 on the
+short caches), ms per step:
+
+| N | oMLX-style prompts | distinct prompts | short caches |
+| ---: | ---: | ---: | ---: |
+| 3 | 40.3 to 38.8 | 41.1 to 40.1 | 40.6 to 39.2 |
+| 1 | 24.1 to 23.9 | 24.1 to 23.9 | |
+| 2 | 32.7 to 32.1 | 32.9 to 32.4 | 32.6 to 32.0 |
+| 4 | 49.2 to 46.8 | 50.3 to 48.8 | 49.4 to 46.9 |
+| 8 | 76.8 to 70.8 | 80.2 to 76.5 | 79.1 to 74.1 |
+
+(Greedy, DSpark off.) A block beside two other sessions at short depth went
+from 80.6 to 73.9 ms (DSpark on).
+
+### ATTN_TILES, LIVE_SPLITS: decode attention
+
+`DS4_METAL_DISABLE_V41_ATTN_TILES=1` and `…_LIVE_SPLITS=1` turn them off.
+
+ATTN_TILES runs decode attention's scores and PV on simdgroup matrices: 8 heads
+by 64 keys a threadgroup, 1,024 threads, 8x8 tiles, the keys read straight from
+the cache by index. It is adapted from oMLX's decode attention (notice in
+`licenses/omlx.txt`) and runs at every row count: one-row decode, batched rows
+and verify blocks. V4.1 decode attends to at most 640 keys (128 raw and up to
+512 selected), so the kernel's limits are never reached; it falls back to the
+vec kernel under `--quality`, on GPUs other than the M3 and M5 families, with
+DECODE_ATTENTION off, and across two Macs.
+
+This group is not bit for bit with the vec kernel. Rows stay equal to the same
+session decoded alone, since one-row decode takes the tiles too, but not to
+main's serial output; `--exact` turns it off. Its accuracy against the vec
+kernel: over 21 long DeepSeek V4.1 scoring cases, mean NLL 0.2993 against
+0.3003; over 129 further cases, the token-weighted distance to the original
+checkpoint's output grows by 0.0011 (+4%), NLL moves by less than 0.0002, and
+top-1 agreement with the original is 0.9680 against 0.9673. Greedy from 16
+prompts to the first differing token, 735 steps: mean KL 0.00175, at most 0.035,
+14 differing tokens (1.9%).
+
+LIVE_SPLITS: attention splits its keys over 32 partials, and with at most 640
+keys 12 of them had none. Only the splits with keys launch, and the reduce reads
+only those. The logits are the same bits.
+
+Kind: arithmetic (ATTN_TILES), kernel launches (LIVE_SPLITS). Measured while
+building it, 128 tokens, ATTN_TILES off to on, oMLX-style / distinct prompts:
+N=3 38.3 to 36.2 ms / 39.4 to 36.9; N=1 23.6 to 22.7 / 23.6 to 22.7; N=2 31.4
+to 29.7 / 31.9 to 30.3; N=4 46.1 to 43.2 / 48.2 to 45.0; N=8 69.7 to 65.4 /
+75.3 to 70.2 (greedy, DSpark off). LIVE_SPLITS: −0.60 and −0.43 ms at N=8 on the
+two prompt sets, −0.13 and −0.04 at N=4, 0 at one row: it pays from four rows.
+
+### FINAL_SPIN: wake on the GPU's signal
+
+`DS4_METAL_DISABLE_V41_FINAL_SPIN=1` turns it off.
+
+A step ends with the host waiting for its last command buffer. The buffer's
+completion reached the host about 0.33 ms after the GPU had finished. Now the
+head buffer signals a shared event, and the host spins on that event for the
+final wait. One CPU core spins through the last command buffer, 3 to 5 ms a
+step, and only for that wait. It is off while `DS4_METAL_CB_TIMES` is set.
+
+Kind: idle time. Measured while building it: −0.33 ms at every N, one row
+included; serial decode at depth 40.2 to 40.7 t/s; one-stream DSpark at short
+depth 50.4 to 50.7 t/s sampled and 65.4 to 65.5 greedy. The logits are the same
+bits.
+
+### The server: prefill beside decoding sessions
+
+A cold prompt that arrives while other sessions decode used to stop them. The
+server changes below are V4.1-only and need `--batched-session`.
+
+**A time share, 2,048-token chunks.** Any V4.1 prefill chunk sweeps all the
+routed experts, about 0.55 s, plus about 1.0 ms a token, however short it is.
+At the old 128-token chunk, decoders got one step per chunk: three decoders at
+about 2,700 tokens beside a cold 9,240-token prompt ran 1.37 t/s, and the
+prefill took 53.1 s. Larger chunks alone froze them harder (0.40 t/s at 2,048
+tokens). Now the decoders get as much wall time after each chunk as the chunk
+took (`DS4_SERVER_MIXED_DECODE_SHARE`, 100% by default), and a chunk is 2,048
+tokens: decoders 8.1 t/s, the prefill 22.8 s, everything done in 41.8 s against
+78.2. Its worst stall between two tokens was 2.7 s.
+
+**Parked sweeps.** The prefill now runs as one sweep in 32,768-token syncs and
+parks between its chunks, keeping its place on its own stack and its own graph,
+so the decoding sessions take a step at every park. A parked sweep that is
+cancelled still comes back to unwind under the lock. Only a sync's end is a
+checkpoint: 32,768-token syncs ran 868 t/s on a cold 125,915-token prompt,
+against 883 for one sync of the whole prompt, which stored no checkpoint during
+the prefill, and 791 for 8,192-token syncs.
+
+**Waiters and short requests.** A parked sweep could not see a thread queued on
+the inference lock and retook the lock first, so a title request beside two cold
+prefills took 129 to 154 s. A sweep now holds until queued threads have had the
+lock. A request no wider than one chunk also no longer takes turns with sweeps:
+layer-major chunks run per layer however few the rows, so a 15-token prompt had
+alternated with wide chunks at every layer, 7.7 to 14.5 s.
+
+Measured while building it, server level, three sessions decoding greedily
+beside a cold 9,240-token prompt:
+
+| | prefill s | decoders t/s | gap p99 ms | gap max ms |
+| --- | ---: | ---: | ---: | ---: |
+| time share, no drafter | 22.7 | 12.5 | 2,663 | 2,675 |
+| parked sweeps, no drafter | 22.1 | 14.2 | 278 | 554 |
+| time share, DSpark on, disk KV cache | 22.8 | 11.6 to 12.8 | 2,686 | 2,725 |
+| parked sweeps, DSpark on, disk KV cache | 22.7 | 13.6 to 16.0 | 276 | 337 |
+
+Beside a cold 125,916-token prompt the worst stall is 0.8 s, where a sweep's
+encoder chunk is 8,192 rows. A prefill alone still runs at 917 to 925 t/s. The
+prefill's logits and state, and every decoder's, equal a plain prefill and
+serial decoding at every park (3,500 to 40,000 tokens).
+
+A replay of real agent traffic at a deployment configuration (four batched
+sessions and a utility session, a 1,048,576-token context, DSpark on), against
+the build before the waiter, short-request and sync-width changes: utility requests
+(titles, summaries) median 15.1 to 2.3 s, worst 234 to 23.3 s, with 117 served
+instead of 29; first tokens of short appends median 13.9 to 5.8 s, worst 66.3 to
+9.7 s; checkpoints refused during prefill 15 to 0. Cold prefills there finish
+later than before, since short work now runs beside them and decoders keep half
+the wall clock. `DS4_SERVER_DISABLE_PREFILL_YIELD=1` returns to the time share
+alone.
+
+**The utility session in a batch.** With `--batched-session` and
+`--utility-ctx` together, the utility session's row joins the decode step beside
+the other sessions; before, the utility session needed non-batched mode. During three decoding streams a title took 0.57 s and an image request
+2.6 s; the streams' four-row steps cost the normal four-row time.
 
 ## Two Macs
 

@@ -1,8 +1,9 @@
 # Changes for DeepSeek V4.1 Flash on Metal
 
 This branch is DwarfStar main at `5379c1c9` plus the commits below, in order.
-Each speed group is one commit with one off switch, and each group's off path
-is main's code. [docs/METAL-V41.md](docs/METAL-V41.md) explains why each group
+Each speed group has one off switch, and each group's off path is main's code.
+Up to commit 119 each commit holds at most one group; from commit 120 a commit
+can hold several (below). [docs/METAL-V41.md](docs/METAL-V41.md) explains why each group
 is faster, and [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every switch.
 
 ## The commits
@@ -102,10 +103,65 @@ is faster, and [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md) lists every switch.
 | 91 | Load the vision attention's K and V as half, straight from memory. | (flash kernel) |
 | 92 | Decode each request image once, not twice. | `DS4_DISABLE_V41_VISION_PREP_REUSE=1` |
 | 93 | Walk the vision attention's keys in tiles of 16. | `VISION_ATTN_KT16` |
+| 94 | Allow up to 256 images per server request (DwarfStar PR #1245). | (server) |
+| 95 | Drain the autorelease pool around Metal buffer contents (DwarfStar PR #1244). | (memory) |
+| 96 | Give C callers an autorelease pool around the engine entry points. | (memory) |
+| 97 | Store continued checkpoints during long V4.1 prefills. | (server) |
+| 98 | Never finish an OpenAI stream with `tool_calls` and no call, or drop its withheld text. | (server) |
+| 99 | Bring back the disk KV cache's eviction ladder, on KV v2. | (server) |
+| 100 | Map metadata-only model opens shared, not private. | (loader) |
+| 101 | Render a request body to prompt token ids, for tests. | (test) |
+| 102 | Bind images in prompt order. | (input) |
+| 103 | Keep only the current turn's reasoning when a request declares no tools. | (prompt) |
+| 104 | Join content blocks with a blank line. | (prompt) |
+| 105 | Render tools as DeepSeek's encoder does. | (prompt) |
+| 106 | Keep other models' special spellings as plain text. | (prompt) |
+| 107 | Pre-tokenize exactly as `tokenizer.json` does. | (tokenizer) |
+| 108 | Test V4.1 request prompts against DeepSeek's encoder. | (test) |
+| 109 | Sample V4.1 tokens with position-keyed Gumbel noise. | `KEYED_SAMPLING` |
+| 110 | Sample V4.1 with keyed noise by default. | `KEYED_SAMPLING` |
+| 111 | Key full-distribution samples, with their candidates found on the GPU. | `KEYED_GPU` |
+| 112 | ds4-bench jobs: sampled DSpark runs, per-run switch masks, keyed counters. | (tool) |
+| 113 | Copy a verify block's keyed candidates out of the shared buffer. | `KEYED_GPU` |
+| 114 | Build untruncated sampling probabilities in one pass, and let DSpark verify by p/q at top_p 1. | `FULL_PROBS` |
+| 115 | Verify DSpark drafts by p/q at top_p 1 too, and drop the keyed verify. | (DSpark) |
+| 116 | Build DSpark's q and p on the GPU, with the draws' candidates. | `PQ_GPU` |
+| 117 | ds4-server: log which sampler served each request. | (server) |
+| 118 | `--exact` also turns off keyed sampling and the full-distribution builds. | `DS4_V41_EXACT` |
+| 119 | Validate the spectral parameters of progressive JPEG scans. | (input) |
+| 120 | Let two Metal unit checks take not-exact kernels and E4M3 rounding ties. | (test) |
+| 121 | ds4-server: share wall time between V4.1 decoders and a mixed prefill chunk, in 2,048-token chunks. | `DS4_SERVER_MIXED_DECODE_SHARE` |
+| 122 | ds4-bench: decode several saved sessions together (`session`, `nrun`); write command buffer times to a file. | (tool) |
+| 123 | Give cross-session decode rows each row's one-row bits. | `HEAD_ROWS`, `DECODE_ROWS` |
+| 124 | Run two to four session rows on one-row decode's stages. | `BATCH_FLUSH`, `ROWS_REG`, `BATCH_ROPE`, `BATCH_KV`, `BATCH_TAIL`, `BATCH_LOW`, `BATCH_NARROW`, `BATCH_HIER` |
+| 125 | Overlap session rows' stages in concurrent sections. | `BATCH_OVERLAP`, `BATCH_DOWN`, `BATCH_WAVE`, `BATCH_MIX` |
+| 126 | Give session rows one-row decode's fixed-shape expert kernels. | `BATCH_STATIC`, `BATCH_RBLOCK`, `BATCH_EXPAND` |
+| 127 | Run session rows' q_a and kv side by side. | `BATCH_QKV` |
+| 128 | Run five to eight session rows on the exact eight-row tiles. | `BATCH_MMA`, `BATCH_TAIL8`, `BATCH_DEFER8`, `BATCH_ROUTER8`, `BATCH_QROPE`, `BATCH_HEAD8`, `BATCH_LOWBF` |
+| 129 | Pre-encode session rows' next buffer; narrow Engram and the second table's reads for rows. | `BATCH_PE`, `BATCH_ENGRAM`, `BATCH_READS` |
+| 130 | Find session rows' keyed draws on the GPU. | `KEYED_GPU` |
+| 131 | ds4-server: run the utility session beside batched sessions. | (server) |
+| 132 | Read session rows' Engram in one pass at two to eight rows. | `BATCH_ENGRAM` |
+| 133 | ds4-bench: sample `nrun` rows, change their count between steps, report cycle time. | (tool) |
+| 134 | Batch DSpark sessions, with verify blocks beside other sessions' rows. | `MIXED_STEP`, `MIXED_CARRY`, `VERIFY_STACK`, `VERIFY_COPIES`, `VERIFY_DECODE` |
+| 135 | Read a shared expert once across decode rows. | `READ_ONCE` |
+| 136 | Decode V4.1's FP4 expert weights without a table. | `FP4_NO_TABLE` |
+| 137 | Decode attention on simdgroup matrices, live splits only, and a spin on the final wait. | `ATTN_TILES`, `LIVE_SPLITS`, `FINAL_SPIN` |
+| 138 | Token id fixtures for ds4-bench, per-token scores for `score_official`, request spans in the server log. | (tool) |
+| 139 | ds4-server: serve decoders and short requests between V4.1 prefill chunks. | `DS4_SERVER_DISABLE_PREFILL_YIELD=1` |
 
 Commits 59 to 93 came after the first release on main and are kept as they
 were committed. Commit 59 was committed as a work in progress; commits 60 to 62
 complete it with its tests.
+
+Commits 94 to 119 are the previous update: prompts as DeepSeek's encoder
+writes them, sampling at top_p 1, memory and disk cache fixes. Commits 120 to
+139 add batched decoding of several sessions at once. They are grouped by
+mechanism rather than one commit per group: a commit holds the groups that
+share one change of approach (for example, two to four rows taking one-row
+decode's fused stages), and each group inside it still has its own off switch
+and its own bits against one-row decode. [docs/METAL-V41.md](docs/METAL-V41.md#several-sessions-at-once)
+explains each group.
 
 Switch names without a prefix are `DS4_METAL_DISABLE_V41_<NAME>=1`, except
 `COMPUTE_TENSOR_COPY`, which is `DS4_METAL_DISABLE_COMPUTE_TENSOR_COPY=1`.

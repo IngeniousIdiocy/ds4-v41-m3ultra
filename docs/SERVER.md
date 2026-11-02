@@ -69,7 +69,7 @@ The startup line reports both figures.
 | Backend/model | Decode execution |
 | --- | --- |
 | Metal, resident Flash | Native shared-expert/QKV batching where supported |
-| Metal, resident V4.1 Flash | Native decoding for 2-8 sessions |
+| Metal, resident V4.1 Flash | Native decoding for 2-8 sessions, each at the bits of that session decoded alone; DSpark drafts inside the batch |
 | Metal RDMA TP, V4.1 Flash | Native decoding for 3-8 sessions; ordered fallback for two |
 | Metal SSD streaming, V4.1 Flash | Ordered fallback |
 | Metal, GLM 5.2 | Ordered fallback |
@@ -90,10 +90,21 @@ experts, and after each one decoders keep the model for as long as the chunk
 took, so they run at about half speed instead of one token per chunk.
 `DS4_SERVER_MIXED_DECODE_SHARE` sets that decode time as a percentage of the
 chunk's (default 100; 0 returns to one decode step per chunk).
+With `--batched-session`, a V4.1 prefill instead runs as one sweep in
+32,768-token syncs and parks between its chunks: the decoding sessions take a
+step at every park, a queued request gets the model before the sweep comes
+back, and a request no wider than one chunk does not take turns with sweeps.
+Only a sync's end is a checkpoint. `DS4_SERVER_DISABLE_PREFILL_YIELD=1` returns
+to the time share alone.
 Session-batched serving uses ordinary target decoding, except Qwen3.8 on
-Metal, where `--mtp` also batches speculative decoding. Its
-`--mtp-exact-sampling` mode uses ordinary batches for nonzero-temperature
-requests. Other models do not use MTP/DSpark while session batching is active.
+Metal, where `--mtp` also batches speculative decoding, and V4.1 on one Mac,
+where `--dspark` drafts inside the batch: a drafting session's verify block
+leads the step and the other sessions follow as plain rows. While three or
+fewer sessions decode (`DS4_SERVER_MIXED_ROWS`), they take turns drafting;
+with more, every session decodes plain rows. Qwen3.8's `--mtp-exact-sampling` mode
+uses ordinary batches for nonzero-temperature requests; V4.1's verifies a
+sampled draft by the p/q test. Other models do not use MTP/DSpark while
+session batching is active.
 For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-users).
 
 ## Request defaults, utility requests and serial reasoning
