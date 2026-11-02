@@ -2815,6 +2815,58 @@ static int check_batch_wave(void) {
     return 1;
 }
 
+/* BATCH_WAVE: rows attending in a section each keep their own attention scratch, however that scratch last grew. A
+ * verify block's split attention grows it, as a server's first real DSpark block does. Run alone (--batch-wave), this
+ * process's scratch starts empty and the growth is real. */
+static int check_batch_wave_attention(void) {
+    enum { D = 512, H = 64, K = 512, C = 2048, NR = 136, ROWS = 3, V = 8, START = 3073 };
+    float *sinks = NULL;
+    CHECK(posix_memalign((void **)&sinks, getpagesize(), getpagesize()) == 0);
+    for (int h = 0; h < H; h++) sinks[h] = random_value();
+    CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
+    const uint64_t row = (uint64_t)H * D * 4;
+    ds4_gpu_tensor *qt = upload(NULL, V * row), *rt = upload(NULL, (size_t)NR * D * 4), *ct = upload(NULL, (size_t)C * D * 4);
+    ds4_gpu_tensor *it = upload(NULL, V * K * 4), *ref = upload(NULL, V * row), *got = upload(NULL, V * row);
+    CHECK(qt && rt && ct && it && ref && got);
+    float *q = ds4_gpu_tensor_contents(qt), *raw = ds4_gpu_tensor_contents(rt), *comp = ds4_gpu_tensor_contents(ct);
+    int32_t *ids = ds4_gpu_tensor_contents(it);
+    for (size_t i = 0; i < (size_t)V * H * D; i++) q[i] = bf16(random_value() / 4);
+    for (uint32_t i = 0; i < NR * D; i++) raw[i] = bf16(random_value() / 4);
+    for (uint32_t i = 0; i < C * D; i++) comp[i] = bf16(random_value() / 4);
+    for (uint32_t t = 0; t < V; t++)
+        for (uint32_t j = 0; j < K; j++) ids[t * K + j] = (int32_t)((j * 127u + t * 17u) % C);
+#define ROW_ATTENTION(out) do { \
+        ds4_gpu_tensor *rq = ds4_gpu_tensor_view(qt, r * row, row), *ri = ds4_gpu_tensor_view(it, (uint64_t)r * K * 4, K * 4); \
+        ds4_gpu_tensor *ro = ds4_gpu_tensor_view((out), r * row, row); \
+        CHECK(rq && ri && ro && ds4_gpu_attention_indexed_mixed_batch_heads_tensor(ro, sinks, getpagesize(), 0, rq, rt, ct, \
+            0, ri, 1, START + r, 128, NR, 0, C, K, 128, 2, H, D)); \
+        ds4_gpu_tensor_free(rq); ds4_gpu_tensor_free(ri); ds4_gpu_tensor_free(ro); \
+    } while (0)
+    CHECK(ds4_gpu_begin_commands());
+    for (uint32_t r = 0; r < ROWS; r++) ROW_ATTENTION(ref);
+    CHECK(ds4_gpu_end_commands());
+    ds4_gpu_dsv41_verify_rows(1);
+    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(got, sinks, getpagesize(), 0, qt, rt, ct, 0, it, V, START,
+                                                              NR, NR, 0, C, K, 128, 2, H, D));
+    ds4_gpu_dsv41_verify_rows(0);
+    CHECK(ds4_gpu_synchronize());
+    memset(ds4_gpu_tensor_contents(got), 0xff, V * row);
+    CHECK(ds4_gpu_begin_commands());
+    ds4_gpu_wave_begin(ROWS);
+    for (uint32_t r = 0; r < ROWS; r++) {
+        ds4_gpu_wave_row((int)r);
+        ROW_ATTENTION(got);
+    }
+    CHECK(ds4_gpu_wave_end() && ds4_gpu_end_commands() && ds4_gpu_synchronize());
+    CHECK(same_bits(ref, got, (size_t)ROWS * H * D));
+#undef ROW_ATTENTION
+    ds4_gpu_tensor *tensors[] = {qt, rt, ct, it, ref, got};
+    for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
+    free(sinks);
+    fprintf(stderr, "V4.1 batch wave: rows' attention after a verify block grew the scratch == each row alone\n");
+    return 1;
+}
+
 /* ROWS_MMA: a DSpark block's Q8_0 matmuls of 3-8 rows on simdgroup matrices against the row kernels. The sums run in
  * another order, so the outputs agree to float rounding (and to one bf16 step when rounded), not bit for bit. Any other
  * batch of 3-8 rows, such as a short prefill, keeps the row kernels and their bits. */
@@ -4019,7 +4071,7 @@ static int check_v41_groups(void) {
         check_shared_expert() && check_concurrent_ffn() && check_index_score_wide() &&
         check_index_bf16() && check_topk() && check_index_candidates() &&
         check_decode_attention() && check_fixed_shapes() && check_sampler_scan() &&
-        check_row_matmuls() && check_head_rows() && check_rows_reg() && check_batch_rope() && check_batch_tail() && check_batch_router() && check_batch_overlap() && check_batch_wave() && check_rows_mma() && check_verify_kernels() &&
+        check_row_matmuls() && check_head_rows() && check_rows_reg() && check_batch_rope() && check_batch_tail() && check_batch_router() && check_batch_overlap() && check_batch_wave_attention() && check_batch_wave() && check_rows_mma() && check_verify_kernels() &&
         check_public_controller() && check_prefill_index() && check_prefill_attention() &&
         check_prefill_folds() &&
         check_moe_dedup() &&
@@ -4049,7 +4101,7 @@ int main(int argc, char **argv) {
         return ok ? 0 : 1;
     }
     if (argc == 2 && !strcmp(argv[1], "--batch-wave")) {
-        const int ok = ds4_gpu_init() && check_batch_wave();
+        const int ok = ds4_gpu_init() && check_batch_wave_attention() && check_batch_wave();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

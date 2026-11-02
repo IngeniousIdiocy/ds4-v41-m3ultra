@@ -46,9 +46,17 @@ typedef void (argsort_t)(
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]);
 
+// Whether a sorts strictly before b, descending; with ids, exactly tied scores by ascending id, which a wide row's
+// radix select does (kernel_topk_select_*).
+static inline bool ds4_sort_before(float a, int ia, float b, int ib, bool ids) {
+    return a > b || (ids && a == b && ia < ib);
+}
+
 // Sort one float row into an index row. DS4 only exports the descending
 // instance because router and indexer selection both need top-k order.
-template<ds4_sort_order order, bool causal = false, bool shuffle = false>
+// ids: rows wide enough that decode takes the radix select order their exact ties the same way; the merge ladder
+// that follows takes the left run on a tie, so it keeps that order.
+template<ds4_sort_order order, bool causal = false, bool shuffle = false, bool ids = false>
 kernel void kernel_argsort_f32_i32(
         constant   ds4_metal_args_argsort & args,
         device   const char * src0,
@@ -68,6 +76,7 @@ kernel void kernel_argsort_f32_i32(
     const int width = causal ? min(args.ne00,
         int((args.causal_start + uint(i01) + 1u) / args.causal_ratio)) : args.ne00;
     if (i00 >= width) return;
+    const bool by_id = ids && width >= 16384;
     const int work_width = causal ?
         ((width - 1) / ntg.x) * args.top_k + min((width - 1) % ntg.x + 1, args.top_k) : args.ne0;
 
@@ -101,9 +110,9 @@ kernel void kernel_argsort_f32_i32(
                 const bool first = ((col & k) == 0) == ((col & j) == 0);
                 const bool exchange = first ?
                     (reg_idx >= width || (other < width && (order == DS4_SORT_ORDER_ASC ?
-                        reg_value > value : reg_value < value))) :
+                        reg_value > value : ds4_sort_before(value, other, reg_value, reg_idx, by_id)))) :
                     (other >= width || (reg_idx < width && (order == DS4_SORT_ORDER_ASC ?
-                        reg_value < value : reg_value > value)));
+                        reg_value < value : ds4_sort_before(reg_value, reg_idx, value, other, by_id))));
                 if (exchange) { reg_idx = other; reg_value = value; }
                 continue;
             }
@@ -113,7 +122,8 @@ kernel void kernel_argsort_f32_i32(
                     if (shmem_i32[col] >= width ||
                        (shmem_i32[ixj] <  width && (order == DS4_SORT_ORDER_ASC ?
                             shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00] :
-                            shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00]))
+                            ds4_sort_before(shmem_f32[shmem_i32[ixj] - i00], shmem_i32[ixj],
+                                            shmem_f32[shmem_i32[col] - i00], shmem_i32[col], by_id)))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }
@@ -121,7 +131,8 @@ kernel void kernel_argsort_f32_i32(
                     if (shmem_i32[ixj] >= width ||
                        (shmem_i32[col] <  width && (order == DS4_SORT_ORDER_ASC ?
                             shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00] :
-                            shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00]))
+                            ds4_sort_before(shmem_f32[shmem_i32[col] - i00], shmem_i32[col],
+                                            shmem_f32[shmem_i32[ixj] - i00], shmem_i32[ixj], by_id)))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }
@@ -150,6 +161,7 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+template [[host_name("kernel_argsort_f32_i32_desc_causal_ids")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true, true>;
 // The same SIMD-exchange network for the non-causal block sort of the decode call (one row, k = 512).
 template [[host_name("kernel_argsort_f32_i32_desc_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, false, true>;
 

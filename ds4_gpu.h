@@ -130,6 +130,11 @@ typedef struct {
 #define DS4_GPU_V41B_BATCH_PE (1ull << 20)   /* with PREENCODE cross-session decode rows' next first buffer is encoded in the final wait */
 #define DS4_GPU_V41B_BATCH_ENGRAM (1ull << 21)   /* cross-session decode rows read the narrow Engram copy */
 #define DS4_GPU_V41B_BATCH_READS (1ull << 22)   /* cross-session decode rows read the second Engram table after the first has joined */
+#define DS4_GPU_V41B_MIXED_STEP (1ull << 26)   /* a DSpark verify block shares its step with other sessions' rows */
+#define DS4_GPU_V41B_MIXED_CARRY (1ull << 27)   /* with MIXED_STEP a block's correction is its stream's row in the next step */
+#define DS4_GPU_V41B_VERIFY_DECODE (1ull << 25)   /* with VERIFY_INDEXED a DSpark verify block attends with the decode kernels */
+#define DS4_GPU_V41B_VERIFY_COPIES (1ull << 24)   /* a DSpark verify block's rollback snapshot and commit copies run as one concurrent level */
+#define DS4_GPU_V41B_VERIFY_STACK (1ull << 23)   /* a DSpark verify block runs the cross-session rows' FFN, Engram, router and head stack */
 #define DS4_GPU_V41B_BATCH_MIX (1ull << 8)   /* 2-4 cross-session decode rows' attention runs the HC mix beside q_b */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
 #define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */
@@ -310,6 +315,8 @@ void ds4_gpu_kv_norm_task_end_concurrent(void);
 int ds4_gpu_overlap_begin(void);
 void ds4_gpu_overlap_level(void);
 void ds4_gpu_overlap_end(void);
+int ds4_gpu_copy_level_begin(void);
+void ds4_gpu_copy_level_end(void);
 /* BATCH_WAVE: between begin and end the compute dispatches of the row named by ds4_gpu_wave_row are recorded, then
  * replayed with every row's k-th dispatch in one concurrent level. 0 from end: a section outgrew the recorder. */
 void ds4_gpu_wave_begin(uint32_t rows);

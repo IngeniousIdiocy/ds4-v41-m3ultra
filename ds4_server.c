@@ -10516,7 +10516,9 @@ struct server_slot {
     bool decode_done;
     int decode_token;
     bool decode_speculative;
-    int decode_accepted[2];
+    int decode_accepted[17];
+    const struct decode_cycle *decode_cycle;   /* V4.1 DSpark: what a slot alone in its step drafts with */
+    int decode_carry;                          /* MIXED_STEP: the correction a block left for this slot's next token */
     int decode_accepted_count;
     int decode_rc;
     char decode_err[160];
@@ -14005,6 +14007,25 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     return server_eval_tokens(s, slot, token, false, accepted, &count, err, errlen);
 }
 
+/* A slot's solo DSpark cycle, run by the decode coordinator when the slot is alone in its step; else a plain row. */
+typedef struct decode_cycle {
+    int cap, eos, top_k;
+    bool ignore_eos;
+    ds4_think_mode think_mode;
+    float temperature, top_p, min_p;
+    uint64_t *rng;
+} decode_cycle;
+
+static int server_eval_cycle(server *s, server_slot *slot, int token, const decode_cycle *c,
+                             int accepted[17], int *n_accepted, int *carry, char *err, size_t errlen) {
+    slot->decode_cycle = c;
+    slot->decode_carry = -1;
+    const int rc = server_eval_tokens(s, slot, token, false, accepted, n_accepted, err, errlen);
+    slot->decode_cycle = NULL;
+    *carry = slot->decode_carry;
+    return rc;
+}
+
 static long server_decode_coalesce_us(void) {
     long us = 2000;
     const char *env = getenv("DS4_SERVER_DECODE_COALESCE_US");
@@ -14043,6 +14064,9 @@ static void *decode_worker_main(void *arg) {
     int *n_accepted = xmalloc((size_t)slots * sizeof(*n_accepted));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
+    const char *rows_env = getenv("DS4_SERVER_MIXED_ROWS");
+    const int mixed_rows = rows_env ? atoi(rows_env) : 3;
+    int block_slot = slots - 1;
 
     pthread_mutex_lock(&s->model_mu);
     for (;;) {
@@ -14093,14 +14117,67 @@ static void *decode_worker_main(void *arg) {
 
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
+        const decode_cycle *cycle = count == 1 ? members[0]->decode_cycle : NULL;
+        int cycle_tokens[17], cycle_count = 0, cycle_member = 0, cycle_carry = -1, mixed = -2;
+        /* MIXED_STEP: at most mixed_rows streams beside the utility row, one block a step, the next stream that would draft */
+        int streams = 0;
+        for (int m = 0; m < count; m++) streams += !members[m]->utility;
+        /* every stream's state this step, in the slot's order, for the log: why it would not draft, or r, whichever gets the
+         * block; R reasoning, u the utility row */
+        int ready = 0;
+        char states[96] = "";
+        for (int i = 0, used = 0; log_batches && i < slots; i++) {
+            for (int m = 0; m < count; m++) {
+                if (members[m] != server_decode_slot(s, i)) continue;
+                const decode_cycle *c = members[m]->decode_cycle;
+                int backoff = 0;
+                const char state = members[m]->utility ? 'u' : !c ? 'R' :
+                    ds4_session_cycle_state(items[m].session, items[m].token, c->cap, c->eos, &backoff);
+                ready += state == 'r';
+                used += snprintf(states + used, sizeof(states) - (size_t)used, "%s%d%c%.0d", used ? "," : "", i, state, backoff);
+            }
+        }
+        if (count > 1 && streams <= mixed_rows && plain_count == count && ds4_engine_mixed_step(s->engine)) {
+            mixed = -1;
+            for (int i = 1; i <= slots && mixed < 0; i++) {
+                const server_slot *want = server_decode_slot(s, (block_slot + i) % slots);
+                for (int m = 0; m < count; m++) {
+                    const decode_cycle *c = members[m]->decode_cycle;
+                    if (members[m] != want || !c || !ds4_session_cycle_ready(items[m].session, items[m].token, c->cap, c->eos))
+                        continue;
+                    mixed = m;
+                    block_slot = (block_slot + i) % slots;
+                    cycle = c;
+                    cycle_member = m;
+                }
+            }
+        }
         pthread_mutex_lock(&s->inference_mu);
-        int rc = plain_count ? ds4_sessions_eval_batch(items, plain_count,
-                                         batch_err, sizeof(batch_err)) : 0;
+        int rc = 0;
+        if (mixed == -1) {
+            rc = ds4_sessions_eval_mixed(items, count, -1, 0, 0, false, DS4_THINK_HIGH, 0, 0, 0, 0, NULL, NULL, NULL,
+                                         batch_err, sizeof(batch_err));
+        } else if (mixed >= 0) {
+            cycle_count = ds4_sessions_eval_mixed(items, count, mixed, cycle->cap < 17 ? cycle->cap : 17, cycle->eos, cycle->ignore_eos,
+                cycle->think_mode, cycle->temperature, cycle->top_k, cycle->top_p, cycle->min_p, cycle->rng,
+                cycle_tokens, &cycle_carry, batch_err, sizeof(batch_err));
+            rc = cycle_count < 1;
+        } else if (cycle) {
+            cycle_count = cycle->ignore_eos ?
+                ds4_session_eval_speculative_argmax_ignoring_eos(items[0].session, items[0].token, cycle->cap, cycle->eos,
+                    cycle->think_mode, cycle_tokens, 17, batch_err, sizeof(batch_err)) :
+                ds4_session_eval_speculative(items[0].session, items[0].token, cycle->cap, cycle->eos, cycle->temperature,
+                    cycle->top_k, cycle->top_p, cycle->min_p, cycle->rng, cycle_tokens, 17, batch_err, sizeof(batch_err));
+            rc = cycle_count < 1;
+        } else if (plain_count) {
+            rc = ds4_sessions_eval_batch(items, plain_count, batch_err, sizeof(batch_err));
+        }
+        if (rc == 0 && count == 1 && plain_count) ds4_session_keep_candidates(items[0].session);
         for (int i = 0; i < plain_count; i++) {
             accepted[i][0] = items[i].token;
             n_accepted[i] = 1;
         }
-        if (rc == 0 && count > plain_count)
+        if (rc == 0 && count > plain_count)   /* one group or the other: V4.1's rows are plain_count */
             rc = ds4_sessions_eval_batch_speculative_argmax(items + plain_count, count - plain_count,
                     accepted + plain_count, n_accepted + plain_count, batch_err, sizeof(batch_err));
         if (rc != 0)
@@ -14108,9 +14185,9 @@ static void *decode_worker_main(void *arg) {
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: decode batch count=%d elapsed=%.3f ms status=%s",
+                       "ds4-server: decode batch count=%d elapsed=%.3f ms status=%s block=%d at=%.3f ready=%d states=%s",
                        count, (now_sec() - batch_t0) * 1000.0,
-                       rc == 0 ? "ok" : "error");
+                       rc == 0 ? "ok" : "error", cycle ? cycle_count : 0, now_sec(), ready, states);
         }
 
         pthread_mutex_lock(&s->model_mu);
@@ -14120,8 +14197,11 @@ static void *decode_worker_main(void *arg) {
             slot->decode_in_flight = false;
             slot->decode_rc = rc;
             if (rc == 0) {
-                slot->decode_accepted_count = n_accepted[i];
-                memcpy(slot->decode_accepted, accepted[i], (size_t)n_accepted[i] * sizeof(int));
+                const bool own = cycle && i == cycle_member;
+                slot->decode_accepted_count = own ? cycle_count : n_accepted[i];
+                slot->decode_carry = own ? cycle_carry : -1;
+                memcpy(slot->decode_accepted, own ? cycle_tokens : accepted[i],
+                       (size_t)slot->decode_accepted_count * sizeof(int));
             }
             if (rc != 0) {
                 snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
@@ -14703,6 +14783,7 @@ decode_again:
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
+    int carry = -1;   /* MIXED_STEP: a block's correction, this loop's next token */
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
@@ -14742,11 +14823,12 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
+        int token = carry >= 0 ? carry : j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
                                             j->req.think_mode) :
             ds4_session_sample(slot->session, temperature, top_k,
                                top_p, min_p, &rng);
+        carry = -1;
         if (token < 0) {
             finish = "error";
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
@@ -14765,11 +14847,18 @@ decode_again:
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
         /* --serial-reasoning: every V4.1 reasoning span decodes serially. */
-        if (!s->batched_mode && !slot->utility &&
+        const bool drafts = !slot->utility &&
             !(thinking.inside && s->serial_reasoning && ds4_engine_is_deepseek41(s->engine)) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
-        {
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (s->batched_mode && drafts && ds4_engine_is_deepseek41(s->engine)) {
+            const decode_cycle cycle = {max_tokens - completion, eos_token, top_k, j->req.ignore_eos, j->req.think_mode,
+                                        temperature, top_p, min_p, &rng};
+            if (server_eval_cycle(s, slot, token, &cycle, toks, &ntok, &carry, err, sizeof(err)) != 0) {
+                finish = "error";
+                break;
+            }
+        } else if (!s->batched_mode && drafts) {
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
@@ -15023,13 +15112,16 @@ decode_again:
                 !dsml_decode_state_uses_payload_sampling(dsml_tracker.decode);
             /* Opportunistic drafts are greedy under both parser modes.
              * Only exact sampling changes their acceptance distribution. */
-            if (ti + 1 < ntok && ds4_engine_mtp_exact_sampling(s->engine) &&
-                payload_temperature > 0.0f &&
+            if (ds4_engine_mtp_exact_sampling(s->engine) && payload_temperature > 0.0f &&
                 next_greedy != greedy_tool_syntax) {
-                resample = true;
-                break;
+                carry = -1;   /* drawn in the other mode */
+                if (ti + 1 < ntok) {
+                    resample = true;
+                    break;
+                }
             }
         }
+        if (kept < ntok) carry = -1;
         if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
             int pos = block_start + kept;
             const double rewind_t0 = now_sec();
@@ -16975,7 +17067,7 @@ int main(int argc, char **argv) {
                    server_prefill_quantum_for(&s, false),
                    server_prefill_quantum_for(&s, true),
                    server_decode_coalesce_us());
-        if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp) {
+        if (ds4_engine_mtp_draft_tokens(engine) > 1 && !s.qwen4_batch_mtp && !ds4_engine_is_deepseek41(engine)) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }

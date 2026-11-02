@@ -705,6 +705,26 @@ extern char **environ;
  *       [set=NAME=VALUE ...] [unset=NAME ...] [warm=1] [fixture=PATH] [state=1] [dump=PATH]
  *                                           restore the current frontier, apply the
  *                                           environment changes, reset the RNG, decode
+ *   vbits label=L tokens=N block=K [tail=M] [seed=S] [off=HEX] [off2=HEX]
+ *                                           a serial chain from the frontier, then the same tokens as
+ *                                           verify blocks of K rows, each row's logits against serial, the
+ *                                           session state against serial's, and M serial tokens after them
+ *   mbits label=L rows=K tokens=N block=B [first=I] [reject=1] [seed=S] [temp=T] [lead=S] [join=J] [leave=J]
+ *                                     [hold=M] [off=HEX] [off2=HEX]
+ *                                           K frontiers: serial chains drawn with the session's sampler, then the same
+ *                                           tokens in steps where one session holds a block of B rows beside the
+ *                                           others' rows, rotating (B=1: plain rows), every row, draw and final state
+ *                                           against serial. reject=1: each block keeps a random prefix, the rest other
+ *                                           tokens. lead=S: no block before step S; join=J: row r arrives at step r*J;
+ *                                           leave=J: row r stops r*J tokens early; hold=M: rows from M on never hold
+ *   mcyc label=L rows=K tokens=N [first=I] [seed=S] [mixed=0] [off=HEX] [off2=HEX]
+ *                                           K frontiers through the server's step: sampled at temperature 1, one
+ *                                           drafted block a step, rotating, a correction carried to the next step,
+ *                                           then each stream's tokens serially: final logits and state against that.
+ *                                           mixed=0: plain rows only, for the same streams' time
+ *   ptail label=L tokens=N [seed=S] [set=NAME=VALUE ...] [unset=NAME ...]
+ *                                           a serial chain from the frontier, then the same tokens as a
+ *                                           prompt sync, the last logits and session state against serial's
  *   session idx=I ctx=C                     make session I (1..8, created or resized to ctx C)
  *                                           current; save, load and run then act on it
  *   nrun label=L rows=K tokens=N [first=I] [hash=1] [live=1] [off=HEX] [off2=HEX] [set=NAME=VALUE ...] [unset=NAME ...] [warm=1]
@@ -732,6 +752,7 @@ extern char **environ;
 #define BENCH_CACHE_CONTRACT "v41-prefix-1"
 #define BENCH_JOB_COUNTERS 19
 #define BENCH_MAX_SESSIONS 9   /* [0] is the main session; 1..8 are the rows of an nrun */
+#define DS4_BENCH_ROWS 8
 
 typedef struct {
     char path[PATH_MAX];
@@ -921,6 +942,413 @@ static uint64_t job_switch(char **kv, int n, char *env_desc, size_t env_cap, uin
     *base = base_off;
     return run_off;
 }
+
+#ifdef BENCH_V41_OFF
+/* softmax at temperature 1 into p, doubles */
+static void vbits_softmax(const float *l, int n, double *p) {
+    double top = l[0], sum = 0;
+    for (int i = 1; i < n; i++) if (l[i] > top) top = l[i];
+    for (int i = 0; i < n; i++) sum += p[i] = exp((double)l[i] - top);
+    for (int i = 0; i < n; i++) p[i] /= sum;
+}
+
+/* One vbits: from the frontier a serial chain sampled at temperature 1 with every step's logits, then the same tokens
+ * through verify blocks of K rows, each row's logits against serial bit for bit, with KL and NLL where they differ. */
+static int job_vbits(char **kv, int n, int job, ds4_session *s, ds4_session_snapshot *snap, float *logits, int cap) {
+    char err[256] = "", env_desc[256] = "";
+    const char *v, *label = job_get(kv, n, "label");
+    const int tokens = (v = job_get(kv, n, "tokens")) ? atoi(v) : 96;
+    const int block = (v = job_get(kv, n, "block")) ? atoi(v) : 6;
+    const int tail = (v = job_get(kv, n, "tail")) ? atoi(v) : 32;
+    uint64_t rng = (v = job_get(kv, n, "seed")) ? strtoull(v, NULL, 10) : 7, base;
+    job_switch(kv, n, env_desc, sizeof(env_desc), &base);
+    if (ds4_session_load_snapshot(s, snap, err, sizeof(err)) != 0) goto fail;
+    const int vocab = ds4_session_copy_logits(s, logits, cap);
+    const int total = tokens + tail;
+    float *serial = malloc((size_t)total * vocab * sizeof(float)), *rows = malloc((size_t)block * vocab * sizeof(float));
+    double *ps = malloc((size_t)vocab * sizeof(double)), *pr = malloc((size_t)vocab * sizeof(double));
+    int *chain = malloc((size_t)total * sizeof(int));
+    double *block_kl = calloc((size_t)tokens / block + 1, sizeof(double));
+    ds4_session_snapshot at_serial = {0}, at_verify = {0};
+    uint64_t state_bytes = 0, state_first = UINT64_MAX, tail_bad = 0;
+    double tail_kl = 0, tail_bins[8] = {0}, first_block[16] = {0};
+    uint64_t row_bad[16] = {0}, h = 1469598103934665603ull, bad_floats = 0, bad_rows = 0, checked = 0;
+    double kl = 0, nll = 0, kl_max = 0, row_kl[16] = {0};
+    int first_bad = -1, rc = 1;
+    for (int t = 0; t < total; t++) {
+        if (t == tokens && ds4_session_save_snapshot(s, &at_serial, err, sizeof(err)) != 0) goto done;
+        vbits_softmax(logits, vocab, ps);
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        double u = (double)(rng >> 11) / 9007199254740992.0;
+        int pick = vocab - 1;
+        for (int i = 0; i < vocab; i++) if ((u -= ps[i]) < 0) { pick = i; break; }
+        chain[t] = pick;
+        if (ds4_session_eval(s, pick, err, sizeof(err)) != 0) goto done;
+        ds4_session_copy_logits(s, logits, cap);
+        memcpy(serial + (size_t)t * vocab, logits, (size_t)vocab * sizeof(float));
+        for (int i = 0; i < vocab; i++) { uint32_t u32; memcpy(&u32, &logits[i], 4); h = (h ^ u32) * 1099511628211ull; }
+    }
+    if (ds4_session_load_snapshot(s, snap, err, sizeof(err)) != 0) goto done;
+    for (int t = 0; t + block <= tokens; t += block) {
+        if (ds4_test_ds41_verify_tokens(s, chain + t, block, rows, err, sizeof(err)) != 0) goto done;
+        for (int r = 0; r < block; r++) {
+            const float *a = serial + (size_t)(t + r) * vocab, *b = rows + (size_t)r * vocab;
+            int bad = 0;
+            for (int i = 0; i < vocab; i++) bad += memcmp(&a[i], &b[i], 4) != 0;
+            checked++;
+            if (!bad) continue;
+            bad_rows++; bad_floats += bad; if (r < 16) row_bad[r]++;
+            if (first_bad < 0) first_bad = t + r;
+            vbits_softmax(a, vocab, ps); vbits_softmax(b, vocab, pr);
+            double one = 0;
+            for (int i = 0; i < vocab; i++) if (ps[i] > 0 && pr[i] > 0) one += ps[i] * log(ps[i] / pr[i]);
+            kl += one; if (one > kl_max) kl_max = one;
+            if (r < 16) row_kl[r] += one;
+            block_kl[t / block] += one / block;
+            if (t == 0 && r < 16) first_block[r] = one;
+            if (t + r + 1 < tokens) nll += log(ps[chain[t + r + 1]] / pr[chain[t + r + 1]]);
+        }
+    }
+    if (ds4_session_save_snapshot(s, &at_verify, err, sizeof(err)) != 0) goto done;
+    for (uint64_t i = 0; i < at_serial.len && i < at_verify.len; i++)
+        if (at_serial.ptr[i] != at_verify.ptr[i]) { state_bytes++; if (state_first == UINT64_MAX) state_first = i; }
+    /* serial decode from here: does what the blocks committed reach later tokens? */
+    for (int t = tokens; t < total; t++) {
+        if (ds4_session_eval(s, chain[t], err, sizeof(err)) != 0) goto done;
+        ds4_session_copy_logits(s, logits, cap);
+        const float *a = serial + (size_t)t * vocab;
+        if (!memcmp(a, logits, (size_t)vocab * sizeof(float))) continue;
+        tail_bad++;
+        vbits_softmax(a, vocab, ps); vbits_softmax(logits, vocab, pr);
+        double one = 0;
+        for (int i = 0; i < vocab; i++) if (ps[i] > 0 && pr[i] > 0) one += ps[i] * log(ps[i] / pr[i]);
+        tail_kl += one;
+        tail_bins[(t - tokens) / 32 < 8 ? (t - tokens) / 32 : 7] += one / 32;
+    }
+    fprintf(stderr, "vbits %s block=%d rows=%llu bad=%llu first_bad=%d bad_floats=%llu kl_mean=%.3e kl_max=%.3e nll_mean=%.3e serial=%016llx by_row=",
+            label ? label : "", block, (unsigned long long)checked, (unsigned long long)bad_rows, first_bad,
+            (unsigned long long)bad_floats, kl / (double)(checked ? checked : 1), kl_max, nll / (double)(checked ? checked : 1),
+            (unsigned long long)h);
+    for (int r = 0; r < block && r < 16; r++) fprintf(stderr, "%s%llu", r ? "," : "", (unsigned long long)row_bad[r]);
+    fputs(" kl_by_row=", stderr);
+    for (int r = 0; r < block && r < 16; r++) fprintf(stderr, "%s%.2e", r ? "," : "", row_kl[r] / (tokens / block));
+    fputs(" kl_by_block=", stderr);
+    for (int b = 0; b < tokens / block; b++) fprintf(stderr, "%s%.2e", b ? "," : "", block_kl[b]);
+    fprintf(stderr, " state_bytes=%llu of %llu first=%lld tail_bad=%llu of %d tail_kl_mean=%.3e",
+            (unsigned long long)state_bytes, (unsigned long long)at_serial.len,
+            state_first == UINT64_MAX ? -1ll : (long long)state_first, (unsigned long long)tail_bad, tail,
+            tail ? tail_kl / tail : 0);
+    fputs(" first_block=", stderr);
+    for (int r = 0; r < block && r < 16; r++) fprintf(stderr, "%s%.2e", r ? "," : "", first_block[r]);
+    fputs(" tail_bins=", stderr);
+    for (int b = 0; b < 8 && b * 32 < tail; b++) fprintf(stderr, "%s%.2e", b ? "," : "", tail_bins[b]);
+    fputc('\n', stderr);
+    rc = 0;
+done:
+    free(serial); free(rows); free(ps); free(pr); free(chain); free(block_kl);
+    ds4_session_snapshot_free(&at_serial);
+    ds4_session_snapshot_free(&at_verify);
+    if (!rc) return 0;
+fail:
+    fprintf(stderr, "ds4-bench: job %d: vbits failed: %s\n", job, err);
+    return 1;
+}
+
+static int cmp_ns(const void *a, const void *b) {
+    const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* One mbits: see the job list. A step is timed only when every row is in it and the block is full. */
+static int job_mbits(char **kv, int n, int job, ds4_session **sessions, ds4_session_snapshot *snaps, const bool *have,
+                     float *logits, int cap) {
+    char err[256] = "", env_desc[2048] = "";
+    const char *v, *label = job_get(kv, n, "label");
+    const int first = (v = job_get(kv, n, "first")) ? atoi(v) : 1;
+    const int rows = (v = job_get(kv, n, "rows")) ? atoi(v) : 2;
+    const int tokens = (v = job_get(kv, n, "tokens")) ? atoi(v) : 96;
+    const int block = (v = job_get(kv, n, "block")) ? atoi(v) : 6;
+    const bool reject = (v = job_get(kv, n, "reject")) && atoi(v);
+    const float temp = (v = job_get(kv, n, "temp")) ? (float)atof(v) : 1.0f;
+    const int lead = (v = job_get(kv, n, "lead")) ? atoi(v) : 0;
+    const int join = (v = job_get(kv, n, "join")) ? atoi(v) : 0;
+    const int leave = (v = job_get(kv, n, "leave")) ? atoi(v) : 0;
+    const int hold = (v = job_get(kv, n, "hold")) ? atoi(v) : rows;
+    const uint64_t seed = (v = job_get(kv, n, "seed")) ? strtoull(v, NULL, 10) : 7;
+    uint64_t rng = seed * 2654435761u + 1, base, sampler[BENCH_MAX_SESSIONS], kg0[4], kg1[4];
+    if (rows < 1 || first < 1 || first + rows > BENCH_MAX_SESSIONS || block < 1 || block > 6) goto fail;
+    job_switch(kv, n, env_desc, sizeof(env_desc), &base);
+    float *serial[BENCH_MAX_SESSIONS] = {0}, *blk = NULL;
+    int *chain[BENCH_MAX_SESSIONS] = {0}, pos[BENCH_MAX_SESSIONS] = {0}, end[BENCH_MAX_SESSIONS], vocab = 0, next = 0, rc = 1, timed = 0;
+    int first_bad[BENCH_MAX_SESSIONS], row_bad[BENCH_MAX_SESSIONS] = {0}, first_step = -1;
+    memset(first_bad, 0xff, sizeof(first_bad));
+    ds4_session_snapshot at_serial[BENCH_MAX_SESSIONS] = {{0}};
+    uint64_t *ns = malloc((size_t)tokens * rows * sizeof(uint64_t)), bad = 0, draws = 0, checked = 0, state = 0, steps = 0, mixed = 0;
+    for (int r = 0; r < rows; r++) {
+        ds4_session *s = sessions[first + r];
+        uint64_t draw = seed + (uint64_t)r;
+        end[r] = tokens - r * leave;
+        if (!s || !have[first + r] || ds4_session_load_snapshot(s, &snaps[first + r], err, sizeof(err)) != 0) goto done;
+        vocab = ds4_session_copy_logits(s, logits, cap);
+        if (!blk) blk = malloc((size_t)DS4_BENCH_ROWS * vocab * sizeof(float));
+        serial[r] = malloc((size_t)tokens * vocab * sizeof(float));
+        chain[r] = malloc((size_t)tokens * sizeof(int));
+        for (int t = 0; t < end[r]; t++) {
+            const int pick = ds4_session_sample(s, temp, 0, 1.0f, 0.0f, &draw);
+            chain[r][t] = pick;
+            if (pick < 0 || ds4_session_eval(s, pick, err, sizeof(err)) != 0) goto done;
+            ds4_session_copy_logits(s, logits, cap);
+            memcpy(serial[r] + (size_t)t * vocab, logits, (size_t)vocab * sizeof(float));
+        }
+        if (ds4_session_save_snapshot(s, &at_serial[r], err, sizeof(err)) != 0 ||
+            ds4_session_load_snapshot(s, &snaps[first + r], err, sizeof(err)) != 0) goto done;
+        sampler[r] = seed + (uint64_t)r;
+        (void)ds4_session_sample(s, temp, 0, 1.0f, 0.0f, &sampler[r]);   /* as a slot does before its first step */
+    }
+    ds4_keyed_gpu_counts(kg0);
+    for (;;) {
+        ds4_decode_item others[BENCH_MAX_SESSIONS];
+        int who[BENCH_MAX_SESSIONS], n_others = 0, b = -1, k = 1, keep = 1, toks[DS4_BENCH_ROWS];
+        for (int i = 0; i < hold && block > 1 && (int)steps >= lead; i++) {   /* the block rotates among rows with room for one */
+            const int r = (next + i) % hold;
+            if ((int)steps >= r * join && end[r] - pos[r] >= 2) { b = r; next = r + 1; break; }
+        }
+        for (int r = 0; r < rows; r++) if (r != b && (int)steps >= r * join && pos[r] < end[r]) {
+            who[n_others] = r;
+            others[n_others].session = sessions[first + r];
+            others[n_others++].token = chain[r][pos[r]];
+        }
+        if (b < 0 && !n_others) {
+            int left = 0;
+            for (int r = 0; r < rows; r++) left += pos[r] < end[r];
+            if (!left) break;
+            steps++;    /* a row yet to arrive */
+            continue;
+        }
+        if (b >= 0) {
+            k = block < end[b] - pos[b] ? block : end[b] - pos[b];
+            if (k + n_others > DS4_BENCH_ROWS) k = DS4_BENCH_ROWS - n_others;
+            keep = k;
+            if (reject) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; keep = 1 + (int)(rng % (uint64_t)k); }
+            for (int i = 0; i < k; i++)
+                toks[i] = i < keep ? chain[b][pos[b] + i] : (chain[b][pos[b] + i] + 1 + i) % vocab;
+        }
+        const bool full = n_others + (b >= 0) == rows && (b < 0 || k == block);
+        const uint64_t t0 = bench_now_ns();
+        int stat = 0;
+        ds4_session *hold_s = b >= 0 ? sessions[first + b] : NULL;
+        if (b >= 0 && k > 1 && n_others) stat = ds4_test_ds41_mixed_tokens(hold_s, toks, k, keep, blk, others, n_others, err, sizeof(err));
+        else if (b >= 0 && k > 1 && keep == k) stat = ds4_test_ds41_verify_tokens(hold_s, toks, k, blk, err, sizeof(err));
+        else if (b >= 0 && !n_others) stat = ds4_session_eval(hold_s, toks[0], err, sizeof(err)), keep = k = 1;
+        else if (b >= 0) {                                       /* a row short of a block, or none fits */
+            others[n_others].session = hold_s;
+            others[n_others].token = toks[0];
+            who[n_others++] = b;
+            b = -1;
+            stat = ds4_sessions_eval_batch(others, n_others, err, sizeof(err));
+        } else if (n_others > 1) stat = ds4_sessions_eval_batch(others, n_others, err, sizeof(err));
+        else stat = ds4_session_eval(others[0].session, others[0].token, err, sizeof(err));
+        const uint64_t dt = bench_now_ns() - t0;
+        if (stat) goto done;
+        if (b >= 0 && k == 1) ds4_session_copy_logits(hold_s, blk, vocab);
+        steps++;
+        mixed += b >= 0 && n_others;
+        if (full && steps > 4) ns[timed++] = dt;
+        for (int i = 0; b >= 0 && i < keep; i++) {
+            checked++;
+            if (!memcmp(blk + (size_t)i * vocab, serial[b] + (size_t)(pos[b] + i) * vocab, (size_t)vocab * sizeof(float))) continue;
+            bad++;
+            row_bad[b]++;
+            if (first_bad[b] < 0) first_bad[b] = pos[b] + i;
+            if (first_step < 0) first_step = (int)steps;
+        }
+        for (int i = 0; i < n_others; i++) {
+            const int r = who[i];
+            ds4_session_copy_logits(sessions[first + r], logits, cap);
+            checked++;
+            if (memcmp(logits, serial[r] + (size_t)pos[r] * vocab, (size_t)vocab * sizeof(float))) {
+                bad++;
+                row_bad[r]++;
+                if (first_bad[r] < 0) first_bad[r] = pos[r];
+                if (first_step < 0) first_step = (int)steps;
+            }
+            if (++pos[r] < end[r] && ds4_session_sample(sessions[first + r], temp, 0, 1.0f, 0.0f, &sampler[r]) != chain[r][pos[r]]) draws++;
+        }
+        if (b >= 0 && (pos[b] += keep) < end[b] && ds4_session_sample(hold_s, temp, 0, 1.0f, 0.0f, &sampler[b]) != chain[b][pos[b]]) draws++;
+    }
+    ds4_keyed_gpu_counts(kg1);
+    for (int r = 0; r < rows; r++) {
+        ds4_session_snapshot at = {0};
+        if (ds4_session_save_snapshot(sessions[first + r], &at, err, sizeof(err)) != 0) goto done;
+        for (uint64_t i = 0; i < at.len && i < at_serial[r].len; i++) state += at.ptr[i] != at_serial[r].ptr[i];
+        if (at.len != at_serial[r].len) state++;
+        ds4_session_snapshot_free(&at);
+    }
+    qsort(ns, (size_t)timed, sizeof(*ns), cmp_ns);
+    double mean = 0;
+    for (int i = 0; i < timed; i++) mean += (double)ns[i] / 1e6;
+    fprintf(stderr, "mbits %s rows=%d block=%d reject=%d steps=%llu mixed=%llu checked=%llu bad=%llu draws_bad=%llu first_bad_step=%d state_bytes=%llu keyed_gpu=%llu timed=%d median_ms=%.3f p90_ms=%.3f mean_ms=%.3f\n",
+            label ? label : "", rows, block, reject, (unsigned long long)steps, (unsigned long long)mixed, (unsigned long long)checked,
+            (unsigned long long)bad, (unsigned long long)draws, first_step, (unsigned long long)state, (unsigned long long)(kg1[0] - kg0[0]), timed,
+            timed ? (double)ns[timed / 2] / 1e6 : 0.0, timed ? (double)ns[timed * 9 / 10] / 1e6 : 0.0, timed ? mean / timed : 0.0);
+    for (int r = 0; r < rows; r++) if (row_bad[r]) fprintf(stderr, "mbits %s row %d: bad=%d first=%d end_pos=%d\n", label ? label : "", r, row_bad[r], first_bad[r], ds4_session_pos(sessions[first + r]));
+    rc = 0;
+done:
+    for (int r = 0; r < BENCH_MAX_SESSIONS; r++) { free(serial[r]); free(chain[r]); ds4_session_snapshot_free(&at_serial[r]); }
+    free(blk); free(ns);
+    if (!rc) return 0;
+fail:
+    fprintf(stderr, "ds4-bench: job %d: mbits failed: %s\n", job, err);
+    return 1;
+}
+
+/* One mcyc: see the job list. */
+static int job_mcyc(char **kv, int n, int job, ds4_session **sessions, ds4_session_snapshot *snaps, const bool *have,
+                    int eos, float *logits, int cap) {
+    char err[256] = "", env_desc[2048] = "";
+    const char *v, *label = job_get(kv, n, "label");
+    const int first = (v = job_get(kv, n, "first")) ? atoi(v) : 1;
+    const int rows = (v = job_get(kv, n, "rows")) ? atoi(v) : 2;
+    const int tokens = (v = job_get(kv, n, "tokens")) ? atoi(v) : 256;
+    const bool mixed = !(v = job_get(kv, n, "mixed")) || atoi(v);
+    const uint64_t seed = (v = job_get(kv, n, "seed")) ? strtoull(v, NULL, 10) : 7;
+    uint64_t base, rng[BENCH_MAX_SESSIONS], state = 0, steps = 0, blocks = 0, carries = 0, drafted = 0, ns = 0;
+    if (rows < 1 || first < 1 || first + rows > BENCH_MAX_SESSIONS) {
+        fprintf(stderr, "ds4-bench: job %d: mcyc needs rows inside sessions 1..%d\n", job, BENCH_MAX_SESSIONS - 1);
+        return 1;
+    }
+    job_switch(kv, n, env_desc, sizeof(env_desc), &base);
+    int *chain[BENCH_MAX_SESSIONS] = {0}, len[BENCH_MAX_SESSIONS] = {0}, next[BENCH_MAX_SESSIONS], rc = 1, turn = rows - 1, bad = 0, vocab = 0;
+    float *final = malloc((size_t)rows * cap * sizeof(float));
+    ds4_session_snapshot at[BENCH_MAX_SESSIONS] = {{0}};
+    for (int r = 0; r < rows; r++) {
+        ds4_session *s = sessions[first + r];
+        rng[r] = seed + (uint64_t)r;
+        chain[r] = malloc(((size_t)tokens + 32) * sizeof(int));
+        if (!s || !have[first + r] || ds4_session_load_snapshot(s, &snaps[first + r], err, sizeof(err)) != 0) goto done;
+        next[r] = ds4_session_sample(s, 1.0f, 0, 1.0f, 0.0f, &rng[r]);
+    }
+    for (;;) {
+        ds4_decode_item items[BENCH_MAX_SESSIONS];
+        int who[BENCH_MAX_SESSIONS], count = 0, block = -1, got[17], carry = -1, kept = 0;
+        for (int r = 0; r < rows; r++) if (len[r] < tokens) {
+            who[count] = r;
+            items[count].session = sessions[first + r];
+            items[count++].token = next[r];
+        }
+        if (!count) break;
+        for (int i = 1; mixed && i <= rows && block < 0; i++) {
+            const int r = (turn + i) % rows;
+            for (int m = 0; m < count; m++)
+                if (who[m] == r && ds4_session_cycle_ready(items[m].session, items[m].token, 16, eos)) { block = m; turn = r; }
+        }
+        const uint64_t t0 = bench_now_ns();
+        if (count == 1 && block >= 0) {
+            kept = ds4_session_eval_speculative(items[0].session, items[0].token, 16, eos, 1.0f, 0, 1.0f, 0.0f, &rng[who[0]], got, 17, err, sizeof(err));
+            if (kept < 1) goto done;
+        } else if (block >= 0) {
+            kept = ds4_sessions_eval_mixed(items, count, block, 16, eos, false, DS4_THINK_HIGH, 1.0f, 0, 1.0f, 0.0f, &rng[who[block]], got, &carry, err, sizeof(err));
+            if (kept < 1) goto done;
+        } else if (ds4_sessions_eval_mixed(items, count, -1, 0, 0, false, DS4_THINK_HIGH, 0, 0, 0, 0, NULL, NULL, NULL, err, sizeof(err)) < 0) goto done;
+        ns += bench_now_ns() - t0;
+        steps++;
+        blocks += block >= 0 && kept > 1;
+        carries += carry >= 0;
+        for (int m = 0; m < count; m++) {
+            const int r = who[m];
+            if (m == block) {
+                drafted += (uint64_t)kept - 1;
+                for (int i = 0; i < kept; i++) chain[r][len[r]++] = got[i];
+            } else chain[r][len[r]++] = items[m].token;
+            next[r] = m == block && carry >= 0 ? carry : ds4_session_sample(items[m].session, 1.0f, 0, 1.0f, 0.0f, &rng[r]);
+        }
+    }
+    for (int r = 0; r < rows; r++) {
+        ds4_session *s = sessions[first + r];
+        vocab = ds4_session_copy_logits(s, final + (size_t)r * cap, cap);
+        if (ds4_session_save_snapshot(s, &at[r], err, sizeof(err)) != 0 ||
+            ds4_session_load_snapshot(s, &snaps[first + r], err, sizeof(err)) != 0) goto done;
+        for (int t = 0; t < len[r]; t++) if (ds4_session_eval(s, chain[r][t], err, sizeof(err)) != 0) goto done;
+        ds4_session_copy_logits(s, logits, cap);
+        bad += memcmp(logits, final + (size_t)r * cap, (size_t)vocab * sizeof(float)) != 0;
+        ds4_session_snapshot end = {0};
+        if (ds4_session_save_snapshot(s, &end, err, sizeof(err)) != 0) goto done;
+        for (uint64_t i = 0; i < end.len && i < at[r].len; i++) state += end.ptr[i] != at[r].ptr[i];
+        if (end.len != at[r].len) state++;
+        ds4_session_snapshot_free(&end);
+    }
+    uint64_t total = 0;
+    for (int r = 0; r < rows; r++) total += (uint64_t)len[r];
+    fprintf(stderr, "mcyc %s rows=%d mixed=%d tokens=%llu steps=%llu blocks=%llu carries=%llu drafted=%llu bad_logits=%d state_bytes=%llu tps=%.2f ms_per_step=%.2f\n",
+            label ? label : "", rows, mixed, (unsigned long long)total, (unsigned long long)steps, (unsigned long long)blocks, (unsigned long long)carries,
+            (unsigned long long)drafted, bad, (unsigned long long)state, (double)total * 1e9 / (double)ns, (double)ns / 1e6 / (double)steps);
+    rc = 0;
+done:
+    if (rc) fprintf(stderr, "ds4-bench: job %d: mcyc failed: %s\n", job, err);
+    for (int r = 0; r < BENCH_MAX_SESSIONS; r++) { free(chain[r]); ds4_session_snapshot_free(&at[r]); }
+    free(final);
+    return rc;
+}
+
+/* One ptail: a chain sampled at temperature 1 through serial decode, then the same tokens as a prompt sync (a short
+ * prefill under 256), the last logits and the session state against serial's. */
+static int job_ptail(char **kv, int n, int job, ds4_session *s, ds4_session_snapshot *snap, float *logits, int cap) {
+    char err[256] = "", env_desc[256] = "";
+    const char *v, *label = job_get(kv, n, "label");
+    const int tokens = (v = job_get(kv, n, "tokens")) ? atoi(v) : 8;
+    uint64_t rng = (v = job_get(kv, n, "seed")) ? strtoull(v, NULL, 10) : 7, base;
+    job_switch(kv, n, env_desc, sizeof(env_desc), &base);
+    if (ds4_session_load_snapshot(s, snap, err, sizeof(err)) != 0) goto fail;
+    const int vocab = ds4_session_copy_logits(s, logits, cap);
+    float *serial = malloc((size_t)vocab * sizeof(float));
+    double *ps = malloc((size_t)vocab * sizeof(double)), *pr = malloc((size_t)vocab * sizeof(double));
+    ds4_session_snapshot at_serial = {0}, at_sync = {0};
+    ds4_tokens prompt = {0};
+    const ds4_tokens *have = ds4_session_tokens(s);
+    for (int i = 0; i < have->len; i++) ds4_tokens_push(&prompt, have->v[i]);
+    int rc = 1;
+    for (int t = 0; t < tokens; t++) {
+        vbits_softmax(logits, vocab, ps);
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        double u = (double)(rng >> 11) / 9007199254740992.0;
+        int pick = vocab - 1;
+        for (int i = 0; i < vocab; i++) if ((u -= ps[i]) < 0) { pick = i; break; }
+        ds4_tokens_push(&prompt, pick);
+        if (ds4_session_eval(s, pick, err, sizeof(err)) != 0) goto done;
+        ds4_session_copy_logits(s, logits, cap);
+    }
+    memcpy(serial, logits, (size_t)vocab * sizeof(float));
+    if (ds4_session_save_snapshot(s, &at_serial, err, sizeof(err)) != 0 ||
+        ds4_session_load_snapshot(s, snap, err, sizeof(err)) != 0 ||
+        ds4_session_sync(s, &prompt, err, sizeof(err)) != 0) goto done;
+    ds4_session_copy_logits(s, logits, cap);
+    if (ds4_session_save_snapshot(s, &at_sync, err, sizeof(err)) != 0) goto done;
+    uint64_t bad = 0, state_bytes = 0;
+    int top_s = 0, top_p = 0;
+    double kl = 0;
+    for (int i = 0; i < vocab; i++) {
+        bad += memcmp(&serial[i], &logits[i], 4) != 0;
+        if (serial[i] > serial[top_s]) top_s = i;
+        if (logits[i] > logits[top_p]) top_p = i;
+    }
+    vbits_softmax(serial, vocab, ps); vbits_softmax(logits, vocab, pr);
+    for (int i = 0; i < vocab; i++) if (ps[i] > 0 && pr[i] > 0) kl += ps[i] * log(ps[i] / pr[i]);
+    for (uint64_t i = 0; i < at_serial.len && i < at_sync.len; i++) state_bytes += at_serial.ptr[i] != at_sync.ptr[i];
+    fprintf(stderr, "ptail %s tokens=%d bad_floats=%llu kl=%.3e flip=%d state_bytes=%llu of %llu\n", label ? label : "",
+            tokens, (unsigned long long)bad, kl, top_s != top_p, (unsigned long long)state_bytes,
+            (unsigned long long)at_serial.len);
+    rc = 0;
+done:
+    free(serial); free(ps); free(pr);
+    ds4_tokens_free(&prompt);
+    ds4_session_snapshot_free(&at_serial);
+    ds4_session_snapshot_free(&at_sync);
+    if (!rc) return 0;
+fail:
+    fprintf(stderr, "ds4-bench: job %d: ptail failed: %s\n", job, err);
+    return 1;
+}
+#endif
 
 static int cmp_u64(const void *a, const void *b) {
     const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -1413,6 +1841,24 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
             fflush(jo);
             continue;
         }
+#ifdef BENCH_V41_OFF
+        if (!strcmp(verb, "vbits") && have_snap[cur]) {
+            if ((rc = job_vbits(kv, n, job, session, &snaps[cur], logits, logits_cap)) != 0) break;
+            continue;
+        }
+        if (!strcmp(verb, "mcyc")) {
+            if ((rc = job_mcyc(kv, n, job, sessions, snaps, have_snap, eos, logits, logits_cap)) != 0) break;
+            continue;
+        }
+        if (!strcmp(verb, "mbits")) {
+            if ((rc = job_mbits(kv, n, job, sessions, snaps, have_snap, logits, logits_cap)) != 0) break;
+            continue;
+        }
+        if (!strcmp(verb, "ptail") && have_snap[cur]) {
+            if ((rc = job_ptail(kv, n, job, session, &snaps[cur], logits, logits_cap)) != 0) break;
+            continue;
+        }
+#endif
         if (strcmp(verb, "run") != 0 || !have_snap[cur]) {
             fprintf(stderr, "ds4-bench: job %d: unknown verb %s or run before save/load\n", job, verb);
             rc = 1;
@@ -1452,6 +1898,7 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
             break;
         }
         /* Quiescent boundary: restore the frontier, then switch the arm. */
+        fprintf(stderr, "ds4-bench: job %d: run %s\n", job, label ? label : "");
         const uint64_t t0 = bench_now_ns();
         if (ds4_session_load_snapshot(session, &snaps[cur], err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: job %d: restore failed: %s\n", job, err);

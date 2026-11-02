@@ -229,6 +229,8 @@ static const char *ss_category(const char *key) {
 }
 
 static bool ss_compat_key(const char *key) {
+    /* mbits rows need no drafter features: a frontier saved without the drafter loads beside it */
+    if (getenv("DS4_SNAPSTORE_ANY_DRAFTER") && (!strcmp(key, "drafter") || !strcmp(key, "armed"))) return false;
     static const char *keys[] = {"contract", "payload_version", "model", "drafter", "armed", "ctx",
                                  "prefill_chunk", "vocab", "prefill_repr", "prefill_values", "canary"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(*keys); i++) if (!strcmp(key, keys[i])) return true;

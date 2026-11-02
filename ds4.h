@@ -531,6 +531,7 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+void ds4_session_keep_candidates(ds4_session *s);
 /* The V4.1 GPU top-p selector's sampling outcomes since process start: 0 decided, 1 heap mass short, 2 ambiguous,
  * 3 overflow, 4 invalid, 5 zero finite, 6 unbound, 7 settings outside temp 1 / top_k 0 / top_p 0.95 / min_p 0,
  * 8 stale (paths 1-8 fell back to the CPU sampler); and the decode steps that encoded it. */
@@ -541,15 +542,15 @@ void ds4_keyed_gpu_counts(uint64_t out[4]);
  * the GPU, 3 on the CPU, 4 verify blocks whose p was built on the GPU */
 void ds4_pq_gpu_counts(uint64_t out[5]);
 uint64_t ds4_sampler_gpu_encoded_count(void);
+/* Teacher-force a V4.1 verification block, returning logits after each token. */
+int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
+                                float *logits, char *err, size_t errlen);
 #ifdef DS4_TEST_HOOKS
 /* the selector's reference and production consumers on one summary (HDR: 64-byte header, P: 505 partials,
  * CAND: 2048 {float logit; uint32_t id}); the summary they leave is {int id; float logit, prob}[2048] */
 int ds4_test_selector_consume(const void *hdr, const float *P, const void *cand, const float *lg, uint64_t *rng, int *token);
 int ds4_test_selector_consume_fast(const void *hdr, const float *P, const void *cand, const float *lg, uint64_t *rng, int *token);
 const void *ds4_test_selector_summary(void);
-/* Teacher-force a V4.1 verification block, returning logits after each token. */
-int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
-                                float *logits, char *err, size_t errlen);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
@@ -604,6 +605,8 @@ typedef struct {
 /* Advance independent sessions by one token each. Batch size one is exactly
  * ds4_session_eval(). Backends without native batching use a correctness-first
  * sequential fallback. */
+int ds4_test_ds41_mixed_tokens(ds4_session *s, const int *tokens, int count, int keep, float *logits,
+                               ds4_decode_item *others, int n, char *err, size_t errlen);
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
 /* One speculative cycle for a batch of sessions (greedy acceptance, Qwen3.8
@@ -635,6 +638,16 @@ int ds4_session_eval_speculative_argmax_ignoring_eos(
  * Positive-temperature DSpark normally commits greedily verified draft
  * tokens; dspark_exact_sampling selects exact stochastic p/q acceptance for
  * DSpark or an internal GLM MTP block. */
+/* MIXED_STEP: one step for the sessions' next tokens. items[block], when block >= 0, may draft: its block shares the
+ * step with the others' rows and accepted receives what it commits (the return value, at least 1). A rejected draft's
+ * correction comes back in *carry, undecoded, or -1: it is the stream's next token, in place of a sample. block < 0:
+ * plain rows, returning 0. Either way each stream's controller counts its row. Negative on error. */
+bool ds4_engine_mixed_step(ds4_engine *e);
+bool ds4_session_cycle_ready(ds4_session *s, int first_token, int cap, int eos);
+char ds4_session_cycle_state(ds4_session *s, int first_token, int cap, int eos, int *backoff);
+int ds4_sessions_eval_mixed(ds4_decode_item *items, int count, int block, int cap, int eos, bool ignore_eos,
+                            ds4_think_mode think_mode, float temperature, int top_k, float top_p, float min_p,
+                            uint64_t *rng, int *accepted, int *carry, char *err, size_t errlen);
 int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  int max_tokens, int eos_token,
                                  float temperature, int top_k,

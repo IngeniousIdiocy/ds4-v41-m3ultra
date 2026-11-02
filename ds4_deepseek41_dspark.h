@@ -369,9 +369,11 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
 /* Cache appends beyond the accepted frontier are invisible. Only the six
  * overwritten raw-ring slots and pooling carries need rollback; no compressed
  * cache proportional to the context is copied. */
+/* others (MIXED_STEP): sessions whose next rows share the block's step, tokens after the block's */
 static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
-        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
-    if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
+        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count,
+        ds41_gpu_graph *const *others, uint32_t n_others) {
+    if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS || count + n_others > DS4_TP_BATCH_MAX_ROWS ||
         g->pos > g->ctx || count > g->ctx - g->pos || !ds41_tp_batch_enabled(g)) return false;
     /* Prepost the complete small-row exchange window, as in V4.0 verification.
      * Bulk-prefill handshakes at every attention/FFN gate are too expensive. */
@@ -381,11 +383,12 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         !ds4_tp_batch_block_begin_gates(g_tp_block_ctx, count, DS4_N_LAYER, &gates) ||
         gates != 2)) return false;
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
-    ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
+    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     bool ok = ds4_gpu_begin_commands();
     d->verify_start = g->pos;
     d->verify_count = 0;
     d->rewind_end = 0;
+    ds41_copy_level(true);
     for (uint32_t i = 0; ok && i <= DS41_VERIFY_ROWS; i++) {
         if (i >= count && i != DS41_VERIFY_ROWS) continue;
         const uint32_t slot = (g->pos + i) % DS41_DRAFT_WINDOW;
@@ -416,6 +419,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
             ok = ok && row->tp_logits_half;
         }
         row->verify_prefix = true;
+        row->kg_want = false;   /* a block's rows are not sampled from the keyed buffer */
         for (uint32_t owner = 0; owner < 4; owner++) {
             const uint64_t off = (i * 8u + owner * 2u) * kv;
             row->verify_previous_kv[owner] = pool_k[owner] ? pool_k[owner] :
@@ -437,8 +441,11 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
                     ds4_gpu_tensor_copy(row->verify_previous_score[owner], 0, g->previous_score[owner], 0, kv);
         }
     }
-    ds41_dspark_rows(true);
-    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w, 0);
+    ds41_copy_level(false);
+    /* VERIFY_STACK: the block takes the cross-session rows' kernels, not DSpark's */
+    ds41_dspark_rows(g->tp_world != 1 || !ds41_on2(DS4_GPU_V41B_VERIFY_STACK));
+    for (uint32_t i = 0; i < n_others; i++) graphs[count + i] = others[i];
+    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)(count + n_others), count, m, w, 0);
     ds41_dspark_rows(false);
     d->pq_done = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -477,6 +484,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_commit(ds41_dspark *d, ds41_gpu_graph *
     const uint32_t row = keep ? keep - 1u : DS41_VERIFY_ROWS;
     ds41_gpu_graph *last = &d->verified[row];
     bool ok = ds4_gpu_begin_commands();
+    if (ok) ds41_copy_level(true);
     for (uint32_t i = keep; ok && i < d->verify_count; i++) {
         const uint32_t slot = (d->verify_start + i) % DS41_DRAFT_WINDOW;
         for (uint32_t il = 0; ok && il < 40; il++)
@@ -494,6 +502,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_commit(ds41_dspark *d, ds41_gpu_graph *
     if (ok) ok = ds4_gpu_tensor_copy(g->residual, 0, last->residual, 0, DS4_N_HC * feature) &&
         ds4_gpu_tensor_copy(g->pre, 0, last->pre, 0, DS4_N_HC * 4u) &&
         ds4_gpu_tensor_copy(g->logits, 0, last->logits, 0, (uint64_t)DS4_N_VOCAB * 4u);
+    ds41_copy_level(false);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (ok) {
         g->pos = last->pos;

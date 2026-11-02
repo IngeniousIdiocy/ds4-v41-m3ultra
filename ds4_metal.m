@@ -577,6 +577,11 @@ uint64_t ds4_gpu_v41_off2(void) {
             "DS4_METAL_DISABLE_V41_BATCH_PE",
             "DS4_METAL_DISABLE_V41_BATCH_ENGRAM",
             "DS4_METAL_DISABLE_V41_BATCH_READS",
+            "DS4_METAL_DISABLE_V41_VERIFY_STACK",
+            "DS4_METAL_DISABLE_V41_VERIFY_COPIES",
+            "DS4_METAL_DISABLE_V41_VERIFY_DECODE",
+            "DS4_METAL_DISABLE_V41_MIXED_STEP",
+            "DS4_METAL_DISABLE_V41_MIXED_CARRY",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -9745,6 +9750,18 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     return 1;
 }
 
+/* VERIFY_COPIES: copies between begin and end have distinct destinations and sources none of them writes */
+static int g_copy_level;
+int ds4_gpu_copy_level_begin(void) {
+    if (!ds4_gpu_v41_on2(DS4_GPU_V41B_VERIFY_COPIES) || !ds4_gpu_overlap_begin()) return 0;
+    return g_copy_level = 1;
+}
+void ds4_gpu_copy_level_end(void) {
+    if (!g_copy_level) return;
+    g_copy_level = 0;
+    ds4_gpu_overlap_end();
+}
+
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes) {
@@ -9761,7 +9778,7 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
      * open compute encoder: a blit closes it, and DSpark verify and rollback
      * issue many small copies per cycle. The bytes moved are the same. */
     const uint64_t src_at = s.offset + src_offset, dst_at = d.offset + dst_offset;
-    if (ds4_gpu_v41_on(DS4_GPU_V41_COMPUTE_TENSOR_COPY) && !g_batch_encoder_concurrent &&
+    if (ds4_gpu_v41_on(DS4_GPU_V41_COMPUTE_TENSOR_COPY) && (!g_batch_encoder_concurrent || g_copy_level) &&
         ((src_at | dst_at | bytes) & 15u) == 0 && bytes / 16u <= UINT32_MAX &&
         (s.buffer != d.buffer || src_at + bytes <= dst_at || dst_at + bytes <= src_at)) {
         static id<MTLComputePipelineState> copy_pipeline;
@@ -19520,6 +19537,8 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
                                                  scale);
 }
 
+static int g_v41_verify_rows;
+
 /* Radix select, deterministic compaction and one in-place sort of the winners
  * (kernel_topk_select_*): every dispatch spans the GPU, where the merge ladder
  * ends on two or three threadgroups.  Returns 0 without encoding anything when
@@ -19688,8 +19707,12 @@ static int ds4_gpu_indexer_topk_tensor_impl(
          * every NaN-free row; a NaN row may order its ties differently than the full merge. */
         const bool decode_k512 = radix && !causal_ratio && n_tokens == 1u && top_k == 512u &&
             ds4_gpu_v41_on(DS4_GPU_V41_TOPK);
+        /* VERIFY_DECODE: a verify block's wide rows order exact ties as decode's radix select does */
+        const bool ids = causal_ratio && g_v41_verify_rows && ds4_gpu_v41_on(DS4_GPU_V41_TOPK) &&
+            ds4_gpu_v41_on2(DS4_GPU_V41B_VERIFY_DECODE);
         id<MTLComputePipelineState> sort_pipeline = causal_ratio ?
-            ds4_gpu_get_pipeline(getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") ?
+            ds4_gpu_get_pipeline(ids ? "kernel_argsort_f32_i32_desc_causal_ids" :
+                getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") ?
                 "kernel_argsort_f32_i32_desc_causal" : "kernel_argsort_f32_i32_desc_causal_shuffle") :
             g_argsort_f32_i32_desc_pipeline;
         id<MTLComputePipelineState> merge_pipeline = causal_ratio ?
@@ -24267,7 +24290,7 @@ static ds4_wave_rec_row g_wave[DS4_WAVE_ROWS];
 static uint32_t g_wave_rows;
 static BOOL g_wave_failed;
 static NSMutableArray *g_wave_keep;
-static NSMapTable *g_wave_clones;   /* scratch buffer -> its per-row clones, or NSNull */
+static NSMapTable *g_wave_clones;   /* scratch buffer -> its per-row clones */
 /* the objects this section holds, with each one's clones once replay looked them up (1: it has none); entries live
  * no longer than the section, whose g_wave_keep holds them */
 static struct { void *object, *clones; } g_wave_seen[256];
@@ -24283,6 +24306,26 @@ static inline __typeof__(&g_wave_seen[0]) ds4_gpu_wave_seen(id object) {
     return e;
 }
 
+/* the process-wide scratch a row's stages write, by identity: a label says nothing about who shares a buffer */
+static inline BOOL ds4_gpu_wave_scratch(id<MTLBuffer> b) {
+    return b == g_flash_attn_kv_buffer || b == g_flash_attn_pad_buffer || b == g_flash_attn_tmp_buffer ||
+        b == g_flash_attn_blk_buffer || b == g_flash_attn_mask_buffer || b == g_indexer_topk_buffer ||
+        b == g_topk_select_buffer || b == g_topk_gather_buffer;
+}
+
+/* Decided as the row binds it: a later row can grow the scratch, and the buffer this row holds is no longer the global. */
+static void ds4_gpu_wave_bound(id<MTLBuffer> b) {
+    __typeof__(&g_wave_seen[0]) e = ds4_gpu_wave_seen(b);
+    if (e->clones || !ds4_gpu_wave_scratch(b)) return;
+    NSMutableArray *a = [g_wave_clones objectForKey:b];
+    if (!a) {
+        a = [NSMutableArray array];
+        for (int i = 1; i < DS4_WAVE_ROWS; i++) [a addObject:[g_device newBufferWithLength:b.length options:b.resourceOptions]];
+        [g_wave_clones setObject:a forKey:b];
+    }
+    e->clones = (__bridge void *)a;
+}
+
 @interface DS4WaveRecorder : NSObject
 @end
 @implementation DS4WaveRecorder
@@ -24294,7 +24337,7 @@ static inline __typeof__(&g_wave_seen[0]) ds4_gpu_wave_seen(id object) {
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {
     g_wave[g_wave_row].cur[i] = (ds4_wave_bind){1, (uint8_t)i, (__bridge void *)b, o, 0};
     g_wave[g_wave_row].used |= 1u << i;
-    if (b) (void)ds4_gpu_wave_seen(b);
+    if (b) ds4_gpu_wave_bound(b);
 }
 - (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { g_wave[g_wave_row].cur[i].off = o; }
 - (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {
@@ -24321,7 +24364,7 @@ static inline __typeof__(&g_wave_seen[0]) ds4_gpu_wave_seen(id object) {
 - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)buf indirectBufferOffset:(NSUInteger)off
                          threadsPerThreadgroup:(MTLSize)b {
     ds4_wave_dispatch *d = [self record:MTLSizeMake(0, 0, 0) group:b form:2];
-    if (d) { d->indirect = (__bridge void *)buf; d->indirect_off = off; (void)ds4_gpu_wave_seen(buf); }
+    if (d) { d->indirect = (__bridge void *)buf; d->indirect_off = off; ds4_gpu_wave_bound(buf); }
 }
 @end
 
@@ -24353,20 +24396,11 @@ void ds4_gpu_wave_row(int row) { g_wave_row = row; }
 static id<MTLBuffer> ds4_gpu_wave_buffer(id<MTLBuffer> b, uint32_t row) {
     if (!b || !row) return b;
     __typeof__(&g_wave_seen[0]) seen = ds4_gpu_wave_seen(b);
-    if (seen->clones) return seen->clones == (void *)1 ? b : ((__bridge NSArray *)seen->clones)[row - 1u];
-    id e = [g_wave_clones objectForKey:b];
-    if (!e) {
-        NSString *l = b.label;
-        if (([l hasPrefix:@"ds4_flash_attn"] || [l isEqualToString:@"ds4_indexer_topk"] || [l hasPrefix:@"ds4_topk_"]) &&
-            ![l containsString:@"zero"]) {
-            NSMutableArray *a = [NSMutableArray array];
-            for (int i = 1; i < DS4_WAVE_ROWS; i++) [a addObject:[g_device newBufferWithLength:b.length options:b.resourceOptions]];
-            e = a;
-        } else e = [NSNull null];
-        [g_wave_clones setObject:e forKey:b];
+    if (!seen->clones) {
+        NSArray *a = [g_wave_clones objectForKey:b];
+        seen->clones = a ? (__bridge void *)a : (void *)1;
     }
-    seen->clones = e == (id)[NSNull null] ? (void *)1 : (__bridge void *)e;
-    return e == (id)[NSNull null] ? b : ((NSArray *)e)[row - 1u];
+    return seen->clones == (void *)1 ? b : ((__bridge NSArray *)seen->clones)[row - 1u];
 }
 
 static void ds4_gpu_wave_apply(id<MTLComputeCommandEncoder> enc, uint32_t row, const ds4_wave_dispatch *d) {
@@ -32784,7 +32818,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     &g_flash_attn_tmp_buffer,
                     &g_flash_attn_tmp_bytes,
                     (NSUInteger)(partial_bytes + stats_bytes),
-                    "ds4_dsv4_indexed_attention_split_tmp")) {
+                    "ds4_flash_attn_tmp")) {
                 return 0;
             }
 

@@ -60,6 +60,12 @@ static inline void ds41_admit_serial(ds41_admission *a, double ms) {
     a->serial_ms = a->sample_count & 1u ? sorted[mid] : 0.5 * (sorted[mid - 1u] + sorted[mid]);
 }
 
+/* One token decoded beside another session's block: no serial price, but it counts. */
+static inline void ds41_admit_row(ds41_admission *a) {
+    a->serial_tokens++;
+    if (a->skip) a->skip--;
+}
+
 /* One drafted cycle took `ms` and produced `rows` tokens: a verified block, or a declined one that decoded its first
  * token serially. */
 static inline void ds41_admit_cycle(ds41_admission *a, double ms, uint32_t rows, bool verified) {
