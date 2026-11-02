@@ -44875,9 +44875,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok && mixed) ok = ds41_attention_batch(g, graphs, model, l, il, prefill_rows, q_roped);
         const bool fused_tail = !shared_owner && ds41_on(DS4_GPU_V41_HC_FUSION) &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0 && l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
-        /* BATCH_TAIL: cross-session rows take the same tail once each row has attended below */
+        /* BATCH_TAIL: cross-session rows take the same tail once each row has attended below (its expand is a
+         * ROW_MATMULS kernel) */
         const bool tail_rows = fused_tail && decode_rows && !rows_batch && (rows <= 4u || ds41_on2(DS4_GPU_V41B_BATCH_TAIL8)) &&
-            g->tp_world == 1 && ds41_on2(DS4_GPU_V41B_BATCH_TAIL);
+            g->tp_world == 1 && ds41_on2(DS4_GPU_V41B_BATCH_TAIL) && ds41_on(DS4_GPU_V41_ROW_MATMULS);
         bool expanded = ok && fused_tail && rows_batch && ds41_attention_low_batch(g, model, l, rows) &&
             ds41_attention_expand_rows(&active, model, l, rows);
 #else

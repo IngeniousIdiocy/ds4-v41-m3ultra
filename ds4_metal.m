@@ -51046,14 +51046,14 @@ int ds4_gpu_dsv41_hc_block_input(ds4_gpu_tensor *mix, ds4_gpu_tensor *x, ds4_gpu
 
 /* The bf16 in/out Q8_0 matvec of one row whose outputs (joined with `add` and rounded to bf16 when add is given) expand
  * straight into the n_hc residual streams. */
-/* VERIFY_BATCH: 2-8 rows of the Q8 projection with the HC expand, the rows sharing each weight pass (ROW_MATMULS),
- * from three rows on simdgroup matrices (ROWS_MMA). */
+/* VERIFY_BATCH, BATCH_TAIL: 2-8 rows of the Q8 projection with the HC expand, the rows sharing each weight pass
+ * (ROW_MATMULS), from three rows on simdgroup matrices (ROWS_MMA). The callers gate on their own switch. */
 int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size,
                                      uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
                                      const ds4_gpu_tensor *x, const ds4_gpu_tensor *add,
                                      const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
                                      uint32_t n_hc, uint32_t rows) {
-    if (!ds4_gpu_v41_on(DS4_GPU_V41_VERIFY_BATCH) || !ds4_gpu_v41_on(DS4_GPU_V41_ROW_MATMULS)) return 0;
+    if (!ds4_gpu_v41_on(DS4_GPU_V41_ROW_MATMULS)) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     if (!out_hc || !x || !residual_hc || !split || !model_map || n_hc != 4 || !in_dim ||
