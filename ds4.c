@@ -43415,9 +43415,8 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 #ifdef __APPLE__
-/* BATCH_OVERLAP: the FFN of 2-4 cross-session decode rows as one-row decode runs it. After the router and the pair
- * kernel's plan, the block's deferred HC mix and the shared gate and up ride the routed pair kernel's concurrent
- * encoder; with BATCH_DOWN (*down) the shared down rides the routed sum's level. The shared mid is already rounded. */
+/* BATCH_OVERLAP: the FFN of 2-4 cross-session decode rows as one-row decode runs it. After the router the block's
+ * deferred HC mix and the shared gate and up ride the routed pair kernel's concurrent encoder; with BATCH_DOWN (*down) the shared down rides the routed sum's level. The shared mid is already rounded. */
 static bool ds41_moe_overlap(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il,
                              uint32_t count, bool *down) {
     ds41_prefill_row *b = &g->batch;
@@ -43425,9 +43424,7 @@ static bool ds41_moe_overlap(ds41_gpu_graph *g, const ds4_model *m, const ds4_la
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
     *down = ds41_on2(DS4_GPU_V41B_BATCH_DOWN);
-    if (!ds41_router_rows(g, m, l, il, count) ||
-        (ds41_on(DS4_GPU_V41_MOE_DEDUP) && !ds4_gpu_dsv41_moe_plan_rows(b->selected, DS4_N_EXPERT_USED, count)) ||
-        !ds4_gpu_overlap_begin()) return false;
+    if (!ds41_router_rows(g, m, l, il, count) || !ds4_gpu_overlap_begin()) return false;
     const bool ok = ds41_hc_input_rows(b, m, l, true, b->attn_split, 24u, count, b->flat_norm) &&
         ds41_shared_swiglu(b->shared_mid, m, l, b->norm, count) &&
         ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,

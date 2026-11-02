@@ -5207,6 +5207,85 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_static_v41_f32(
     (void)tiitg;
 }
 
+/* BATCH_STATIC: that kernel with a row count, six pairs a row and each row's activation 20480 bytes on. */
+static inline void ds4_mxfp4_pair_swiglu_rows_static_v41(
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        device const char *ids,
+        device const char *weights,
+        threadgroup char *shmem,
+        const uint pair,
+        const uint row_group,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr uint64_t V41_ROWS = 2304, V41_EXPERT_BYTES = 2304ull * 2720ull;
+    ds4_metal_args_mul_mv_id sa = {};
+    sa.nei0 = 6; sa.nei1 = 1; sa.nbi1 = 24;
+    sa.ne00 = 5120; sa.ne01 = 2304; sa.ne02 = 384;
+    sa.nb00 = 136; sa.nb01 = 2720; sa.nb02 = V41_EXPERT_BYTES;
+    sa.ne10 = 5120; sa.ne11 = 1; sa.ne12 = 1; sa.ne13 = 1;
+    sa.nb10 = 4; sa.nb11 = 20480; sa.nb12 = 20480;
+    sa.ne0 = 2304; sa.ne1 = 6; sa.nb1 = 9216; sa.nr0 = N_R0_MXFP4;
+    sa.tp_rank = 0; sa.tp_world = 1; sa.tp_addend = 0; sa.tp_expert_base = 0;
+    const int32_t expert = ((device const int32_t *)ids)[pair];
+    device const float *route = (device const float *)(weights + (uint64_t)pair * sizeof(float));
+    device char *gate_cur = dst_gate + (uint64_t)pair * V41_ROWS * sizeof(float);
+    device char *up_cur = dst_up + (uint64_t)pair * V41_ROWS * sizeof(float);
+    device char *mid_cur = dst_mid + (uint64_t)pair * V41_ROWS * sizeof(float);
+    device const char *gate_expert = src0_gate + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
+    device const char *up_expert = src0_up + (int64_t)expert * (int64_t)V41_EXPERT_BYTES;
+    kernel_mul_mv_mxfp4_pair_swiglu_static_impl<thread ds4_metal_args_mul_mv_id &,
+        DS4_MXFP4_PAIR_STATIC_NB_V41, DS4_MXFP4_PAIR_STATIC_NB_V41>(
+        sa, act, gate_expert, up_expert, src1 + (uint64_t)(pair / 6u) * 20480u, gate_cur, up_cur, mid_cur,
+        route[0], shmem, uint3(row_group, 0, 0), tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_rows_static_v41_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        device const char *ids,
+        device const char *weights,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void)args;
+    ds4_mxfp4_pair_swiglu_rows_static_v41(act, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, ids, weights,
+                                          shmem, tgpig.z, tgpig.x, tiisg, sgitg);
+}
+
+/* BATCH_RBLOCK: the same with the grid's fastest axis on the pairs */
+kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        device const char *ids,
+        device const char *weights,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void)args;
+    ds4_mxfp4_pair_swiglu_rows_static_v41(act, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid, ids, weights,
+                                          shmem, tgpig.x, tgpig.y, tiisg, sgitg);
+}
+
 /* TP-safe exact-shape sibling. The resident model view starts at this rank's
  * first expert, while IDs remain global, so preserve the ownership test and
  * rebase before entering the same compile-time-unrolled implementation. */
@@ -7050,6 +7129,71 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32(
         }
     }
     (void)tiitg;
+}
+
+/* BATCH_STATIC: the fixed-route static sum at the V4.1 shape with a row count and every stride a literal */
+static inline void ds4_mxfp4_sum6_rows_static_v41(
+        device const char *src0s,
+        device const char *src1,
+        device char *dst,
+        device const char *ids,
+        threadgroup char *shmem,
+        const uint token,
+        const uint row_group,
+        ushort tiisg,
+        ushort sgitg) {
+    constexpr uint64_t V41_DOWN_EXPERT_BYTES = 5120ull * DS4_MXFP4_DOWN_STATIC_NB_V41 * sizeof(block_mxfp4);
+    const uint32_t first_row = row_group * N_R0_MXFP4;
+    device const int32_t *token_ids = (device const int32_t *)ids + token * DS4_MXFP4_DOWN_STATIC_SLOTS;
+    device const char *token_src1 = src1 + (uint64_t)token * 6u * 9216u;
+    threadgroup float *lut = (threadgroup float *)shmem;
+    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float2 sumf = 0.0f;
+    for (short slot = 0; slot < DS4_MXFP4_DOWN_STATIC_SLOTS; slot++) {
+        device const char *expert_base = src0s + (int64_t)token_ids[slot] * (int64_t)V41_DOWN_EXPERT_BYTES;
+        device const float *y = (device const float *)(token_src1 + (uint64_t)slot * 9216u);
+        sumf += ds4_mxfp4_accumulate_full_rows_static<DS4_MXFP4_DOWN_STATIC_NB_V41>(
+            expert_base, y, first_row, lut, tiisg);
+    }
+
+    device float *out = (device float *)(dst + (uint64_t)token * 20480u);
+    FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
+        const float value = simd_sum(sumf[row]);
+        if (tiisg == 0) out[first_row + row] = value;
+    }
+}
+
+kernel void kernel_mul_mv_id_mxfp4_sum6_rows_static_v41_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        device const char *src0s,
+        device const char *src1,
+        device char *dst,
+        device const char *ids,
+        device const char *add_in,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void)args; (void)add_in;
+    ds4_mxfp4_sum6_rows_static_v41(src0s, src1, dst, ids, shmem, tgpig.y, tgpig.x, tiisg, sgitg);
+}
+
+/* BATCH_RBLOCK */
+kernel void kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        device const char *src0s,
+        device const char *src1,
+        device char *dst,
+        device const char *ids,
+        device const char *add_in,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void)args; (void)add_in;
+    ds4_mxfp4_sum6_rows_static_v41(src0s, src1, dst, ids, shmem, tgpig.x, tgpig.y, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_id_mxfp4_sum6_tp_full_rows_static_f32(

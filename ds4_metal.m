@@ -563,6 +563,9 @@ uint64_t ds4_gpu_v41_off2(void) {
             "DS4_METAL_DISABLE_V41_BATCH_DOWN",
             "DS4_METAL_DISABLE_V41_BATCH_WAVE",
             "DS4_METAL_DISABLE_V41_BATCH_MIX",
+            "DS4_METAL_DISABLE_V41_BATCH_STATIC",
+            "DS4_METAL_DISABLE_V41_BATCH_RBLOCK",
+            "DS4_METAL_DISABLE_V41_BATCH_EXPAND",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -33864,6 +33867,8 @@ static int ds4_gpu_encode_mul_mv_id_pair(
     return 1;
 }
 
+static BOOL g_moe_rblock;   /* BATCH_RBLOCK: the next routed dispatch's grid has the pairs or rows on its fastest axis */
+
 static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -33914,7 +33919,7 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [enc dispatchThreadgroups:g_moe_rblock ? MTLSizeMake(pairs, row_groups, 1) : MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -33924,7 +33929,6 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
  * dispatch, then one threadgroup per distinct expert with a simdgroup per
  * (row, slot) pair (kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32). */
 static id<MTLBuffer> g_moe_plan;
-static BOOL g_moe_plan_encoded;   /* BATCH_OVERLAP: the next pair kernel's plan ran ahead of its concurrent encoder */
 
 static int ds4_gpu_encode_moe_plan(id<MTLCommandBuffer> cb, const ds4_gpu_mul_mv_id_args *args,
                                    id<MTLBuffer> ids, NSUInteger ids_off) {
@@ -33940,16 +33944,6 @@ static int ds4_gpu_encode_moe_plan(id<MTLCommandBuffer> cb, const ds4_gpu_mul_mv
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
-}
-
-int ds4_gpu_dsv41_moe_plan_rows(const ds4_gpu_tensor *selected, uint32_t top_k, uint32_t rows) {
-    if (!selected || !g_batch_cb || !top_k || top_k > 8u || !rows || rows > 8u ||
-        ds4_gpu_tensor_bytes(selected) < (uint64_t)top_k * rows * sizeof(int32_t)) return 0;
-    ds4_gpu_mul_mv_id_args args = {.nei0 = (int32_t)top_k, .nei1 = (int32_t)rows,
-                                   .nbi1 = (uint64_t)top_k * sizeof(int32_t)};
-    g_moe_plan_encoded = ds4_gpu_encode_moe_plan(g_batch_cb, &args, ds4_gpu_tensor_buffer(selected),
-                                                 ds4_gpu_tensor_offset(selected)) != 0;
-    return g_moe_plan_encoded;
 }
 
 static int ds4_gpu_encode_mul_mv_id_pair_swiglu_dedup(
@@ -33970,8 +33964,7 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu_dedup(
         args->nei1 != (int32_t)rows || (uint64_t)args->nei0 * rows > 64u) return 0;
     if (!pair_pipeline) pair_pipeline = ds4_gpu_get_pipeline("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32");
     if (!pair_pipeline) return 0;
-    if (!g_moe_plan_encoded && !ds4_gpu_encode_moe_plan(cb, args, ids, ids_off)) return 0;
-    g_moe_plan_encoded = NO;
+    if (!ds4_gpu_encode_moe_plan(cb, args, ids, ids_off)) return 0;
     id<MTLBuffer> plan = g_moe_plan;
     const NSUInteger nr0 = (NSUInteger)args->nr0;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + nr0 - 1u) / nr0;
@@ -34367,7 +34360,8 @@ static int ds4_gpu_encode_mul_mv_id_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [enc dispatchThreadgroups:g_moe_rblock ? MTLSizeMake((NSUInteger)args->nei1, row_groups, 1) :
+                                             MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -46141,12 +46135,34 @@ int ds4_gpu_routed_moe_batch_tensor(
             (n_tokens <= 4u || v41_decode_batch || use_tp_mxfp4_static_batch) &&
             down_sum6_pipeline != nil;
         /* MOE_DEDUP: a few single-node MXFP4 rows read every distinct expert once */
+        /* BATCH_STATIC: rows at the V4.1 shape run the fixed-shape kernels' row-count siblings */
+        const bool rows_static = gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4 &&
+            use_tiny_pair_swiglu && direct_down_sum && g_v41_decode_rows && n_tokens >= 2u && n_tokens <= 8u &&
+            !use_tp_mxfp4_static_batch && g_tp_split_world == 1 && ds4_gpu_v41_on2(DS4_GPU_V41B_BATCH_STATIC) &&
+            gate_args.ne00 == 5120 && gate_args.ne01 == 2304 && gate_args.ne02 == 384 && gate_args.nb01 == 2720 &&
+            gate_args.nb12 == 20480 && gate_args.ne11 == 1 && gate_args.ne0 == 2304 && down_args.ne00 == 2304 &&
+            down_args.ne01 == 5120 && down_args.nb01 == 1224 && down_args.nb11 == 9216 && down_args.nb12 == 6 * 9216 &&
+            down_args.nb1 == 20480;
+        const bool rblock = rows_static && ds4_gpu_v41_on2(DS4_GPU_V41B_BATCH_RBLOCK);
         const bool dedup = gate_type == DS4_METAL_TENSOR_MXFP4 && n_tokens >= 2u && n_tokens <= 8u &&
-            !use_tp_mxfp4_static_batch && g_tp_split_world == 1 && ds4_gpu_v41_on(DS4_GPU_V41_MOE_DEDUP);
+            !use_tp_mxfp4_static_batch && g_tp_split_world == 1 && ds4_gpu_v41_on(DS4_GPU_V41_MOE_DEDUP) && !rows_static &&
+            !g_batch_encoder_concurrent;
+        if (rows_static) {
+            static id<MTLComputePipelineState> pair_kernels[2], sum_kernels[2];
+            if (!pair_kernels[rblock]) {
+                pair_kernels[rblock] = ds4_gpu_new_mul_mv_tg_multiple_pipeline(rblock ?
+                    "kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41_f32" :
+                    "kernel_mul_mv_id_mxfp4_pair_swiglu_rows_static_v41_f32", 1);
+                sum_kernels[rblock] = ds4_gpu_new_mul_mv_tg_multiple_pipeline(rblock ?
+                    "kernel_mul_mv_id_mxfp4_sum6_rows_rblock_v41_f32" : "kernel_mul_mv_id_mxfp4_sum6_rows_static_v41_f32", 1);
+            }
+            tiny_pair_swiglu_pipeline = pair_kernels[rblock];
+            down_sum6_pipeline = sum_kernels[rblock];
+            if (!tiny_pair_swiglu_pipeline || !down_sum6_pipeline) return 0;
+        }
         /* BATCH_OVERLAP admits the tiny pair kernel and its direct sum, the two levels it brackets; anything else
          * returns to serial encoders here */
         if (g_batch_encoder_concurrent && !(use_tiny_pair_swiglu && direct_down_sum)) ds4_gpu_overlap_end();
-        if (!dedup || !use_tiny_pair_swiglu) g_moe_plan_encoded = NO;
         int ok = 0;
         if (use_iq2_batch_selected_addr) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
@@ -46366,6 +46382,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                 .clamp_value = clamp,
             };
             if (dedup) DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32");
+            if (rows_static) DS4_TEST_NOTE("kernel_mul_mv_id_mxfp4_pair_swiglu_rows_static_v41_f32");
+            g_moe_rblock = rblock;
             ok = dedup ? ds4_gpu_encode_mul_mv_id_pair_swiglu_dedup(cb, &gate_args, &act_args,
                     gate_buf, (NSUInteger)gate_inner, up_buf, (NSUInteger)up_inner,
                     xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
@@ -46393,8 +46411,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        weightsbuf,
                                                        ds4_gpu_tensor_offset(weights),
                                                        gate_smem,
-                                                       use_tp_mxfp4_static_batch ? 1 : 2,
+                                                       use_tp_mxfp4_static_batch || rows_static ? 1 : 2,
                                                        false);
+            g_moe_rblock = NO;
         } else if (use_tiny_pair_mv) {
             id<MTLComputePipelineState> pair_pipeline =
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
@@ -46598,6 +46617,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                          2,
                                                          q4_batch_table_queue_residency);
             } else if (direct_down_sum) {
+                g_moe_rblock = rblock;
                 ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
                                                      down_sum6_pipeline,
                                                      &down_args,
@@ -46612,7 +46632,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                      nil,
                                                      0,
                                                      down_smem,
-                                                     use_tp_mxfp4_static_batch ? 1 : 2);
+                                                     use_tp_mxfp4_static_batch || rows_static ? 1 : 2);
+                g_moe_rblock = NO;
             } else if (use_mm_id) {
                 if (use_packed_mpp)
                     ok = ds4_gpu_encode_moe_packed_rhs(cb, &down_mm_args,
@@ -48348,6 +48369,10 @@ static int ds4_gpu_hc_expand_add_split_impl(
             expand_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_serial_add_bf16");
             n_elem = (uint64_t)n_embd;
             DS4_TEST_NOTE("kernel_dsv4_hc_expand4_serial_add_bf16");
+        } else if (n_hc == 4 && n_embd == 5120 && round_bf16 && g_v41_decode_rows && ds4_gpu_v41_on2(DS4_GPU_V41B_BATCH_EXPAND)) {
+            expand_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_rows_add_bf16");
+            n_elem = (uint64_t)n_embd * n_tokens64;
+            DS4_TEST_NOTE("kernel_dsv4_hc_expand4_rows_add_bf16");
         } else if (n_hc == 4) {
             expand_pipeline = ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
                                                       "kernel_dsv4_hc_expand4");

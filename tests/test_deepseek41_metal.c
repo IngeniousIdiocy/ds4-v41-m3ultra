@@ -3209,6 +3209,25 @@ static int check_moe_dedup(void) {
     }
     ds4_gpu_dsv41_dspark_rows(0);
     CHECK(ds4_gpu_test_kernel_runs("kernel_mul_mv_id_mxfp4_pair_swiglu_dedup_f32") == runs + 7);
+    /* BATCH_STATIC in either grid order: session rows on the fixed-shape kernels, the same bits */
+    const uint64_t rows_static = ds4_gpu_test_kernel_runs("kernel_mul_mv_id_mxfp4_pair_swiglu_rows_static_v41_f32");
+    ds4_gpu_dsv41_decode_rows(1);
+    for (uint32_t rows = 2; rows <= ROWS; rows++)
+        for (int order = 0; order < 2; order++) {
+            bool mid_f16 = false;
+            ds4_gpu_test_set_v41_off2(DS4_GPU_V41B_BATCH_STATIC);
+            CHECK(ds4_gpu_routed_moe_batch_tensor(ref, gate, up, mid, experts, map, bytes, eg, eu, ed, MXFP4, MXFP4,
+                      gate_row * FF, gate_row, down_row * D, down_row, D, FF, D, sel, w, NE, NU, 10.0f, x, 3, rows,
+                      &mid_f16, true));
+            ds4_gpu_test_set_v41_off2(order ? DS4_GPU_V41B_BATCH_RBLOCK : 0);
+            CHECK(ds4_gpu_routed_moe_batch_tensor(got, gate, up, mid, experts, map, bytes, eg, eu, ed, MXFP4, MXFP4,
+                      gate_row * FF, gate_row, down_row * D, down_row, D, FF, D, sel, w, NE, NU, 10.0f, x, 3, rows,
+                      &mid_f16, true));
+            ds4_gpu_test_set_v41_off2(0);
+            CHECK(ds4_gpu_synchronize() && same_bits(ref, got, rows * D));
+        }
+    ds4_gpu_dsv41_decode_rows(0);
+    CHECK(ds4_gpu_test_kernel_runs("kernel_mul_mv_id_mxfp4_pair_swiglu_rows_static_v41_f32") == rows_static + 14);
     ds4_gpu_test_set_flags(0);
     ds4_gpu_tensor *tensors[] = {x, sel, w, gate, up, mid, experts, ref, got};
     for (size_t i = 0; i < sizeof(tensors) / sizeof(*tensors); i++) ds4_gpu_tensor_free(tensors[i]);
@@ -3924,6 +3943,11 @@ static int check_v41_groups(void) { return 1; }
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--batch-router")) {
         const int ok = ds4_gpu_init() && check_batch_router();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--moe-dedup")) {
+        const int ok = ds4_gpu_init() && check_moe_dedup();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

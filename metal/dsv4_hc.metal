@@ -730,6 +730,39 @@ kernel void kernel_dsv4_hc_expand4_serial_add_bf16(
     }
 }
 
+// BATCH_EXPAND: that kernel with a row count: gid walks the rows' 5120 columns.
+kernel void kernel_dsv4_hc_expand4_rows_add_bf16(
+        device  const float * block_out [[buffer(1)]],
+        device  const float * residual  [[buffer(2)]],
+        device  const float * post      [[buffer(3)]],
+        device  const float * comb      [[buffer(4)]],
+        device  const float * block_add [[buffer(5)]],
+        device        float * dst       [[buffer(6)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint t = gid / 5120u, d = gid - t * 5120u;
+    const float block_v = ds4_bf16_round(block_out[gid] + block_add[gid]);
+
+    device const float *res = residual + t * 20480u + d;
+    const float r0 = res[0];
+    const float r1 = res[5120u];
+    const float r2 = res[2u*5120u];
+    const float r3 = res[3u*5120u];
+    device const float *post_t = post + t * 24u;
+    device const float *comb_t = comb + t * 24u;
+    device float *out = dst + t * 20480u + d;
+
+    for (uint dst_hc = 0; dst_hc < 4u; ++dst_hc) {
+        float acc = block_v * post_t[dst_hc];
+
+        acc += comb_t[dst_hc + 0u] * r0;
+        acc += comb_t[dst_hc + 4u] * r1;
+        acc += comb_t[dst_hc + 8u] * r2;
+        acc += comb_t[dst_hc + 12u] * r3;
+
+        out[dst_hc*5120u] = ds4_bf16_round(acc);
+    }
+}
+
 // Decode-time FFN tail fusion:
 //
 //     shared_out = shared_mid @ Wshared_down

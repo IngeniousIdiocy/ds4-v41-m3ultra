@@ -195,7 +195,6 @@ int ds4_gpu_dsv41_deferred_collapse(ds4_gpu_tensor *x, ds4_gpu_tensor *norm, con
 int ds4_gpu_dsv41_deferred_collapse_rows(ds4_gpu_tensor *x, ds4_gpu_tensor *norm, const ds4_gpu_tensor *residual,
                                          const ds4_gpu_tensor *pre, const void *model_map, uint64_t model_size,
                                          uint64_t norm_offset, float eps, uint32_t rows, uint32_t pre_stride);
-int ds4_gpu_dsv41_moe_plan_rows(const ds4_gpu_tensor *selected, uint32_t top_k, uint32_t rows);
 int ds4_gpu_dsv41_query_deferred_hc(ds4_gpu_tensor *q, ds4_gpu_tensor *mix, ds4_gpu_tensor *split,
                                     const ds4_gpu_tensor *qr, const ds4_gpu_tensor *residual,
                                     const void *model_map, uint64_t model_size, uint64_t q_offset, uint64_t fn_offset,
