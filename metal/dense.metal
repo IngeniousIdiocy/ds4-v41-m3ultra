@@ -4914,60 +4914,102 @@ kernel void kernel_engram_blend_r2_bf16(
     helper_mv_reduce_and_write<NR0, true>((device float *) dst, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
-/* BATCH_ENGRAM: that reader with one simdgroup group per activation row, as kernel_mul_mv_f16_f32_4_rows has them. */
-kernel void kernel_engram_blend_rows_bf16(
+/* BATCH_ENGRAM: K activation rows on that reader's layout in one pass: a lane decodes its weight words once and keeps a
+ * sumf per (output, row), so the rows load the weights once */
+template<short K>
+static inline void kernel_engram_blend_rows_reg_impl(
         constant ds4_metal_args_mul_mv & args,
-        device const uchar * codes  [[buffer(1)]],
-        device const char  * src1   [[buffer(2)]],
-        device       char  * dst    [[buffer(3)]],
-        device const uchar * scales [[buffer(4)]],
-        threadgroup  char  * shmem  [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        device const uchar * codes,
+        device const char  * src1,
+        device       char  * dst,
+        device const uchar * scales,
+        threadgroup  char  * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
     constexpr short NR0 = 2;
     const short NSG = FC_mul_mv_nsg;
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NB  = 32;
     constexpr short NF  = 16;
-    constexpr short NF4 = NF/4;
 
     const int nb  = args.ne00/NB;
     const int k16 = args.ne00/16;
     const int r0  = tgpig.x*NR0;
-    const short r1 = sgitg/NSG;
-    const ushort sg = sgitg%NSG;
+    const uint ys = args.nb11/sizeof(float4);
 
-    device const float4 * y4  = (device const float4 *) (src1 + r1*args.nb11);
     device const uint4  * ax4 = (device const uint4 *) (codes + (uint64_t)r0*args.ne00);
     device const uchar  * sx  = scales + (uint64_t)(r0/32)*nb;
 
-    float sumf[NR0] = { 0.f };
+    float sumf[NR0][K];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        FOR_UNROLL (short r = 0; r < K; ++r) sumf[row][r] = 0.f;
+    }
 
     const short ix = tiisg/(NW/NF);
     const short il = tiisg%(NW/NF);
-    const int ib0 = sg*NF + ix;
-
-    float4 yl4[NF4];
-    device const float4 * yb4 = y4 + (ib0*NB + il*NF)/4;
+    const int ib0 = sgitg*NF + ix;
+    device const float4 * yb4 = (device const float4 *) src1 + (ib0*NB + il*NF)/4;
 
     for (int ib = ib0; ib < nb; ib += NSG*NF) {
-        for (short i = 0; i < NF4; ++i) {
-            yl4[i] = yb4[i];
-        }
         const float s = as_type<float>((uint)(sx[ib] + 8u) << 23);   /* 2^(e-119) */
+        float4 d[NR0][4];
         FOR_UNROLL (short row = 0; row < NR0; row++) {
             const uint4 w = ax4[row*k16 + ib*2 + il];
-            float sumq = 0.f;
-            sumq += dot(ds4_blend_dec4(w.x) * s, yl4[0]);
-            sumq += dot(ds4_blend_dec4(w.y) * s, yl4[1]);
-            sumq += dot(ds4_blend_dec4(w.z) * s, yl4[2]);
-            sumq += dot(ds4_blend_dec4(w.w) * s, yl4[3]);
-            sumf[row] += sumq;
+            d[row][0] = ds4_blend_dec4(w.x) * s;
+            d[row][1] = ds4_blend_dec4(w.y) * s;
+            d[row][2] = ds4_blend_dec4(w.z) * s;
+            d[row][3] = ds4_blend_dec4(w.w) * s;
+        }
+        FOR_UNROLL (short r = 0; r < K; ++r) {
+            device const float4 * y = yb4 + r*ys;
+            const float4 y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                float sumq = 0.f;
+                sumq += dot(d[row][0], y0);
+                sumq += dot(d[row][1], y1);
+                sumq += dot(d[row][2], y2);
+                sumq += dot(d[row][3], y3);
+                sumf[row][r] += sumq;
+            }
         }
         yb4 += NSG*NF*NW/4;
     }
 
-    helper_mv_reduce_and_write_rows<NR0, true>((device float *) dst + (uint64_t)r1*args.ne0, sumf, r0, args.ne01, tiisg, sg,
-                                               r1, shmem);
+    threadgroup float * H = (threadgroup float *) shmem;
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        FOR_UNROLL (short r = 0; r < K; ++r) {
+            const float v = simd_sum(sumf[row][r]);
+            if (tiisg == 0) H[(r*NR0 + row)*NSG + sgitg] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg != 0 || sgitg != 0) return;
+    FOR_UNROLL (short r = 0; r < K; ++r) {
+        device float * out = (device float *) dst + (uint64_t)r*args.ne0 + r0;
+        for (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
+            out[row] = ds4_bf16_round(ds4_q8_sg_sum(H + (r*NR0 + row)*NSG, NSG));
+        }
+    }
 }
+
+#define DS4_ENGRAM_ROWS_REG(K) \
+kernel void kernel_engram_blend_rows##K##_reg_bf16( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const uchar * codes  [[buffer(1)]], \
+        device const char  * src1   [[buffer(2)]], \
+        device       char  * dst    [[buffer(3)]], \
+        device const uchar * scales [[buffer(4)]], \
+        threadgroup  char  * shmem  [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_engram_blend_rows_reg_impl<K>(args, codes, src1, dst, scales, shmem, tgpig, tiisg, sgitg); \
+}
+DS4_ENGRAM_ROWS_REG(2)
+DS4_ENGRAM_ROWS_REG(3)
+DS4_ENGRAM_ROWS_REG(4)
+DS4_ENGRAM_ROWS_REG(5)
+DS4_ENGRAM_ROWS_REG(6)
+DS4_ENGRAM_ROWS_REG(7)
+DS4_ENGRAM_ROWS_REG(8)

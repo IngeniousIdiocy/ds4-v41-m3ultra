@@ -22277,8 +22277,8 @@ int ds4_gpu_matmul_engram_fp8_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor 
     return ds4_gpu_fp8_reader(out, codes, e8m0, in_dim, out_dim, x, 1);
 }
 
-/* BATCH_ENGRAM: rows of the Engram reader, one simdgroup group per row and at most 32 simdgroups per threadgroup, so
- * more rows go in chunks (the F16 row kernel's dispatch). */
+/* BATCH_ENGRAM: rows of the Engram reader in one pass, one simdgroup group; its reduction is the tree over at most 8
+ * simdgroups. */
 int ds4_gpu_matmul_engram_fp8_weights_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
                                            uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
@@ -22288,30 +22288,29 @@ int ds4_gpu_matmul_engram_fp8_weights_rows(ds4_gpu_tensor *out, const ds4_gpu_te
         ds4_gpu_tensor_bytes(x) < (uint64_t)rows * in_dim * sizeof(float) ||
         ds4_gpu_tensor_bytes(out) < (uint64_t)rows * out_dim * sizeof(float)) return 0;
     const ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
-    if (strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4") != 0 || mv_dispatch.nsg > 16) return 0;
-    const uint32_t chunk = 32u / (uint32_t)mv_dispatch.nsg;
+    if (strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4") != 0 || mv_dispatch.nsg > 8) return 0;
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_engram_blend_rows_bf16", mv_dispatch.nsg);
+        char name[48];
+        snprintf(name, sizeof(name), "kernel_engram_blend_rows%u_reg_bf16", rows);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(name, mv_dispatch.nsg);
         if (!pipeline) return 0;
-        DS4_TEST_NOTE("kernel_engram_blend_rows_bf16");
+        DS4_TEST_NOTE("kernel_engram_blend_rows_reg_bf16");
         ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
-        for (uint32_t r = 0; r < rows; r += chunk) {
-            const NSUInteger groups = rows - r < chunk ? rows - r : chunk;
-            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:pipeline];
-            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
-            [enc setBuffer:ds4_gpu_tensor_buffer(codes) offset:ds4_gpu_tensor_offset(codes) atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) + (NSUInteger)r * in_dim * sizeof(float) atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) + (NSUInteger)r * out_dim * sizeof(float) atIndex:3];
-            [enc setBuffer:ds4_gpu_tensor_buffer(e8m0) offset:ds4_gpu_tensor_offset(e8m0) atIndex:4];
-            [enc setThreadgroupMemoryLength:groups * 2u * 32u * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / 2u, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg * groups, 1)];
-            ds4_gpu_end_compute_encoder(cb, enc);
-        }
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(codes) offset:ds4_gpu_tensor_offset(codes) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(e8m0) offset:ds4_gpu_tensor_offset(e8m0) atIndex:4];
+        [enc setThreadgroupMemoryLength:((NSUInteger)rows * 2u * (NSUInteger)mv_dispatch.nsg * sizeof(float) + 15u) & ~(NSUInteger)15u
+                                atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / 2u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "Engram FP8 rows matvec");
     }
 }

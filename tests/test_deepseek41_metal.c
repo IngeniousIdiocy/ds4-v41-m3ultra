@@ -1508,7 +1508,7 @@ static int check_narrow_weights(void) {
     }
     for (int k = 0; k < 3; k++) CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs[k] + 1);
     /* BATCH_ENGRAM: 2-8 rows of the Engram reader, each row's bits as its one-row reader (poisoned outputs) */
-    const uint64_t engram_rows = ds4_gpu_test_kernel_runs("kernel_engram_blend_rows_bf16");
+    const uint64_t engram_rows = ds4_gpu_test_kernel_runs("kernel_engram_blend_rows_reg_bf16");
     ds4_gpu_tensor *ex = upload(NULL, 8 * ins[0] * 4), *er = upload(NULL, 8 * outs[0] * 4), *eg = upload(NULL, 8 * outs[0] * 4);
     CHECK(ex && er && eg);
     float *exv = ds4_gpu_tensor_contents(ex);
@@ -1525,7 +1525,7 @@ static int check_narrow_weights(void) {
         CHECK(ds4_gpu_matmul_engram_fp8_weights_rows(eg, codes[0], scales[0], ins[0], outs[0], ex, rows));
         CHECK(ds4_gpu_synchronize() && same_bits(er, eg, (uint64_t)rows * outs[0]));
     }
-    CHECK(ds4_gpu_test_kernel_runs("kernel_engram_blend_rows_bf16") == engram_rows + 7);
+    CHECK(ds4_gpu_test_kernel_runs("kernel_engram_blend_rows_reg_bf16") == engram_rows + 7);
     ds4_gpu_tensor_free(ex); ds4_gpu_tensor_free(er); ds4_gpu_tensor_free(eg);
     ds4_gpu_test_set_flags(0);
     for (int k = 0; k < 2; k++) { ds4_gpu_tensor_free(codes[k]); ds4_gpu_tensor_free(scales[k]); }
