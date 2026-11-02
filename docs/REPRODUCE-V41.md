@@ -237,6 +237,11 @@ header of its own, so no two share a prefix.
   tokens that arrived in the window where all N were decoding, over that window.
   Host sampling and the server's own work between steps are inside these times.
 - **One session.** The same, with one conversation, on the same server.
+- **How much was drafted.** With `DS4_SERVER_BATCH_LOG=1` (main's variable)
+  the server logs a line per step; this branch adds how many tokens the
+  drafting session kept in that step (`block=`, 0 when no session drafted) and
+  each session's controller state (`states=`, `b` for a back-off after a
+  loss). The README's drafting counts come from these lines.
 - **A cold prompt beside decoding sessions.** Three conversations decode greedily
   while, 3 s in, a fourth request arrives with a cold 9,240-token prompt. Record
   every gap between two tokens of the same decoding session while the cold

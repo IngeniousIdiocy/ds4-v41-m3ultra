@@ -98,6 +98,16 @@ host and the server's own work between steps.
 | 2 | 68.7 | 34.6 |
 | 4 | 90.9 | 22.8 |
 
+The drafter added little to these figures. On these short code prompts at
+temperature 1 its drafts rarely held: at three sessions, 45 of the 251 steps
+gave a session a drafting turn and 39 of those kept only one token, and the
+sessions' controllers were backing off after a loss in 81% of their steps. At
+four sessions no session drafts (see [New in this update](#new-in-this-update)).
+Drafting inside a batch pays on long agent turns: replayed real agent turns at
+134K to 263K tokens decoded 3.8% faster with three streams together than as
+plain rows, and 8.1% faster with two
+([docs/METAL-V41.md](docs/METAL-V41.md#mixed_step-mixed_carry-verify_stack-verify_copies-verify_decode-dspark-in-a-batch)).
+
 When a cold 9,240-token prompt arrives while three sessions decode (greedily,
 DSpark on), they keep going at about 10 tok/s each: its prefill took 17.7 s,
 and the longest wait between two tokens of a decoding session was 336 ms (292 ms
@@ -365,7 +375,7 @@ that checks a draft; "Batch" means one step that decodes several sessions
 | MIXED_CARRY | DSpark, batch: a rejected draft's correction rides in the next shared step. |
 | READ_ONCE | DSpark, batch: rows that picked the same expert read it once. |
 | FP4_NO_TABLE | Decode, batch: FP4 expert codes become floats by shifts, without a table (oMLX's decode). |
-| LIVE_SPLITS | Decode, batch: attention launches only the splits that have keys. |
+| LIVE_SPLITS | Batch, from four rows: attention launches only the splits that have keys. |
 | FINAL_SPIN | Decode, batch: the host spins on the last command buffer's signal instead of waiting for completion. |
 | ATTN_TILES | Decode, batch, DSpark: attention scores and PV on the matrix units (from oMLX's kernel). Not bit for bit. |
 | TP_BALANCED_ROUTE | TP: each Mac takes half of every token's experts. |
@@ -554,10 +564,10 @@ The groups that are not bit for bit:
 - **Faster decode for one session too.** The routed experts decode their FP4
   weights with shifts instead of a table behind a barrier, decode attention runs
   its scores on the matrix units (not bit for bit; `--exact` keeps main's
-  kernel), only attention splits that have
-  keys launch, and the host spins on the last command buffer's event instead of
+  kernel), and the host spins on the last command buffer's event instead of
   waiting for its completion. Serial decode at 8K is now 43.7 tok/s, against
-  41.4 in the previous update.
+  41.4 in the previous update. Launching only the attention splits that have
+  keys saves nothing for one session; it pays from four sessions, most at eight.
 - **Prefill no longer stalls the other sessions.** A cold prompt now prefills in
   32,768-token syncs and parks between chunks, and the decoding sessions take a
   step at every park. Beside three decoding sessions, a cold 9,240-token prompt

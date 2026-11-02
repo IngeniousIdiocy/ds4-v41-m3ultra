@@ -1113,7 +1113,10 @@ ms at N=3, −0.33 at N=2, −0.26 at N=4. BATCH_NARROW measured +0.05 at N=3,
 −0.26 at N=2 and +0.14 at N=4, in an arm that also carried a narrow Engram form
 that was later removed, so its own effect was not separated; it is within
 0.3 ms either way. It stays as the rows' form of NARROW_WEIGHTS and is the path
-BATCH_ROUTER8 extends to eight rows.
+BATCH_ROUTER8 extends to eight rows: with BATCH_NARROW off, five to eight rows
+read the F32 gate too. Its own gain is therefore not known. It has not been
+measured on its own, at two to four rows or, through BATCH_ROUTER8, at five to
+eight.
 
 ### BATCH_OVERLAP, BATCH_DOWN, BATCH_WAVE, BATCH_MIX, BATCH_QKV: work side by side
 
@@ -1191,7 +1194,10 @@ register kernels.
 
 Kind: arithmetic, kernel launches. Measured while building it, all six together:
 N=5 75.0 to 59.7 ms, N=6 86.6 to 67.3, N=7 98.9 to 75.6, N=8 95.4 to 83.6, about
-8 ms a row with no cliff. The six were not measured one by one.
+8 ms a row with no cliff. The six were not measured one by one, so how the gain
+splits among them is not known. All but BATCH_MMA carry a two-to-four-row group
+(BATCH_TAIL and BATCH_LOW, BATCH_OVERLAP, BATCH_NARROW and BATCH_HIER, the
+rotation of BATCH_ROPE, HEAD_ROWS) on to eight rows.
 
 ### BATCH_NARROW_ENGRAM, BATCH_READS, BATCH_PE: Engram and the handoff for rows
 
@@ -1218,7 +1224,8 @@ top_p 1), as one row does.
 Kind: idle time, bytes moved. Measured while building it:
 - BATCH_NARROW_ENGRAM, one pass against the form before it (sampled at
   temperature 1): −0.11 ms at N=3, −0.08 at N=2, −0.27 at N=4, −1.1 at N=5,
-  −1.0 at N=6 and N=7, −0.61 at N=8.
+  −1.0 at N=6 and N=7, −0.61 at N=8. It pays most from five rows, where the
+  form before it read the weights twice; below that it is small.
 - BATCH_READS: about 0 at N=2 and N=3, −0.40 at N=4, −0.25 at N=5, −0.49 at
   N=6, −0.69 at N=7, −0.97 at N=8. It pays from four rows and costs nothing
   below.
@@ -1226,8 +1233,9 @@ Kind: idle time, bytes moved. Measured while building it:
   waited on the Engram join (0 at N=3, +0.19 at N=2). With BATCH_READS: −0.13 ms
   at N=3, −0.10 at N=2, −0.07 at N=4, −0.09 at N=8 greedy; −0.09 and −0.06 at
   N=3 and N=2 sampled. Rows already committed their first buffer about as fast
-  as one row does with the slot, so there was little left for it to remove. It
-  stays on: exact and never a loss with BATCH_READS.
+  as one row does with the slot, so there was little left for it to remove. With
+  BATCH_READS it pays a small, steady 0.06 to 0.13 ms at every N measured, and
+  it stays on.
 - KEYED_GPU for rows, sampled at temperature 1 and top_p 1: −0.28 ms at N=3; at
   the server, three streams went from 71.8 to 72.7 t/s.
 
@@ -1308,7 +1316,10 @@ block alone 68.4 to 66.1; plain rows at N=8 81.9 to 79.5 at short depth, 86.8
 to 86.0 at 131K. Plain rows at N=4: −0.29 ms on the short caches, −0.17 on
 oMLX-style prompts (one shared text with a unique prefix per row, 1,024
 tokens), +0.02 on 1,024-token distinct texts, and +0.17 at 131K. Plain rows at N=2 and N=3 do
-not take it: they repeat too few experts for the plan's cost.
+not take it: they repeat too few experts for the plan's cost. At four plain rows
+it is about even, a small saving where rows repeat experts and a small cost at
+131K, where they repeat fewer; it pays in every step with a verify block and at
+eight rows.
 
 ### FP4_NO_TABLE: FP4 codes without a table
 
