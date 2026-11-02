@@ -36,6 +36,7 @@ Numbers are from a Mac Studio M3 Ultra (80 GPU cores, 512 GB):
 - Row reuse has a cost curve: 2, 3, 6 and 8 rows are competing designs, because accumulators, registers and staging grow with rows.
 - Test no, partial and full expert overlap; full overlap is a capability case, not an average.
 - A short-row MMA verify design beat row-sharing kernels: disabling its matrix units dropped verify from 77.5 to 65.4 rows/s (16%).
+- Price a verify block against the same number of other sessions' rows on one timeline. Six verify rows cost 18.9 ms more than six cross-session rows: 1,072 extra small passes (copies, RoPE, bf16 linear) at about 7 µs of idle each, 3.4 ms of copies, and an FFN without the batched rows' fused input. Running the block on the batched rows' kernels, with decode's attention, took verify from 79.8 to 72.5 ms on real turns, exact.
 
 **When should it draft at all?** The controller is part of the economics. On V4.1 prose, drafting everywhere ran at 31.2 t/s, and the controller alone brought it to 39.1, about serial. On code it costs 1.5 t/s. The policy:
 - decode 16 tokens serially, and take the median of the last nine serial tokens as the cost;
@@ -51,6 +52,10 @@ Keep the policy fixed while tuning kernels. A trained confidence head's sigmoid 
 - Gate verify kernels by purpose, never by row count. Kernels gated on 3 to 8 rows also caught the minimum prefill batch of 8, and an 8-token prompt changed its first generated token.
 - Causal-state correctness (rollback) is a separate contract from numerical equality.
 - An exact MMA is possible. `simd_sum` is a fixed adjacent-pairs tree, and `simdgroup_multiply` from zero matches per-lane FMA chains, so a batched kernel can reproduce the row kernels' bits. Turn off fast-math reassociation there with `#pragma clang fp reassociate(off)`.
+- Exact verify with decode's attention needs decode's selection order too.
+  - Past 16,384 visible keys, decode's radix select orders tied scores by id; a batched block sort left ties in its network's order, and one 131K row on repeated code differed. Order ties by id in the block sort.
+  - Below (top_k + 1) × ratio keys (2,052 at ratio 4), batched selection hands ids in key order while decode sums in pick order: 96 of 96 rows differed at 256 and 1,024 tokens, none from 4,096. Take the per-row pick there.
+  - Exactness needs repeated text, not more depths of one text: eight depths of one text had passed.
 
 **Is sampled decoding still correct?** Greedy tests do not prove it. GLM's rejection path reapplied top-k, top-p and min-p to modified logits, which could change the residual's support, so GLM's release stayed greedy-only. A faster approximate sampler is a product decision.
 
@@ -84,6 +89,9 @@ Keep the policy fixed while tuning kernels. A trained confidence head's sigmoid 
 - **A 64-slot GPU drafter correction cache.** +0.03 t/s for 32 MiB per session, after an upstream redesign removed most of the cost.
 - **An early per-attempt controller** priced one poor narrow verify and kept real code writes nearly serial. A windowed policy fixed it.
 - **A controller threshold tuned to content.** A controller paying 5 to 7% on chat met the bar written for it, but derived from costs it would have been rejected before the run. For example, a 121 ms cycle against a 31 ms serial token breaks even at 3.9 rows. A losing verified probe costs 1.3 steps; a drafter-only decline costs 0.3.
+- **A correction as its own one-row step beside other sessions.** Every other session waits a whole step for one token. Carried as its stream's row in the next shared step, rejected blocks went from 115.6 to 91.1 ms.
+- **Two verify blocks in one shared step.** At three sessions, one block computes to 82 t/s, three blocks of 3, 3 and 2 rows to 68, plain rows 74. One block a step, rotating.
+- **Drafting beside three other sessions.** Exact verify at four sessions computes to −1.1% to +1.8% against plain rows from short to 300K, so blocks join steps of at most three sessions.
 
 ## Procedure, switches and measurement
 

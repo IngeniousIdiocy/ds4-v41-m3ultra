@@ -43,10 +43,12 @@ Numbers are from a Mac Studio M3 Ultra (80 GPU cores, 512 GB) running DeepSeek V
 - **Host work between tokens.**
   - A NEON scan of the sampler's first pass cut it from 674 to 555 µs per call on sampled decoding.
   - Moving the drafter capture into the head's command buffer saved 0.24 ms per token.
+- **The final wait.** A command buffer's completion reaches the host about 0.33 ms after the GPU ends. The head buffer signals a shared event and the host spins on it: −0.33 ms per step at every session count, one included (40.2 to 40.7 t/s at depth). One core spins 3 to 5 ms per step, so spin on that wait only.
 
 **How many threadgroups are busy in each phase?** A phase that ends on a few threadgroups is a serial tail, however few bytes it moves.
 - **One-core reductions.** The Engram gate ran one 32-lane group per stream, and the hyper-connection collapse ran on one 1,024-thread group. Spread the loads but keep each lane's sum chain and order: +0.66 t/s, bit-exact. The gate went from 122.5 to 7.5 µs.
 - **The top-k merge ladder** ended its last rounds on two or three threadgroups. A radix select finds only the 512th score's cutoff across the whole GPU, for rows of 16,384 or more: +2.56 t/s at 131K.
+- **Empty splits.** V4.1 decode attention sees at most 640 keys (128 raw, 512 selected), so 12 of its 32 splits had none. Launching and reducing only the live ones saved 0.60 ms per step at eight sessions, 0.13 at four.
 
 **What is known before the token runs?**
 - **Fixed shapes.** Compile the model's constant decode shapes into the kernels: +0.98 t/s on the release branch and +2.3 on main.
@@ -79,6 +81,10 @@ Numbers are from a Mac Studio M3 Ultra (80 GPU cores, 512 GB) running DeepSeek V
 - The attention block's hyper-connection mix runs inside the query projection's dispatch.
 - On GLM, the router was folded into the shared gate/up grid.
 - Moving work that is already hidden beside a big stream saves nothing.
+
+**Do rows that pick the same expert each issue their own loads?** Then the shared read happens only in the cache. Cross-session dedup lost by 1.5 ms per step at four same-text sessions, and forcing every row onto one row's experts saved only 1.9 ms of 40.7 at three. One load and one decode feeding K accumulators saved 6.0 ms at three on full overlap. Real sessions share 3.9% of experts at three 131K rows and 14% at eight; a six-row DSpark block repeats 31 to 34%, so blocks are the use: 84.7 to 80.9 ms for a block beside two sessions.
+
+**What does each threadgroup set up before its first useful load?** The routed expert kernels filled an FP4 table in threadgroup memory behind a barrier. Decoding the codes with shifts on the packed bytes, written as the table form's flat chain of 16 terms, saved 1.5 ms per step at three sessions, 6.0 at eight and 0.19 at one, bit-exact.
 
 **What grows with context, and what has an earlier layer already ruled out?**
 - Past layer 20, V4.1 can only select blocks that layer 20 kept. Build that candidate list once per token, and score and select only over it.
@@ -117,6 +123,20 @@ Numbers are from a Mac Studio M3 Ultra (80 GPU cores, 512 GB) running DeepSeek V
 - **An Engram row cache.** 30.7% of rows recur, but a token stops waiting only when all 24 rows hit, which happened on 8.7 to 14.1% of tokens. Price the hit that removes a wait, not the hit rate.
 - **A narrow Engram reader measured alone.** It showed no gain, because neighbouring work absorbed it.
 - **Optimizing a shared-expert wrapper the default path did not call.** Speed barely moved; the default path ran a concurrent wrapper.
+- **Exact eight-row MMA tiles for two to four batched rows.** The 8x8 tile is the hardware shape, so unused rows cost full multiplies: +1.8 ms per step at three sessions, +2.1 at two, +0.50 at four. Register kernels win through four rows, tiles from five.
+- **A row-count test in a tile's hot loop** (`!ra ? 0 : xa[k]`) cost 4 ms per step at eight rows. Pick the pointer outside the loop; a tile row past the count repeats row 0, unread.
+- **Outputs per threadgroup raised to cut launches.** Six outputs per threadgroup at two rows lost 0.20 ms against four, and two at four rows lost 0.14 against three: the extra sums per lane cost more than the launches saved.
+- **A one-thread plan for shared experts.** One GPU thread grouping 6N (row, expert) pairs spends about 60 ns a compare and stores one by one: +0.69 ms at three sessions, +2.7 at eight. A thread per pair, counting its own company, costs +0.20 and +0.33.
+- **Read-once groups of eight rows.** Exact order needs every input loaded before the weights, so eight rows hold 128 input floats live: one group of eight saved 2.9 ms where two groups of four saved 7.9. Cap the group size.
+- **One pipeline per read-once group size.** Splitting the lone pairs into 2, 4 or 8 launches cost 1.1, 3.0 and 3.8 ms at eight sessions. In one launch the list order matters: writing lone pairs first left the groups last and cut a three-session block's saving from 4.0 to 2.8 ms.
+- **`reassociate(off)` to restore a group kernel's bits.** No help, and 86 to 109 ms per step at eight rows. Library fast math orders each sum by where its terms are defined, so decoding the weights before loading the inputs changed every row's rounding; load the inputs first. The FP4 decode without a table had the same cause: fast math flattened the table form to one 16-term chain in definition order, so spell it out with `fma`.
+- **FP4 words from three aligned loads and shifts.** +0.62 ms at three sessions, +5.1 at eight; byte loads already merge. Raw unaligned word loads looked 4.4 ms faster at three: they read wrong data, and rows that all route alike are fast.
+- **oMLX's thread shape on the routed kernels** (four rows a simdgroup, eight simdgroups a threadgroup). Same bits, +1.1 ms at three sessions, +4.3 at eight. Its edge was the FP4 table and barrier it does without.
+- **oMLX's dense tiles ported literally.** +1.8 ms at four sessions, +1.6 at eight, against exact register kernels and exact tiles. A profile that runs a stage twice finds the weights in the system cache the second time, so its stage times are not clean.
+- **An attention row axis across sessions.** One session's vec stage already fills the GPU (overlapped with the other rows it keeps 78% of its time at four), so a row axis saves only launches, under 0.15 ms at three. The win was scores and PV on 8x8 tiles, 8 heads by 64 keys a threadgroup: 38.3 to 36.3 ms at three sessions, not bit for bit.
+- **A second Engram pass above four batched rows.** A threadgroup held four rows at eight simdgroups, so a fifth re-read the weights: +0.32 ms at five, +0.69 at eight. One register pass at every row count: −1.1 at five.
+- **Batched rows' Engram reads on each session's parked readers.** +0.81 ms at three sessions, +2.6 at eight. Waking parked threads is slower than one worker doing the reads.
+- **Pre-encode for batched rows.** It paid 0.06 to 0.13 ms, not the 0.5 to 0.7 of idle it targeted. Rows already commit their first buffer as fast as one row does with the slot; one row's gain is its own layer-0 encode.
 
 ## Exactness while fast
 

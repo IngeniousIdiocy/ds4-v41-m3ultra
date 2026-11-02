@@ -94,6 +94,9 @@ A base without them ran 658 t/s at 8K and 741 at 63K; with them, 737 and 846.
 - **Fused verify expert kernels for eight-row prefill batches.** Not faster (0.265 against 0.272 s).
 - **Large expert banks as a default** (GLM). They paid only above about 33K tokens.
 - **A merged candidate compared without its prefill-only work.** It kept 741 t/s at 63K against 846. Inventory every phase before claiming a whole-build result.
+- **Bigger chunks alone for decoders beside a prefill.** Each chunk pays one sweep of all experts, 0.55 s plus 1.02 ms a token, however short, so bigger chunks froze three decoders harder: 0.40 t/s at 2,048 tokens against 1.37 at 128. A time share held them near 8 t/s with a 2.7 s worst stall. A layered prefill parked between chunks, the decoders stepping at each park, takes the stall to about 0.35 s (0.8 s beside a 126K prompt).
+- **Taking turns at chunk level with a short request.** A 15-token prompt prefills layer by layer, so it took turns with the sweep's wide chunks at every layer: 7.7 to 14.5 s. Short prefills skip the turns: 0.6 to 0.9 s. A parked sweep must also count threads queued on the lock; one that could not see them retook it first, and a title beside two cold prefills took 129 to 154 s.
+- **One sync for the whole prompt.** 883 t/s against 868 with 32,768-token syncs (8,192-token syncs ran 791), but it stored no checkpoint during the prefill. 32,768 keeps them for 1.7%.
 
 ## Exactness while fast
 
