@@ -3546,12 +3546,12 @@ kernel void NAME( \
         ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
     kernel_dsv4_attn_out_low_q8_0_f32_rows_reg_impl<K, NR0, ROUND>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg); \
 }
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows2_reg, 2, 4, false)
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows3_reg, 3, 4, false)
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows4_reg, 4, 2, false)
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows2_reg, 2, 4, true)
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows3_reg, 3, 4, true)
-DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows4_reg, 4, 2, true)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows2_reg, 2, 2, false)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows3_reg, 3, 3, false)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_rows4_reg, 4, 3, false)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows2_reg, 2, 2, true)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows3_reg, 3, 3, true)
+DS4_ATTN_OUT_LOW_ROWS_REG(kernel_dsv4_attn_out_low_q8_0_f32_bf16_rows4_reg, 4, 3, true)
 #undef DS4_ATTN_OUT_LOW_ROWS_REG
 
 /* The matrix rows form: grid z is the group, ne12 carries the token count. */

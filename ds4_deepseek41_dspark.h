@@ -438,7 +438,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         }
     }
     ds41_dspark_rows(true);
-    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
+    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w, 0);
     ds41_dspark_rows(false);
     d->pq_done = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)

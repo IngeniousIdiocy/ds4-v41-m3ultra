@@ -574,6 +574,9 @@ uint64_t ds4_gpu_v41_off2(void) {
             "DS4_METAL_DISABLE_V41_BATCH_QROPE",
             "DS4_METAL_DISABLE_V41_BATCH_HEAD8",
             "DS4_METAL_DISABLE_V41_BATCH_LOWBF",
+            "DS4_METAL_DISABLE_V41_BATCH_PE",
+            "DS4_METAL_DISABLE_V41_BATCH_ENGRAM",
+            "DS4_METAL_DISABLE_V41_BATCH_READS",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -13036,7 +13039,8 @@ int ds4_gpu_embed_token_hc_tensor(
         [enc setComputePipelineState:g_get_rows_f16_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-        if (g_pe_embed_word) [enc setBuffer:g_pe_tokword offset:0 atIndex:2];   /* the slot reads the token word */
+        if (g_pe_embed_word)   /* the slot reads the row's token word */
+            [enc setBuffer:g_pe_tokword offset:(NSUInteger)(g_pe_embed_word - 1) * sizeof(int32_t) atIndex:2];
         else [enc setBytes:&token_i32 length:sizeof(token_i32) atIndex:2];
         [enc setBuffer:g_embed_rows_buffer offset:0 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(nw0, 1, 1)
@@ -20581,7 +20585,7 @@ static int ds4_gpu_matmul_q8_0_rows_tensor_impl(
         if (rope_tab && !rope_exact && (!reg_kernel || !round_bf16)) return 0;
         const char *reg_name = reg_kernel ? reg_names[(rope_tab ? 2 : 0) + (round_bf16 ? 1 : 0)][n_rows - 2u] : NULL;
         if (rows_kernel) {
-            dispatch.nr0 = reg_kernel && n_rows == 4u ? 2 : 4;   /* the four-row kernels' outputs per threadgroup */
+            dispatch.nr0 = !reg_kernel ? 4 : rope_tab || n_rows == 2u ? 2 : 3;   /* the register kernels' outputs per threadgroup */
             args.nr0 = dispatch.nr0;
             DS4_TEST_NOTE(reg_kernel ? reg_name : mma_kernel ? mma_name : exact_kernel ? exact_name : rows_name);
         }
@@ -22271,6 +22275,45 @@ static int ds4_gpu_fp8_reader(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, 
 int ds4_gpu_matmul_engram_fp8_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
                                       uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x) {
     return ds4_gpu_fp8_reader(out, codes, e8m0, in_dim, out_dim, x, 1);
+}
+
+/* BATCH_ENGRAM: rows of the Engram reader, one simdgroup group per row and at most 32 simdgroups per threadgroup, so
+ * more rows go in chunks (the F16 row kernel's dispatch). */
+int ds4_gpu_matmul_engram_fp8_weights_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
+                                           uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!codes || !e8m0 || !in_dim || (in_dim % 32u) || (out_dim % 32u) || (ds4_gpu_tensor_offset(codes) % 16u) ||
+        rows < 2u || rows > 8u || ds4_gpu_tensor_bytes(codes) < (uint64_t)in_dim * out_dim ||
+        ds4_gpu_tensor_bytes(e8m0) < (uint64_t)(in_dim / 32u) * (out_dim / 32u) ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)rows * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < (uint64_t)rows * out_dim * sizeof(float)) return 0;
+    const ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
+    if (strcmp(mv_dispatch.function_name, "kernel_mul_mv_f16_f32_4") != 0 || mv_dispatch.nsg > 16) return 0;
+    const uint32_t chunk = 32u / (uint32_t)mv_dispatch.nsg;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline("kernel_engram_blend_rows_bf16", mv_dispatch.nsg);
+        if (!pipeline) return 0;
+        DS4_TEST_NOTE("kernel_engram_blend_rows_bf16");
+        ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        for (uint32_t r = 0; r < rows; r += chunk) {
+            const NSUInteger groups = rows - r < chunk ? rows - r : chunk;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(codes) offset:ds4_gpu_tensor_offset(codes) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) + (NSUInteger)r * in_dim * sizeof(float) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) + (NSUInteger)r * out_dim * sizeof(float) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(e8m0) offset:ds4_gpu_tensor_offset(e8m0) atIndex:4];
+            [enc setThreadgroupMemoryLength:groups * 2u * 32u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim / 2u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg * groups, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+        return ds4_gpu_finish_command_buffer(cb, owned, "Engram FP8 rows matvec");
+    }
 }
 
 int ds4_gpu_dsv41_project_fp8_bf16_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
@@ -28867,7 +28910,7 @@ int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
                 "kernel_dsv4_attn_out_low_q8_0_f32_mma8_exact";
             if (mma_kernel) { args.nr0 = 8; args.ne12 = (int32_t)n_rows; }
             if (exact_kernel) { args.nr0 = 8; args.ne12 = (int32_t)n_rows; }
-            if (reg_kernel) args.nr0 = n_rows == 4u ? 2 : 4;
+            if (reg_kernel) args.nr0 = n_rows == 2u ? 2 : 3;
             if (rows_kernel) DS4_TEST_NOTE(reg_kernel ? reg_name :
                                            mma_kernel ? "kernel_dsv4_attn_out_low_q8_0_f32_mma_rows8" :
                                            exact_kernel ? exact_name :
@@ -50943,7 +50986,7 @@ int ds4_gpu_dsv41_matmul_expand_rows(ds4_gpu_tensor *out_hc, const void *model_m
              "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_rows4_reg"},
             {"kernel_mul_mv_q8_0_f32_hc_expand4_rows2_reg", "kernel_mul_mv_q8_0_f32_hc_expand4_rows3_reg",
              "kernel_mul_mv_q8_0_f32_hc_expand4_rows4_reg"}};
-        if (reg_kernel && rows == 4u) { dispatch.nr0 = 2; args.nr0 = 2; }
+        if (reg_kernel) { dispatch.nr0 = rows == 2u ? 2 : 3; args.nr0 = dispatch.nr0; }
         const char *fn = reg_kernel ? reg_names[in_bf16][rows - 2u] :
             mma_kernel ? (mma == 8 ? "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows8" :
                                        "kernel_mul_mv_q8_0_f32_bf16io_hc_expand4_mma_rows") :
@@ -54233,16 +54276,17 @@ int ds4_gpu_pe_pending(void) { return g_pe_cb != nil; }
 int ds4_gpu_pe_supported(void) {
     return g_initialized && g_pe_retained > 0 && ds4_gpu_v41_on(DS4_GPU_V41_PREENCODE);
 }
-void ds4_gpu_pe_embed_word(int on) { g_pe_embed_word = on && g_pe_preparing; }
+/* row + 1: the next embed reads that row's token word; 0: its own token */
+void ds4_gpu_pe_embed_word(int row) { g_pe_embed_word = g_pe_preparing ? row : 0; }
 
 /* Open the slot as the command batch. Token N's final buffer must already be committed (no open batch). */
 int ds4_gpu_pe_begin(void) {
     if (!ds4_gpu_pe_supported() || g_batch_cb || g_pe_preparing || g_pe_final_cb == nil) return 0;
     ds4_gpu_pe_drop();
     if (!g_pe_tokword) {
-        g_pe_tokword = [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        g_pe_tokword = [g_device newBufferWithLength:32 options:MTLResourceStorageModeShared];
         if (!g_pe_tokword) return 0;
-        memset([g_pe_tokword contents], 0, 16);
+        memset([g_pe_tokword contents], 0, 32);
         g_pe_tokword.label = @"ds4_pe_token_word";
     }
     ds4_gpu_pe_save_state();
@@ -54276,10 +54320,10 @@ int ds4_gpu_pe_end(int ok) {
 }
 
 /* Commit the slot as the token's first buffer (the "flush" after layer 0) and open the next batch buffer. */
-int ds4_gpu_pe_commit(int32_t token) {
-    if (!g_pe_cb || g_batch_cb || g_pe_preparing) return 0;
+int ds4_gpu_pe_commit_rows(const int32_t *tokens, uint32_t rows) {
+    if (!g_pe_cb || g_batch_cb || g_pe_preparing || rows > 8u) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
-    *(int32_t *)[g_pe_tokword contents] = token;
+    memcpy([g_pe_tokword contents], tokens, rows * sizeof(int32_t));
     if (g_pe_transients) [g_transient_buffers addObjectsFromArray:g_pe_transients];
     g_pe_transients = nil;
     id<MTLCommandBuffer> cb = g_pe_cb;
@@ -54302,6 +54346,8 @@ int ds4_gpu_pe_commit(int32_t token) {
     }
     return 1;
 }
+
+int ds4_gpu_pe_commit(int32_t token) { return ds4_gpu_pe_commit_rows(&token, 1u); }
 
 /* ==== The GPU bridge behind the decode head ====
  * Right after the decode step's final (head) buffer is committed, and before the next token's pre-encoded slot is

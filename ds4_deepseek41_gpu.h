@@ -214,6 +214,8 @@ int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n);
  * bytes (outputs rounded to bf16): the wide matvecs' bits. 0, encoding nothing, when the shape does not fit. */
 int ds4_gpu_matmul_bf16_router_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *weights,
                                        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x);
+int ds4_gpu_matmul_engram_fp8_weights_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
+                                           uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x, uint32_t rows);
 int ds4_gpu_matmul_engram_fp8_weights(ds4_gpu_tensor *out, const ds4_gpu_tensor *codes, const ds4_gpu_tensor *e8m0,
                                       uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
 /* BATCH_NARROW: the router copy's reader over a few rows. */

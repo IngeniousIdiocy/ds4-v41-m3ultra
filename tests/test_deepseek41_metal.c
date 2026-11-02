@@ -1507,6 +1507,26 @@ static int check_narrow_weights(void) {
         CHECK(same_bits(a, b, outs[k]));
     }
     for (int k = 0; k < 3; k++) CHECK(ds4_gpu_test_kernel_runs(names[k]) == runs[k] + 1);
+    /* BATCH_ENGRAM: 2-8 rows of the Engram reader, each row's bits as its one-row reader (poisoned outputs) */
+    const uint64_t engram_rows = ds4_gpu_test_kernel_runs("kernel_engram_blend_rows_bf16");
+    ds4_gpu_tensor *ex = upload(NULL, 8 * ins[0] * 4), *er = upload(NULL, 8 * outs[0] * 4), *eg = upload(NULL, 8 * outs[0] * 4);
+    CHECK(ex && er && eg);
+    float *exv = ds4_gpu_tensor_contents(ex);
+    for (uint32_t i = 0; i < 8 * ins[0]; i++) exv[i] = random_value() / 4;
+    for (uint32_t rows = 2; rows <= 8; rows++) {
+        for (uint32_t r = 0; r < rows; r++) {
+            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(ex, (uint64_t)r * ins[0] * 4, ins[0] * 4);
+            ds4_gpu_tensor *yr = ds4_gpu_tensor_view(er, (uint64_t)r * outs[0] * 4, outs[0] * 4);
+            CHECK(xr && yr && ds4_gpu_matmul_engram_fp8_weights(yr, codes[0], scales[0], ins[0], outs[0], xr));
+            ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
+        }
+        CHECK(ds4_gpu_synchronize());
+        memset(ds4_gpu_tensor_contents(eg), 0xff, (size_t)rows * outs[0] * 4);
+        CHECK(ds4_gpu_matmul_engram_fp8_weights_rows(eg, codes[0], scales[0], ins[0], outs[0], ex, rows));
+        CHECK(ds4_gpu_synchronize() && same_bits(er, eg, (uint64_t)rows * outs[0]));
+    }
+    CHECK(ds4_gpu_test_kernel_runs("kernel_engram_blend_rows_bf16") == engram_rows + 7);
+    ds4_gpu_tensor_free(ex); ds4_gpu_tensor_free(er); ds4_gpu_tensor_free(eg);
     ds4_gpu_test_set_flags(0);
     for (int k = 0; k < 2; k++) { ds4_gpu_tensor_free(codes[k]); ds4_gpu_tensor_free(scales[k]); }
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(rt); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b);

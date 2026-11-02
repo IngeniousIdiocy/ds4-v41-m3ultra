@@ -127,6 +127,9 @@ typedef struct {
 #define DS4_GPU_V41B_BATCH_QROPE (1ull << 17)   /* with BATCH_MMA q_b of 5-8 rows rotates as it stores, as BATCH_ROPE does at 2-4 */
 #define DS4_GPU_V41B_BATCH_HEAD8 (1ull << 18)   /* with SHORT_MMA the vocabulary head of 5-8 decode rows on sixteen simdgroups */
 #define DS4_GPU_V41B_BATCH_LOWBF (1ull << 19)   /* with BATCH_LOW the low projection rounds to bf16 as it stores, so output-B need not as it loads */
+#define DS4_GPU_V41B_BATCH_PE (1ull << 20)   /* with PREENCODE cross-session decode rows' next first buffer is encoded in the final wait */
+#define DS4_GPU_V41B_BATCH_ENGRAM (1ull << 21)   /* 2-3 cross-session decode rows read the narrow Engram copy */
+#define DS4_GPU_V41B_BATCH_READS (1ull << 22)   /* cross-session decode rows read the second Engram table after the first has joined */
 #define DS4_GPU_V41B_BATCH_MIX (1ull << 8)   /* 2-4 cross-session decode rows' attention runs the HC mix beside q_b */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
 #define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */
@@ -337,9 +340,10 @@ int ds4_gpu_end_commands_async(void);
 int ds4_gpu_pe_supported(void);
 int ds4_gpu_pe_pending(void);
 int ds4_gpu_pe_begin(void);
-void ds4_gpu_pe_embed_word(int on);
+void ds4_gpu_pe_embed_word(int row);
 int ds4_gpu_pe_end(int ok);
 int ds4_gpu_pe_commit(int32_t token);
+int ds4_gpu_pe_commit_rows(const int32_t *tokens, uint32_t rows);
 void ds4_gpu_pe_drop(void);
 int ds4_gpu_end_commands_commit(bool bridge);
 int ds4_gpu_end_commands_wait(void);
