@@ -65,6 +65,9 @@ typedef struct ds4_session ds4_session;
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 typedef bool (*ds4_session_cancel_fn)(void *ud);
+/* Between chunks of a long prefill. park false: does anything want the model?
+ * park true: hand it over and return once it is back. */
+typedef bool (*ds4_session_yield_fn)(void *ud, bool park);
 
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 
@@ -445,6 +448,7 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * usable, but a partial layer-major pass is invalidated and the next sync
  * rebuilds it. Do not assume an interrupted session can be saved or decoded. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
+void ds4_session_set_yield(ds4_session *s, ds4_session_yield_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */

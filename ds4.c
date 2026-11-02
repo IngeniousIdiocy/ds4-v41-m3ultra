@@ -41048,6 +41048,8 @@ typedef struct {
     uint32_t plan_rows;
     /* CED: a prefill sweep's decoder rows see no window keys before this position (0: all of them) */
     uint32_t window_floor;
+    ds4_session_yield_fn yield;
+    void *yield_ud;
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     bool rows_decode;   /* a step of cross-session decode rows is encoding */
@@ -43985,6 +43987,13 @@ static bool ds41_carry_copy(ds41_gpu_graph *g, uint32_t offset, uint32_t count, 
     return ok;
 }
 
+/* A sweep's rows and its place in them live in this session's graph, and between
+ * chunks no command is open, so other sessions can run here. */
+static void ds41_prefill_yield(ds41_gpu_graph *g) {
+    if (g->yield && g->tp_world == 1 && g->yield(g->yield_ud, false) && ds4_gpu_synchronize())
+        g->yield(g->yield_ud, true);
+}
+
 /* Decoder attention reads all encoder compressed keys, but only the previous
  * 127 decoder inputs. Publish the former for the entire prefix; warm the latter
  * before evaluating each shrinking suffix. No old decoder output is needed. */
@@ -43999,6 +44008,7 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_BATCH_PUBLISH");
     const uint32_t chunk = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;
     for (uint32_t off = offset; ok && off < offset + rows; off += chunk) {
+        ds41_prefill_yield(g);
         if (cancel && cancel(cancel_ud)) return false;
         const uint32_t count = offset + rows - off < chunk ? offset + rows - off : chunk;
         ds41_prefill_row active = {0};
@@ -44370,6 +44380,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         }
         for (uint32_t off = first; ok && off < total_count;
              off += trim ? chunk - off % chunk : chunk) {
+            ds41_prefill_yield(g);
             if (cancel && cancel(cancel_ud)) { ok = false; break; }
             const uint32_t span = trim ? chunk - off % chunk : chunk;
             const uint32_t count = total_count - off < span ? total_count - off : span;
@@ -77845,6 +77856,17 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     if (!s) return;
     s->cancel = fn;
     s->cancel_ud = ud;
+}
+
+void ds4_session_set_yield(ds4_session *s, ds4_session_yield_fn fn, void *ud) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s && ds4_session_is_ds41(s)) {
+        s->ds41_graph.yield = fn;
+        s->ds41_graph.yield_ud = ud;
+    }
+#else
+    (void)s; (void)fn; (void)ud;
+#endif
 }
 
 static bool ds4_session_cancelled(ds4_session *s) {

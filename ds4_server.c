@@ -41,6 +41,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
@@ -10525,6 +10526,7 @@ struct server_slot {
     job *running;
     bool busy;
     bool prefill_waiting;
+    int prefill_left;   /* tokens this slot's prompt still needs, at its last turn */
 
     bool decode_pending;
     bool decode_in_flight;
@@ -10658,6 +10660,7 @@ struct server {
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
+    atomic_int inference_wanted;   /* threads queued on inference_mu, which a sweep cannot see */
     pthread_mutex_t model_mu;
     pthread_cond_t model_cv;
     bool model_busy;
@@ -10669,6 +10672,7 @@ struct server {
     int idle_prefill_quantum;   /* the engine's prefill cap: wide chunks while nothing generates */
     int last_prefill_slot;
     double mixed_decode_share;  /* decode wall time owed per second of prefill wall time */
+    bool prefill_yields;        /* one sweep of the whole prompt, handing the model over between its chunks */
     uint64_t request_seq;       /* the last request id logged */
     double prefill_started;
     double prefill_resume_at;   /* active generations hold the model until this time */
@@ -10688,7 +10692,9 @@ struct server {
 };
 
 static void server_inference_lock(server *s) {
+    atomic_fetch_add(&s->inference_wanted, 1);
     pthread_mutex_lock(&s->inference_mu);
+    atomic_fetch_sub(&s->inference_wanted, 1);
 }
 
 static void server_inference_unlock(server *s) {
@@ -11835,7 +11841,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     if (!s || !slot || slot->utility) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     /* Image-conditioned rows go to disk only with the images' identity, which
      * a later load must match (fingerprints at the same marker offsets). A
      * prefill still conditioning on images (progress-callback writes) or a
@@ -11985,7 +11991,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
                    "ds4-server: kv cache kept reason=prefill-interrupted (%s) file=%s",
                    g_stop_requested ? "shutdown" : "client disconnected", path);
         slot->continued_last_store_tokens = 0;
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         ds4_session_invalidate(slot->session);
         pthread_mutex_unlock(&s->inference_mu);
         return;
@@ -12002,7 +12008,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->kv_mu);
     slot->continued_last_store_tokens = 0;
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     ds4_session_invalidate(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
 }
@@ -12051,7 +12057,7 @@ static int kv_cache_try_load_key(server *s, server_slot *slot,
     if (slot->utility) return 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     /* A load replaces the live state, image identities included: drop the
      * slot's vision state first so nothing stale survives a failed load. */
     if (ds4_session_has_vision_state(slot->session)) {
@@ -12125,7 +12131,7 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: multimodal disk kv dropped images=%zu tokens=%d reason=suffix-does-not-extend-restored-images",
                    req->image_count, loaded);
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         ds4_session_invalidate(slot->session);
         pthread_mutex_unlock(&s->inference_mu);
         if (loaded_path_out) {
@@ -13121,6 +13127,25 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* A parked sweep comes back even when its job was cancelled: it unwinds under the lock. */
+static void server_prefill_resume(server *s, server_slot *slot) {
+    pthread_mutex_lock(&s->model_mu);
+    slot->prefill_waiting = true;
+    pthread_cond_broadcast(&s->model_cv);
+    while (s->model_busy ||
+           (!g_stop_requested && !slot_job_cancelled(slot) &&
+            (s->decode_pending > 0 || server_next_prefill_slot_locked(s) != slot->id ||
+             server_prefill_yielding_locked(s)))) {
+        server_prefill_wait_locked(s);
+    }
+    slot->prefill_waiting = false;
+    s->last_prefill_slot = slot->id;
+    s->model_busy = true;
+    s->prefill_started = now_sec();
+    pthread_mutex_unlock(&s->model_mu);
+    pthread_mutex_lock(&s->inference_mu);
+}
+
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
     int quantum = generation_active ? s->mixed_prefill_quantum :
@@ -13132,7 +13157,30 @@ static int server_prefill_quantum_for(const server *s,
     return quantum;
 }
 
+static bool server_prefill_yield(void *ud, bool park) {
+    server_slot *slot = ud;
+    server *s = slot->srv;
+    if (park) {
+        server_prefill_leave(s);
+        /* The lock is first-fit: a sweep coming straight back beats a sleeping waiter to it. */
+        while (atomic_load(&s->inference_wanted) > 0) usleep(100);
+        server_prefill_resume(s, slot);
+        return true;
+    }
+    pthread_mutex_lock(&s->model_mu);
+    /* Layer-major chunks are per layer however few the rows, so taking turns
+     * with sweeps would stretch a short append across dozens of wide chunks. */
+    const bool wanted = s->active_generations > 0 || atomic_load(&s->inference_wanted) > 0 ||
+                        (slot->prefill_left > server_prefill_quantum_for(s, false) &&
+                         server_next_prefill_slot_locked(s) >= 0);
+    pthread_mutex_unlock(&s->model_mu);
+    return wanted;
+}
+
 static int server_prefill_quantum(server *s) {
+    /* A yielding sweep hands over between chunks, so it can be the widest there
+     * is. It still has to end: mid-sweep state is no checkpoint to keep. */
+    if (s->prefill_yields) return 32768;
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
     pthread_mutex_unlock(&s->model_mu);
@@ -13154,7 +13202,7 @@ static int server_session_sync(server *s, server_slot *slot,
         return rc;
     }
 
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     int live = ds4_session_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
     pthread_mutex_unlock(&s->inference_mu);
@@ -13170,6 +13218,7 @@ static int server_session_sync(server *s, server_slot *slot,
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
+        slot->prefill_left = prompt->len - done;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
@@ -13264,7 +13313,7 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
     /* Start at the exact live frontier when both tokens and image identities
      * match. Starting at zero made the first scheduling slice truncate a
      * perfectly reusable long checkpoint, forcing a complete refill. */
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     int done = server_multimodal_resume_pos(slot->session, prompt,
                                             images, image_count);
     pthread_mutex_unlock(&s->inference_mu);
@@ -13292,6 +13341,7 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         }
         ds4_tokens prefix = *prompt;
         prefix.len = target;
+        slot->prefill_left = prompt->len - done;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, &prefix,
                                              images, prefix_images,
@@ -13341,7 +13391,7 @@ static int server_generation_rewind(server *s, server_slot *slot,
                                      request *r, int pos,
                                      bool resample, int last_token,
                                      char *err, size_t errlen) {
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     /* A mode change only needs logits at the retained boundary. Replaying the
      * previous token can cross before the verifier snapshot in exact mode. */
     if (resample && ds4_session_rewind_speculative(slot->session, pos)) {
@@ -13785,7 +13835,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     }
 
     char err[160] = {0};
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     ds4_session_rewrite_result rr =
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
@@ -13808,7 +13858,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                             rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
         if (loaded == 0) {
-            pthread_mutex_lock(&s->inference_mu);
+            server_inference_lock(s);
             ds4_session_invalidate(slot->session);
             pthread_mutex_unlock(&s->inference_mu);
         }
@@ -13957,7 +14007,7 @@ static int server_eval_tokens(server *s, server_slot *slot, int token,
                                                            "client disconnected");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         int rc = ds4_session_eval(slot->session, token, err, errlen);
         pthread_mutex_unlock(&s->inference_mu);
         if (rc == 0) { accepted[0] = token; *n_accepted = 1; }
@@ -14268,7 +14318,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * utility job remembered, so nothing below can continue from it. */
     if (slot->utility) request_live_state_clear(s, slot);
     const bool multimodal = j->req.image_count != 0;
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     const bool live_vision_match =
@@ -14376,7 +14426,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         prompt_for_sync = &effective_prompt;
         break;
     case REUSE_MEMORY_REWIND: {
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         ds4_session_rewind(slot->session, reuse.reuse_tokens);
         /* Rewinding mutates the session, so re-validate before trusting the
          * frontier: the common prefix must land exactly on the rewind target
@@ -15112,7 +15162,7 @@ decode_again:
                 client_stop = true;
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
-                pthread_mutex_lock(&s->inference_mu);
+                server_inference_lock(s);
                 ds4_session_invalidate(slot->session);
                 pthread_mutex_unlock(&s->inference_mu);
                 text_stop = true;
@@ -15671,11 +15721,13 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     pthread_mutex_unlock(&s->model_mu);
 
     ds4_session_set_cancel(slot->session, job_cancelled, j);
+    if (s->prefill_yields) ds4_session_set_yield(slot->session, server_prefill_yield, slot);
     if (!job_cancelled(j)) {
         if (g_stop_requested) server_refuse_stopping(s, j);
         else generate_job_inner(s, slot, j);
     }
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    ds4_session_set_yield(slot->session, NULL, NULL);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
@@ -15939,7 +15991,7 @@ static void *server_canary_main(void *arg) {
     if (g_stop_requested) {
         snprintf(err, sizeof(err), "the server is stopping");
     } else {
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         if (ds4_kvstore_engine_canary(s->engine, DS4_KVSTORE_CANARY_TOKENS, &canary,
                                       err, sizeof(err)) != 0)
             canary = 0;
@@ -16997,6 +17049,8 @@ int main(int argc, char **argv) {
     s.mixed_prefill_quantum = ds4_engine_is_deepseek41(engine) && !cfg.mixed_prefill_quantum_set ?
         2048 : cfg.mixed_prefill_quantum;
     s.mixed_decode_share = ds4_engine_is_deepseek41(engine) ? server_mixed_decode_share() : 0;
+    s.prefill_yields = cfg.batched_sessions > 0 && ds4_engine_is_deepseek41(engine) &&
+        !getenv("DS4_SERVER_DISABLE_PREFILL_YIELD");
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
@@ -17271,6 +17325,30 @@ static void test_batched_prefill_round_robin(void) {
     slots[0].prefill_waiting = false;
     slots[2].prefill_waiting = false;
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
+
+    pthread_mutex_init(&s.model_mu, NULL);
+    slots[1].srv = &s;
+    TEST_ASSERT(!server_prefill_yield(&slots[1], false));
+    atomic_store(&s.inference_wanted, 1);
+    TEST_ASSERT(server_prefill_yield(&slots[1], false));
+    atomic_store(&s.inference_wanted, 0);
+    slots[3].prefill_waiting = true;
+    TEST_ASSERT(!server_prefill_yield(&slots[1], false));
+    slots[1].prefill_left = 1 << 20;
+    TEST_ASSERT(server_prefill_yield(&slots[1], false));
+    slots[3].prefill_waiting = false;
+    pthread_mutex_destroy(&s.model_mu);
+
+    /* a sweep hands over to a generation or another prefill, and to nothing else */
+    pthread_mutex_init(&s.model_mu, NULL);
+    slots[1].srv = &s;
+    TEST_ASSERT(!server_prefill_yield(&slots[1], false));
+    s.active_generations = 1;
+    TEST_ASSERT(server_prefill_yield(&slots[1], false));
+    s.active_generations = 0;
+    slots[2].prefill_waiting = true;
+    TEST_ASSERT(server_prefill_yield(&slots[1], false));
+    pthread_mutex_destroy(&s.model_mu);
 }
 
 static void test_mixed_prefill_quantum_option(void) {

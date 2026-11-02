@@ -717,6 +717,9 @@ extern char **environ;
  *                                           against serial. reject=1: each block keeps a random prefix, the rest other
  *                                           tokens. lead=S: no block before step S; join=J: row r arrives at step r*J;
  *                                           leave=J: row r stops r*J tokens early; hold=M: rows from M on never hold
+ *   ysync label=L fixture=PATH depth=D rows=K [first=I] [seed=S]
+ *       the current session prefills to D twice, plainly and with rows K of decode at each of its yields: the
+ *       prefill's logits and state, and each decoder's against serial
  *   mcyc label=L rows=K tokens=N [first=I] [seed=S] [mixed=0] [off=HEX] [off2=HEX]
  *                                           K frontiers through the server's step: sampled at temperature 1, one
  *                                           drafted block a step, rotating, a correction carried to the next step,
@@ -1207,6 +1210,103 @@ done:
 fail:
     fprintf(stderr, "ds4-bench: job %d: mbits failed: %s\n", job, err);
     return 1;
+}
+
+#define BENCH_YSYNC_TOKENS 4096
+typedef struct {
+    ds4_session **sessions;
+    int rows, cap, len, next[BENCH_MAX_SESSIONS], *chain[BENCH_MAX_SESSIONS];
+    uint64_t rng[BENCH_MAX_SESSIONS], parks;
+    bool failed;
+} bench_yield;
+
+static bool bench_yield_fn(void *ud, bool park) {
+    bench_yield *y = ud;
+    if (!park || y->failed || y->len >= y->cap) return !park ? !y->failed && y->len < y->cap : true;
+    char err[256] = "";
+    ds4_decode_item items[BENCH_MAX_SESSIONS];
+    y->parks++;
+    for (int r = 0; r < y->rows; r++) {
+        items[r].session = y->sessions[r];
+        items[r].token = y->next[r];
+        y->chain[r][y->len] = y->next[r];
+    }
+    if (ds4_sessions_eval_batch(items, y->rows, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-bench: ysync decode failed: %s\n", err);
+        y->failed = true;
+        return true;
+    }
+    y->len++;
+    for (int r = 0; r < y->rows; r++) y->next[r] = ds4_session_sample(y->sessions[r], 1.0f, 0, 1.0f, 0.0f, &y->rng[r]);
+    return true;
+}
+
+/* One ysync: see the job list. */
+static int job_ysync(char **kv, int n, int job, ds4_session *session, const ds4_tokens *all, ds4_session **sessions,
+                     ds4_session_snapshot *snaps, const bool *have, float *logits, int cap) {
+    char err[256] = "";
+    const char *v, *label = job_get(kv, n, "label");
+    const int depth = (v = job_get(kv, n, "depth")) ? atoi(v) : 0;
+    const int first = (v = job_get(kv, n, "first")) ? atoi(v) : 1;
+    const int rows = (v = job_get(kv, n, "rows")) ? atoi(v) : 3;
+    const uint64_t seed = (v = job_get(kv, n, "seed")) ? strtoull(v, NULL, 10) : 7;
+    if (!all || depth <= 0 || depth > all->len || rows < 1 || first < 1 || first + rows > BENCH_MAX_SESSIONS) {
+        fprintf(stderr, "ds4-bench: job %d: ysync needs fixture=, depth= and rows inside sessions 1..%d\n", job, BENCH_MAX_SESSIONS - 1);
+        return 1;
+    }
+    ds4_tokens prefix = { .v = all->v, .len = depth, .cap = depth };
+    ds4_session_snapshot plain = {0}, yielded = {0};
+    bench_yield y = {.sessions = sessions + first, .rows = rows, .cap = BENCH_YSYNC_TOKENS};
+    int rc = 1, bad = 0;
+    uint64_t state = 0, prefill_state = 0;
+    float *final = malloc((size_t)rows * cap * sizeof(float));
+    for (int r = 0; r < rows; r++) {
+        ds4_session *s = sessions[first + r];
+        y.rng[r] = seed + (uint64_t)r;
+        y.chain[r] = malloc(BENCH_YSYNC_TOKENS * sizeof(int));
+        if (s == session || !s || !have[first + r] || ds4_session_load_snapshot(s, &snaps[first + r], err, sizeof(err)) != 0) goto done;
+        y.next[r] = ds4_session_sample(s, 1.0f, 0, 1.0f, 0.0f, &y.rng[r]);
+    }
+    ds4_session_invalidate(session);
+    if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0 ||
+        ds4_session_save_snapshot(session, &plain, err, sizeof(err)) != 0) goto done;
+    const unsigned long long want = bench_fnv_logits(session, logits, cap);
+    ds4_session_invalidate(session);
+    const uint64_t t0 = bench_now_ns();
+    ds4_session_set_yield(session, bench_yield_fn, &y);
+    const int sync_rc = ds4_session_sync(session, &prefix, err, sizeof(err));
+    ds4_session_set_yield(session, NULL, NULL);
+    const uint64_t ns = bench_now_ns() - t0;
+    if (sync_rc != 0 || y.failed || ds4_session_save_snapshot(session, &yielded, err, sizeof(err)) != 0) goto done;
+    const unsigned long long got = bench_fnv_logits(session, logits, cap);
+    for (uint64_t i = 0; i < plain.len && i < yielded.len; i++) prefill_state += plain.ptr[i] != yielded.ptr[i];
+    if (plain.len != yielded.len) prefill_state++;
+    for (int r = 0; r < rows; r++) {
+        ds4_session *s = sessions[first + r];
+        ds4_session_snapshot at = {0}, end = {0};
+        const int vocab = ds4_session_copy_logits(s, final + (size_t)r * cap, cap);
+        if (ds4_session_save_snapshot(s, &at, err, sizeof(err)) != 0 ||
+            ds4_session_load_snapshot(s, &snaps[first + r], err, sizeof(err)) != 0) { ds4_session_snapshot_free(&at); goto done; }
+        for (int t = 0; t < y.len; t++) if (ds4_session_eval(s, y.chain[r][t], err, sizeof(err)) != 0) { ds4_session_snapshot_free(&at); goto done; }
+        ds4_session_copy_logits(s, logits, cap);
+        bad += memcmp(logits, final + (size_t)r * cap, (size_t)vocab * sizeof(float)) != 0;
+        if (ds4_session_save_snapshot(s, &end, err, sizeof(err)) != 0) { ds4_session_snapshot_free(&at); goto done; }
+        for (uint64_t i = 0; i < end.len && i < at.len; i++) state += end.ptr[i] != at.ptr[i];
+        if (end.len != at.len) state++;
+        ds4_session_snapshot_free(&at);
+        ds4_session_snapshot_free(&end);
+    }
+    fprintf(stderr, "ysync %s depth=%d rows=%d parks=%llu steps=%d prefill_logits=%s prefill_state_bytes=%llu bad_logits=%d state_bytes=%llu wall=%.2f\n",
+            label ? label : "", depth, rows, (unsigned long long)y.parks, y.len, got == want ? "same" : "DIFF",
+            (unsigned long long)prefill_state, bad, (unsigned long long)state, (double)ns / 1e9);
+    rc = 0;
+done:
+    if (rc) fprintf(stderr, "ds4-bench: job %d: ysync failed: %s\n", job, err);
+    for (int r = 0; r < rows; r++) free(y.chain[r]);
+    ds4_session_snapshot_free(&plain);
+    ds4_session_snapshot_free(&yielded);
+    free(final);
+    return rc;
 }
 
 /* One mcyc: see the job list. */
@@ -1851,6 +1951,10 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
 #ifdef BENCH_V41_OFF
         if (!strcmp(verb, "vbits") && have_snap[cur]) {
             if ((rc = job_vbits(kv, n, job, session, &snaps[cur], logits, logits_cap)) != 0) break;
+            continue;
+        }
+        if (!strcmp(verb, "ysync")) {
+            if ((rc = job_ysync(kv, n, job, session, job_fixture(engine, &fx, job_get(kv, n, "fixture")), sessions, snaps, have_snap, logits, logits_cap)) != 0) break;
             continue;
         }
         if (!strcmp(verb, "mcyc")) {
