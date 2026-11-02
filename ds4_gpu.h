@@ -128,7 +128,7 @@ typedef struct {
 #define DS4_GPU_V41B_BATCH_HEAD8 (1ull << 18)   /* with SHORT_MMA the vocabulary head of 5-8 decode rows on sixteen simdgroups */
 #define DS4_GPU_V41B_BATCH_LOWBF (1ull << 19)   /* with BATCH_LOW the low projection rounds to bf16 as it stores, so output-B need not as it loads */
 #define DS4_GPU_V41B_BATCH_PE (1ull << 20)   /* with PREENCODE cross-session decode rows' next first buffer is encoded in the final wait */
-#define DS4_GPU_V41B_BATCH_ENGRAM (1ull << 21)   /* 2-3 cross-session decode rows read the narrow Engram copy */
+#define DS4_GPU_V41B_BATCH_ENGRAM (1ull << 21)   /* 2-4 cross-session decode rows read the narrow Engram copy */
 #define DS4_GPU_V41B_BATCH_READS (1ull << 22)   /* cross-session decode rows read the second Engram table after the first has joined */
 #define DS4_GPU_V41B_BATCH_MIX (1ull << 8)   /* 2-4 cross-session decode rows' attention runs the HC mix beside q_b */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */

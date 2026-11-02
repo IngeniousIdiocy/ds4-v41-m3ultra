@@ -44652,6 +44652,33 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* KEYED_GPU: decode rows' keyed draws' candidates in the step's final buffer, one 1/T, each row keyed for its next
+ * position. Rows that did not sample keyed read nothing; a step whose rows differ in 1/T leaves them all to the CPU. */
+static struct { uint32_t rows; uint64_t keys[DS4_TP_BATCH_MAX_ROWS]; float inv_t; bool want[DS4_TP_BATCH_MAX_ROWS]; } g_ds41_rows_kg;
+
+static bool ds41_rows_keyed_encode(ds41_gpu_graph *const *graphs, const uint32_t *positions, ds4_gpu_tensor *logits,
+                                   uint32_t rows) {
+    g_ds41_rows_kg.rows = 0;
+    if (!ds41_on(DS4_GPU_V41_KEYED_GPU) || !ds4_gpu_selector_ready() || graphs[0]->tp_world != 1) return true;
+    float inv_t = 0;
+    for (uint32_t i = 0; i < rows; i++) {
+        const ds41_gpu_graph *g = graphs[i];
+        g_ds41_rows_kg.want[i] = g->kg_want && !g->streaming && !g->quality;
+        g_ds41_rows_kg.keys[i] = !g_ds41_rows_kg.want[i] ? 1u :
+            sample_key_mix(g->kg_seed ^ sample_key_mix((uint64_t)positions[i] + 2u));
+        if (!g_ds41_rows_kg.want[i]) continue;
+        if (inv_t && inv_t != g->kg_inv_t) return true;
+        inv_t = g->kg_inv_t;
+    }
+    if (!inv_t) return true;
+    g_ds41_rows_kg.inv_t = inv_t;
+    g_ds41_rows_kg.rows = rows;
+    (void)ds41_sel_gen_begin(&g_sel_gen);   /* a one-row summary's buffers are about to be overwritten */
+    return ds4_gpu_keyed_encode(logits, rows, g_ds41_rows_kg.keys, inv_t) != 0;
+}
+#endif
+
 /* slot (BATCH_PE): 1 encodes the next step's first buffer, embed from the token words and layer 0, no tokens yet;
  * 2 is the step that committed that buffer, from its hash and Engram reads on, layers from 1. */
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
@@ -44940,6 +44967,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 0, batch_logits, (uint64_t)i * logits_bytes, logits_bytes);
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ok && slot != 1 && batch_logits && !prefill_rows && decode_rows && !g->tp_logits_half)
+        ok = ds41_rows_keyed_encode(graphs, positions, batch_logits, rows);
+#endif
     ds4_gpu_tensor_free(batch_logits);
     ds41_decode_rows(false);
     g->rows_decode = false;
@@ -63558,10 +63589,12 @@ struct ds4_session {
     bool sel_bound;
     uint32_t sel_pos;
     uint64_t sel_gen;
-    /* KEYED_GPU: the bound summary is the keyed draw's candidates (key sel_key, 1/T sel_inv_t), not the selector's */
-    bool sel_keyed;
+    /* KEYED_GPU: the bound summary is the keyed draw's candidates (key sel_key, 1/T sel_inv_t), not the selector's;
+     * sel_row: they came from a batch step and are this session's own copy, so no later step can overwrite them */
+    bool sel_keyed, sel_row;
     uint64_t sel_key;
     float sel_inv_t;
+    kg_gpu_row kg_row;
     bool greedy_splitkv_anchor_valid;
 };
 
@@ -81265,12 +81298,13 @@ static bool ds41_keyed_take(ds4_session *s, const sample_key *k, int *token) {
     if (!on) return false;
     const uint64_t key = sample_key_mix(k->seed ^ sample_key_mix((uint64_t)pos + 1u));
     if (!bound || s->sel_key != key || s->sel_inv_t != 1.0f / k->temperature ||
-        ds41_sel_bind_check(&g_sel_gen, true, s->sel_gen, s->sel_pos, &s->ds41_graph, s->ds41_graph.sel_done,
-                            pos, s->ds41_graph.pos)) {
+        (s->sel_row ? s->sel_pos != pos || s->ds41_graph.pos != pos :
+         ds41_sel_bind_check(&g_sel_gen, true, s->sel_gen, s->sel_pos, &s->ds41_graph, s->ds41_graph.sel_done,
+                             pos, s->ds41_graph.pos))) {
         if (ds4_gpu_selector_ready()) g_kg_counts[1]++;
         return false;
     }
-    const int path = ds41_keyed_finish(ds4_gpu_keyed_out(), s->logits, k, pos, token);
+    const int path = ds41_keyed_finish(s->sel_row ? &s->kg_row : ds4_gpu_keyed_out(), s->logits, k, pos, token);
     g_kg_counts[path == 0 ? 0 : path == 1 ? 2 : 3]++;
     return path == 0;
 }
@@ -82302,6 +82336,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         s->sel_pos = (uint32_t)s->checkpoint.len;
         s->sel_gen = s->ds41_graph.sel_gen;
         s->sel_keyed = s->ds41_graph.kg_gpu;
+        s->sel_row = false;
         s->sel_key = s->ds41_graph.kg_key;
         s->sel_inv_t = s->ds41_graph.kg_inv_t;
         if (rewindable) d->rewind_end = s->ds41_graph.pos;
@@ -84466,6 +84501,7 @@ static int ds4_sessions_eval_batch_native(
     }
 #endif
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && defined(__APPLE__)
+    g_ds41_rows_kg.rows = 0;
     const bool rows_slot = native_ds41 && !prefill_rows && ds41_rows_slot_on(graphs, count);
     bool slot = false;
     if (rows_slot) ok = ds41_rows_slot_take(graphs, tokens, count, &slot);
@@ -84613,7 +84649,19 @@ static int ds4_sessions_eval_batch_native(
         if (!ds4_session_is_glm(s) && !native_ds41) {
             ds4_session_dspark_capture_note_checkpoint(s);
         }
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && defined(__APPLE__)
+        if (native_ds41 && g_ds41_rows_kg.rows && g_ds41_rows_kg.want[i]) {
+            s->kg_row = ((const kg_gpu_row *)ds4_gpu_keyed_out())[i];
+            s->sel_bound = s->sel_keyed = s->sel_row = true;
+            s->sel_pos = (uint32_t)s->checkpoint.len;
+            s->sel_key = g_ds41_rows_kg.keys[i];
+            s->sel_inv_t = g_ds41_rows_kg.inv_t;
+        }
+#endif
     }
+#if defined(DS4_HAS_DEEPSEEK41_GPU) && defined(__APPLE__)
+    g_ds41_rows_kg.rows = 0;
+#endif
     if (prefill && prefill->progress)
         prefill->progress(prefill->progress_ud, "prefill_chunk",
                           prefill_prompt->len, prefill_prompt->len);
