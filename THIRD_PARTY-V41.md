@@ -1,7 +1,8 @@
 # Third-party code, weights and dependencies for DeepSeek V4.1 on Metal
 
 The repository licence (`LICENSE`, MIT) is DwarfStar's and is unchanged.
-`third_party/` and `licenses/` are DwarfStar's and unchanged. This file records
+`third_party/` and `licenses/` are DwarfStar's and unchanged, except
+`licenses/omlx.txt`, which this branch adds (below). This file records
 what the V4.1 Metal work adds on top of them, and where the pieces came from.
 
 ## DwarfStar
@@ -24,6 +25,19 @@ switches off back to DwarfStar's own code.
 ## Ivan Fioravanti and Tarjei Mandt
 
 This branch is built on antirez's DwarfStar. Thanks to Tarjei Mandt ([kernelpool/ds4](https://github.com/kernelpool/ds4)) and Ivan Fioravanti ([ivanfioravanti/ds4-metal](https://github.com/ivanfioravanti/ds4-metal)): some of the code here started in their forks, including several of Tarjei's decode and verify kernels and Ivan's narrow decode weight copies, prefill index scorer, prefill attention on simdgroup matrices (PREFILL_MMA), bounded decoder replay (CED) and in-chunk suffix trim (SUFFIX_TRIM). The speed groups and how they fit together are this project's own.
+
+## oMLX
+
+Thanks to the [oMLX](https://github.com/jundot/omlx) contributors for their
+V4.1 decode kernels and the ideas this work borrowed from them. Three pieces of
+the batched decode started in oMLX's `omlx/patches/deepseek_v41/` (MIT,
+`Copyright (c) 2023 DeepSeek`): decode attention's scores and PV on
+simdgroup-matrix tiles (ATTN_TILES), rewritten in Metal for this engine's key
+cache and reduce; the FP4 expert decode by shifts instead of a table
+(FP4_NO_TABLE); and the row-block-major order of the routed expert grids
+(BATCH_RBLOCK). [licenses/omlx.txt](licenses/omlx.txt) has the notice. oMLX's
+other kernels were ported and measured too; they lost to this engine's own and
+are not shipped ([docs/FAILED-EXPERIMENTS-V41.md](docs/FAILED-EXPERIMENTS-V41.md)).
 
 ## DwarfStar pull requests
 

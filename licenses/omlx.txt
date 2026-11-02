@@ -1,17 +1,39 @@
-ds4's V4.1 Metal decode adapts two pieces of oMLX, https://github.com/jundot/omlx:
+ds4's V4.1 Metal decode adapts three pieces of oMLX, https://github.com/jundot/omlx, as read at
+v0.7.3 (commit 9de79bc39a01c1f3fec1e849903aaf0dd5478d7a):
 
 - kernel_dsv41_attn_tile in metal/flash_attn.metal, from attn_scores and attn_pv in
   omlx/patches/deepseek_v41/decode_layer.py and decode_fused.py, rewritten in Metal for ds4's
   key cache, partials and reduce, with a verify block's rows added.
-- ds4_mxfp4_codes in metal/moe.metal, the FP4 decode by shifts, after
+- ds4_mxfp4_codes in metal/moe.metal, the FP4 decode by shifts, after fp4_decode8 in
   omlx/patches/deepseek_v41/decode_moe.py.
+- The row-block-major order of the routed expert grids for several decode rows
+  (kernel_mul_mv_id_mxfp4_pair_swiglu_rows_rblock_v41 in metal/moe.metal), after the same
+  file's decode. Only the order was taken, no code.
 
-The oMLX package is licensed under the Apache License 2.0, see Apache-2.0.txt in this directory:
-Copyright the omlx contributors. Those source files carry SPDX MIT headers, and the LICENSE in
-that directory reads:
+All three come from omlx/patches/deepseek_v41/. Its files carry SPDX MIT headers, and the LICENSE
+in that directory is the MIT licence with the line "Copyright (c) 2023 DeepSeek", reproduced
+below. The rest of the oMLX package is licensed under the Apache License 2.0 (Apache-2.0.txt in
+this directory); nothing outside that directory was used. ds4's own LICENSE carries the same
+copyright line and the same MIT permission text.
 
 MIT License
 
 Copyright (c) 2023 DeepSeek
 
-The MIT permission text is the one in ds4's LICENSE file, which keeps the same notice.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
