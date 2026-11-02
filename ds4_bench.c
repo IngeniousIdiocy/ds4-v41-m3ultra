@@ -683,11 +683,13 @@ extern char **environ;
 
 /* ---- Resident job runner (--jobs FILE --token-csv PATH) ----
  * One process, one engine and session, many experiment jobs:
- *   save fixture=PATH depth=N cache=PATH [canary=M]
+ *   save fixture=PATH depth=N|all cache=PATH [canary=M] [quantum=Q] [fresh=1]
  *                                           prefill the first N tokens, write the engine
  *                                           payload + a .meta identity file (snapshot format 4,
  *                                           ds4_snapstore.h); canary=M also records the logits of
- *                                           a fresh M-token prefill of the fixture in a side session
+ *                                           a fresh M-token prefill of the fixture in a side session;
+ *                                           quantum=Q prefills in Q-token chunks as a server does
+ *                                           beside generations; fresh=1 drops the session's frontier
  *   load fixture=PATH depth=N cache=PATH [expect=reject]
  *                                           restore a saved frontier of exactly that
  *                                           fixture prefix (no prefill fallback: a missing,
@@ -698,6 +700,14 @@ extern char **environ;
  *       [set=NAME=VALUE ...] [unset=NAME ...] [warm=1] [fixture=PATH] [state=1] [dump=PATH]
  *                                           restore the current frontier, apply the
  *                                           environment changes, reset the RNG, decode
+ *   session idx=I ctx=C                     make session I (1..8, created or resized to ctx C)
+ *                                           current; save, load and run then act on it
+ *   nrun label=L rows=K tokens=N [first=I] [hash=1] [live=1] [off=HEX] [set=NAME=VALUE ...] [unset=NAME ...] [warm=1]
+ *                                           sessions I..I+K-1 restore their frontiers and decode
+ *                                           greedily together through ds4_sessions_eval_batch; per
+ *                                           row and step: PATH.steps.csv; per job: PATH.nruns.csv;
+ *                                           hash=1 hashes each row's logits per step, outside timing;
+ *                                           live=1 decodes from the sessions as they stand, no restore
  *   quit                                    end the runner (until then it waits for appended jobs)
  * Each run restores the in-memory snapshot of the last save/load, so arms switch at a
  * quiescent boundary. Per token: PATH; per job: PATH.jobs.csv, with the GPU top-p
@@ -712,6 +722,7 @@ extern char **environ;
  * prefix producer appears (e.g. an FP8 prefill path), never stamp old payloads. */
 #define BENCH_CACHE_CONTRACT "v41-prefix-1"
 #define BENCH_JOB_COUNTERS 19
+#define BENCH_MAX_SESSIONS 9   /* [0] is the main session; 1..8 are the rows of an nrun */
 
 typedef struct {
     char path[PATH_MAX];
@@ -856,19 +867,143 @@ static void job_counters(uint64_t c[BENCH_JOB_COUNTERS]) {
     assert(k == BENCH_JOB_COUNTERS);
 }
 
+/* The arm's switches, at a quiescent boundary: off=HEX on top of the process's own groups, set= and unset=. */
+static uint64_t job_switch(char **kv, int n, char *env_desc, size_t env_cap, uint64_t *base) {
+    const char *v;
+    /* off=HEX: these V4.1 switch groups off for this run, on top of the process's own (they are read once) */
+    static uint64_t base_off;
+    static bool base_read;
+#ifdef BENCH_V41_OFF
+    if (!base_read) { base_off = ds4_gpu_v41_off(); base_read = true; }
+#endif
+    const uint64_t run_off = base_off | ((v = job_get(kv, n, "off")) ? strtoull(v, NULL, 16) : 0);
+#ifdef BENCH_V41_OFF
+    ds4_gpu_test_set_v41_off(run_off);
+#endif
+    for (int i = 1; i < n; i++) {
+        if (!strncmp(kv[i], "set=", 4) && strchr(kv[i] + 4, '=')) {
+            char name[128];
+            const char *eq = strchr(kv[i] + 4, '=');
+            snprintf(name, sizeof(name), "%.*s", (int)(eq - kv[i] - 4), kv[i] + 4);
+            setenv(name, eq + 1, 1);
+        } else if (!strncmp(kv[i], "unset=", 6)) {
+            unsetenv(kv[i] + 6);
+        } else {
+            continue;
+        }
+        const size_t used = strlen(env_desc);
+        snprintf(env_desc + used, env_cap - used, "%s%s", used ? ";" : "", kv[i]);
+    }
+    *base = base_off;
+    return run_off;
+}
+
+static int cmp_u64(const void *a, const void *b) {
+    const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* One nrun: K sessions' frontiers decode together. Step time is the ds4_sessions_eval_batch
+ * call alone; argmax and any hashing sit between the calls, as a server's sampling does. */
+static int job_nrun(char **kv, int n, int job, ds4_session **sessions, ds4_session_snapshot *snaps,
+                    const bool *have, int eos, float *logits, int logits_cap, FILE *out, FILE *steps) {
+    const char *v, *label = job_get(kv, n, "label");
+    const int first = (v = job_get(kv, n, "first")) ? atoi(v) : 1;
+    const int rows = (v = job_get(kv, n, "rows")) ? atoi(v) : 0;
+    const int tokens = (v = job_get(kv, n, "tokens")) ? atoi(v) : 64;
+    const bool hash = (v = job_get(kv, n, "hash")) && atoi(v) != 0;
+    const bool live = (v = job_get(kv, n, "live")) && atoi(v) != 0;
+    char err[256], env_desc[2048] = "";
+    if (rows <= 0 || first < 1 || first + rows > BENCH_MAX_SESSIONS || tokens <= 0) {
+        fprintf(stderr, "ds4-bench: job %d: nrun needs rows= and first= inside sessions 1..%d\n", job, BENCH_MAX_SESSIONS - 1);
+        return 1;
+    }
+    for (int i = first; i < first + rows; i++) {
+        if (!sessions[i] || !have[i] || (!live && ds4_session_load_snapshot(sessions[i], &snaps[i], err, sizeof(err)) != 0)) {
+            fprintf(stderr, "ds4-bench: job %d: nrun cannot restore session %d: %s\n", job, i, have[i] ? err : "no frontier");
+            return 1;
+        }
+    }
+    uint64_t base_off = 0;
+    const uint64_t run_off = job_switch(kv, n, env_desc, sizeof(env_desc), &base_off);
+    uint64_t *eval_ns = malloc((size_t)tokens * sizeof(uint64_t) * 2);
+    uint64_t *row = calloc((size_t)tokens * (size_t)rows, sizeof(uint64_t) * 2);   /* token, logits hash */
+    uint64_t chain[BENCH_MAX_SESSIONS] = {0};
+    if (!eval_ns || !row) { free(eval_ns); free(row); return 1; }
+    ds4_decode_item items[BENCH_MAX_SESSIONS];
+    int rc = 0;
+    const uint64_t t_begin = bench_now_ns();
+    for (int step = 0; step < tokens && !rc; step++) {
+        const uint64_t h0 = bench_now_ns();
+        for (int i = 0; i < rows; i++) {
+            ds4_session *s = sessions[first + i];
+            uint64_t *r = row + ((size_t)step * (size_t)rows + (size_t)i) * 2u;
+            if (hash) {
+                r[1] = bench_fnv_logits(s, logits, logits_cap);
+                chain[i] = chain[i] * 1099511628211ull ^ r[1];
+            }
+            const int t = ds4_session_argmax_excluding(s, eos);
+            items[i].session = s;
+            items[i].token = t;
+            r[0] = (uint64_t)t;
+        }
+        const uint64_t t0 = bench_now_ns();
+        rc = ds4_sessions_eval_batch(items, rows, err, sizeof(err));
+        const uint64_t t1 = bench_now_ns();
+        eval_ns[(size_t)step * 2u] = t1 - t0;
+        eval_ns[(size_t)step * 2u + 1u] = t0 - h0;
+    }
+    const uint64_t t_end = bench_now_ns();
+    if (rc) fprintf(stderr, "ds4-bench: job %d: batch decode failed: %s\n", job, err);
+#ifdef BENCH_V41_OFF
+    ds4_gpu_test_set_v41_off(base_off);
+#endif
+    uint64_t *only = malloc((size_t)tokens * sizeof(uint64_t));
+    uint64_t sum = 0;
+    for (int i = 0; only && i < tokens; i++) { only[i] = eval_ns[(size_t)i * 2u]; sum += only[i]; }
+    if (only) qsort(only, (size_t)tokens, sizeof(uint64_t), cmp_u64);
+    for (int step = 0; step < tokens; step++)
+        for (int i = 0; i < rows; i++) {
+            const uint64_t *r = row + ((size_t)step * (size_t)rows + (size_t)i) * 2u;
+            fprintf(steps, "%d,%s,%d,%d,%llu,%llu,%llu,%016llx\n", job, label ? label : "", step, i,
+                    (unsigned long long)r[0], (unsigned long long)eval_ns[(size_t)step * 2u],
+                    (unsigned long long)eval_ns[(size_t)step * 2u + 1u], (unsigned long long)r[1]);
+        }
+    fprintf(out, "%d,%s,%d,%d,%d,%llx,%s,%.4f,%.4f,%.4f,%.4f,%.3f,", job, label ? label : "", first, rows, tokens,
+            (unsigned long long)run_off, env_desc,
+            only ? (double)only[tokens / 2] / 1e6 : 0, only ? (double)only[tokens / 10] / 1e6 : 0,
+            only ? (double)only[tokens * 9 / 10] / 1e6 : 0, (double)sum / tokens / 1e6, (double)(t_end - t_begin) / 1e9);
+    for (int i = 0; i < rows; i++) fprintf(out, "%s%016llx", i ? ";" : "", (unsigned long long)chain[i]);
+    fputc('\n', out);
+    fflush(out);
+    fflush(steps);
+    free(only);
+    free(eval_ns);
+    free(row);
+    return rc;
+}
+
 static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *session) {
     FILE *jf = fopen(cfg->jobs_path, "rb");
     FILE *tok = cfg->token_csv_path ? fopen(cfg->token_csv_path, "wb") : NULL;
     char jobs_out[PATH_MAX];
     snprintf(jobs_out, sizeof(jobs_out), "%s.jobs.csv", cfg->token_csv_path ? cfg->token_csv_path : "jobs");
     FILE *jo = cfg->token_csv_path ? fopen(jobs_out, "wb") : NULL;
-    if (!jf || !tok || !jo) {
+    snprintf(jobs_out, sizeof(jobs_out), "%s.steps.csv", cfg->token_csv_path ? cfg->token_csv_path : "jobs");
+    FILE *steps = cfg->token_csv_path ? fopen(jobs_out, "wb") : NULL;
+    snprintf(jobs_out, sizeof(jobs_out), "%s.nruns.csv", cfg->token_csv_path ? cfg->token_csv_path : "jobs");
+    FILE *nruns = cfg->token_csv_path ? fopen(jobs_out, "wb") : NULL;
+    if (!jf || !tok || !jo || !steps || !nruns) {
         fprintf(stderr, "ds4-bench: --jobs needs a readable job file and --token-csv\n");
         if (jf) fclose(jf);
         if (tok) fclose(tok);
         if (jo) fclose(jo);
+        if (steps) fclose(steps);
+        if (nruns) fclose(nruns);
         return 1;
     }
+    fprintf(steps, "job,label,step,row,token,eval_ns,host_ns,logits_fnv64\n");
+    fprintf(nruns, "job,label,first,rows,tokens,off,env,median_ms,p10_ms,p90_ms,mean_ms,wall_s,row_chain_fnv64\n");
     fprintf(tok, "job,label,index,token,sel0_ns,eval0_ns,eval1_ns\n");
     fprintf(jo, "job,verb,label,cache,env,mode,temp,top_p,top_k,min_p,seed,warm,tokens,eos,"
                 "setup_ns,restore_ns,first_sel0_ns,last_eval1_ns,decode_tps,pos,prefix_fnv64,logits_fnv64,state_fnv64,"
@@ -881,8 +1016,10 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
     uint64_t *ns = NULL;
     int ns_cap = 0;
     bench_fixture fx = {0};
-    ds4_session_snapshot snap = {0};
-    bool have_snap = false;
+    ds4_session *sessions[BENCH_MAX_SESSIONS] = {session};
+    ds4_session_snapshot snaps[BENCH_MAX_SESSIONS] = {{0}};
+    bool have_snap[BENCH_MAX_SESSIONS] = {false};
+    int cur = 0;
     char cache[PATH_MAX] = "-";
     /* Lineage: the snapshot the session's current frontier came from (load or
      * save), so a longer save records which prefix it extended. */
@@ -909,6 +1046,34 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
         char env_desc[2048] = "";
         uint64_t setup_ns = 0, restore_ns = 0;
         job++;
+        if (!strcmp(verb, "session")) {
+            const char *iv = job_get(kv, n, "idx"), *cv = job_get(kv, n, "ctx");
+            const int idx = iv ? atoi(iv) : 0, ctx = cv ? atoi(cv) : 0;
+            if (idx < 1 || idx >= BENCH_MAX_SESSIONS || ctx <= 0) {
+                fprintf(stderr, "ds4-bench: job %d: session needs idx=1..%d and ctx=\n", job, BENCH_MAX_SESSIONS - 1);
+                rc = 1;
+                break;
+            }
+            if (sessions[idx] && ds4_session_ctx(sessions[idx]) != ctx) {
+                ds4_session_free(sessions[idx]);
+                sessions[idx] = NULL;
+                ds4_session_snapshot_free(&snaps[idx]);
+                memset(&snaps[idx], 0, sizeof(snaps[idx]));
+                have_snap[idx] = false;
+            }
+            if (!sessions[idx] && ds4_session_create(&sessions[idx], engine, ctx) != 0) {
+                fprintf(stderr, "ds4-bench: job %d: cannot create session %d ctx %d\n", job, idx, ctx);
+                rc = 1;
+                break;
+            }
+            cur = idx;
+            session = sessions[idx];
+            continue;
+        }
+        if (!strcmp(verb, "nrun")) {
+            rc = job_nrun(kv, n, job, sessions, snaps, have_snap, eos, logits, logits_cap, nruns, steps);
+            continue;
+        }
         if (!strcmp(verb, "save") || !strcmp(verb, "load")) {
             const char *path = job_get(kv, n, "cache");
             char meta_path[PATH_MAX], ident[8192];
@@ -918,7 +1083,7 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
             const uint64_t t0 = bench_now_ns();
             const ds4_tokens *all = job_fixture(engine, &fx, job_get(kv, n, "fixture"));
             const char *d = job_get(kv, n, "depth");
-            const int depth = d ? atoi(d) : 0;
+            const int depth = d && !strcmp(d, "all") && all ? all->len : d ? atoi(d) : 0;
             if (!strcmp(verb, "save")) {
                 const char *off = NULL;
                 for (char **e = environ; *e && !off; e++)
@@ -931,6 +1096,7 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
                     break;
                 }
                 ds4_tokens prefix = { .v = all->v, .len = depth, .cap = depth };
+                if (job_get(kv, n, "fresh")) ds4_session_invalidate(session);
                 int base_len = 0;   /* > 0: this save extends the session's current frontier */
                 {
                     const ds4_tokens *cur = ds4_session_tokens(session);
@@ -939,7 +1105,16 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
                 }
                 uint64_t c0[BENCH_JOB_COUNTERS], c1[BENCH_JOB_COUNTERS];
                 job_counters(c0);
-                if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+                const char *qv = job_get(kv, n, "quantum");
+                const int quantum = qv ? atoi(qv) : 0;
+                int sync_rc = 0;
+                for (int target = quantum > 0 ? quantum : depth; !sync_rc; target += quantum) {
+                    ds4_tokens part = prefix;
+                    part.len = target < depth ? target : depth;
+                    sync_rc = ds4_session_sync(session, &part, err, sizeof(err));
+                    if (part.len == depth) break;
+                }
+                if (sync_rc != 0) {
                     fprintf(stderr, "ds4-bench: job %d: prefill failed: %s\n", job, err);
                     rc = 1;
                     break;
@@ -1126,15 +1301,15 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
             }
             setup_ns = bench_now_ns() - t0;
             const uint64_t t2 = bench_now_ns();
-            ds4_session_snapshot_free(&snap);
-            memset(&snap, 0, sizeof(snap));
-            if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
+            ds4_session_snapshot_free(&snaps[cur]);
+            memset(&snaps[cur], 0, sizeof(snaps[cur]));
+            if (ds4_session_save_snapshot(session, &snaps[cur], err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: job %d: in-memory snapshot failed: %s\n", job, err);
                 rc = 1;
                 break;
             }
             restore_ns = bench_now_ns() - t2;
-            have_snap = true;
+            have_snap[cur] = true;
             snprintf(cache, sizeof(cache), "%s", path);
             const ds4_tokens *have = ds4_session_tokens(session);
             fprintf(jo, "%d,%s,,%s,,,,,,,,,0,0,%llu,%llu,0,0,0,%d,%016llx,%016llx,", job, verb, cache,
@@ -1146,7 +1321,7 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
             fflush(jo);
             continue;
         }
-        if (strcmp(verb, "run") != 0 || !have_snap) {
+        if (strcmp(verb, "run") != 0 || !have_snap[cur]) {
             fprintf(stderr, "ds4-bench: job %d: unknown verb %s or run before save/load\n", job, verb);
             rc = 1;
             break;
@@ -1186,37 +1361,15 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
         }
         /* Quiescent boundary: restore the frontier, then switch the arm. */
         const uint64_t t0 = bench_now_ns();
-        if (ds4_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
+        if (ds4_session_load_snapshot(session, &snaps[cur], err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: job %d: restore failed: %s\n", job, err);
             if (dump) fclose(dump);
             rc = 1;
             break;
         }
         restore_ns = bench_now_ns() - t0;
-        /* off=HEX: these V4.1 switch groups off for this run, on top of the process's own (they are read once) */
-        static uint64_t base_off;
-        static bool base_read;
-#ifdef BENCH_V41_OFF
-        if (!base_read) { base_off = ds4_gpu_v41_off(); base_read = true; }
-#endif
-        const uint64_t run_off = base_off | ((v = job_get(kv, n, "off")) ? strtoull(v, NULL, 16) : 0);
-#ifdef BENCH_V41_OFF
-        ds4_gpu_test_set_v41_off(run_off);
-#endif
-        for (int i = 1; i < n; i++) {
-            if (!strncmp(kv[i], "set=", 4) && strchr(kv[i] + 4, '=')) {
-                char name[128];
-                const char *eq = strchr(kv[i] + 4, '=');
-                snprintf(name, sizeof(name), "%.*s", (int)(eq - kv[i] - 4), kv[i] + 4);
-                setenv(name, eq + 1, 1);
-            } else if (!strncmp(kv[i], "unset=", 6)) {
-                unsetenv(kv[i] + 6);
-            } else {
-                continue;
-            }
-            const size_t used = strlen(env_desc);
-            snprintf(env_desc + used, sizeof(env_desc) - used, "%s%s", used ? ";" : "", kv[i]);
-        }
+        uint64_t base_off = 0;
+        const uint64_t run_off = job_switch(kv, n, env_desc, sizeof(env_desc), &base_off);
         if (tokens > ns_cap) {
             free(ns);
             ns = calloc((size_t)tokens * 4u, sizeof(ns[0]));
@@ -1309,10 +1462,15 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
     fclose(jf);
     fclose(tok);
     fclose(jo);
+    fclose(steps);
+    fclose(nruns);
     free(ns);
     free(logits);
     ds4_tokens_free(&fx.tokens);
-    ds4_session_snapshot_free(&snap);
+    for (int i = 0; i < BENCH_MAX_SESSIONS; i++) {
+        ds4_session_snapshot_free(&snaps[i]);
+        if (i && sessions[i]) ds4_session_free(sessions[i]);
+    }
     return rc;
 }
 

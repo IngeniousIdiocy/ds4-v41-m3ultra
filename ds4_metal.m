@@ -287,8 +287,27 @@ static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> c
     pthread_mutex_unlock(&g_timeline_mutex);
 }
 
+/* DS4_METAL_CB_TIMES=<file>: each batch command buffer's kernel and GPU start and end, ns, with no change to its
+ * passes. The timeline above splits them, which slows encoding, so only this shows the real idle time. */
+static void ds4_gpu_cb_times_attach(id<MTLCommandBuffer> cb) {
+    static int probed;
+    static FILE *fp;
+    if (!probed) {
+        probed = 1;
+        const char *path = getenv("DS4_METAL_CB_TIMES");
+        if (path && path[0]) fp = fopen(path, "a");
+    }
+    if (!fp || !cb) return;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        fprintf(fp, "C %.0f %.0f %.0f %.0f\n", done.kernelStartTime * 1e9, done.kernelEndTime * 1e9,
+                done.GPUStartTime * 1e9, done.GPUEndTime * 1e9);
+        fflush(fp);
+    }];
+}
+
 /* Attach to a freshly created batch command buffer. */
 static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb) {
+    ds4_gpu_cb_times_attach(cb);
     if (!g_timeline_enabled || !cb) return;
     DS4TimelineBatch *b = [DS4TimelineBatch new];
     b->samples = [NSMutableArray array];
