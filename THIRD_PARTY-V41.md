@@ -1,9 +1,24 @@
 # Third-party code, weights and dependencies for DeepSeek V4.1 on Metal
 
 The repository licence (`LICENSE`, MIT) is DwarfStar's and is unchanged.
-`third_party/` and `licenses/` are DwarfStar's and unchanged, except
-`licenses/omlx.txt`, which this branch adds (below). This file records
-what the V4.1 Metal work adds on top of them, and where the pieces came from.
+`third_party/` and `licenses/` are DwarfStar's, with three changes:
+
+- `licenses/omlx.txt`, which this branch adds (below).
+- `third_party/iris/png.h`, the bundled PNG decoder, is this branch's own
+  change and decodes the same pixels faster (a 3840x2160 screenshot in 35 ms
+  instead of 97): CRC-32 from a 256-entry table, Adler-32 reduced once every
+  5,552 bytes as zlib does, and on Apple the image data inflated by the
+  system's DEFLATE decoder, accepted only when it gives exactly the expected
+  bytes with a matching Adler-32; otherwise the bundled decoder runs.
+  `DS4_DISABLE_PNG_SYSTEM_INFLATE=1` always runs the bundled decoder.
+- `third_party/iris/jpeg.h` carries Giulio Davide Carparelli's fix from
+  DwarfStar (antirez/ds4 commit `2768d0ed`, issue #1292): progressive scans
+  whose spectral selection or successive approximation values break the JPEG
+  standard are rejected, since one with an end index past 63 could write
+  outside a coefficient block.
+
+This file records what the V4.1 Metal work adds on top of them, and where the
+pieces came from.
 
 ## DwarfStar
 
