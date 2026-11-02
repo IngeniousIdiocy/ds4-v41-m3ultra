@@ -790,7 +790,14 @@ static const ds4_tokens *job_fixture(ds4_engine *engine, bench_fixture *fx, cons
         char *text = read_file(path);
         ds4_tokens_free(&fx->tokens);
         memset(&fx->tokens, 0, sizeof(fx->tokens));
-        ds4_tokenize_text(engine, text, &fx->tokens);
+        const size_t len = strlen(path);
+        if (len > 4 && !strcmp(path + len - 4, ".ids")) {   /* decimal token ids, for the same prompt in another engine */
+            char *p = text, *end;
+            for (long id = strtol(p, &end, 10); end != p; p = end, id = strtol(p, &end, 10))
+                ds4_tokens_push(&fx->tokens, (int)id);
+        } else {
+            ds4_tokenize_text(engine, text, &fx->tokens);
+        }
         free(text);
         snprintf(fx->path, sizeof(fx->path), "%s", path);
     }

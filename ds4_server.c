@@ -10333,6 +10333,21 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+static uint64_t request_wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* A request's id and wall-clock span, among a finish line's flags: its turn's
+ * intervals overlap under concurrency, and the second-resolution prefix and
+ * the elapsed time at the line's end cannot tell identical spans apart. */
+static void request_stamps(char *flags, size_t cap, uint64_t rid, uint64_t start_ms) {
+    const size_t n = strlen(flags);
+    snprintf(flags + n, cap - n, "%srid=%llu start_ms=%llu end_ms=%llu", n ? " " : "",
+             (unsigned long long)rid, (unsigned long long)start_ms, (unsigned long long)request_wall_ms());
+}
+
 static pthread_mutex_t server_log_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void server_log(ds4_log_type type, const char *fmt, ...) {
@@ -10654,6 +10669,7 @@ struct server {
     int idle_prefill_quantum;   /* the engine's prefill cap: wide chunks while nothing generates */
     int last_prefill_slot;
     double mixed_decode_share;  /* decode wall time owed per second of prefill wall time */
+    uint64_t request_seq;       /* the last request id logged */
     double prefill_started;
     double prefill_resume_at;   /* active generations hold the model until this time */
     pthread_mutex_t mu;
@@ -14487,6 +14503,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
     const double t0 = now_sec();
+    const uint64_t start_ms = request_wall_ms();
+    const uint64_t rid = __atomic_add_fetch(&s->request_seq, 1, __ATOMIC_RELAXED);
     uint64_t samp0[3 + 4 + 5];   /* the request's sampler paths, logged at its finish */
     sampler_counts(samp0);
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
@@ -15552,13 +15570,14 @@ decode_again:
                    req_flags);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-        char flags[80];
+        char flags[160];
         log_flags(flags, sizeof(flags),
                   responses_protocol,
                   true,
                   thinking.inside,
                   saw_tool_start,
                   saw_tool_end);
+        request_stamps(flags, sizeof(flags), rid, start_ms);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
@@ -15580,13 +15599,14 @@ decode_again:
                        now_sec() - t0);
         }
     } else {
-        char flags[80];
+        char flags[160];
         log_flags(flags, sizeof(flags),
                   responses_protocol,
                   j->req.has_tools,
                   thinking.inside,
                   false,
                   false);
+        request_stamps(flags, sizeof(flags), rid, start_ms);
         if (!strcmp(final_finish, "error") && err[0]) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",

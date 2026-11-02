@@ -1054,6 +1054,12 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
+            if (getenv("DS4_SCORE_TOK")) {   /* one line per scored token */
+                static FILE *tf;
+                if (!tf) tf = fopen(getenv("DS4_SCORE_TOK"), "w");
+                fprintf(tf, "%s %d %d %d %.9f\n", id, i, target.v[i], greedy, logits[target.v[i]] - logsum);
+                fflush(tf);
+            }
             if (i == 0) first_match = (greedy == target.v[i]);
             if (still_matching && greedy == target.v[i]) lcp++;
             else still_matching = false;
