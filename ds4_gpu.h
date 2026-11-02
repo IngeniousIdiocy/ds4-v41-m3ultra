@@ -119,6 +119,7 @@ typedef struct {
 #define DS4_GPU_V41B_BATCH_STATIC (1ull << 9)   /* 2-8 cross-session decode rows' routed experts run one-row decode's fixed-shape kernels with a row count, no plan */
 #define DS4_GPU_V41B_BATCH_RBLOCK (1ull << 10)   /* with BATCH_STATIC the routed grids visit every pair at a row block before the next block */
 #define DS4_GPU_V41B_BATCH_EXPAND (1ull << 11)   /* cross-session decode rows' FFN join with its shape as literals */
+#define DS4_GPU_V41B_BATCH_QKV (1ull << 12)   /* with BATCH_MIX q_a and kv run side by side at the head of that section */
 #define DS4_GPU_V41B_BATCH_MIX (1ull << 8)   /* 2-4 cross-session decode rows' attention runs the HC mix beside q_b */
 #define DS4_GPU_V41_FULL_PROBS (1ull << 57)   /* an untruncated probability build (top_p 1, no top-k or min-p) is the softmax in one pass, with no heap or sort */
 #define DS4_GPU_V41_KEYED_GPU (1ull << 56)   /* the decode step finds the keyed draw's candidates on the GPU; the CPU scores only them */

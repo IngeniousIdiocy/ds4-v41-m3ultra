@@ -42792,19 +42792,24 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
 #ifdef __APPLE__
     /* both norms in one dispatch */
     if (ds41_on(DS4_GPU_V41_QKV_FUSION) && count <= DS4_TP_BATCH_MAX_ROWS) {
+        /* BATCH_QKV: the section opens here */
+        const bool side = mix_pre && ds41_on2(DS4_GPU_V41B_BATCH_QKV);
+        if (side && !ds4_gpu_overlap_begin()) return false;
         if (!ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) ||
             !ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true)) return false;
+        if (side) ds4_gpu_overlap_level();
         if (!ds4_gpu_dsv41_norm_pair_rows(b->qr, b->qr, l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q,
                 b->kv, b->kv, l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, m->map, m->size, DS4_RMS_EPS, count) &&
-            !(ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
+            (side || !(ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
                   l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
               ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
               ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
                   l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
-              ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16))) return false;
+              ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16)))) return false;
+        if (side) ds4_gpu_overlap_level();
         /* BATCH_MIX: mix_pre, the block's deferred HC mix beside q_b (its norm goes to dead after_attn, not flat_norm,
          * which can alias q); the caller closes the section */
-        if (mix_pre && (!ds4_gpu_overlap_begin() ||
+        if (mix_pre && ((!side && !ds4_gpu_overlap_begin()) ||
                         !ds41_hc_input_rows(b, m, l, false, mix_pre, mix_stride, count, b->after_attn))) return false;
         const bool table = tab_il >= 0 && l->attn_q_b->type == DS4_TENSOR_Q8_0 &&
             ds4_gpu_dsv41_project_q_rows(b->q, m->map, m->size, l->attn_q_b->abs_offset, (uint32_t)l->attn_q_b->dim[0], q_dim,

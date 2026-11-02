@@ -566,6 +566,7 @@ uint64_t ds4_gpu_v41_off2(void) {
             "DS4_METAL_DISABLE_V41_BATCH_STATIC",
             "DS4_METAL_DISABLE_V41_BATCH_RBLOCK",
             "DS4_METAL_DISABLE_V41_BATCH_EXPAND",
+            "DS4_METAL_DISABLE_V41_BATCH_QKV",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
