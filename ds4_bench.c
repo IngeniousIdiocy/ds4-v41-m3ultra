@@ -30,6 +30,11 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <notify.h>
+#include <dispatch/dispatch.h>
+#endif
 
 /* CUDA builds resolve these weak symbols through libcudart; other builds
  * remain independent of CUDA headers and libraries. */
@@ -703,11 +708,15 @@ extern char **environ;
  *   session idx=I ctx=C                     make session I (1..8, created or resized to ctx C)
  *                                           current; save, load and run then act on it
  *   nrun label=L rows=K tokens=N [first=I] [hash=1] [live=1] [off=HEX] [off2=HEX] [set=NAME=VALUE ...] [unset=NAME ...] [warm=1]
+ *        [temp=T top_p=P seed=S] [pattern=K:STEPS,K:STEPS,...]
  *                                           sessions I..I+K-1 restore their frontiers and decode
  *                                           greedily together through ds4_sessions_eval_batch; per
  *                                           row and step: PATH.steps.csv; per job: PATH.nruns.csv;
  *                                           hash=1 hashes each row's logits per step, outside timing;
- *                                           live=1 decodes from the sessions as they stand, no restore
+ *                                           live=1 decodes from the sessions as they stand, no restore;
+ *                                           temp=T > 0 samples each row (seed + row) instead of the argmax;
+ *                                           pattern cycles how many rows take each step, the last K of the
+ *                                           rows, so row 0 drops out first (steps.csv has K lines for the step)
  *   quit                                    end the runner (until then it waits for appended jobs)
  * Each run restores the in-memory snapshot of the last save/load, so arms switch at a
  * quiescent boundary. Per token: PATH; per job: PATH.jobs.csv, with the GPU top-p
@@ -851,6 +860,20 @@ static int bench_canary(ds4_engine *engine, const ds4_tokens *all, int len, char
     return rc;
 }
 
+/* One row's token of a step: its sample, or the argmax without temp */
+typedef struct {
+    ds4_session *s;
+    float temp, top_p;
+    uint64_t *rng;
+    int eos, token;
+} bench_sample_row_t;
+
+static void bench_sample_row(void *ctx, size_t i) {
+    bench_sample_row_t *b = (bench_sample_row_t *)ctx + i;
+    b->token = b->temp > 0.0f ? ds4_session_sample(b->s, b->temp, 0, b->top_p, 0.0f, b->rng) :
+        ds4_session_argmax_excluding(b->s, b->eos);
+}
+
 /* The GPU top-p selector's counters, in jobs.csv column order: sel_encoded, then sel_decided .. sel_stale (9). */
 static void job_counters(uint64_t c[BENCH_JOB_COUNTERS]) {
     uint64_t g[9];
@@ -906,6 +929,22 @@ static int cmp_u64(const void *a, const void *b) {
 
 /* One nrun: K sessions' frontiers decode together. Step time is the ds4_sessions_eval_batch
  * call alone; argmax and any hashing sit between the calls, as a server's sampling does. */
+/* Thermal pressure at a job's start invalidates it: wait it out, outside the timing, for up to 15 minutes. */
+static void bench_thermal_clear(int job) {
+#ifdef __APPLE__
+    static int token = -1;
+    if (token < 0 && notify_register_check("com.apple.system.thermalpressurelevel", &token) != NOTIFY_STATUS_OK) return;
+    const uint64_t start = bench_now_ns();
+    uint64_t level = 0;
+    while (notify_get_state(token, &level) == NOTIFY_STATUS_OK && level && bench_now_ns() - start < 900000000000ull) sleep(1);
+    if (bench_now_ns() - start > 500000000ull)
+        fprintf(stderr, "ds4-bench: job %d: waited %.0f s for thermal pressure 0, now %llu\n", job,
+                (double)(bench_now_ns() - start) / 1e9, (unsigned long long)level);
+#else
+    (void)job;
+#endif
+}
+
 static int job_nrun(char **kv, int n, int job, ds4_session **sessions, ds4_session_snapshot *snaps,
                     const bool *have, int eos, float *logits, int logits_cap, FILE *out, FILE *steps) {
     const char *v, *label = job_get(kv, n, "label");
@@ -914,6 +953,19 @@ static int job_nrun(char **kv, int n, int job, ds4_session **sessions, ds4_sessi
     const int tokens = (v = job_get(kv, n, "tokens")) ? atoi(v) : 64;
     const bool hash = (v = job_get(kv, n, "hash")) && atoi(v) != 0;
     const bool live = (v = job_get(kv, n, "live")) && atoi(v) != 0;
+    const float temp = (v = job_get(kv, n, "temp")) ? (float)atof(v) : 0.0f;
+    const float top_p = (v = job_get(kv, n, "top_p")) ? (float)atof(v) : 1.0f;
+    const uint64_t seed = (v = job_get(kv, n, "seed")) ? strtoull(v, NULL, 10) : 1u;
+    const bool psample = (v = job_get(kv, n, "psample")) && atoi(v);   /* rows sample at once, as the server's slots do */
+    int pat_k[32], pat_n[32], n_pat = 0, pat_steps = 0;
+    for (const char *p = job_get(kv, n, "pattern"); p && *p && n_pat < 32;) {
+        int k = 0, len = 0, used = 0;
+        if (sscanf(p, "%d:%d%n", &k, &len, &used) != 2 || k < 1 || k > rows || len < 1) break;
+        pat_k[n_pat] = k;
+        pat_n[n_pat++] = len;
+        pat_steps += len;
+        p += used + (p[used] == ',');
+    }
     char err[256], env_desc[2048] = "";
     if (rows <= 0 || first < 1 || first + rows > BENCH_MAX_SESSIONS || tokens <= 0) {
         fprintf(stderr, "ds4-bench: job %d: nrun needs rows= and first= inside sessions 1..%d\n", job, BENCH_MAX_SESSIONS - 1);
@@ -930,41 +982,73 @@ static int job_nrun(char **kv, int n, int job, ds4_session **sessions, ds4_sessi
     uint64_t *eval_ns = malloc((size_t)tokens * sizeof(uint64_t) * 2);
     uint64_t *row = calloc((size_t)tokens * (size_t)rows, sizeof(uint64_t) * 2);   /* token, logits hash */
     uint64_t chain[BENCH_MAX_SESSIONS] = {0};
+    uint64_t rng[BENCH_MAX_SESSIONS];
+    for (int i = 0; i < BENCH_MAX_SESSIONS; i++) rng[i] = seed + (uint64_t)i;
     if (!eval_ns || !row) { free(eval_ns); free(row); return 1; }
     ds4_decode_item items[BENCH_MAX_SESSIONS];
     int rc = 0;
+    bench_thermal_clear(job);
+    uint64_t c0[BENCH_JOB_COUNTERS], c1[BENCH_JOB_COUNTERS];
+    job_counters(c0);
     const uint64_t t_begin = bench_now_ns();
+    int *step_rows = calloc((size_t)tokens, sizeof(int));
+    if (!step_rows) { free(eval_ns); free(row); return 1; }
     for (int step = 0; step < tokens && !rc; step++) {
         const uint64_t h0 = bench_now_ns();
-        for (int i = 0; i < rows; i++) {
-            ds4_session *s = sessions[first + i];
+        int k = rows;
+        if (n_pat) {
+            int at = step % pat_steps, seg = 0;
+            while (at >= pat_n[seg]) at -= pat_n[seg++];
+            k = pat_k[seg];
+        }
+        step_rows[step] = k;
+        bench_sample_row_t par[BENCH_MAX_SESSIONS];
+        for (int a = 0; a < k; a++) {
+            const int i = a;
+            ds4_session *s = sessions[first + rows - k + a];
             uint64_t *r = row + ((size_t)step * (size_t)rows + (size_t)i) * 2u;
             if (hash) {
                 r[1] = bench_fnv_logits(s, logits, logits_cap);
                 chain[i] = chain[i] * 1099511628211ull ^ r[1];
             }
-            const int t = ds4_session_argmax_excluding(s, eos);
             items[i].session = s;
-            items[i].token = t;
-            r[0] = (uint64_t)t;
+            par[i] = (bench_sample_row_t){s, temp, top_p, &rng[first + rows - k + a], eos, -1};
+            if (!psample) bench_sample_row(par, (size_t)i);
+        }
+#ifdef __APPLE__
+        if (psample) dispatch_apply_f((size_t)k, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), par, bench_sample_row);
+#else
+        for (int i = 0; psample && i < k; i++) bench_sample_row(par, (size_t)i);
+#endif
+        for (int i = 0; i < k; i++) {
+            items[i].token = par[i].token;
+            row[((size_t)step * (size_t)rows + (size_t)i) * 2u] = (uint64_t)par[i].token;
         }
         const uint64_t t0 = bench_now_ns();
-        rc = ds4_sessions_eval_batch(items, rows, err, sizeof(err));
+        rc = ds4_sessions_eval_batch(items, k, err, sizeof(err));
         const uint64_t t1 = bench_now_ns();
         eval_ns[(size_t)step * 2u] = t1 - t0;
         eval_ns[(size_t)step * 2u + 1u] = t0 - h0;
     }
     const uint64_t t_end = bench_now_ns();
+    job_counters(c1);
     if (rc) fprintf(stderr, "ds4-bench: job %d: batch decode failed: %s\n", job, err);
 #ifdef BENCH_V41_OFF
     ds4_gpu_test_set_v41_off(base_off);
 #endif
     uint64_t *only = malloc((size_t)tokens * sizeof(uint64_t));
+    uint64_t *cycle = malloc((size_t)tokens * sizeof(uint64_t));
+    uint64_t *gaps = malloc((size_t)tokens * sizeof(uint64_t));
     uint64_t sum = 0;
     for (int i = 0; only && i < tokens; i++) { only[i] = eval_ns[(size_t)i * 2u]; sum += only[i]; }
+    for (int i = 0; cycle && gaps && i < tokens; i++) {
+        gaps[i] = eval_ns[(size_t)i * 2u + 1u];
+        cycle[i] = eval_ns[(size_t)i * 2u] + gaps[i];
+    }
     if (only) qsort(only, (size_t)tokens, sizeof(uint64_t), cmp_u64);
+    if (cycle && gaps) { qsort(cycle, (size_t)tokens, sizeof(uint64_t), cmp_u64); qsort(gaps, (size_t)tokens, sizeof(uint64_t), cmp_u64); }
     for (int step = 0; step < tokens; step++)
-        for (int i = 0; i < rows; i++) {
+        for (int i = 0; i < step_rows[step]; i++) {
             const uint64_t *r = row + ((size_t)step * (size_t)rows + (size_t)i) * 2u;
             fprintf(steps, "%d,%s,%d,%d,%llu,%llu,%llu,%016llx\n", job, label ? label : "", step, i,
                     (unsigned long long)r[0], (unsigned long long)eval_ns[(size_t)step * 2u],
@@ -974,13 +1058,19 @@ static int job_nrun(char **kv, int n, int job, ds4_session **sessions, ds4_sessi
             (unsigned long long)run_off, env_desc,
             only ? (double)only[tokens / 2] / 1e6 : 0, only ? (double)only[tokens / 10] / 1e6 : 0,
             only ? (double)only[tokens * 9 / 10] / 1e6 : 0, (double)sum / tokens / 1e6, (double)(t_end - t_begin) / 1e9);
+    fprintf(out, "%.4f,%.4f,%llu,%llu,%llu,%llu,%llu,", cycle ? (double)cycle[tokens / 2] / 1e6 : 0, gaps ? (double)gaps[tokens / 2] / 1e6 : 0,
+            (unsigned long long)(c1[1] - c0[1]), (unsigned long long)(c1[10] - c0[10]), (unsigned long long)(c1[11] - c0[11]),
+            (unsigned long long)(c1[12] - c0[12]), (unsigned long long)(c1[13] - c0[13]));
     for (int i = 0; i < rows; i++) fprintf(out, "%s%016llx", i ? ";" : "", (unsigned long long)chain[i]);
     fputc('\n', out);
     fflush(out);
     fflush(steps);
     free(only);
+    free(cycle);
+    free(gaps);
     free(eval_ns);
     free(row);
+    free(step_rows);
     return rc;
 }
 
@@ -1004,7 +1094,8 @@ static int run_jobs(const bench_config *cfg, ds4_engine *engine, ds4_session *se
         return 1;
     }
     fprintf(steps, "job,label,step,row,token,eval_ns,host_ns,logits_fnv64\n");
-    fprintf(nruns, "job,label,first,rows,tokens,off,env,median_ms,p10_ms,p90_ms,mean_ms,wall_s,row_chain_fnv64\n");
+    fprintf(nruns, "job,label,first,rows,tokens,off,env,median_ms,p10_ms,p90_ms,mean_ms,wall_s,cycle_ms,gap_ms,"
+                   "sel_decided,kg_decided,kg_unbound,kg_overflow,kg_invalid,row_chain_fnv64\n");
     fprintf(tok, "job,label,index,token,sel0_ns,eval0_ns,eval1_ns\n");
     fprintf(jo, "job,verb,label,cache,env,mode,temp,top_p,top_k,min_p,seed,warm,tokens,eos,"
                 "setup_ns,restore_ns,first_sel0_ns,last_eval1_ns,decode_tps,pos,prefix_fnv64,logits_fnv64,state_fnv64,"
