@@ -3,7 +3,8 @@
 This page says how the numbers in the README were taken, so they can be taken
 again. It covers the quiet machine, decode from saved caches, cold prefill at
 several depths, comparing groups inside one process, follow-up turns, image
-first tokens and the accuracy of the defaults that are not bit for bit.
+first tokens, the accuracy of the defaults that are not bit for bit, and
+several sessions decoding at once.
 
 The machine was a Mac Studio with an M3 Ultra (80 GPU cores) and 512 GB of
 memory. The weights were the MXFP4 build of the October 17 checkpoint and its
@@ -63,6 +64,11 @@ so that prefill and model loading are not timed.
 4. Caches are tied to their engine's payload format. This branch reads main's
    payloads and extends them with the drafter window; the previous release used
    a format of its own. Make each engine's caches with that engine.
+5. A cache also holds its prompt's token ids. This branch pre-tokenizes text as
+   `tokenizer.json` does and main does not, so the prose prompt is 417,059
+   tokens here and 419,509 on main. Decoding from a restored cache does not
+   tokenize anything, so main's caches still serve for decode; a prefill that
+   continues a cache's text must use a cache made with the same tokenizer.
 
 `ds4-bench --jobs FILE --token-csv PATH` does this in one resident process: a
 `save` job prefills a fixture to a depth and writes a cache (snapshot format 4,
@@ -143,8 +149,8 @@ builds, or with the group off and on:
 - Cold prefill: the logits after a 32K prefill, at every prefill step.
 - Strict DSpark (`--dspark-strict`): the tokens, which must equal serial
   decoding's.
-- Default DSpark: the tokens, which may differ from serial decoding by design
-  (see the README's exactness section).
+- Default DSpark: the tokens and the verify logits, which with the defaults
+  equal serial decoding's (see the README's exactness section).
 
 The unit checks in `tests/test_deepseek41_metal --v41-groups` compare each fast
 kernel with the one it replaces at V4.1's shapes, without the model.
@@ -154,17 +160,26 @@ with the faster defaults on: the logits after cold prefills of 8, 8K, 32K and
 131K tokens, 256 greedy steps from main's 8K cache, and the same 256 steps with
 the drafter loaded and DSpark on.
 
+Main and this branch now tokenize the prose prompt differently (section 2), so
+a cold prefill of the same text gives different ids, and its logits cannot be
+compared across the two. For this update the `--exact` prefills were compared
+with the previous update of this branch, which tokenizes the same way; decoding
+from main's saved cache needs no tokenizer and is compared with main directly.
+
 ## 7. Follow-up turns
 
 A follow-up turn is a prompt appended to a saved session, as a chat's next turn
-is. Restore main's 8K prose cache, time the prefill of the next N tokens of the
-same text (for example 1K, 2K and 4K), and restore again for each repetition.
-The README's figure is the 2K follow-up, without the drafter.
+is. Prefill 8K tokens of the prose prompt with the build under test and save
+the session, then restore it and time the prefill of the next N tokens of the
+same text (for example 1K, 2K and 4K), restoring again for each repetition.
+Main's figure comes from main's own 8K cache. The README's figure is the 2K
+follow-up, without the drafter.
 
 ## 8. Image first token
 
-Image figures are timed through `ds4-server` with the launch the README shows,
-plus `--vision` with the 1017 vision file. Send each request to a server that
+Image figures are timed through `ds4-server` with one session (no
+`--batched-session`, `-c 393216`), the drafter, the disk KV cache and
+`--utility-ctx 32768`, plus `--vision` with the 1017 vision file. Send each request to a server that
 has already answered a short text request, with an empty disk KV cache
 directory so nothing is restored: one image, the text "Describe this image."
 and `max_tokens` 1. Time from sending the request to the end
@@ -178,7 +193,9 @@ embedding time and the prompt's prefill time for each request.
 
 ## 9. Accuracy of the non-exact defaults
 
-PREFILL_MMA and CED are compared with the exact prefill in two ways.
+PREFILL_MMA and CED are compared with the exact prefill in two ways, and
+ATTN_TILES with main's decode attention by the long scoring cases and by greedy
+runs.
 
 - **Follow-up chains.** Prefill 3K tokens exactly and save the session. Then,
   for each configuration, restore it and append 1K tokens at a time up to 32K,
@@ -197,3 +214,49 @@ PREFILL_MMA and CED are compared with the exact prefill in two ways.
   environment.
   The paired difference between two configurations, with its standard error
   over the 21 cases, is the figure the docs give.
+- **Greedy runs to the first difference** (ATTN_TILES). Decode 16 prompts
+  greedily with the group on and off, from the same caches, keeping the full
+  logits of every step, and stop each prompt at the first step whose tokens
+  differ. Report the KL divergence of the two logits at every step before it,
+  its mean and maximum, and how many prompts reached a difference.
+
+## 10. Several sessions at once
+
+The server figures are taken through `ds4-server` with the launch the README
+shows, plus `--vision` with the 1017 vision file: four batched sessions, the
+drafter on, temperature 1 and top_p 1. Each conversation is a raw
+`/v1/completions` prompt, a 2K- to 3K-token slice of a C source file behind a
+header of its own, so no two share a prefix.
+
+- **Warm, then decode together.** Send each conversation once with
+  `max_tokens` 1, so its prompt is prefilled and resident. Check that the
+  machine is quiet, then send the N measured requests at the same moment,
+  streamed, 256 tokens each, each with its own seed, and record the arrival time
+  of every streamed token. A session's rate is its tokens after the first over
+  the time from its first token to its last; the figure for all sessions is the
+  tokens that arrived in the window where all N were decoding, over that window.
+  Host sampling and the server's own work between steps are inside these times.
+- **One session.** The same, with one conversation, on the same server.
+- **A cold prompt beside decoding sessions.** Three conversations decode greedily
+  while, 3 s in, a fourth request arrives with a cold 9,240-token prompt. Record
+  every gap between two tokens of the same decoding session while the cold
+  prompt prefills, and report the 99th percentile and the longest.
+
+The comparison with oMLX is decode only, greedy, DSpark off, in one resident
+process per engine. ds4-bench restores N saved sessions (`session` jobs) and
+decodes them together (`run nrun=N`), 128 tokens, and reports milliseconds per
+step for all N rows; each N runs three times in serpentine order and the median
+is taken. The prompts are the same 1,024 token ids on both engines, in two
+sets of eight: prompts made the way oMLX's own benchmark makes them (its source
+code behind a unique header, so rows share much of their text), and prompts of
+distinct text. oMLX
+v0.7.3 ran DeepSeek's released FP4 and FP8 weights of the same checkpoint
+through a small harness over its `BatchGenerator`: one batched prefill of the N
+rows, then 127 steps of N rows, the same shape as `nrun`, timed the same way,
+in a quiet session of its own. oMLX's own
+benchmark command was not used, because it uploads its results.
+
+Batched rows are checked against each session decoded alone: decode the
+sessions together with a hash of every row's full logits at every step, then
+each session alone from the same cache, and compare the hashes, at two to
+eight rows and at short depth and 34K to 300K.

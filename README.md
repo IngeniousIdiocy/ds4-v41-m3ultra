@@ -2,26 +2,34 @@
 
 This branch is [antirez's DwarfStar](https://github.com/antirez/ds4) (main at
 `5379c1c9`) plus a set of Metal speed-ups for DeepSeek V4.1 Flash. On a 512 GB
-M3 Ultra with the MXFP4 build of the October 17 checkpoint, it decodes about
-twice as fast as main: **41.4 tok/s at 8K context and 40.5 at 131K**, against
-main's 19.9 and 17.9. With DSpark drafting, code answers run at **58.8 tok/s**.
-A cold 131K-token prompt takes **138.8 s**, against main's 189.5 s, and a 4K
-screenshot reaches its first token in **2.8 s**.
+M3 Ultra with the MXFP4 build of the October 17 checkpoint, it decodes more
+than twice as fast as main: **43.7 tok/s at 8K context and 42.8 at 131K**,
+against main's 19.9 and 17.9. With DSpark drafting, code answers run at
+**67.7 tok/s**. Several sessions now decode together: three sessions at once,
+as a chat with two agents beside it, get **77.7 tok/s** in all through the
+server, with DSpark on and DeepSeek's recommended sampling. A cold 131K-token
+prompt takes **139.7 s**, against main's 189.5 s, and a 4K screenshot reaches
+its first token in **2.9 s**.
 
-The speed-ups come in 58 groups for the language model and 8 for image input.
-Each group does one thing, is added on top of main in its own commits, and has
-one switch that turns it off and runs main's code instead.
-Serial decoding from a given cache gives main's output bit for bit. A few
-defaults trade the last bits for speed, with a measured loss within noise, most
-of all MMA prefill attention and CED, the bounded decoder replay of DeepSeek's
-V4.1 report. `--exact` (or `DS4_V41_EXACT=1`) turns off every default that is
-not bit for bit; see [Exactness](#exactness).
+The speed-ups come in 96 groups for the language model and 8 for image input.
+Each group does one thing and has one switch that turns it off and runs main's
+code instead. Groups are added on top of main in their own commits; from this
+update on, one commit can hold several groups that share a mechanism.
+A few defaults trade the last bits for speed, with a measured loss within
+noise: MMA prefill attention, CED (the bounded decoder replay of DeepSeek's
+V4.1 report) and, new in this update, decode attention on the matrix units, so
+by default serial decoding no longer gives main's output bit for bit.
+`--exact` (or `DS4_V41_EXACT=1`) turns off every default that is not bit for
+bit, and then serial decoding from a given cache gives main's output bit for
+bit; see [Exactness](#exactness). Decoding several sessions together never
+changes what a session writes: each gets the bits it would get decoded alone.
 
 [![V4.1 release video: DwarfStar main vs every speed group on](docs/video-poster.jpg)](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/releases/download/v41-video/v41-on-main-speedups.mp4)
 
 The video's numbers were measured at tag [`v41-video`](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/tree/v41-video). Later defaults, such as MMA attention and CED, are not in it. Also available: [720p](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/releases/download/v41-video/v41-on-main-speedups-phone.mp4) · [subtitles](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/releases/download/v41-video/v41-on-main-speedups.srt) · [release page](https://github.com/IngeniousIdiocy/ds4-v41-m3ultra/releases/tag/v41-video)
 
 Thanks to Ivan Fioravanti and Tarjei Mandt for their public V4.1 optimizations and for the ideas this work borrowed; [THIRD_PARTY-V41.md](THIRD_PARTY-V41.md) has the details.
+Thanks also to the [oMLX](https://github.com/jundot/omlx) contributors: three pieces of the batched decode started in their V4.1 kernels.
 Everything below the line further down is DwarfStar's own README, which
 applies here unchanged.
 
@@ -35,16 +43,16 @@ a cold prompt in an empty session, without the drafter.
 
 | | DwarfStar main | this branch |
 | --- | ---: | ---: |
-| Serial decode, 8K | 19.9 t/s | **41.4 t/s** |
-| Serial decode, 131K | 17.9 t/s | **40.5 t/s** |
-| DSpark, prose, 8K | 18.6 t/s | **40.1 t/s** |
-| DSpark, code, 8K | 26.5 t/s | **58.8 t/s** |
-| Cold prefill, 32K | 45.0 s | **33.7 s** |
-| Cold prefill, 131K | 189.5 s | **138.8 s** |
+| Serial decode, 8K | 19.9 t/s | **43.7 t/s** |
+| Serial decode, 131K | 17.9 t/s | **42.8 t/s** |
+| DSpark, prose, 8K | 18.6 t/s | **42.6 t/s** |
+| DSpark, code, 8K | 26.5 t/s | **67.7 t/s** |
+| Cold prefill, 32K | 45.0 s | **34.0 s** |
+| Cold prefill, 131K | 189.5 s | **139.7 s** |
 | A 2K-token follow-up onto an 8K cache | 5.8 s | **2.7 s** |
 
 Prefill includes MMA attention and CED. With `--exact`, cold prefill takes
-37.3 s at 32K and 150.1 s at 131K.
+37.5 s at 32K and 150.8 s at 131K.
 
 Image input is timed through `ds4-server` with the 1017 vision encoder
 (`--vision`), the drafter and the disk KV cache loaded: a request with one image,
@@ -56,25 +64,64 @@ image chats, before the image speed-ups.
 
 | First token of an image request | before the image speed-ups | this branch |
 | --- | ---: | ---: |
-| 3840x2160 screenshot (1,002 prompt tokens) | 8.0 s | **2.8 s** |
+| 3840x2160 screenshot (1,002 prompt tokens) | 8.0 s | **2.9 s** |
 | 1400x900 screenshot (806 prompt tokens) | 5.3 s | **2.2 s** |
 | 512x507 image (218 prompt tokens) | 1.5 s | **1.0 s** |
 
 The prose prompt is `speed-bench/promessi_sposi.txt` (an Italian novel); the
 code prompt is DwarfStar's own C and Python source. The model continues each
-one. Main's serial and 32K figures come from the same session as the branch's.
-Main's DSpark figures and its 131K prefill come from a later quiet session;
-main cannot restore the branch's saved drafter state, so its DSpark runs start
-with a warm-up from main's own caches. The previous release, our
+one. This branch's figures come from one quiet session on this build. Main's
+come from earlier quiet sessions, measured the same way with the same tool and
+caches; main cannot restore the branch's saved drafter state, so its DSpark runs
+start with a warm-up from main's own caches. The image figures' left column is
+from the previous update's sessions. The previous release, our
 earlier build of this work on an older DwarfStar, stays available as the tag
 `v41-oct-release` of this repository.
 [docs/REPRODUCE-V41.md](docs/REPRODUCE-V41.md) says how each number was taken.
 
-A token takes about 24 ms on this branch at 8K, against about 50 ms on main.
+A token takes about 23 ms on this branch at 8K, against about 50 ms on main.
 Most of the difference is not arithmetic: it is time the GPU spent waiting for
 the host, kernel launches that did very little work, and bytes read that were
 wider than they needed to be. [docs/METAL-V41.md](docs/METAL-V41.md) explains
 each group in those terms.
+
+**Several sessions at once.** Through `ds4-server` with the launch shown under
+[Quick start](#quick-start) (four batched sessions, the drafter on, temperature
+1 and top_p 1, plus `--vision`), N sessions decode 256 tokens each, together,
+from 2K- to 3K-token prompts of C source. The times include sampling on the
+host and the server's own work between steps.
+
+| Sessions decoding together, DSpark on | tok/s in all | tok/s per session |
+| ---: | ---: | ---: |
+| 3 | **77.7** | 26.0 |
+| 1 | 43.9 | 43.9 |
+| 2 | 68.7 | 34.6 |
+| 4 | 90.9 | 22.8 |
+
+When a cold 9,240-token prompt arrives while three sessions decode (greedily,
+DSpark on), they keep going at about 10 tok/s each: its prefill took 17.7 s,
+and the longest wait between two tokens of a decoding session was 336 ms (292 ms
+at the 99th percentile). A cold 125,915-token prompt alone takes 145.4 s
+through the server.
+
+Decode alone, greedy, with DSpark off, in one resident process per engine, the
+same 1,024-token prompts as token ids on both, against
+[oMLX](https://github.com/jundot/omlx) v0.7.3 running DeepSeek's released
+weights of the same checkpoint. Tokens per second for all sessions, from the
+median step time of three runs:
+
+| Sessions, DSpark off | this branch, oMLX benchmark prompts | oMLX | this branch, distinct prompts | oMLX |
+| ---: | ---: | ---: | ---: | ---: |
+| 3 | **83.2** | 63.9 | **81.2** | 62.6 |
+| 1 | **44.2** | 38.6 | **44.1** | 38.4 |
+| 2 | **67.4** | 59.5 | **66.1** | 58.5 |
+| 4 | **92.2** | 77.0 | **88.7** | 74.1 |
+| 8 | **122.4** | 113.7 | **113.7** | 105.3 |
+
+oMLX's figures come from a quiet session of its own; its own benchmark command
+uploads results, so it was not used.
+[docs/REPRODUCE-V41.md](docs/REPRODUCE-V41.md#10-several-sessions-at-once) has
+both methods.
 
 ### Hardware and memory
 
@@ -162,6 +209,9 @@ After `git pull`, run `make` again. Then:
   the old numerics (main changed the router's softplus).
 - **ds4-bench saved caches:** save them again. The old ones record the old
   drafter and the old numerics.
+- **From the previous update of this branch:** run `make` again and keep
+  everything else. The disk KV cache's numerics canary is the same, so its
+  checkpoints still restore.
 - **From this branch's earlier build** (tag `v41-video`): run `make` again and
   keep everything else. Text checkpoints in the disk KV cache are refused once
   and rebuilt, because MMA attention and CED change the numerics canary; with
@@ -196,17 +246,22 @@ With DSpark, add the drafter:
   --mtp-model gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark
 ```
 
-As a server, with the disk KV cache and the options this branch adds:
+As a server, with four sessions decoding together, the drafter, the disk KV
+cache and the options this branch adds (the configuration the server figures
+for several sessions were measured in, plus `--vision`):
 
 ```sh
 ./ds4-server -m gguf/DeepSeek-V4.1-Flash-MXFP4.gguf --metal \
-  --host 127.0.0.1 --port 8000 -c 393216 --prefill-chunk 8192 \
-  --mtp-model gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark \
-  --kv-disk-dir kvcache --kv-disk-space-mb 98304 \
-  --kv-cache-cold-max-tokens 393216 --kv-cache-continued-interval-tokens 4096 \
-  --default-top-p 1.0 --default-min-p 0 \
+  --host 127.0.0.1 --port 8000 -c 1048576 --prefill-chunk 8192 --batched-session 4 \
+  --mtp-model gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf --dspark --mtp-exact-sampling \
+  --kv-disk-dir kvcache --kv-disk-space-mb 122880 \
+  --kv-cache-cold-max-tokens 1048576 --kv-cache-continued-interval-tokens 4096 \
+  --default-top-p 1.0 --default-min-p 0 --default-reasoning-effort low \
   --utility-ctx 32768 --serial-reasoning
 ```
+
+`-c` is each session's context. This keeps about 380 GiB wired on a 512 GB Mac;
+for one session, drop `--batched-session` and use a smaller `-c`.
 
 Run the binaries from the repository root (or pass `--chdir`): the engine builds
 its Metal kernels from `metal/` at startup. No environment variable is needed.
@@ -216,7 +271,8 @@ its Metal kernels from `metal/` at startup. No environment variable is needed.
 
 Each group's switch is `DS4_METAL_DISABLE_V41_<NAME>=1` unless the row says
 otherwise. "Decode" means one token at a time; "DSpark" means the six-row step
-that checks a draft; "TP" means two Macs.
+that checks a draft; "Batch" means one step that decodes several sessions
+(`--batched-session`); "TP" means two Macs.
 
 | Group | What it speeds up |
 | --- | --- |
@@ -274,6 +330,44 @@ that checks a draft; "TP" means two Macs.
 | KEYED_GPU | Sampled decode at top_p 1: the GPU finds the few ids that can win the keyed draw, and the CPU scores only those. |
 | FULL_PROBS | DSpark at top_p 1: the untruncated probabilities are the softmax in one pass, with no heap or sort. |
 | PQ_GPU | DSpark at top_p 1: the draft and target distributions for the p/q verify, and the draws' candidates, are built on the GPU. |
+| HEAD_ROWS | Batch: each session's vocabulary head at its one-row bits. |
+| DECODE_ROWS | Batch: six to eight rows through the fused decode MoE kernels, at their one-row bits. |
+| BATCH_FLUSH | Batch: the first command buffer commits after layer 0, so the GPU starts sooner. |
+| ROWS_REG | Batch: two to four rows' Q8_0 products in registers, one pass over the weights. |
+| BATCH_ROPE | Batch: the rows keep one-row decode's per-step RoPE tables. |
+| BATCH_KV | Batch: the rows' KV rows roped, quantized and stored in one dispatch. |
+| BATCH_TAIL | Batch: two to four rows' output projections expand straight into the hyper-connection streams. |
+| BATCH_LOW | Batch: two to four rows' low projection in registers. |
+| BATCH_NARROW | Batch: two to four rows read the BF16 router copy. |
+| BATCH_HIER | Batch: two to four rows pick experts with the hierarchical router. |
+| BATCH_OVERLAP | Batch: the mix and shared expert run beside the routed experts. |
+| BATCH_DOWN | Batch: the shared down projection beside the routed sum. |
+| BATCH_WAVE | Batch: the rows' attention stages run side by side, in waves. |
+| BATCH_MIX | Batch: the hyper-connection mix beside q_b. |
+| BATCH_STATIC | Batch: the routed experts on one-row decode's fixed-shape kernels. |
+| BATCH_RBLOCK | Batch: the routed grids in row-block-major order (oMLX's order). |
+| BATCH_EXPAND | Batch: the FFN join with its shape built in. |
+| BATCH_QKV | Batch: q_a and kv side by side. |
+| BATCH_MMA | Batch: five to seven rows on the exact eight-row matrix kernels. |
+| BATCH_TAIL8 | Batch: BATCH_TAIL and BATCH_LOW through eight rows. |
+| BATCH_DEFER8 | Batch: BATCH_OVERLAP through eight rows. |
+| BATCH_ROUTER8 | Batch: BATCH_NARROW and BATCH_HIER through eight rows. |
+| BATCH_QROPE | Batch: q_b of five to eight rows rotates as it stores. |
+| BATCH_HEAD8 | Batch: the head of five to eight rows on sixteen SIMD groups. |
+| BATCH_LOWBF | Batch: the low projection rounds to bf16 as it stores. |
+| BATCH_PE | Batch: the next step's first command buffer is encoded during the final wait. |
+| BATCH_ENGRAM | Batch: two to eight rows read the Engram copy in one pass. |
+| BATCH_READS | Batch: the second Engram table is read once the first has joined. |
+| VERIFY_STACK | DSpark, batch: a verify block on the batch's FFN, Engram, router and head kernels. |
+| VERIFY_COPIES | DSpark: a verify block's rollback and commit copies in one concurrent level. |
+| VERIFY_DECODE | DSpark: a verify block attends with the decode kernels, so it gives serial decoding's bits. |
+| MIXED_STEP | DSpark, batch: a verify block shares its step with other sessions' rows. |
+| MIXED_CARRY | DSpark, batch: a rejected draft's correction rides in the next shared step. |
+| READ_ONCE | DSpark, batch: rows that picked the same expert read it once. |
+| FP4_NO_TABLE | Decode, batch: FP4 expert codes become floats by shifts, without a table (oMLX's decode). |
+| LIVE_SPLITS | Decode, batch: attention launches only the splits that have keys. |
+| FINAL_SPIN | Decode, batch: the host spins on the last command buffer's signal instead of waiting for completion. |
+| ATTN_TILES | Decode, batch, DSpark: attention scores and PV on the matrix units (from oMLX's kernel). Not bit for bit. |
 | TP_BALANCED_ROUTE | TP: each Mac takes half of every token's experts. |
 | TP_SHARED_SPLIT | TP: the shared expert is split across both Macs. |
 | TP_GATES | TP: partials go straight into the exchange slots. |
@@ -298,14 +392,18 @@ environment:
 
 ### Exactness
 
-Every group has an off switch. Serial decoding from a given cache gives
-DwarfStar main's output bit for bit. Prefill has two defaults that are not:
+Every group has an off switch. Three defaults are not bit for bit with
+DwarfStar main, two in prefill and one in decode:
 
 - **PREFILL_MMA** runs prefill attention on the matrix units, which adds in a
   different order.
 - **CED** replays only a prompt's last 256 rows through the 20 decoder layers,
   as DeepSeek's V4.1 report does (its causal encoder-decoder with bounded
   replay); IMAGE_CED does the same for prompts that hold images.
+- **ATTN_TILES**, new in this update, runs decode attention's scores and PV on
+  the matrix units, which also adds in a different order. Serial decoding from
+  a given cache therefore no longer gives main's output bit for bit by default;
+  with `--exact` it does.
 
 Their cost is within noise. After each of 29 follow-ups of 1K tokens, from 3K
 to 32K, the next token was the same as the exact prefill's, with a mean
@@ -315,6 +413,11 @@ log-likelihood per token is 0.3003 against 0.3010 with exact prefill (prose
 0.4452 against 0.4487, code 0.1910 against 0.1896). These were measured with
 the groups through PREFILL_PIPELINE; the four prefill groups after it give the
 same bits as the code they replace, so the figures hold for this build.
+ATTN_TILES on top of them: over the same 21 cases, 0.2993 against 0.3003 with
+main's decode attention. Greedy decoding of 16 prompts, compared with main's
+attention step by step until the tokens differed, took 735 steps in all, with a
+mean KL divergence of 0.00175 (at most 0.035); 14 of the 16 reached a different
+token.
 
 **One switch for main's bits.** `--exact` on `ds4` and `ds4-server`, or
 `DS4_V41_EXACT=1` for any tool, is off by default. It turns off every default
@@ -327,19 +430,20 @@ serial output:
 - ROWS_MMA and VERIFY_INDEXED (DSpark), and DSpark drafting itself, as
   `--dspark-strict` does;
 - VISION_ATTN_FLASH (the vision encoder's attention);
+- ATTN_TILES (decode attention);
 - KEYED_SAMPLING, KEYED_GPU, FULL_PROBS and PQ_GPU (sampling at top_p 1), so a
   sampled decode draws with main's sampler.
 
 With `--exact`, the logits after cold prefills of 8, 8K, 32K and 131K tokens
-are main's, and so are 256 greedy steps of tokens and logits from main's own
+are main's for the same token ids, and so are 256 greedy steps of tokens and logits from main's own
 8K cache, with or without the drafter loaded. A disk KV checkpoint written in
 one mode is refused in the other, so an exact session never continues from
 state the faster defaults wrote.
 
-With every group on except PREFILL_MMA and CED, serial decoding gives DwarfStar
-main's logits bit for bit: every one of 128 greedy steps from main's own saved
-caches at 8K and 131K prose, at every step of the progression below, and the
-logits after a cold 32K prefill. Short prompts are exact too: after prompts of
+Through the progression below, with every group on except PREFILL_MMA and CED,
+serial decoding gave DwarfStar main's logits bit for bit: every one of 128
+greedy steps from main's own saved caches at 8K and 131K prose, at every step,
+and the logits after a cold 32K prefill. (ATTN_TILES came later.) Short prompts are exact too: after prompts of
 three to eight tokens the logits and the next 32 greedy tokens are main's.
 Strict DSpark gives the serial tokens.
 
@@ -349,12 +453,22 @@ order of sums, so it gives main's bits at the speed of the faster kernels it
 replaced. `DS4_METAL_DISABLE_V41_SHORT_MMA=1` runs main's own kernels instead,
 with the same output.
 
-DSpark's default mode is different, on main as here. It keeps the state of the
-batched verify, and the batched verify is not bit for bit equal to decoding one
-token at a time, so greedy DSpark output can differ from serial output where two
-tokens are nearly tied. This branch verifies in a batch by default because it is
-faster; `DS4_METAL_DISABLE_V41_VERIFY_INDEXED=1` verifies row by row instead,
-which gives serial decoding's tokens.
+**Several sessions at once.** Every batch group gives each session's row the
+bits of that session decoded alone with the same switches, sampled or greedy,
+so batching never changes what a session writes. Each group was checked by
+hashing every row's full logits at every step against that session's own
+one-row run, at two to eight rows, at short depth and at 34K to 300K.
+
+**DSpark.** DSpark's default mode keeps the state of the batched verify. On
+main the batched verify is not bit for bit equal to decoding one token at a
+time, so greedy DSpark output can differ from serial output where two tokens
+are nearly tied. Here a verify block now attends with the decode kernels
+(VERIFY_DECODE) and runs on the decode stages (VERIFY_STACK), so with the
+defaults greedy DSpark gives serial decoding's tokens: its verify logits equal
+serial decoding's at 44 places from a few hundred tokens to 400K, and greedy
+DSpark wrote serial decoding's 512 tokens on each of five texts. With
+VERIFY_STACK or VERIFY_DECODE off the old difference returns, and
+`DS4_METAL_DISABLE_V41_VERIFY_INDEXED=1` verifies row by row instead.
 
 The groups that are not bit for bit:
 
@@ -362,10 +476,13 @@ The groups that are not bit for bit:
 - **VISION_ATTN_FLASH**: the vision encoder's attention on the matrix units, in
   float with a different order of sums. See image input below for its
   accuracy.
-- **VERIFY_INDEXED** (the batched verify, above).
-- **ROWS_MMA**: three to eight rows of a draft or verify block on the matrix
-  units add in a different order, so verify logits can differ in the last bits.
-  It runs only inside DSpark; prefills never take it.
+- **ATTN_TILES** (above). A batched row still equals its session decoded
+  alone, since one-row decode takes the same kernel.
+- **VERIFY_INDEXED** and **ROWS_MMA**, only with VERIFY_STACK or VERIFY_DECODE
+  off: then the batched verify and the matrix units' order of sums can change a
+  verify row's last bits. With the defaults a verify block gives serial
+  decoding's bits (above). ROWS_MMA runs only inside DSpark; prefills never
+  take it.
 - **VERIFY_KERNELS**: verify rows now carry the bits of each row decoded alone,
   instead of main's batch kernels' bits, so DSpark's tokens can differ from
   main's DSpark.
@@ -398,7 +515,7 @@ The groups that are not bit for bit:
   the same numerics; another image behind the same text misses and is read
   again. A restored prefix skips the encoder for the images it already holds.
 - **Faster images.** The groups above take a 4K screenshot's first token from
-  8.0 s to 2.8 s: preparation on every core, one decode per image, a
+  8.0 s to 2.9 s: preparation on every core, one decode per image, a
   faster PNG decoder, the encoder's attention on the matrix units, and CED and
   the short-prefill groups for the prompt that follows.
 - **Image accuracy.** On 216 exactly scored questions about 42 rendered images
@@ -410,6 +527,49 @@ The groups that are not bit for bit:
   image per request. Use `--exact` where bit-for-bit output matters.
 
 ### New in this update
+
+- **Several sessions decode together.** With `--batched-session N`, `ds4-server`
+  keeps N sessions resident and decodes every session that is ready in one step:
+  each layer's weights are read once for all of them. A chat with two agents
+  working beside it, the case this update was built for, gets 77.7 tokens per
+  second in all, against 43.9 for one session alone (DSpark on, temperature 1,
+  top_p 1, through the server). Each session's output is bit for bit what it
+  would be decoded alone, sampled or greedy, at every depth checked, so batching
+  never changes what a session writes. Two to four rows run on register kernels
+  that read each weight once and keep every row's own order of sums; five to eight
+  rows run on the exact eight-row tiles. The groups are explained under
+  "Several sessions at once" in [docs/METAL-V41.md](docs/METAL-V41.md#several-sessions-at-once).
+- **DSpark inside a batch.** A session with the drafter loaded keeps drafting
+  while other sessions decode: its verify block leads the step and the other
+  sessions follow as plain rows, and a rejected draft's correction becomes that
+  session's row in the next step instead of a step of its own. While three or
+  fewer sessions decode, they take turns drafting, one block a step; with more,
+  every session decodes plain rows. A verify block now
+  attends with the decode kernels, so DSpark's greedy output is serial decoding's,
+  bit for bit, at every depth checked from a few hundred tokens to 400K.
+- **Expert weights read once for the rows that share them.** When two rows pick
+  the same expert, one load feeds both rows' sums, in each row's own order. A
+  verify block repeats a third of its experts, so blocks always take it; plain
+  rows take it from four sessions.
+- **Faster decode for one session too.** The routed experts decode their FP4
+  weights with shifts instead of a table behind a barrier, decode attention runs
+  its scores on the matrix units (not bit for bit; `--exact` keeps main's
+  kernel), only attention splits that have
+  keys launch, and the host spins on the last command buffer's event instead of
+  waiting for its completion. Serial decode at 8K is now 43.7 tok/s, against
+  41.4 in the previous update.
+- **Prefill no longer stalls the other sessions.** A cold prompt now prefills in
+  32,768-token syncs and parks between chunks, and the decoding sessions take a
+  step at every park. Beside three decoding sessions, a cold 9,240-token prompt
+  prefilled in 17.7 s while they kept decoding, and the longest wait between two
+  of their tokens was 336 ms. A title or a short
+  append no longer waits for a cold prefill to finish: it gets the model between
+  chunks.
+- **The utility session beside batched sessions.** `--utility-ctx` now works with
+  `--batched-session`: the utility row joins the batch, so titles and summaries
+  run beside the chats instead of waiting for them.
+
+### In the previous update
 
 - **Prompts exactly as DeepSeek's encoder writes them.** For the same chat
   request, ds4 now produces the token ids that the 1017 checkpoint's
@@ -436,21 +596,11 @@ The groups that are not bit for bit:
   once.
 - **DeepSeek's recommended sampling, at full speed.** DeepSeek recommends
   temperature 1 and top_p 1.0 for the 1017 checkpoint, and the server example
-  above now uses it. At top_p 0.95, a run of repeated text can become
+  above uses it. At top_p 0.95, a run of repeated text can become
   permanent: once the next repeated token is above 0.95 probability, every
   other token is cut, so the model can never leave it. At 1.0 it escapes. Before
-  this update top_p 1.0 was slower, because it sampled the full vocabulary on
-  the CPU. The four sampler groups above make it as fast as 0.95 or faster
-  (temperature 1, 512 sampled tokens, median of three seeds; the top_p 0.95
-  column is the best of three measurement windows, the top_p 1.0 column the
-  final build's):
-
-  | | top_p 0.95 | top_p 1.0 |
-  | --- | ---: | ---: |
-  | Serial decode, prose 8K | 40.6 t/s | **41.6 t/s** |
-  | Serial decode, prose 131K | 40.7 t/s | **40.7 t/s** |
-  | DSpark, code 8K | 48.2 t/s | **49.6 t/s** |
-
+  that update top_p 1.0 was slower, because it sampled the full vocabulary on
+  the CPU. The four sampler groups above make it as fast as 0.95 or faster.
   Sampling a token at top_p 1.0 now costs about 1 µs, against 12 to 14 µs for
   the top-p selector and about 320 µs on the previous CPU path. DSpark at top_p
   1 verifies drafts with the p/q test, with both distributions built on the
@@ -578,6 +728,10 @@ together they take a cold 32K prefill from 37.9 s to 33.7 s and 131K from
 151.6 s to 138.8 s, and a 2K-token follow-up onto an 8K cache from 4.8 s to
 2.7 s.
 
+The groups of this update, HEAD_ROWS through ATTN_TILES, came after the
+progression too. [docs/METAL-V41.md](docs/METAL-V41.md#several-sessions-at-once)
+gives each one's gain as it was added, and the speed table above is this build.
+
 After the progression session, ROWS_MMA and VERIFY_KERNELS were limited to
 DSpark's rows; before, they also took an eight-token prefill, which was fast but
 not main's bits. That change and the SHORT_MMA exactness switch (see Exactness)
@@ -607,10 +761,11 @@ make test-deepseek41-verify-indexed DS4_TEST_MODEL=gguf/DeepSeek-V4.1-Flash-MXFP
 
 ### V4.1 documents
 
-- [docs/METAL-V41.md](docs/METAL-V41.md): what each group does and why it is faster, and one
-  speed-up identified but not built.
+- [docs/METAL-V41.md](docs/METAL-V41.md): what each group does and why it is faster, the
+  groups that decode several sessions at once, and one speed-up identified but not built.
 - [docs/RUNTIME-V41.md](docs/RUNTIME-V41.md): every option and switch.
 - [docs/REPRODUCE-V41.md](docs/REPRODUCE-V41.md): how the numbers were measured.
+- [docs/FAILED-EXPERIMENTS-V41.md](docs/FAILED-EXPERIMENTS-V41.md): the ideas that were built and measured and did not pay, and why.
 - [CHANGES-V41.md](CHANGES-V41.md): the commits, and what changed since the previous release.
 - [THIRD_PARTY-V41.md](THIRD_PARTY-V41.md): where the pieces came from.
 - [.claude/skills](.claude/skills): three skills for Claude Code and Codex users optimizing Metal inference: decode, prefill and speculative decoding.
